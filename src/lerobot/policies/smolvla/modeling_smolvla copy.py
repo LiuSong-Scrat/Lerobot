@@ -594,7 +594,7 @@ class SelfAttention(nn.Module):
         # Optional：可加 LayerNorm，对点维做 normalize
         self.norm = nn.LayerNorm(C)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         # x: (B, N, C)
         B, N, C = x.shape
 
@@ -607,9 +607,6 @@ class SelfAttention(nn.Module):
         # Q K^T / sqrt(C)
         scores = torch.bmm(Q, K.transpose(1, 2))  # (B, N, N)
         scores = scores / (C ** 0.5)
-        if mask is not None:
-            key_mask = mask[:, None, :]
-            scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
 
         # 3) softmax 沿 N 维 (即每行是 N 个点的权重)
         attn_weights = F.softmax(scores, dim=2)  # (B, N, N)
@@ -619,15 +616,13 @@ class SelfAttention(nn.Module):
 
         # 5) 可选：加 LayerNorm + 残差
         x_out = self.norm(x_out + x)  # (B, N, C)
-        if mask is not None:
-            x_out = x_out * mask.unsqueeze(-1).to(dtype=x_out.dtype)
 
         return x_out   
 
 class LitePTTokenizer(nn.Module):
     """
     input:  pc (B,N,C) XYZ m RGB 0-255
-    output: xyz_tok (B,Pmax,3), tok (B,Pmax,dim), g (B,dim), tok_mask (B,Pmax)
+    output: xyz_tok (B,T,3), tok (B,T,dim), g (B,dim)
     """
 
     def __init__(self, in_dim=6, dim=128, n_tokens=512, grid_size=0.005):
@@ -636,7 +631,7 @@ class LitePTTokenizer(nn.Module):
         self.n_tokens = n_tokens
         self.grid_size = grid_size
 
-        self.backbone = LitePT(in_channels=in_dim, enc_mode=True)
+        self.backbone = LitePT(in_channels=in_dim)
         self.out_proj = nn.LazyLinear(dim)
 
     def _is_degenerate(self, xyz, eps=1e-6):
@@ -675,14 +670,13 @@ class LitePTTokenizer(nn.Module):
 
     def forward(self, pc):
         B, N, C = pc.shape
+        T = self.n_tokens
         device = pc.device
 
         # ========= 输出 =========
-        empty_len = 1
-        global_xyz_tok = torch.zeros(B, empty_len, 3, device=device, dtype=pc.dtype)
-        tok = torch.zeros(B, empty_len, self.dim, device=device, dtype=pc.dtype)
+        global_xyz_tok = torch.zeros(B, T, 3, device=device, dtype=pc.dtype)
+        tok = torch.zeros(B, T, self.dim, device=device, dtype=pc.dtype)
         g = torch.zeros(B, self.dim, device=device, dtype=pc.dtype)
-        tok_mask = torch.zeros(B, empty_len, device=device, dtype=torch.bool)
 
         # ========= mask valid =========
         valid_mask = []
@@ -691,7 +685,7 @@ class LitePTTokenizer(nn.Module):
         valid_mask = torch.tensor(valid_mask, device=device)
 
         if valid_mask.sum() == 0:
-            return global_xyz_tok, tok, g, tok_mask
+            return global_xyz_tok, tok, g
 
         pc_v = pc[valid_mask]  # (Bv,N,C)
         Bv = pc_v.shape[0]
@@ -712,7 +706,7 @@ class LitePTTokenizer(nn.Module):
         coord, feat, batch = self._grid_sample_batch(coord, feat, batch)
 
         if coord.shape[0] == 0:
-            return global_xyz_tok, tok, g, tok_mask
+            return global_xyz_tok, tok, g
 
         # ========= offset =========
         counts = torch.bincount(batch, minlength=Bv)
@@ -733,46 +727,42 @@ class LitePTTokenizer(nn.Module):
 
         # ========= recover batch =========
         if hasattr(point, "batch"):
-            b_p = point.batch.to(torch.long)
+            b_p = point.batch
         else:
             # fallback（关键🔥）
             b_p = torch.bucketize(
                 torch.arange(xyz_p.shape[0], device=device),
-                offset,
-                right=True,
+                offset
             )
 
         # ========= 按batch拆分 =========
         valid_idx = torch.nonzero(valid_mask).squeeze(1)
-        token_counts = torch.bincount(b_p, minlength=Bv)
-        max_tokens = max(int(token_counts.max().item()), 1)
-
-        global_xyz_tok = torch.zeros(B, max_tokens, 3, device=device, dtype=pc.dtype)
-        tok = torch.zeros(B, max_tokens, self.dim, device=device, dtype=pc.dtype)
-        tok_mask = torch.zeros(B, max_tokens, device=device, dtype=torch.bool)
 
         for i in range(Bv):
-            global_b = valid_idx[i].item()
+            global_b = valid_idx[i]
 
-            P = int(token_counts[i].item())
+            idx_all = torch.nonzero(b_p == i, as_tuple=False).squeeze(1)
+            P = idx_all.numel()
 
             if P == 0:
                 continue
 
-            idx_all = torch.nonzero(b_p == i, as_tuple=False).squeeze(1)
+            if P >= T:
+                sel = idx_all[torch.randperm(P, device=device)[:T]]
+            else:
+                sel = idx_all[torch.randint(0, P, (T,), device=device)]
 
-            global_xyz_tok[global_b, :P] = xyz_p[idx_all]
-            tok[global_b, :P] = feat_p[idx_all]
-            tok_mask[global_b, :P] = True
+            global_xyz_tok[global_b] = xyz_p[sel]
+            tok[global_b] = feat_p[sel]
             g[global_b] = feat_p[idx_all].max(dim=0).values
 
-        return global_xyz_tok, tok, g, tok_mask
+        return global_xyz_tok, tok, g
     
 
 class LitePTEncoder(nn.Module):
     """
     input:  pc (B,N,C)
-    output: global feature (B,dim)
+    output: xyz_tok (B,T,3), tok (B,T,dim), g (B,dim)
     """
 
     def __init__(self, in_dim=6, dim=128, n_tokens=512, grid_size=0.05):
@@ -809,27 +799,23 @@ class LitePTEncoder(nn.Module):
 
 
 
-    def _masked_softmax(self, scores, mask):
-        mask = mask.unsqueeze(-1)
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        weights = F.softmax(scores, dim=1)
-        weights = weights * mask.to(dtype=weights.dtype)
-        denom = weights.sum(dim=1, keepdim=True).clamp_min(torch.finfo(weights.dtype).tiny)
-        return weights / denom
-
     def forward(self, scene_pc):
-        scene_xyz, scene_tok, _scene_g, scene_mask = self.pc_backbone(scene_pc)
-        scene_tok = self.attention(scene_tok, scene_mask)
-        alpha = self._masked_softmax(self.att[0](scene_tok), scene_mask)
+        scene_xyz, scene_tok, scenen_g = self.pc_backbone(scene_pc)   # (B,T,3),(B,T,C),(B,C)
+        scene_tok = self.attention(scene_tok)
+        # 3. 权重加权求和得到全局特征
+        alpha = self.att(scene_tok)        # [B, N, C]
+
+
         center = (scene_xyz * alpha).sum(dim=1)
+        centroid_xyz = scene_pc[...,:3] - center.unsqueeze(-2)
+        scene_pc1 = torch.cat([centroid_xyz, scene_pc[...,3:]], dim=-1)
+        scene_xyz1, scene_tok1, scenen_g1 = self.pc_backbone1(scene_pc1)   # (B,T,3),(B,T,C),(B,C)
+        scene_tok1 = self.attention1(scene_tok1)
+        # 3. 权重加权求和得到全局特征
+        alpha1 = self.att1(scene_tok1)        # [B, N, C]
 
-        centroid_xyz = scene_pc[..., :3] - center.unsqueeze(-2)
-        scene_pc1 = torch.cat([centroid_xyz, scene_pc[..., 3:]], dim=-1)
-        _scene_xyz1, scene_tok1, _scene_g1, scene_mask1 = self.pc_backbone1(scene_pc1)
-        scene_tok1 = self.attention1(scene_tok1, scene_mask1)
-        alpha1 = self._masked_softmax(self.att1[0](scene_tok1), scene_mask1)
 
-        global_feat = (scene_tok1 * alpha1).sum(dim=1)
+        global_feat = (scene_tok1 * alpha1).sum(dim=1)  # [B, C]
         return global_feat
 
 

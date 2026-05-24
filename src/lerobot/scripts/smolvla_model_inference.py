@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,69 @@ DEFAULT_POLICY_PATH = (
     "outputs/train/my_smolvla_song1/checkpoints/last/pretrained_model"
 )
 DEFAULT_POLICY_REPO_ID = "/home/liusong/scp_receive/smolvla"
+
+
+class PointCloudMemmapDataset(torch.utils.data.Dataset):
+    """Inject point clouds from per-episode .npy memmaps into a LeRobotDataset item."""
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        point_cloud_dir: str | Path,
+        key: str = "observation.point_cloud",
+        mmap_mode: str = "r",
+    ) -> None:
+        self.dataset = dataset
+        self.point_cloud_dir = Path(point_cloud_dir)
+        self.key = key
+        self.mmap_mode = mmap_mode
+        self._point_cloud_cache: dict[int, np.ndarray] = {}
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_point_cloud_cache"] = {}
+        return state
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @staticmethod
+    def _to_int(value) -> int:
+        if torch.is_tensor(value):
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, np.ndarray):
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
+        point_clouds = self._point_cloud_cache.get(episode_index)
+        if point_clouds is None:
+            path = self.point_cloud_dir / f"episode_{episode_index:06d}.npy"
+            if not path.exists():
+                raise FileNotFoundError(f"Point cloud memmap file is missing: {path}")
+            point_clouds = np.load(path, mmap_mode=self.mmap_mode)
+            self._point_cloud_cache[episode_index] = point_clouds
+        return point_clouds
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        episode_index = self._to_int(item["episode_index"])
+        frame_index = self._to_int(item["frame_index"])
+        point_cloud = self._episode_point_clouds(episode_index)[frame_index]
+        item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
+        return item
+
+
+def maybe_wrap_point_cloud_memmap_dataset(dataset):
+    root = Path(getattr(dataset, "root", dataset.meta.root))
+    point_cloud_dir = root / "point_clouds"
+    if not point_cloud_dir.is_dir():
+        return dataset
+    mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
+    return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
 
 import numpy as np
 import torch.nn.functional as F
@@ -190,7 +254,7 @@ class SmolVLA_ModelInference:
             self.policy.config.vlm_model_name,
             local_files_only=local_files_only,
         )
-        self.dataset: LeRobotDataset | None = None
+        self.dataset: torch.utils.data.Dataset | None = None
         self.predict_action_queue = deque()
         self.policy.n_action_steps = 16
         self.policy.horizon = 32
@@ -210,15 +274,16 @@ class SmolVLA_ModelInference:
         *,
         root: str | Path | None = None,
         episodes: list[int] | None = None,
-    ) -> LeRobotDataset:
+    ) -> torch.utils.data.Dataset:
         meta = LeRobotDatasetMetadata(str(dataset_repo_id), root=root)
         delta_timestamps = resolve_delta_timestamps(self.policy.config, meta)
-        self.dataset = LeRobotDataset(
+        dataset = LeRobotDataset(
             str(dataset_repo_id),
             root=root,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
+        self.dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
         return self.dataset
 
     @torch.inference_mode()

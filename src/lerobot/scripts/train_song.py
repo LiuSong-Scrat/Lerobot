@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -57,6 +58,72 @@ from lerobot.utils.utils import (
 
 import numpy as np
 import os
+
+
+class PointCloudMemmapDataset(torch.utils.data.Dataset):
+    """Inject point clouds from per-episode .npy memmaps into a LeRobotDataset item."""
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        point_cloud_dir: str | Path,
+        key: str = "observation.point_cloud",
+        mmap_mode: str = "r",
+    ):
+        self.dataset = dataset
+        self.point_cloud_dir = Path(point_cloud_dir)
+        self.key = key
+        self.mmap_mode = mmap_mode
+        self._point_cloud_cache: dict[int, np.ndarray] = {}
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_point_cloud_cache"] = {}
+        return state
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @staticmethod
+    def _to_int(value) -> int:
+        if torch.is_tensor(value):
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, np.ndarray):
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
+        point_clouds = self._point_cloud_cache.get(episode_index)
+        if point_clouds is None:
+            path = self.point_cloud_dir / f"episode_{episode_index:06d}.npy"
+            if not path.exists():
+                raise FileNotFoundError(f"Point cloud memmap file is missing: {path}")
+            point_clouds = np.load(path, mmap_mode=self.mmap_mode)
+            self._point_cloud_cache[episode_index] = point_clouds
+        return point_clouds
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        episode_index = self._to_int(item["episode_index"])
+        frame_index = self._to_int(item["frame_index"])
+        point_cloud = self._episode_point_clouds(episode_index)[frame_index]
+        item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
+        return item
+
+
+def maybe_wrap_point_cloud_memmap_dataset(dataset):
+    root = Path(getattr(dataset, "root", dataset.meta.root))
+    point_cloud_dir = root / "point_clouds"
+    if not point_cloud_dir.is_dir():
+        return dataset
+    logging.info(f"Loading point clouds from per-episode memmap files in {point_cloud_dir}")
+    mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
+    return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
+
+
 def visualize_res( batch, result,batch_idx = 0,ood_test_sno=0,step=0):
     import open3d as o3d
     import numpy as np
@@ -164,7 +231,7 @@ def ood_case_inference(policy,preprocessor,postprocessor,batch,step):
     for sno in ood_test_sno:
         scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new{sno}.ply",)
         scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
-        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, 1024)
+        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, batch['observation.point_cloud'][0][0].shape[0])
         batch['observation.point_cloud'][0][0] = torch.tensor(scene_point_cloud).to("cuda")
         batch['task'][0] = 'place, red_cube, eff_open, None\n'
         model_batch = preprocessor(batch)
@@ -267,6 +334,15 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        output_dict["skipped_nonfinite_loss"] = 1
+        train_metrics.loss = loss.item()
+        train_metrics.grad_norm = float("nan")
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.update_s = time.perf_counter() - start_time
+        return train_metrics, output_dict
+
     # Use accelerator's backward method
     accelerator.backward(loss)
 
@@ -277,6 +353,15 @@ def update_policy(
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
+
+    if not torch.isfinite(torch.as_tensor(grad_norm)):
+        optimizer.zero_grad(set_to_none=True)
+        output_dict["skipped_nonfinite_grad"] = 1
+        train_metrics.loss = loss.item()
+        train_metrics.grad_norm = grad_norm.item()
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.update_s = time.perf_counter() - start_time
+        return train_metrics, output_dict
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
@@ -367,12 +452,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -706,11 +793,11 @@ import sys
 sys.argv = [
     "train.py",  # dummy script name
     # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song1/checkpoints/last/pretrained_model",
-   "--policy.type=smolvla",
+    "--policy.type=smolvla",
     "--policy.repo_id=/home/liusong/scp_receive/smolvla",
     "--policy.push_to_hub=false",
     "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
-    "--batch_size=48",
+    "--batch_size=6",
     "--steps=50000",
     "--log_freq=1",
     "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song",
@@ -719,9 +806,8 @@ sys.argv = [
     "--wandb.enable=true",
     "--save_freq=2000",
     "--eval_freq=1000 ",
+    "--num_workers=6 ",
 ]
 
 if __name__ == "__main__":
     main()
-
-

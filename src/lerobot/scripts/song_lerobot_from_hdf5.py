@@ -1,5 +1,6 @@
 from pathlib import Path
 import concurrent.futures
+import json
 import os
 import shutil
 import threading
@@ -19,6 +20,9 @@ from tqdm import tqdm
 
 ROOT = Path("/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp")
 HDF5_FOLDER = Path("/home/liusong/temp/temp")
+POINT_CLOUD_DIR_NAME = "point_clouds"
+POINT_CLOUD_KEY = "observation.point_cloud"
+POINT_CLOUD_SHAPE = (50000, 6)
 FPS_BATCH_SIZE = int(os.environ.get("SONG_FPS_BATCH_SIZE", "128"))
 USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
 CONVERT_WORKERS = int(os.environ.get("SONG_CONVERT_WORKERS", str(min(20, os.cpu_count() or 1))))
@@ -202,7 +206,6 @@ def vis_umi_data(action,pointcloud):
 # 需要根据你的数据调整 shape
 dataset_features = {
     "action": {"dtype": "float32", "shape": (10,), "names": ["x", "y", "z", "x1", "y1", "z1", "x2", "y2", "z2", "gripper"]},
-    "observation.point_cloud": {"dtype": "float32", "shape": (1024, 6), "names": ["x", "y", "z", "r", "g", "b"]},
     "observation.state": {"dtype": "float32", "shape": (10,), "names": ["x", "y", "z", "x1", "y1", "z1", "x2", "y2", "z2", "gripper"]},
 }
 
@@ -216,9 +219,39 @@ def recreate_empty_dir(path: str | Path) -> Path:
     return path
 
 
+def point_cloud_file(root: Path, episode_index: int) -> Path:
+    return root / POINT_CLOUD_DIR_NAME / f"episode_{episode_index:06d}.npy"
+
+
+def write_point_cloud_meta(root: Path) -> None:
+    pc_dir = root / POINT_CLOUD_DIR_NAME
+    pc_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "key": POINT_CLOUD_KEY,
+        "dtype": "float32",
+        "shape": list(POINT_CLOUD_SHAPE),
+        "layout": "episode_npy",
+        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.npy",
+    }
+    with open(pc_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.ndarray) -> None:
+    point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
+    if point_clouds.ndim != 3 or tuple(point_clouds.shape[1:]) != POINT_CLOUD_SHAPE:
+        raise ValueError(
+            f"Expected point clouds shape (T, {POINT_CLOUD_SHAPE[0]}, {POINT_CLOUD_SHAPE[1]}), "
+            f"got {point_clouds.shape}"
+        )
+
+    pc_path = point_cloud_file(root, episode_index)
+    pc_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(pc_path, point_clouds)
+
+
 def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, point_clouds: np.ndarray, timestamps: np.ndarray) -> dict:
     actions = np.ascontiguousarray(actions, dtype=np.float32)
-    point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     timestamps = np.asarray(timestamps, dtype=np.float32).reshape(-1)
 
     if not (len(actions) == len(point_clouds) == len(timestamps)):
@@ -234,13 +267,13 @@ def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray,
     episode_buffer["timestamp"] = timestamps
     episode_buffer["action"] = actions
     episode_buffer["observation.state"] = actions
-    episode_buffer["observation.point_cloud"] = point_clouds
     return episode_buffer
 
 
 def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
     with h5py.File(h5_path, "r") as f:
-        task_name = f["task_name"][()].decode("utf-8")
+        # task_name = f["task_name"][()].decode("utf-8")
+        task_name = "Place the Red Cube on the Blue Cube"
         obs_pose_eular_eff_to_world = f["observations/pose_eular"][:].astype(np.float32)
         pointcloud_world = f["observations/cloud_rgb/overhead"][:].astype(np.float32)
 
@@ -253,7 +286,8 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
 
         gripper_width = f["observations/eff_angular"][:].astype(np.float32).reshape(-1, 1) * 0.5
         actions = np.concatenate((obs_pose9_data_eff_2_eff0, gripper_width), axis=1).astype(np.float32, copy=False)
-        point_clouds = batched_fps(P_eff, use_cuda=USE_CUDA_FPS)
+        # point_clouds = batched_fps(P_eff, use_cuda=USE_CUDA_FPS)
+        point_clouds = P_eff
 
         timestamps_dataset = f.get("timestamp")
         if timestamps_dataset is not None:
@@ -270,6 +304,8 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
 
 
 def save_converted_episode(dataset: LeRobotDataset, episode: dict) -> None:
+    episode_index = dataset.meta.total_episodes
+    save_episode_point_clouds(dataset.root, episode_index, episode["point_clouds"])
     episode_buffer = make_episode_buffer(
         dataset,
         episode["task"],
@@ -311,6 +347,10 @@ def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max
 
 
 def main():
+    if ROOT.is_dir():
+        shutil.rmtree(ROOT)
+    elif ROOT.exists():
+        ROOT.unlink()
 
     dataset = LeRobotDataset.create(
         repo_id="local_hdf5_converted",  # 只要本地目录名即可
@@ -320,6 +360,7 @@ def main():
         root=ROOT,
         use_videos=False,
     )
+    write_point_cloud_meta(dataset.root)
 
     h5_paths = sorted(HDF5_FOLDER.glob("*.hdf5"))
     if len(h5_paths) == 0:

@@ -64,13 +64,7 @@ class UMIProcessor(ProcessorStep):
         else:
             # No state data to process
             return new_transition
-        
-        # Only process if point cloud exists
-        if 'observation.point_cloud' in observation:
-            point_cloud = observation['observation.point_cloud'].cpu().numpy()  # (batch_size, seq_len, N, 6)
-        else:
-            point_cloud = None
-            
+
         # Get action from transition
         action = new_transition.get(TransitionKey.ACTION)
         if action is not None:
