@@ -54,8 +54,11 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
+from pathlib import Path
 from typing import TypedDict
 
+import numpy as np
+import open3d as o3d
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -65,6 +68,14 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.policies.smolvla.song_pointseg import (
+    MOTION_PRIOR_DIM,
+    PseudoLabelConfig,
+    SongPointSegLoss,
+    SongPointSegLossConfig,
+    SongPointSegNet,
+    generate_pseudo_labels_from_priors,
+)
 from lerobot.policies.utils import (
     populate_queues,
 )
@@ -74,10 +85,6 @@ from lerobot.utils.utils import get_safe_dtype
 from .litept.model import LitePT
 
 
-
-import numpy as np
-import torch.nn.functional as F
-import open3d as o3d
 def create_frame(position, rot_matrix, scale=0.03):
     frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
         size=scale,
@@ -426,7 +433,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
         losses = self.model.forward(pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        pointseg_aux_loss = self.model.last_pointseg_aux_loss
+        pointseg_aux_weight = self.config.pointseg_aux_loss_weight if pointseg_aux_loss is not None else 0.0
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        loss_dict["loss_pointseg_aux"] = (
+            pointseg_aux_loss.detach().item() if torch.is_tensor(pointseg_aux_loss) else 0.0
+        )
+        for key, value in self.model.last_pointseg_metrics.items():
+            if torch.is_tensor(value):
+                loss_dict[key] = value.detach().item()
 
         # Remove padding
         original_action_dim = self.config.action_feature.shape[0]
@@ -451,12 +466,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.sum(dim=(1, 2)) / (valid_action_counts * original_action_dim)
+            per_sample_action_loss = losses.sum(dim=(1, 2)) / (valid_action_counts * original_action_dim)
+            loss_dict["loss_action"] = per_sample_action_loss.mean().item()
+            per_sample_loss = per_sample_action_loss
+            if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
+                per_sample_loss = per_sample_loss + pointseg_aux_weight * pointseg_aux_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.sum() / (valid_action_counts.sum() * original_action_dim)
+            action_loss = losses.sum() / (valid_action_counts.sum() * original_action_dim)
+            loss_dict["loss_action"] = action_loss.item()
+            loss = action_loss
+            if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
+                loss = loss + pointseg_aux_weight * pointseg_aux_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -487,13 +510,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
         bsize = pc.shape[0]
         device = pc.device
         pc = pc.to(dtype=torch.float32)
+        point_cloud_payload: Tensor | dict[str, Tensor] = pc
+        pointseg_keys = (
+            "pointseg.priors",
+            "pointseg.labels",
+            "pointseg.weights",
+            "pointseg.class_scores",
+            "pointseg.role_scores",
+            "pointseg.foreground_score",
+        )
+        if self.model.pointseg_conditioner is not None or any(key in batch for key in pointseg_keys):
+            payload = {"point_cloud": pc}
+            for key in pointseg_keys:
+                if key not in batch:
+                    continue
+                value = batch[key]
+                if torch.is_tensor(value) and value.ndim >= 3 and value.shape[1] == 1:
+                    value = value.squeeze(1)
+                payload[key] = value
+            point_cloud_payload = payload
         mask = torch.ones(bsize, dtype=torch.bool, device=device)
         # if "observation.point_cloud_is_pad" in batch:
         #     mask = batch["observation.point_cloud_is_pad"].bool()
         # else:
         #     mask = torch.ones(bsize, dtype=torch.bool, device=device)
 
-        return [pc], [mask]
+        return [point_cloud_payload], [mask]
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -622,7 +664,7 @@ class SelfAttention(nn.Module):
         if mask is not None:
             x_out = x_out * mask.unsqueeze(-1).to(dtype=x_out.dtype)
 
-        return x_out   
+        return x_out
 
 class LitePTTokenizer(nn.Module):
     """
@@ -767,7 +809,7 @@ class LitePTTokenizer(nn.Module):
             g[global_b] = feat_p[idx_all].max(dim=0).values
 
         return global_xyz_tok, tok, g, tok_mask
-    
+
 
 class LitePTEncoder(nn.Module):
     """
@@ -834,14 +876,14 @@ class LitePTEncoder(nn.Module):
 
 
 
-        
+
         # # has_cond = torch.ones(global_xyz_tok.shape[0])
         # # t_xyz, t_tok = global_xyz_tok, tok
         # # c_xyz, c_tok = global_xyz_tok, tok
-        # # t_tok_rel = self.dense_xattn_full(t_xyz, t_tok, c_xyz, c_tok, has_cond)  # (B,T,C)  
+        # # t_tok_rel = self.dense_xattn_full(t_xyz, t_tok, c_xyz, c_tok, has_cond)  # (B,T,C)
         # # # Only Cross Attention
         # # t_mem = self.proj_pc(t_tok_rel)  # (B,T,D)
-        # # global_feat = t_mem.max(dim=1).values 
+        # # global_feat = t_mem.max(dim=1).values
 
         # tok = self.attention(tok)
         # # 3. 权重加权求和得到全局特征
@@ -853,9 +895,212 @@ class LitePTEncoder(nn.Module):
         # # # fused_feature = self.token_fusion_mlp(slot_relation_feature.reshape(B, -1))
 
 
-        # return global_feat 
-    
+        # return global_feat
 
+
+
+class SongPointCloudConditioner(nn.Module):
+    """Trainable SongPointSeg front-end that emits object/background point-cloud features."""
+
+    def __init__(self, config: SmolVLAConfig):
+        super().__init__()
+        self.config = config
+        self.feature_dim = int(config.pointseg_feature_dim)
+        self.foreground_ratio = float(config.pointseg_foreground_ratio)
+        self.background_ratio = float(config.pointseg_background_ratio)
+        self.min_foreground_points = int(config.pointseg_min_foreground_points)
+        self.min_background_points = int(config.pointseg_min_background_points)
+        self.aux_loss_weight = float(config.pointseg_aux_loss_weight)
+        self.use_temporal_priors_as_input = bool(config.pointseg_use_temporal_priors_as_input)
+        self.use_pseudo_selection = bool(config.pointseg_use_pseudo_selection)
+
+        self.segmenter = SongPointSegNet(
+            backbone_type=config.pointseg_backbone_type,
+            grid_size=config.pointseg_grid_size,
+        )
+        self._load_pointseg_checkpoint(config.pointseg_checkpoint_path)
+        self.foreground_encoder = LitePTEncoder(
+            in_dim=6,
+            dim=self.feature_dim,
+            n_tokens=256,
+            grid_size=config.pointseg_grid_size,
+        )
+        self.background_proj = nn.Linear(6, self.feature_dim)
+        self.pseudo_config = PseudoLabelConfig()
+        self.pointseg_loss = SongPointSegLoss(SongPointSegLossConfig())
+
+    def _load_pointseg_checkpoint(self, checkpoint_path: str | None) -> None:
+        if not checkpoint_path:
+            return
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Song pointseg checkpoint is missing: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        missing, unexpected = self.segmenter.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"SongPointSegNet checkpoint missing keys: {missing}")
+        if unexpected:
+            print(f"SongPointSegNet checkpoint unexpected keys: {unexpected}")
+        for param in self.segmenter.parameters():
+            param.requires_grad_(True)
+
+    @staticmethod
+    def current_frame_priors(point_cloud: Tensor) -> Tensor:
+        xyz = point_cloud[..., :3].to(dtype=torch.float32)
+        ee_dist = torch.linalg.norm(xyz, dim=-1)
+        min_traj_dist = ee_dist
+        approach_delta = torch.zeros_like(ee_dist)
+        held_residual = torch.full_like(ee_dist, 0.05)
+        static_residual = torch.full_like(ee_dist, 0.05)
+        residual_gap = torch.zeros_like(ee_dist)
+        priors = torch.stack(
+            [
+                ee_dist,
+                min_traj_dist,
+                approach_delta,
+                held_residual,
+                static_residual,
+                residual_gap,
+                torch.exp(-held_residual / 0.05),
+                torch.exp(-static_residual / 0.05),
+            ],
+            dim=-1,
+        )
+        if priors.shape[-1] != MOTION_PRIOR_DIM:
+            raise RuntimeError(f"Expected fallback priors dim={MOTION_PRIOR_DIM}, got {priors.shape[-1]}.")
+        return priors
+
+    @staticmethod
+    def _squeeze_optional_temporal_axis(value: Tensor) -> Tensor:
+        if value.ndim >= 3 and value.shape[1] == 1:
+            return value.squeeze(1)
+        return value
+
+    @staticmethod
+    def _select_points(point_cloud: Tensor, scores: Tensor, count: int, *, largest: bool) -> tuple[Tensor, Tensor]:
+        if point_cloud.ndim != 3:
+            raise ValueError(f"Expected point_cloud shape (B,N,C), got {point_cloud.shape}.")
+        if scores.shape != point_cloud.shape[:2]:
+            raise ValueError(f"Expected scores shape {point_cloud.shape[:2]}, got {scores.shape}.")
+
+        bsize, n_points, channels = point_cloud.shape
+        if n_points <= 0:
+            raise ValueError("Cannot select points from an empty point cloud.")
+        count = max(1, int(count))
+        topk_count = min(count, n_points)
+        indices = torch.topk(scores, k=topk_count, dim=1, largest=largest).indices
+        if count > topk_count:
+            repeats = math.ceil(count / topk_count)
+            indices = indices.repeat(1, repeats)[:, :count]
+        selected = point_cloud.gather(1, indices[..., None].expand(bsize, indices.shape[1], channels))
+        selected_scores = scores.gather(1, indices)
+        return selected, selected_scores
+
+    def _target_count(self, n_points: int, ratio: float, minimum: int) -> int:
+        return max(int(minimum), math.ceil(n_points * float(ratio)))
+
+    def _make_pseudo(self, payload: dict[str, Tensor], priors: Tensor) -> dict[str, Tensor]:
+        labels = payload.get("pointseg.labels")
+        weights = payload.get("pointseg.weights")
+        class_scores = payload.get("pointseg.class_scores")
+        if labels is not None and weights is not None and class_scores is not None:
+            pseudo = {
+                "priors": priors,
+                "labels": self._squeeze_optional_temporal_axis(labels).to(dtype=torch.long),
+                "weights": self._squeeze_optional_temporal_axis(weights).to(dtype=torch.float32),
+                "class_scores": self._squeeze_optional_temporal_axis(class_scores).to(dtype=torch.float32),
+            }
+            if "pointseg.foreground_score" in payload:
+                pseudo["foreground_score"] = self._squeeze_optional_temporal_axis(
+                    payload["pointseg.foreground_score"]
+                ).to(dtype=torch.float32)
+            else:
+                pseudo["foreground_score"] = pseudo["class_scores"][..., 1]
+            if "pointseg.role_scores" in payload:
+                pseudo["role_scores"] = self._squeeze_optional_temporal_axis(payload["pointseg.role_scores"]).to(
+                    dtype=torch.float32
+                )
+            return pseudo
+        return generate_pseudo_labels_from_priors(priors, config=self.pseudo_config)
+
+    def _get_temporal_priors(self, payload: dict[str, Tensor], point_cloud: Tensor) -> Tensor | None:
+        priors = payload.get("pointseg.priors")
+        if priors is None:
+            return None
+        priors = self._squeeze_optional_temporal_axis(priors).to(device=point_cloud.device, dtype=torch.float32)
+        if priors.shape[:2] != point_cloud.shape[:2] or priors.shape[-1] != MOTION_PRIOR_DIM:
+            raise ValueError(
+                f"Expected pointseg.priors shape (B,N,{MOTION_PRIOR_DIM}) matching point cloud, "
+                f"got {priors.shape} for point cloud {point_cloud.shape}."
+            )
+        return priors
+
+    def _selection_scores(self, payload: dict[str, Tensor], operation_prob: Tensor) -> Tensor:
+        if not (self.training and self.use_pseudo_selection):
+            return operation_prob
+        foreground_score = payload.get("pointseg.foreground_score")
+        if foreground_score is None:
+            class_scores = payload.get("pointseg.class_scores")
+            if class_scores is None:
+                return operation_prob
+            class_scores = self._squeeze_optional_temporal_axis(class_scores).to(
+                device=operation_prob.device, dtype=operation_prob.dtype
+            )
+            if class_scores.shape[:2] != operation_prob.shape or class_scores.shape[-1] < 2:
+                return operation_prob
+            foreground_score = class_scores[..., 1]
+        else:
+            foreground_score = self._squeeze_optional_temporal_axis(foreground_score).to(
+                device=operation_prob.device, dtype=operation_prob.dtype
+            )
+            if foreground_score.shape != operation_prob.shape:
+                return operation_prob
+        return torch.maximum(operation_prob, foreground_score.detach())
+
+    def forward(self, payload: dict[str, Tensor]) -> dict[str, Tensor]:
+        point_cloud = payload["point_cloud"].to(dtype=torch.float32)
+        temporal_priors = self._get_temporal_priors(payload, point_cloud)
+        fallback_priors = self.current_frame_priors(point_cloud)
+        priors = temporal_priors if (self.use_temporal_priors_as_input and temporal_priors is not None) else fallback_priors
+        pseudo_priors = temporal_priors if temporal_priors is not None else priors
+
+        seg_outputs = self.segmenter(point_cloud, priors=priors)
+        operation_prob = seg_outputs["operation_prob"]
+        selection_scores = self._selection_scores(payload, operation_prob)
+        foreground_count = self._target_count(point_cloud.shape[1], self.foreground_ratio, self.min_foreground_points)
+        background_count = self._target_count(point_cloud.shape[1], self.background_ratio, self.min_background_points)
+        foreground_pc, foreground_prob = self._select_points(
+            point_cloud, selection_scores, foreground_count, largest=True
+        )
+        background_pc, background_prob = self._select_points(
+            point_cloud, selection_scores, background_count, largest=False
+        )
+
+        foreground_pc = torch.cat(
+            [foreground_pc[..., :3], foreground_pc[..., 3:] * foreground_prob.unsqueeze(-1)],
+            dim=-1,
+        )
+        object_feat = self.foreground_encoder(foreground_pc)
+
+        background_features = torch.cat([background_pc[..., :3], background_pc[..., 3:] / 255.0], dim=-1)
+        background_features = background_features * (1.0 - background_prob).unsqueeze(-1)
+        background_feat = self.background_proj(background_features.max(dim=1).values)
+
+        result = {
+            "object_feat": object_feat,
+            "background_feat": background_feat,
+            "operation_prob": operation_prob,
+            "pointseg_outputs": seg_outputs,
+            "pointseg_priors": priors,
+            "pointseg_selection_scores": selection_scores,
+        }
+        if self.training and self.aux_loss_weight > 0:
+            pseudo = self._make_pseudo(payload, pseudo_priors)
+            aux_loss, aux_metrics = self.pointseg_loss(seg_outputs, pseudo, point_cloud)
+            result["pointseg_aux_loss"] = aux_loss
+            result["pointseg_aux_metrics"] = aux_metrics
+        return result
 
 
 class VLAFlowMatching(nn.Module):
@@ -905,8 +1150,24 @@ class VLAFlowMatching(nn.Module):
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
-        self.extractor = LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
-        self.pointcloud_proj = nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+        use_pointseg = self.config.pointseg_enable or self.config.pointseg_checkpoint_path is not None
+        self.extractor = None if use_pointseg else LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
+        self.pointcloud_proj = (
+            None if use_pointseg else nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+        )
+        self.pointseg_conditioner = SongPointCloudConditioner(config) if use_pointseg else None
+        self.pointseg_object_proj = (
+            nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.config.text_config.hidden_size)
+            if use_pointseg
+            else None
+        )
+        self.pointseg_background_proj = (
+            nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.config.text_config.hidden_size)
+            if use_pointseg
+            else None
+        )
+        self.last_pointseg_aux_loss: Tensor | None = None
+        self.last_pointseg_metrics: dict[str, Tensor] = {}
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -961,6 +1222,8 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed point cloud features and language tokens to prepare for SmolVLM transformer processing.
         """
+        self.last_pointseg_aux_loss = None
+        self.last_pointseg_metrics = {}
         embs = []
         pad_masks = []
         att_masks = []
@@ -971,15 +1234,37 @@ class VLAFlowMatching(nn.Module):
         ) in enumerate(zip(point_clouds, point_cloud_masks, strict=False)):
             # Point cloud features replace the original image features.
             # The original SmolVLA image processing is intentionally disabled.
+            payload = pc if isinstance(pc, dict) else {"point_cloud": pc}
+            pc = payload["point_cloud"]
             if pc.ndim != 3:
                 raise ValueError(f"Expected point cloud input shape (B, N, C), got {pc.shape}")
 
-            global_feat = self.extractor(pc)  # (B, C)
-            pc_emb = self.pointcloud_proj(global_feat).unsqueeze(1)
+            if self.pointseg_conditioner is not None:
+                conditioned = self.pointseg_conditioner(payload)
+                if self.pointseg_object_proj is None or self.pointseg_background_proj is None:
+                    raise RuntimeError("Pointseg projections are not initialized.")
+                object_emb = self.pointseg_object_proj(conditioned["object_feat"])
+                background_emb = self.pointseg_background_proj(conditioned["background_feat"])
+                pc_emb = torch.stack([object_emb, background_emb], dim=1)
+                self.last_pointseg_aux_loss = conditioned.get("pointseg_aux_loss")
+                operation_prob = conditioned["operation_prob"].detach()
+                selection_scores = conditioned["pointseg_selection_scores"].detach()
+                self.last_pointseg_metrics = {
+                    "pointseg_foreground_ratio": (operation_prob >= 0.5).to(dtype=torch.float32).mean(),
+                    "pointseg_operation_prob_mean": operation_prob.mean(),
+                    "pointseg_selection_score_mean": selection_scores.mean(),
+                }
+                for key, value in conditioned.get("pointseg_aux_metrics", {}).items():
+                    if torch.is_tensor(value):
+                        self.last_pointseg_metrics[key] = value.detach()
+            else:
+                if self.extractor is None or self.pointcloud_proj is None:
+                    raise RuntimeError("Point cloud extractor is not initialized.")
+                global_feat = self.extractor(pc)  # (B, C)
+                pc_emb = self.pointcloud_proj(global_feat).unsqueeze(1)
             pc_emb_dim = pc_emb.shape[-1]
             pc_emb = pc_emb * math.sqrt(pc_emb_dim)
-            num_pc_tokens = 1
-            pc_emb = pc_emb.expand(-1, num_pc_tokens, -1)  # replicate the global feature token
+            num_pc_tokens = pc_emb.shape[1]
 
             bsize = pc_emb.shape[0]
             if pc_mask.ndim == 1:

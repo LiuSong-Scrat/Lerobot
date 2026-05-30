@@ -15,12 +15,15 @@
 # limitations under the License.
 import dataclasses
 import logging
+import os
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from termcolor import colored
@@ -37,6 +40,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla.song_pointseg import ROLE_FOREGROUND, SongPointSegCachedDataset, write_role_ply
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -55,9 +59,6 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
-
-import numpy as np
-import os
 
 
 class PointCloudMemmapDataset(torch.utils.data.Dataset):
@@ -109,12 +110,102 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         item = self.dataset[idx]
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
-        point_cloud = self._episode_point_clouds(episode_index)[frame_index]
+        point_cloud = np.asarray(self._episode_point_clouds(episode_index)[frame_index], dtype=np.float32).copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
 
 
+class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
+    """Inject offline temporal pointseg samples into the action-training dataset."""
+
+    pointseg_keys = (
+        "observation.point_cloud",
+        "pointseg.priors",
+        "pointseg.labels",
+        "pointseg.weights",
+        "pointseg.class_scores",
+        "pointseg.role_scores",
+        "pointseg.foreground_score",
+    )
+
+    def __init__(self, dataset: torch.utils.data.Dataset, cache_dir: str | Path, *, strict: bool = True):
+        self.dataset = dataset
+        self.cache = SongPointSegCachedDataset(cache_dir)
+        self.strict = strict
+        if self.strict and len(self.cache) < len(self.dataset):
+            raise ValueError(
+                f"Song pointseg cache has {len(self.cache)} samples but action dataset has {len(self.dataset)}. "
+                "Rebuild the cache without --max-samples, or set SONG_POINTSEG_CACHE_STRICT=0 for debugging."
+            )
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @staticmethod
+    def _to_int(value) -> int:
+        if torch.is_tensor(value):
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, np.ndarray):
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def _check_alignment(self, item: dict[str, Any], cache_item: dict[str, torch.Tensor], idx: int) -> None:
+        if "episode_index" in item and "episode_index" in cache_item:
+            item_episode = self._to_int(item["episode_index"])
+            cache_episode = self._to_int(cache_item["episode_index"])
+            if item_episode != cache_episode:
+                raise ValueError(
+                    f"Song pointseg cache is not aligned at dataset index {idx}: "
+                    f"episode_index {cache_episode} != {item_episode}."
+                )
+        if "frame_index" in item and "frame_index" in cache_item:
+            item_frame = self._to_int(item["frame_index"])
+            cache_frame = self._to_int(cache_item["frame_index"])
+            if item_frame != cache_frame:
+                raise ValueError(
+                    f"Song pointseg cache is not aligned at dataset index {idx}: "
+                    f"frame_index {cache_frame} != {item_frame}."
+                )
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        if idx >= len(self.cache):
+            if self.strict:
+                raise IndexError(f"Song pointseg cache is missing dataset index {idx}.")
+            return item
+
+        cache_item = self.cache[idx]
+        self._check_alignment(item, cache_item, idx)
+        for key in self.pointseg_keys:
+            item[key] = cache_item[key]
+        return item
+
+
+def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | None = None):
+    if cache_dir_value is None:
+        cache_dir_value = ""
+    cache_dir_value = str(cache_dir_value).strip()
+    if not cache_dir_value or cache_dir_value.lower() in {"0", "false", "none"}:
+        logging.info("Song pointseg cache is disabled; using online/fallback pointseg priors.")
+        return dataset
+
+    cache_dir = Path(cache_dir_value)
+    manifest = cache_dir / "manifest.json"
+    if not manifest.exists():
+        logging.info(f"Song pointseg cache not found at {cache_dir}; using online/fallback pointseg priors.")
+        return dataset
+
+    strict = os.environ.get("SONG_POINTSEG_CACHE_STRICT", "1") != "0"
+    logging.info(f"Injecting Song pointseg temporal cache from {cache_dir}")
+    return PointSegCacheInjectedDataset(dataset, cache_dir=cache_dir, strict=strict)
+
+
 def maybe_wrap_point_cloud_memmap_dataset(dataset):
+    if isinstance(dataset, PointSegCacheInjectedDataset):
+        return dataset
     root = Path(getattr(dataset, "root", dataset.meta.root))
     point_cloud_dir = root / "point_clouds"
     if not point_cloud_dir.is_dir():
@@ -124,9 +215,9 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset):
     return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
 
 
-def visualize_res( batch, result,batch_idx = 0,ood_test_sno=0,step=0):
-    import open3d as o3d
+def visualize_res(batch, result, batch_idx=0, ood_test_sno=0, step=0, output_dir: str | Path | None = None):
     import numpy as np
+    import open3d as o3d
 
     # ===== rot6d → rotation matrix =====
     def rot6d_to_matrix(rot6d):
@@ -172,7 +263,11 @@ def visualize_res( batch, result,batch_idx = 0,ood_test_sno=0,step=0):
         geometries.append(frame)
 
     # ================= Scene Point Cloud =================
-    cloud = batch['observation.point_cloud'][batch_idx][0].cpu().numpy()
+    point_cloud_value = batch["observation.point_cloud"]
+    if point_cloud_value.ndim == 4:
+        cloud = point_cloud_value[batch_idx][0].cpu().numpy()
+    else:
+        cloud = point_cloud_value[batch_idx].cpu().numpy()
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(cloud[:, :3])
     pcd.colors = o3d.utility.Vector3dVector(cloud[:, 3:] / 255)
@@ -207,13 +302,93 @@ def visualize_res( batch, result,batch_idx = 0,ood_test_sno=0,step=0):
 
 
     # 5. 保存
-    ply_save_path = os.path.join("/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song",f"step{str(step)}_{str(ood_test_sno)}.ply")
-    o3d.io.write_point_cloud(ply_save_path, final_pcd)
-    print(f"合并后的点云已保存为 {ply_save_path}")
+    vis_dir = Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song")
+    vis_dir = vis_dir / "visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    ply_save_path = vis_dir / f"step{step}_{ood_test_sno}.ply"
+    if o3d.io.write_point_cloud(str(ply_save_path), final_pcd):
+        print(f"合并后的点云已保存为 {ply_save_path}")
+    else:
+        logging.warning(f"合并后的点云保存失败: {ply_save_path}")
 
     # o3d.visualization.draw_geometries(geometries)
 
-def ood_case_inference(policy,preprocessor,postprocessor,batch,step):
+
+def _unwrap_policy_module(policy: PreTrainedPolicy) -> PreTrainedPolicy:
+    while hasattr(policy, "module"):
+        policy = policy.module
+    return policy
+
+
+@torch.no_grad()
+def save_joint_pointseg_visualization(
+    policy: PreTrainedPolicy,
+    batch: dict[str, torch.Tensor],
+    *,
+    step: int,
+    output_dir: str | Path | None = None,
+    tag: str = "train",
+    threshold: float = 0.5,
+    max_items: int = 2,
+) -> None:
+    """Save foreground/background masks produced by the joint pointseg branch."""
+    raw_policy = _unwrap_policy_module(policy)
+    model = getattr(raw_policy, "model", None)
+    conditioner = getattr(model, "pointseg_conditioner", None)
+    if conditioner is None:
+        return
+
+    point_cloud_payloads, _ = raw_policy.prepare_point_clouds(batch)
+    payload = point_cloud_payloads[0]
+    if not isinstance(payload, dict):
+        return
+
+    conditioned = conditioner(payload)
+    point_cloud = payload["point_cloud"].detach().float().cpu().numpy()
+    operation_prob = conditioned["operation_prob"].detach().float().cpu().numpy()
+    selection_scores = conditioned["pointseg_selection_scores"].detach().float().cpu().numpy()
+    vis_dir = Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song")
+    vis_dir = vis_dir / "visualizations" / "pointseg"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for batch_idx in range(min(max_items, point_cloud.shape[0])):
+        probs = operation_prob[batch_idx]
+        scores = selection_scores[batch_idx]
+        n_points = probs.shape[0]
+        foreground_count = min(
+            n_points,
+            conditioner._target_count(n_points, conditioner.foreground_ratio, conditioner.min_foreground_points),
+        )
+
+        labels_threshold = (probs >= threshold).astype(np.int64)
+        labels_topk = np.zeros(n_points, dtype=np.int64)
+        if foreground_count >= n_points:
+            topk_idx = np.arange(n_points)
+        else:
+            topk_idx = np.argpartition(-scores, foreground_count - 1)[:foreground_count]
+        labels_topk[topk_idx] = ROLE_FOREGROUND
+
+        stem = f"{tag}_step{step}_b{batch_idx}"
+        write_role_ply(vis_dir / f"{stem}_thr{threshold:.2f}.ply", point_cloud[batch_idx], labels_threshold, probs)
+        write_role_ply(vis_dir / f"{stem}_topk.ply", point_cloud[batch_idx], labels_topk, probs)
+        np.savez_compressed(
+            vis_dir / f"{stem}.npz",
+            point_cloud=point_cloud[batch_idx],
+            operation_prob=probs,
+            selection_scores=scores,
+            labels_threshold=labels_threshold,
+            labels_topk=labels_topk,
+            foreground_count=np.asarray(foreground_count, dtype=np.int64),
+            threshold=np.asarray(threshold, dtype=np.float32),
+        )
+        saved += 1
+
+    if saved:
+        logging.info(f"Joint pointseg visualization saved to {vis_dir} ({tag}, step {step}, {saved} item(s))")
+
+
+def ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir: str | Path | None = None):
     ######这里的Batch已经预处理过，因此不能再preprocess(转umi归一化等)
     batch['action'] = (torch.ones(batch['action'].shape)/3).to(batch['action'].device)
     import open3d as o3d
@@ -231,13 +406,30 @@ def ood_case_inference(policy,preprocessor,postprocessor,batch,step):
     for sno in ood_test_sno:
         scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new{sno}.ply",)
         scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
-        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, batch['observation.point_cloud'][0][0].shape[0])
-        batch['observation.point_cloud'][0][0] = torch.tensor(scene_point_cloud).to("cuda")
+        point_cloud_value = batch["observation.point_cloud"]
+        target_points = point_cloud_value[0, 0].shape[0] if point_cloud_value.ndim == 4 else point_cloud_value[0].shape[0]
+        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, target_points)
+        scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
+        if point_cloud_value.ndim == 4:
+            batch["observation.point_cloud"][0][0] = scene_tensor
+        else:
+            batch["observation.point_cloud"][0] = scene_tensor
         batch['task'][0] = 'place, red_cube, eff_open, None\n'
         model_batch = preprocessor(batch)
+        for key in list(model_batch):
+            if key.startswith("pointseg."):
+                del model_batch[key]
         action_chunk = policy.predict_action_chunk(model_batch)
         action_chunk = postprocessor(action_chunk)
-        visualize_res(batch,action_chunk,ood_test_sno=sno,step=step)
+        visualize_res(batch, action_chunk, ood_test_sno=sno, step=step, output_dir=output_dir)
+        save_joint_pointseg_visualization(
+            policy,
+            model_batch,
+            step=step,
+            output_dir=output_dir,
+            tag=f"ood{sno}",
+            max_items=1,
+        )
 
 def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
     N = xyzrgb.shape[0]
@@ -452,6 +644,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
 
     accelerator.wait_for_everyone()
@@ -459,6 +652,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
@@ -671,6 +865,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            if output_dict:
+                debug_keys = (
+                    "loss_action",
+                    "loss_pointseg_aux",
+                    "pointseg_foreground_ratio",
+                    "pointseg_operation_prob_mean",
+                    "pointseg_selection_score_mean",
+                    "pred_operation_prob",
+                    "pseudo_valid_ratio",
+                    "pseudo_foreground_ratio",
+                    "pred_foreground_ratio",
+                )
+                debug_items = []
+                for key in debug_keys:
+                    value = output_dict.get(key)
+                    if value is not None:
+                        debug_items.append(f"{key}:{float(value):.4g}")
+                if debug_items:
+                    logging.info(" ".join(debug_items))
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -690,7 +903,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.save_checkpoint and is_saving_step:
             with torch.no_grad(), accelerator.autocast():
-                ood_case_inference(policy,preprocessor,postprocessor,batch,step)  ########## Model Validation 
+                save_joint_pointseg_visualization(
+                    policy,
+                    batch,
+                    step=step,
+                    output_dir=cfg.output_dir,
+                    tag="train",
+                    max_items=2,
+                )
+                ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir=cfg.output_dir)  ########## Model Validation 
 
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
@@ -788,26 +1009,40 @@ def main():
     train()
 
 
-
-import sys
-sys.argv = [
-    "train.py",  # dummy script name
-    # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song1/checkpoints/last/pretrained_model",
-    "--policy.type=smolvla",
-    "--policy.repo_id=/home/liusong/scp_receive/smolvla",
-    "--policy.push_to_hub=false",
-    "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
-    "--batch_size=6",
-    "--steps=50000",
-    "--log_freq=1",
-    "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song",
-    "--job_name=my_smolvla_training",
-    "--policy.device=cuda",
-    "--wandb.enable=true",
-    "--save_freq=2000",
-    "--eval_freq=1000 ",
-    "--num_workers=6 ",
-]
+def _apply_song_debug_defaults() -> None:
+    if len(sys.argv) > 1 and os.environ.get("SONG_TRAIN_DEBUG_DEFAULTS") != "1":
+        return
+    sys.argv = [
+        "train_song.py",
+        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
+        "--policy.type=smolvla",
+        "--policy.repo_id=/home/liusong/scp_receive/smolvla",
+        "--policy.push_to_hub=false",
+        "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
+        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
+        "--batch_size=16",
+        "--steps=500000",
+        "--log_freq=1",
+        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e",
+        "--job_name=my_smolvla_pointseg_e2e",
+        "--policy.device=cuda",
+        "--wandb.enable=true",
+        "--save_freq=10000",
+        "--eval_freq=1000",
+        "--num_workers=6",
+        "--policy.pointseg_enable=true",
+        "--policy.pointseg_backbone_type=litept",
+        "--policy.pointseg_grid_size=0.01",
+        "--policy.pointseg_feature_dim=64",
+        "--policy.pointseg_aux_loss_weight=0.2",
+        "--policy.pointseg_foreground_ratio=0.08",
+        "--policy.pointseg_background_ratio=0.25",
+        "--policy.pointseg_min_foreground_points=512",
+        "--policy.pointseg_min_background_points=512",
+        "--policy.pointseg_use_temporal_priors_as_input=false",
+        "--policy.pointseg_use_pseudo_selection=false",
+    ]
 
 if __name__ == "__main__":
+    _apply_song_debug_defaults()
     main()

@@ -76,6 +76,20 @@ class SmolVLAConfig(PreTrainedConfig):
     train_expert_only: bool = False
     train_state_proj: bool = True
 
+    # Song point-cloud foreground/background conditioning.
+    pointseg_enable: bool = False
+    pointseg_checkpoint_path: str | None = None
+    pointseg_backbone_type: str = "litept"
+    pointseg_grid_size: float = 0.01
+    pointseg_feature_dim: int = 64
+    pointseg_foreground_ratio: float = 0.08
+    pointseg_background_ratio: float = 0.25
+    pointseg_min_foreground_points: int = 512
+    pointseg_min_background_points: int = 512
+    pointseg_aux_loss_weight: float = 0.20
+    pointseg_use_temporal_priors_as_input: bool = False
+    pointseg_use_pseudo_selection: bool = True
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
