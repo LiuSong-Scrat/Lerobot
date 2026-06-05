@@ -591,7 +591,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super()._validate_peft_config(peft_config)
         if not self.config.load_vlm_weights:
             import logging
-
+ 
             logging.warning(
                 "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. "
                 "Set `load_vlm_weights=True` to fine-tune the existing policy."
@@ -672,13 +672,13 @@ class LitePTTokenizer(nn.Module):
     output: xyz_tok (B,Pmax,3), tok (B,Pmax,dim), g (B,dim), tok_mask (B,Pmax)
     """
 
-    def __init__(self, in_dim=6, dim=128, n_tokens=512, grid_size=0.005):
+    def __init__(self, in_dim=6, dim=128, n_tokens=512, grid_size=0.005, enc_mode=False):
         super().__init__()
         self.dim = dim
         self.n_tokens = n_tokens
         self.grid_size = grid_size
 
-        self.backbone = LitePT(in_channels=in_dim, enc_mode=True)
+        self.backbone = LitePT(in_channels=in_dim, enc_mode=enc_mode)
         self.out_proj = nn.LazyLinear(dim)
 
     def _is_degenerate(self, xyz, eps=1e-6):
@@ -925,7 +925,7 @@ class SongPointCloudConditioner(nn.Module):
             n_tokens=256,
             grid_size=config.pointseg_grid_size,
         )
-        self.background_proj = nn.Linear(6, self.feature_dim)
+        self.background_encoder = LitePTTokenizer(in_dim=6, dim=self.feature_dim, n_tokens=256, grid_size=config.pointseg_grid_size,enc_mode=True)
         self.pseudo_config = PseudoLabelConfig()
         self.pointseg_loss = SongPointSegLoss(SongPointSegLossConfig())
 
@@ -1077,15 +1077,13 @@ class SongPointCloudConditioner(nn.Module):
             point_cloud, selection_scores, background_count, largest=False
         )
 
-        foreground_pc = torch.cat(
-            [foreground_pc[..., :3], foreground_pc[..., 3:] * foreground_prob.unsqueeze(-1)],
-            dim=-1,
-        )
-        object_feat = self.foreground_encoder(foreground_pc)
+        fg_weight = foreground_prob
+        fg_weight = torch.where(fg_weight >= 0.1, fg_weight, torch.zeros_like(fg_weight))
+        bg_weight = 1.0 - background_prob
+        bg_weight = torch.where(bg_weight >= 0.1, bg_weight, torch.zeros_like(bg_weight))
 
-        background_features = torch.cat([background_pc[..., :3], background_pc[..., 3:] / 255.0], dim=-1)
-        background_features = background_features * (1.0 - background_prob).unsqueeze(-1)
-        background_feat = self.background_proj(background_features.max(dim=1).values)
+        object_feat = self.foreground_encoder(foreground_pc)
+        scene_xyz, scene_tok, background_feat, scene_mask = self.background_encoder(background_pc)
 
         result = {
             "object_feat": object_feat,
@@ -1287,22 +1285,24 @@ class VLAFlowMatching(nn.Module):
 
 
 
-        state_emb = self.state_proj(state)
-        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
-        embs.append(state_emb)
-        bsize = state_emb.shape[0]
-        device = state_emb.device
-        states_seq_len = state_emb.shape[1]
-        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
+        # State token disabled.
+        # state_emb = self.state_proj(state)
+        # state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        # embs.append(state_emb)
+        # bsize = state_emb.shape[0]
+        # device = state_emb.device
+        # states_seq_len = state_emb.shape[1]
+        # state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        # pad_masks.append(state_mask)
         # Set attention masks so that point cloud and language inputs do not attend to state or actions
-        att_masks += [1] * states_seq_len
+        # att_masks += [1] * states_seq_len
 
 
 
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
+        bsize = pad_masks.shape[0]
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :]
 

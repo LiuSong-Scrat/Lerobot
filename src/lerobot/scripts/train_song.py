@@ -1014,29 +1014,29 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
-        "--policy.type=smolvla",
+        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
+        # "--policy.type=smolvla",
         "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
         "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
-        "--batch_size=16",
+        "--batch_size=4",
         "--steps=500000",
         "--log_freq=1",
         "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e",
         "--job_name=my_smolvla_pointseg_e2e",
         "--policy.device=cuda",
         "--wandb.enable=true",
-        "--save_freq=10000",
+        "--save_freq=5000",
         "--eval_freq=1000",
         "--num_workers=6",
         "--policy.pointseg_enable=true",
         "--policy.pointseg_backbone_type=litept",
         "--policy.pointseg_grid_size=0.01",
         "--policy.pointseg_feature_dim=64",
-        "--policy.pointseg_aux_loss_weight=0.2",
+        "--policy.pointseg_aux_loss_weight=0.02",
         "--policy.pointseg_foreground_ratio=0.08",
-        "--policy.pointseg_background_ratio=0.25",
+        "--policy.pointseg_background_ratio=0.08",
         "--policy.pointseg_min_foreground_points=512",
         "--policy.pointseg_min_background_points=512",
         "--policy.pointseg_use_temporal_priors_as_input=false",
@@ -1046,3 +1046,24 @@ def _apply_song_debug_defaults() -> None:
 if __name__ == "__main__":
     _apply_song_debug_defaults()
     main()
+
+
+# def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
+#     N = xyzrgb.shape[0]
+#     if N == 0:
+#         return np.zeros((M, 6))
+#     if N >= M:
+#         idx = np.random.choice(N, M, replace=False)
+#         return xyzrgb[idx]
+#     else:
+#         extra = np.random.choice(N, M - N, replace=True)
+#         return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)   
+# batch['task'][0] = "Place the Red Cube on the Blue Cube"
+# scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new4.ply",)
+# scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
+# scene_point_cloud = random_repeat_sample_points(scene_point_cloud, 50000)
+# batch['observation.point_cloud'][0] = torch.tensor(scene_point_cloud).to("cuda")
+# action_pred = self.predict_action_chunk(batch)
+# vis_umi_data(action_pred.cpu().numpy()[0],batch['observation.point_cloud'].cpu().numpy()[0])
+# print(action_pred[0][:,-1])
+

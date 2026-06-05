@@ -31,16 +31,16 @@ https://arxiv.org/abs/2506.01844
 
 使用方式：
 
-PYTHONPATH=src conda run -n reap python src/lerobot/scripts/cache_song_pointseg_samples.py \
-  --output-dir /path/to/song_pointseg_cache \
-  --current-points 8192 \
+python src/lerobot/scripts/cache_song_pointseg_samples.py \
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache \
+  --current-points 50000 \
   --future-points 16384 \
   --batch-size 8 \
-  --num-workers 4 \
-  --storage-dtype float16 \
-  --overwrite
-  
 然后训练：
 PYTHONPATH=src conda run -n reap python src/lerobot/scripts/train_song_pointseg.py \
   --sample-cache-dir /path/to/song_pointseg_cache \
   --output-dir /path/to/train_output
+  --num-workers 16 \
+  --storage-dtype float16 \
+  --overwrite
+  
