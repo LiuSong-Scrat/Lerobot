@@ -395,7 +395,7 @@ def ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir:
     def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
         N = xyzrgb.shape[0]
         if N == 0:
-            return np.zeros((M, 6))
+            return xyzrgb
         if N >= M:
             idx = np.random.choice(N, M, replace=False)
             return xyzrgb[idx]
@@ -434,15 +434,13 @@ def ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir:
 def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
     N = xyzrgb.shape[0]
     if N == 0:
-        return np.zeros((M, 6))
+        return xyzrgb
     if N >= M:
         idx = np.random.choice(N, M, replace=False)
         return xyzrgb[idx]
     else:
         extra = np.random.choice(N, M - N, replace=True)
-        return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)   
-
-
+        return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)  
 def count_parameters(module: torch.nn.Module, only_trainable: bool = False) -> int:
     skipped = 0
     total = 0
@@ -1020,7 +1018,7 @@ def _apply_song_debug_defaults() -> None:
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
         "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
-        "--batch_size=4",
+        "--batch_size=6",
         "--steps=500000",
         "--log_freq=1",
         "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e",
@@ -1051,7 +1049,7 @@ if __name__ == "__main__":
 # def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
 #     N = xyzrgb.shape[0]
 #     if N == 0:
-#         return np.zeros((M, 6))
+#         return xyzrgb
 #     if N >= M:
 #         idx = np.random.choice(N, M, replace=False)
 #         return xyzrgb[idx]

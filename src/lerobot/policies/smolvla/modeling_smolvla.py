@@ -882,7 +882,7 @@ class LitePTEncoder(nn.Module):
         # # c_xyz, c_tok = global_xyz_tok, tok
         # # t_tok_rel = self.dense_xattn_full(t_xyz, t_tok, c_xyz, c_tok, has_cond)  # (B,T,C)
         # # # Only Cross Attention
-        # # t_mem = self.proj_pc(t_tok_rel)  # (B,T,D)
+        # # t_mem = self.proj_pc(t_tok_rel)  # (B,T,D)q
         # # global_feat = t_mem.max(dim=1).values
 
         # tok = self.attention(tok)

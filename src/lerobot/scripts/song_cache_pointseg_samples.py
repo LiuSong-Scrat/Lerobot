@@ -274,6 +274,7 @@ def cache_samples(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,
     )
 
     current_shard_index = 0
@@ -288,7 +289,7 @@ def cache_samples(args: argparse.Namespace) -> None:
     previews = 0
     progress = tqdm(total=total_samples, desc="Cache Song pointseg", unit="sample")
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in dataloader:
             if written >= total_samples:
                 break

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import warnings
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +15,11 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
+
+try:
+    from pointops import knn_query as _pointops_knn_query
+except Exception:  # pragma: no cover - optional CUDA extension.
+    _pointops_knn_query = None
 
 ROLE_BACKGROUND = 0
 ROLE_FOREGROUND = 1
@@ -42,6 +48,8 @@ POINTSEG_CACHE_FIELDS = (
     "frame_index",
     "dataset_index",
 )
+
+_POINTOPS_KNN_FAILED = False
 
 
 @dataclass(frozen=True)
@@ -345,12 +353,96 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
         }
 
 
+def _use_pointops_knn(device: torch.device) -> bool:
+    return (
+        _pointops_knn_query is not None
+        and not _POINTOPS_KNN_FAILED
+        and device.type == "cuda"
+    )
+
+
+def _nearest_distances_pointops(query: Tensor, target: Tensor) -> Tensor:
+    """Return exact nearest L2 distance using the pointops CUDA KNN kernel."""
+    group_count, query_count = query.shape[:2]
+    target_count = target.shape[1]
+    query_flat = query.reshape(group_count * query_count, 3).contiguous()
+    target_flat = target.reshape(group_count * target_count, 3).contiguous()
+    query_offset = (
+        torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * query_count
+    ).contiguous()
+    target_offset = (
+        torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * target_count
+    ).contiguous()
+    _, dist = _pointops_knn_query(1, target_flat, target_offset, query_flat, query_offset)
+    return dist.reshape(group_count, query_count)
+
+
+def _nearest_distances_from_grouped_queries(query: Tensor, target: Tensor) -> Tensor:
+    """Return nearest L2 distance for each grouped query point.
+
+    query: (G, N, 3), target: (G, M, 3)
+    """
+    global _POINTOPS_KNN_FAILED
+    if _use_pointops_knn(query.device):
+        try:
+            return _nearest_distances_pointops(query, target)
+        except Exception as exc:
+            _POINTOPS_KNN_FAILED = True
+            warnings.warn(
+                f"pointops KNN failed; falling back to torch GEMM nearest-neighbor. Error: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    target_t = target.transpose(1, 2).contiguous()
+    dist_sq = torch.bmm(query, target_t)
+    dist_sq.mul_(-2.0)
+    dist_sq.add_(query.square().sum(dim=-1, keepdim=True))
+    dist_sq.add_(target.square().sum(dim=-1).unsqueeze(-2))
+    min_sq = dist_sq.clamp_min_(0.0).amin(dim=-1)
+    return min_sq.sqrt_()
+
+
 def _nearest_distances(query: Tensor, target: Tensor, chunk_size: int) -> Tensor:
     chunks = []
+    target = target.contiguous()
+    target_t = target.transpose(0, 1).contiguous()
+    target_norm = target.square().sum(dim=-1).unsqueeze(0)
     for start in range(0, query.shape[0], chunk_size):
         query_chunk = query[start : start + chunk_size]
-        chunks.append(torch.cdist(query_chunk.unsqueeze(0), target.unsqueeze(0)).squeeze(0).amin(dim=-1))
+        dist_sq = query_chunk @ target_t
+        dist_sq.mul_(-2.0)
+        dist_sq.add_(query_chunk.square().sum(dim=-1, keepdim=True))
+        dist_sq.add_(target_norm)
+        chunks.append(dist_sq.clamp_min_(0.0).amin(dim=-1).sqrt_())
     return torch.cat(chunks, dim=0)
+
+
+def _future_group_size(chunk_len: int, target_points: int, valid_count: int, device: torch.device) -> int:
+    if valid_count <= 1:
+        return 1
+    if _use_pointops_knn(device):
+        return valid_count
+    elements_per_future = max(1, 2 * chunk_len * target_points)
+    max_elements = 128_000_000
+    if device.type == "cuda":
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            max_bytes = min(int(total_bytes * 0.25), int(free_bytes * 0.60), 1_750_000_000)
+            max_elements = max(32_000_000, max_bytes // 4)
+        except RuntimeError:
+            pass
+    return max(1, min(valid_count, max_elements // elements_per_future))
+
+
+def _scatter_amin_by_batch(dst: Tensor, batch_indices: Tensor, values: Tensor) -> None:
+    try:
+        index = batch_indices[:, None].expand_as(values)
+        dst.scatter_reduce_(0, index, values, reduce="amin", include_self=True)
+    except (AttributeError, RuntimeError):
+        batch_list = batch_indices.detach().cpu().tolist()
+        for local_index, bidx in enumerate(batch_list):
+            dst[bidx] = torch.minimum(dst[bidx], values[local_index])
 
 
 def _motion_residuals_single(
@@ -361,24 +453,99 @@ def _motion_residuals_single(
     *,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor]:
-    held_residuals = []
-    static_residuals = []
     transforms = pose9_to_matrix(future_poses)
     inverse_transforms = invert_transform(transforms)
+    valid_indices = torch.nonzero(~future_is_pad[1:], as_tuple=False).flatten() + 1
 
-    for k in range(1, future_xyz.shape[0]):
-        if bool(future_is_pad[k].item()):
-            continue
-        target_xyz = future_xyz[k]
-        held_residuals.append(_nearest_distances(current_xyz, target_xyz, chunk_size))
-        static_query = transform_points(current_xyz.unsqueeze(0), inverse_transforms[k].unsqueeze(0)).squeeze(0)
-        static_residuals.append(_nearest_distances(static_query, target_xyz, chunk_size))
-
-    if not held_residuals:
+    if valid_indices.numel() == 0:
         inf = torch.full((current_xyz.shape[0],), 1.0, dtype=current_xyz.dtype, device=current_xyz.device)
         return inf, inf
 
-    return torch.stack(held_residuals, dim=0).amin(dim=0), torch.stack(static_residuals, dim=0).amin(dim=0)
+    held_min = torch.full(
+        (current_xyz.shape[0],), float("inf"), dtype=current_xyz.dtype, device=current_xyz.device
+    )
+    static_min = torch.full_like(held_min, float("inf"))
+    valid_targets = future_xyz.index_select(0, valid_indices).contiguous()
+    valid_inverse = inverse_transforms.index_select(0, valid_indices)
+
+    for start in range(0, current_xyz.shape[0], chunk_size):
+        current_chunk = current_xyz[start : start + chunk_size].contiguous()
+        chunk_len = current_chunk.shape[0]
+        group_size = _future_group_size(
+            chunk_len, valid_targets.shape[1], valid_targets.shape[0], current_xyz.device
+        )
+        held_chunks = []
+        static_chunks = []
+        for group_start in range(0, valid_targets.shape[0], group_size):
+            group_end = min(group_start + group_size, valid_targets.shape[0])
+            targets = valid_targets[group_start:group_end]
+            inverse = valid_inverse[group_start:group_end]
+            held_query = current_chunk.unsqueeze(0).expand(targets.shape[0], -1, -1)
+            static_query = transform_points(current_chunk.unsqueeze(0), inverse)
+            grouped_query = torch.cat([held_query, static_query], dim=1).contiguous()
+            nearest = _nearest_distances_from_grouped_queries(grouped_query, targets)
+            held_chunks.append(nearest[:, :chunk_len])
+            static_chunks.append(nearest[:, chunk_len:])
+        held_min[start : start + chunk_len] = torch.cat(held_chunks, dim=0).amin(dim=0)
+        static_min[start : start + chunk_len] = torch.cat(static_chunks, dim=0).amin(dim=0)
+
+    return held_min, static_min
+
+
+def _motion_residuals_batched(
+    current_xyz: Tensor,
+    future_xyz: Tensor,
+    future_poses: Tensor,
+    future_is_pad: Tensor,
+    *,
+    chunk_size: int,
+) -> tuple[Tensor, Tensor]:
+    transforms = pose9_to_matrix(future_poses)
+    inverse_transforms = invert_transform(transforms)
+    valid_future = ~future_is_pad[:, 1:]
+    pair_batch, pair_future_offset = torch.nonzero(valid_future, as_tuple=True)
+    pair_future = pair_future_offset + 1
+
+    held_min = torch.full(
+        current_xyz.shape[:2], float("inf"), dtype=current_xyz.dtype, device=current_xyz.device
+    )
+    static_min = torch.full_like(held_min, float("inf"))
+
+    if pair_batch.numel() == 0:
+        held_min.fill_(1.0)
+        static_min.fill_(1.0)
+        return held_min, static_min
+
+    valid_counts = valid_future.sum(dim=1)
+    for start in range(0, current_xyz.shape[1], chunk_size):
+        current_chunk_len = min(chunk_size, current_xyz.shape[1] - start)
+        group_size = _future_group_size(
+            current_chunk_len, future_xyz.shape[2], int(pair_batch.numel()), current_xyz.device
+        )
+        for group_start in range(0, int(pair_batch.numel()), group_size):
+            group_end = min(group_start + group_size, int(pair_batch.numel()))
+            batch_group = pair_batch[group_start:group_end]
+            future_group = pair_future[group_start:group_end]
+            current_group = current_xyz[batch_group, start : start + current_chunk_len].contiguous()
+            targets = future_xyz[batch_group, future_group].contiguous()
+            inverse = inverse_transforms[batch_group, future_group]
+            static_query = transform_points(current_group, inverse)
+            grouped_query = torch.cat([current_group, static_query], dim=1).contiguous()
+            nearest = _nearest_distances_from_grouped_queries(grouped_query, targets)
+            held_group = nearest[:, :current_chunk_len]
+            static_group = nearest[:, current_chunk_len:]
+            _scatter_amin_by_batch(
+                held_min[:, start : start + current_chunk_len], batch_group, held_group
+            )
+            _scatter_amin_by_batch(
+                static_min[:, start : start + current_chunk_len], batch_group, static_group
+            )
+
+    no_valid = valid_counts == 0
+    if bool(no_valid.any().item()):
+        held_min[no_valid] = 1.0
+        static_min[no_valid] = 1.0
+    return held_min, static_min
 
 
 def compute_motion_priors(
@@ -402,20 +569,13 @@ def compute_motion_priors(
     future_xyz = future_pc[..., :3].to(device=current_pc.device, dtype=torch.float32)
     future_poses = future_poses.to(device=current_pc.device, dtype=torch.float32)
 
-    held = []
-    static = []
-    for bidx in range(bsize):
-        held_res, static_res = _motion_residuals_single(
-            current_xyz[bidx],
-            future_xyz[bidx],
-            future_poses[bidx],
-            future_is_pad[bidx],
-            chunk_size=nn_chunk_size,
-        )
-        held.append(held_res)
-        static.append(static_res)
-    held_residual = torch.stack(held, dim=0)
-    static_residual = torch.stack(static, dim=0)
+    held_residual, static_residual = _motion_residuals_batched(
+        current_xyz,
+        future_xyz,
+        future_poses,
+        future_is_pad,
+        chunk_size=nn_chunk_size,
+    )
 
     trajectory_xyz = future_poses[..., :3]
     valid_traj = ~future_is_pad
@@ -930,7 +1090,7 @@ def save_pointseg_config(path: str | Path, args: Any, pseudo_cfg: PseudoLabelCon
 def move_batch_to_device(batch: dict[str, Any], device: torch.device | str) -> dict[str, Any]:
     moved = {}
     for key, value in batch.items():
-        moved[key] = value.to(device) if torch.is_tensor(value) else value
+        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
     return moved
 
 

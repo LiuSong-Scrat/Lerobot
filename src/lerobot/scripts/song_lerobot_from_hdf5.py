@@ -28,6 +28,17 @@ USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
 CONVERT_WORKERS = int(os.environ.get("SONG_CONVERT_WORKERS", str(min(20, os.cpu_count() or 1))))
 _FPS_CUDA_LOCK = threading.Lock()
 
+def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
+    N = xyzrgb.shape[1]
+    if N == 0:
+        return xyzrgb
+    if N >= M:
+        idx = np.random.choice(N, M, replace=False)
+        return xyzrgb[:, idx]
+    else:
+        extra = np.random.choice(N, M - N, replace=True)
+        return np.concatenate([xyzrgb, xyzrgb[:, extra]], axis=1)   
+
 def from_H_to_trajectory(H):
     """从齐次矩阵转换为轨迹数据"""
     position = H[:3, 3]
@@ -280,6 +291,9 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
         obs_pose9_eff_to_world = traj6_to_pose9(obs_pose_eular_eff_to_world)
         obs_pose9_data_eff_2_eff0 = from_world_to_umi_tra_pose9(obs_pose9_eff_to_world)
         P_eff = from_world_to_umi_pointcloud(obs_pose9_eff_to_world, pointcloud_world)
+       
+        # Const Point NUM
+        P_eff = random_repeat_sample_points(P_eff, POINT_CLOUD_SHAPE[0])
 
         # UMI_VIS
         # vis_umi_data(obs_pose9_data_eff_2_eff0, P_eff[0])
@@ -325,25 +339,46 @@ def convert_and_save_sequential(dataset: LeRobotDataset, h5_paths: list[Path]) -
 def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max_workers: int) -> None:
     # LeRobotDataset's parquet/meta writers are stateful, so conversion is parallelized
     # but episode saving remains ordered and single-threaded.
+    total = len(h5_paths)
+    max_workers = max(1, min(int(max_workers), total))
+    next_to_submit = 0
     next_to_save = 0
     ready: dict[int, dict] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(convert_hdf5_file, h5_path, dataset.fps): idx
-            for idx, h5_path in enumerate(h5_paths)
-        }
+        futures: dict[concurrent.futures.Future, int] = {}
 
-        with tqdm(total=len(h5_paths), desc=f"Converting HDF5 files ({max_workers} threads)") as progress:
-            for future in concurrent.futures.as_completed(futures):
-                idx = futures[future]
-                ready[idx] = future.result()
-                progress.update(1)
+        def submit_until_full() -> None:
+            nonlocal next_to_submit
+            while next_to_submit < total and len(futures) + len(ready) < max_workers:
+                future = executor.submit(convert_hdf5_file, h5_paths[next_to_submit], dataset.fps)
+                futures[future] = next_to_submit
+                next_to_submit += 1
+
+        submit_until_full()
+
+        with tqdm(total=total, desc=f"Converting HDF5 files ({max_workers} threads)") as progress:
+            while futures:
+                done, _ = concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    idx = futures.pop(future)
+                    ready[idx] = future.result()
+                    progress.update(1)
 
                 while next_to_save in ready:
-                    save_converted_episode(dataset, ready.pop(next_to_save))
+                    episode = ready.pop(next_to_save)
+                    save_converted_episode(dataset, episode)
+                    del episode
                     next_to_save += 1
-                    progress.set_postfix(saved=next_to_save)
+                    progress.set_postfix(
+                        saved=next_to_save,
+                        in_flight=len(futures),
+                        ready=len(ready),
+                    )
+
+                submit_until_full()
 
 
 def main():
