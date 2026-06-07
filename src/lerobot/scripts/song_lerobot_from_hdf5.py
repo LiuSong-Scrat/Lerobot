@@ -22,22 +22,11 @@ ROOT = Path("/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_t
 HDF5_FOLDER = Path("/home/liusong/temp/temp")
 POINT_CLOUD_DIR_NAME = "point_clouds"
 POINT_CLOUD_KEY = "observation.point_cloud"
-POINT_CLOUD_SHAPE = (50000, 6)
+POINT_CLOUD_CHANNELS = 6
 FPS_BATCH_SIZE = int(os.environ.get("SONG_FPS_BATCH_SIZE", "128"))
 USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
 CONVERT_WORKERS = int(os.environ.get("SONG_CONVERT_WORKERS", str(min(20, os.cpu_count() or 1))))
 _FPS_CUDA_LOCK = threading.Lock()
-
-def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
-    N = xyzrgb.shape[1]
-    if N == 0:
-        return xyzrgb
-    if N >= M:
-        idx = np.random.choice(N, M, replace=False)
-        return xyzrgb[:, idx]
-    else:
-        extra = np.random.choice(N, M - N, replace=True)
-        return np.concatenate([xyzrgb, xyzrgb[:, extra]], axis=1)   
 
 def from_H_to_trajectory(H):
     """从齐次矩阵转换为轨迹数据"""
@@ -240,7 +229,8 @@ def write_point_cloud_meta(root: Path) -> None:
     meta = {
         "key": POINT_CLOUD_KEY,
         "dtype": "float32",
-        "shape": list(POINT_CLOUD_SHAPE),
+        "shape": [None, POINT_CLOUD_CHANNELS],
+        "variable_num_points": True,
         "layout": "episode_npy",
         "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.npy",
     }
@@ -250,11 +240,13 @@ def write_point_cloud_meta(root: Path) -> None:
 
 def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.ndarray) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
-    if point_clouds.ndim != 3 or tuple(point_clouds.shape[1:]) != POINT_CLOUD_SHAPE:
+    if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
         raise ValueError(
-            f"Expected point clouds shape (T, {POINT_CLOUD_SHAPE[0]}, {POINT_CLOUD_SHAPE[1]}), "
+            f"Expected point clouds shape (T, N, {POINT_CLOUD_CHANNELS}), "
             f"got {point_clouds.shape}"
         )
+    if point_clouds.shape[1] <= 0:
+        raise ValueError(f"Point cloud episodes must contain at least one point, got {point_clouds.shape}.")
 
     pc_path = point_cloud_file(root, episode_index)
     pc_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,9 +284,6 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
         obs_pose9_data_eff_2_eff0 = from_world_to_umi_tra_pose9(obs_pose9_eff_to_world)
         P_eff = from_world_to_umi_pointcloud(obs_pose9_eff_to_world, pointcloud_world)
        
-        # Const Point NUM
-        P_eff = random_repeat_sample_points(P_eff, POINT_CLOUD_SHAPE[0])
-
         # UMI_VIS
         # vis_umi_data(obs_pose9_data_eff_2_eff0, P_eff[0])
 

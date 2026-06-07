@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
+from torch.utils.data._utils.collate import default_collate
 
 try:
     from pointops import knn_query as _pointops_knn_query
@@ -148,14 +149,92 @@ def _identity_pose9(device: torch.device | None = None, dtype: torch.dtype = tor
 
 
 def _sample_rows(array: np.ndarray, count: int, rng: np.random.Generator) -> np.ndarray:
-    if count <= 0:
-        raise ValueError("Point sample count must be positive.")
     n_points = array.shape[0]
     if n_points == 0:
-        return np.zeros((count, array.shape[-1]), dtype=np.float32)
-    replace = n_points < count
-    indices = rng.choice(n_points, count, replace=replace)
+        channels = array.shape[-1] if array.ndim >= 2 else 6
+        return np.zeros((0, channels), dtype=np.float32)
+    if count <= 0 or n_points <= count:
+        return np.ascontiguousarray(array, dtype=np.float32)
+    indices = rng.choice(n_points, count, replace=False)
     return np.ascontiguousarray(array[indices], dtype=np.float32)
+
+
+def _pad_point_tensors(tensors: list[Tensor], pad_value: float | int = 0) -> tuple[Tensor, Tensor]:
+    if not tensors:
+        raise ValueError("Cannot collate an empty point tensor list.")
+    max_points = max(int(tensor.shape[0]) for tensor in tensors)
+    trailing_shape = tuple(tensors[0].shape[1:])
+    if max_points <= 0:
+        raise ValueError("Cannot collate empty point clouds.")
+    padded = tensors[0].new_full((len(tensors), max_points, *trailing_shape), pad_value)
+    is_pad = torch.ones(len(tensors), max_points, dtype=torch.bool)
+    for idx, tensor in enumerate(tensors):
+        n_points = int(tensor.shape[0])
+        if n_points <= 0:
+            continue
+        padded[idx, :n_points] = tensor
+        is_pad[idx, :n_points] = False
+    return padded, is_pad
+
+
+def _pad_single_axis_tensors(tensors: list[Tensor], axis: int, pad_value: float | int = 0) -> tuple[Tensor, Tensor]:
+    if axis < 0:
+        axis += tensors[0].ndim
+    max_points = max(int(tensor.shape[axis]) for tensor in tensors)
+    if max_points <= 0:
+        raise ValueError("Cannot collate tensors with an empty point axis.")
+    out_shape = [len(tensors), *tensors[0].shape]
+    out_shape[axis + 1] = max_points
+    padded = tensors[0].new_full(tuple(out_shape), pad_value)
+    mask_shape = [len(tensors), *tensors[0].shape[:axis], max_points]
+    is_pad = torch.ones(tuple(mask_shape), dtype=torch.bool)
+    for batch_idx, tensor in enumerate(tensors):
+        n_points = int(tensor.shape[axis])
+        slices = [batch_idx, *([slice(None)] * tensor.ndim)]
+        slices[axis + 1] = slice(0, n_points)
+        padded[tuple(slices)] = tensor
+        mask_slices = [batch_idx, *([slice(None)] * axis), slice(0, n_points)]
+        is_pad[tuple(mask_slices)] = False
+    return padded, is_pad
+
+
+def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    if not batch:
+        return {}
+    out: dict[str, Any] = {}
+    keys = set().union(*(item.keys() for item in batch))
+    current_point_fields = {
+        "observation.point_cloud": 0,
+        "pointseg.priors": 0,
+        "pointseg.labels": ROLE_IGNORE,
+        "pointseg.weights": 0,
+        "pointseg.class_scores": 0,
+        "pointseg.role_scores": 0,
+        "pointseg.foreground_score": 0,
+    }
+    for key in sorted(keys):
+        values = [item[key] for item in batch if key in item]
+        if len(values) != len(batch):
+            continue
+        if key == "observation.point_cloud":
+            first = values[0]
+            if torch.is_tensor(first) and first.ndim == 2:
+                out[key], out["observation.point_cloud_is_pad"] = _pad_point_tensors(values, 0)
+                continue
+            if torch.is_tensor(first) and first.ndim == 3 and first.shape[0] == 1:
+                out[key], out["observation.point_cloud_is_pad"] = _pad_single_axis_tensors(values, 1, 0)
+                continue
+        if key in current_point_fields and torch.is_tensor(values[0]) and values[0].ndim >= 1:
+            out[key], _ = _pad_point_tensors(values, current_point_fields[key])
+            continue
+        if key == "observation.point_cloud_future" and torch.is_tensor(values[0]):
+            out[key], out["observation.point_cloud_future_is_pad"] = _pad_single_axis_tensors(values, 1, 0)
+            continue
+        if key == "observation.point_cloud_future_is_pad" and torch.is_tensor(values[0]):
+            out[key], _ = _pad_single_axis_tensors(values, 1, True)
+            continue
+        out[key] = default_collate(values)
+    return out
 
 
 class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
@@ -246,6 +325,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         )
 
         future_samples = []
+        future_point_masks = []
         future_is_pad = []
         for offset in self.temporal_offsets:
             raw_index = frame_index + offset
@@ -253,7 +333,17 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             future_is_pad.append(raw_index >= episode_len)
             future_samples.append(_sample_rows(np.asarray(point_clouds[clamped_index]), self.future_points, rng))
 
-        item["observation.point_cloud_future"] = torch.from_numpy(np.stack(future_samples, axis=0))
+        max_future_points = max(sample.shape[0] for sample in future_samples)
+        if max_future_points <= 0:
+            raise ValueError(f"Future point clouds are empty for dataset index {idx}.")
+        future_array = np.zeros((len(future_samples), max_future_points, future_samples[0].shape[-1]), dtype=np.float32)
+        future_mask = np.ones((len(future_samples), max_future_points), dtype=bool)
+        for future_idx, sample in enumerate(future_samples):
+            n_points = sample.shape[0]
+            future_array[future_idx, :n_points] = sample
+            future_mask[future_idx, :n_points] = False
+        item["observation.point_cloud_future"] = torch.from_numpy(future_array)
+        item["observation.point_cloud_future_is_pad"] = torch.from_numpy(future_mask)
         item["future_is_pad"] = torch.tensor(future_is_pad, dtype=torch.bool)
         item["future_offsets"] = torch.tensor(self.temporal_offsets, dtype=torch.long)
         item["future_ee_poses"] = self._relative_future_poses(item["action"])
@@ -288,6 +378,7 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
         if missing_fields:
             raise ValueError(f"Song pointseg cache is missing fields: {missing_fields}")
         self.fields = fields
+        self.variable_num_points = bool(self.manifest.get("variable_num_points", False))
 
         self.shards = list(self.manifest.get("shards", []))
         if not self.shards:
@@ -325,6 +416,9 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             if not path.exists():
                 raise FileNotFoundError(f"Song pointseg cache array is missing: {path}")
             arrays[field] = np.load(path, mmap_mode=self.mmap_mode)
+        offsets_path = shard_dir / "sample_offsets.npy"
+        if offsets_path.exists():
+            arrays["sample_offsets"] = np.load(offsets_path, mmap_mode=self.mmap_mode)
         self._array_cache[shard_index] = arrays
         return arrays
 
@@ -339,14 +433,19 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
         shard_index, local_index = self._locate_index(idx)
         arrays = self._open_shard(shard_index)
+        if "sample_offsets" in arrays:
+            offsets = arrays["sample_offsets"]
+            point_slice = slice(int(offsets[local_index]), int(offsets[local_index + 1]))
+        else:
+            point_slice = local_index
         return {
-            "observation.point_cloud": self._float_tensor(arrays["point_cloud"][local_index]),
-            "pointseg.priors": self._float_tensor(arrays["priors"][local_index]),
-            "pointseg.labels": self._long_tensor(arrays["labels"][local_index]),
-            "pointseg.weights": self._float_tensor(arrays["weights"][local_index]),
-            "pointseg.class_scores": self._float_tensor(arrays["class_scores"][local_index]),
-            "pointseg.role_scores": self._float_tensor(arrays["role_scores"][local_index]),
-            "pointseg.foreground_score": self._float_tensor(arrays["foreground_score"][local_index]),
+            "observation.point_cloud": self._float_tensor(arrays["point_cloud"][point_slice]),
+            "pointseg.priors": self._float_tensor(arrays["priors"][point_slice]),
+            "pointseg.labels": self._long_tensor(arrays["labels"][point_slice]),
+            "pointseg.weights": self._float_tensor(arrays["weights"][point_slice]),
+            "pointseg.class_scores": self._float_tensor(arrays["class_scores"][point_slice]),
+            "pointseg.role_scores": self._float_tensor(arrays["role_scores"][point_slice]),
+            "pointseg.foreground_score": self._float_tensor(arrays["foreground_score"][point_slice]),
             "episode_index": torch.tensor(int(arrays["episode_index"][local_index]), dtype=torch.long),
             "frame_index": torch.tensor(int(arrays["frame_index"][local_index]), dtype=torch.long),
             "dataset_index": torch.tensor(int(arrays["dataset_index"][local_index]), dtype=torch.long),
@@ -377,13 +476,16 @@ def _nearest_distances_pointops(query: Tensor, target: Tensor) -> Tensor:
     return dist.reshape(group_count, query_count)
 
 
-def _nearest_distances_from_grouped_queries(query: Tensor, target: Tensor) -> Tensor:
+def _nearest_distances_from_grouped_queries(
+    query: Tensor, target: Tensor, target_is_pad: Tensor | None = None
+) -> Tensor:
     """Return nearest L2 distance for each grouped query point.
 
     query: (G, N, 3), target: (G, M, 3)
     """
     global _POINTOPS_KNN_FAILED
-    if _use_pointops_knn(query.device):
+    has_target_mask = target_is_pad is not None and bool(target_is_pad.any().item())
+    if _use_pointops_knn(query.device) and not has_target_mask:
         try:
             return _nearest_distances_pointops(query, target)
         except Exception as exc:
@@ -399,6 +501,8 @@ def _nearest_distances_from_grouped_queries(query: Tensor, target: Tensor) -> Te
     dist_sq.mul_(-2.0)
     dist_sq.add_(query.square().sum(dim=-1, keepdim=True))
     dist_sq.add_(target.square().sum(dim=-1).unsqueeze(-2))
+    if target_is_pad is not None:
+        dist_sq = dist_sq.masked_fill(target_is_pad[:, None, :].to(device=dist_sq.device), float("inf"))
     min_sq = dist_sq.clamp_min_(0.0).amin(dim=-1)
     return min_sq.sqrt_()
 
@@ -497,12 +601,15 @@ def _motion_residuals_batched(
     future_xyz: Tensor,
     future_poses: Tensor,
     future_is_pad: Tensor,
+    future_point_is_pad: Tensor | None = None,
     *,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor]:
     transforms = pose9_to_matrix(future_poses)
     inverse_transforms = invert_transform(transforms)
     valid_future = ~future_is_pad[:, 1:]
+    if future_point_is_pad is not None:
+        valid_future = valid_future & (~future_point_is_pad[:, 1:].all(dim=-1))
     pair_batch, pair_future_offset = torch.nonzero(valid_future, as_tuple=True)
     pair_future = pair_future_offset + 1
 
@@ -528,10 +635,15 @@ def _motion_residuals_batched(
             future_group = pair_future[group_start:group_end]
             current_group = current_xyz[batch_group, start : start + current_chunk_len].contiguous()
             targets = future_xyz[batch_group, future_group].contiguous()
+            target_is_pad = (
+                future_point_is_pad[batch_group, future_group].contiguous()
+                if future_point_is_pad is not None
+                else None
+            )
             inverse = inverse_transforms[batch_group, future_group]
             static_query = transform_points(current_group, inverse)
             grouped_query = torch.cat([current_group, static_query], dim=1).contiguous()
-            nearest = _nearest_distances_from_grouped_queries(grouped_query, targets)
+            nearest = _nearest_distances_from_grouped_queries(grouped_query, targets, target_is_pad)
             held_group = nearest[:, :current_chunk_len]
             static_group = nearest[:, current_chunk_len:]
             _scatter_amin_by_batch(
@@ -554,6 +666,8 @@ def compute_motion_priors(
     future_poses: Tensor,
     future_is_pad: Tensor | None = None,
     *,
+    current_is_pad: Tensor | None = None,
+    future_point_is_pad: Tensor | None = None,
     nn_chunk_size: int = 1024,
 ) -> dict[str, Tensor]:
     """Compute geometry/motion priors used by pseudo labels and the segmentation network."""
@@ -565,6 +679,18 @@ def compute_motion_priors(
             bsize, future_pc.shape[1], dtype=torch.bool, device=current_pc.device
         )
     future_is_pad = future_is_pad.to(device=current_pc.device, dtype=torch.bool)
+    if current_is_pad is None:
+        current_is_pad = torch.zeros(bsize, n_points, dtype=torch.bool, device=current_pc.device)
+    else:
+        current_is_pad = current_is_pad.to(device=current_pc.device, dtype=torch.bool)
+        if current_is_pad.shape != current_pc.shape[:2]:
+            raise ValueError(f"Expected current_is_pad shape {current_pc.shape[:2]}, got {current_is_pad.shape}.")
+    if future_point_is_pad is not None:
+        future_point_is_pad = future_point_is_pad.to(device=current_pc.device, dtype=torch.bool)
+        if future_point_is_pad.shape != future_pc.shape[:3]:
+            raise ValueError(
+                f"Expected future_point_is_pad shape {future_pc.shape[:3]}, got {future_point_is_pad.shape}."
+            )
     current_xyz = current_pc[..., :3].to(dtype=torch.float32)
     future_xyz = future_pc[..., :3].to(device=current_pc.device, dtype=torch.float32)
     future_poses = future_poses.to(device=current_pc.device, dtype=torch.float32)
@@ -574,22 +700,30 @@ def compute_motion_priors(
         future_xyz,
         future_poses,
         future_is_pad,
+        future_point_is_pad,
         chunk_size=nn_chunk_size,
     )
+    held_residual = torch.where(current_is_pad, torch.ones_like(held_residual), held_residual)
+    static_residual = torch.where(current_is_pad, torch.ones_like(static_residual), static_residual)
 
     trajectory_xyz = future_poses[..., :3]
     valid_traj = ~future_is_pad
     point_to_traj = torch.linalg.norm(current_xyz[:, :, None, :] - trajectory_xyz[:, None, :, :], dim=-1)
     point_to_traj = point_to_traj.masked_fill(~valid_traj[:, None, :], float("inf"))
+    point_to_traj = point_to_traj.masked_fill(current_is_pad[:, :, None], float("inf"))
     min_traj_dist = point_to_traj.amin(dim=-1)
     min_traj_dist = torch.where(torch.isfinite(min_traj_dist), min_traj_dist, torch.zeros_like(min_traj_dist))
 
     ee_dist = torch.linalg.norm(current_xyz, dim=-1)
+    ee_dist = torch.where(current_is_pad, torch.zeros_like(ee_dist), ee_dist)
     start_dist = point_to_traj[..., 0]
     future_min_dist = point_to_traj[..., 1:].amin(dim=-1) if point_to_traj.shape[-1] > 1 else start_dist
     future_min_dist = torch.where(torch.isfinite(future_min_dist), future_min_dist, start_dist)
     approach_delta = start_dist - future_min_dist
     residual_gap = static_residual - held_residual
+    min_traj_dist = torch.where(current_is_pad, torch.zeros_like(min_traj_dist), min_traj_dist)
+    approach_delta = torch.where(current_is_pad, torch.zeros_like(approach_delta), approach_delta)
+    residual_gap = torch.where(current_is_pad, torch.zeros_like(residual_gap), residual_gap)
 
     priors = torch.stack(
         [
@@ -607,6 +741,7 @@ def compute_motion_priors(
 
     return {
         "priors": priors,
+        "point_is_pad": current_is_pad,
         "ee_dist": ee_dist,
         "min_traj_dist": min_traj_dist,
         "approach_delta": approach_delta,
@@ -675,6 +810,11 @@ def generate_pseudo_labels_from_priors(
     weights = confidence.detach().clamp(0.05, 1.0)
     weights = torch.where(labels == ROLE_BACKGROUND, weights * config.background_label_weight, weights)
     weights = torch.where(labels == config.ignore_index, torch.zeros_like(weights), weights)
+    point_is_pad = prior_dict.get("point_is_pad")
+    if point_is_pad is not None:
+        point_is_pad = point_is_pad.to(device=labels.device, dtype=torch.bool)
+        labels = torch.where(point_is_pad, torch.full_like(labels, config.ignore_index), labels)
+        weights = torch.where(point_is_pad, torch.zeros_like(weights), weights)
     labels, weights = _promote_minimum_foreground(labels, weights, class_scores.detach(), config)
 
     return {
@@ -696,6 +836,8 @@ def generate_pseudo_labels(
     future_poses: Tensor,
     future_is_pad: Tensor | None = None,
     *,
+    current_is_pad: Tensor | None = None,
+    future_point_is_pad: Tensor | None = None,
     config: PseudoLabelConfig | None = None,
 ) -> dict[str, Tensor]:
     config = config or PseudoLabelConfig()
@@ -704,9 +846,76 @@ def generate_pseudo_labels(
         future_pc,
         future_poses,
         future_is_pad,
+        current_is_pad=current_is_pad,
+        future_point_is_pad=future_point_is_pad,
         nn_chunk_size=config.nn_chunk_size,
     )
     return generate_pseudo_labels_from_priors(prior_dict, config=config)
+
+
+def force_small_current_clouds_foreground(
+    pseudo: dict[str, Tensor],
+    current_pc: Tensor,
+    configured_current_points: int,
+    point_is_pad: Tensor | None = None,
+) -> dict[str, Tensor]:
+    if configured_current_points <= 0:
+        return pseudo
+    if current_pc.ndim != 3:
+        raise ValueError(f"Expected current_pc shape (B,N,C), got {tuple(current_pc.shape)}.")
+
+    if point_is_pad is None:
+        valid = torch.ones(current_pc.shape[:2], dtype=torch.bool, device=current_pc.device)
+    else:
+        point_is_pad = point_is_pad.to(device=current_pc.device, dtype=torch.bool)
+        if point_is_pad.ndim == 3 and point_is_pad.shape[1] == 1:
+            point_is_pad = point_is_pad.squeeze(1)
+        if point_is_pad.shape != current_pc.shape[:2]:
+            raise ValueError(f"Expected point_is_pad shape {current_pc.shape[:2]}, got {point_is_pad.shape}.")
+        valid = ~point_is_pad
+
+    valid_counts = valid.sum(dim=1)
+    small_cloud = valid_counts < int(configured_current_points)
+    if not bool(small_cloud.any().item()):
+        return pseudo
+
+    out = dict(pseudo)
+    for key in ("labels", "weights", "class_scores", "role_scores", "foreground_score"):
+        out[key] = out[key].clone()
+
+    force_mask = small_cloud[:, None] & valid
+    pad_mask = ~valid
+    out["labels"] = torch.where(force_mask, torch.full_like(out["labels"], ROLE_FOREGROUND), out["labels"])
+    out["labels"] = torch.where(pad_mask, torch.full_like(out["labels"], ROLE_IGNORE), out["labels"])
+    out["weights"] = torch.where(force_mask, torch.ones_like(out["weights"]), out["weights"])
+    out["weights"] = torch.where(pad_mask, torch.zeros_like(out["weights"]), out["weights"])
+
+    out["class_scores"][..., ROLE_BACKGROUND] = torch.where(
+        force_mask,
+        torch.zeros_like(out["class_scores"][..., ROLE_BACKGROUND]),
+        out["class_scores"][..., ROLE_BACKGROUND],
+    )
+    out["class_scores"][..., ROLE_FOREGROUND] = torch.where(
+        force_mask,
+        torch.ones_like(out["class_scores"][..., ROLE_FOREGROUND]),
+        out["class_scores"][..., ROLE_FOREGROUND],
+    )
+    out["class_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["class_scores"]), out["class_scores"])
+
+    target_role_index = out["role_scores"].shape[-1] - 1
+    out["role_scores"] = torch.where(force_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
+    out["role_scores"][..., target_role_index] = torch.where(
+        force_mask,
+        torch.ones_like(out["role_scores"][..., target_role_index]),
+        out["role_scores"][..., target_role_index],
+    )
+    out["role_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
+    out["foreground_score"] = torch.where(force_mask, torch.ones_like(out["foreground_score"]), out["foreground_score"])
+    out["foreground_score"] = torch.where(pad_mask, torch.zeros_like(out["foreground_score"]), out["foreground_score"])
+    out["small_cloud_forced_foreground"] = small_cloud
+    if point_is_pad is not None:
+        out["point_is_pad"] = point_is_pad
+    return out
 
 
 def _promote_minimum_foreground(
@@ -723,7 +932,9 @@ def _promote_minimum_foreground(
     min_count = max(1, math.ceil(labels.shape[1] * config.min_foreground_fraction))
 
     for bidx in range(labels.shape[0]):
-        eligible = foreground_scores[bidx] >= config.forced_foreground_min_score
+        eligible = (foreground_scores[bidx] >= config.forced_foreground_min_score) & (
+            labels[bidx] != config.ignore_index
+        )
         if not bool(eligible.any()):
             continue
         count = min(min_count, int(eligible.sum().item()))
@@ -783,12 +994,14 @@ class SongPointSegNet(nn.Module):
         backbone_type: str = "litept",
         hidden_dim: int = 128,
         grid_size: float = 0.01,
-        in_channels: int = 6 + MOTION_PRIOR_DIM,
+        in_channels: int = 6,
     ):
         super().__init__()
         self.backbone_type = backbone_type
         self.grid_size = float(grid_size)
         self.in_channels = int(in_channels)
+        if self.in_channels != 6:
+            raise ValueError("SongPointSegNet now uses only raw XYZRGB point features, so in_channels must be 6.")
 
         if backbone_type == "litept":
             try:
@@ -821,16 +1034,26 @@ class SongPointSegNet(nn.Module):
         else:
             raise ValueError(f"Unknown backbone_type={backbone_type!r}. Expected 'litept' or 'mlp'.")
 
-    def _make_features(self, current_pc: Tensor, priors: Tensor) -> Tensor:
+    def _make_features(self, current_pc: Tensor) -> Tensor:
         xyz = current_pc[..., :3].to(dtype=torch.float32)
         rgb = current_pc[..., 3:6].to(dtype=torch.float32) / 255.0
-        return torch.cat([xyz, rgb, priors.to(dtype=torch.float32)], dim=-1)
+        return torch.cat([xyz, rgb], dim=-1)
 
-    def _forward_litept(self, current_pc: Tensor, features: Tensor) -> Tensor:
+    def _forward_litept(self, current_pc: Tensor, features: Tensor, point_is_pad: Tensor | None = None) -> Tensor:
         bsize, n_points = current_pc.shape[:2]
-        coord = current_pc[..., :3].reshape(-1, 3).contiguous().to(dtype=torch.float32)
-        feat = features.reshape(-1, features.shape[-1]).contiguous().to(dtype=torch.float32)
-        counts = torch.full((bsize,), n_points, dtype=torch.long, device=current_pc.device)
+        if point_is_pad is None:
+            point_is_pad = torch.zeros(bsize, n_points, dtype=torch.bool, device=current_pc.device)
+        valid = ~point_is_pad
+        counts = valid.sum(dim=1).to(dtype=torch.long)
+        valid_batch = counts > 0
+        if not bool(valid_batch.any().item()):
+            return current_pc.new_zeros(bsize, n_points, len(ROLE_NAMES))
+
+        valid_local = torch.nonzero(valid[valid_batch], as_tuple=False)
+        flat_valid = valid[valid_batch].reshape(-1)
+        coord = current_pc[valid_batch, :, :3].reshape(-1, 3)[flat_valid].contiguous().to(dtype=torch.float32)
+        feat = features[valid_batch].reshape(-1, features.shape[-1])[flat_valid].contiguous().to(dtype=torch.float32)
+        counts = counts[valid_batch]
         offset = torch.cumsum(counts, dim=0)
         point = self.backbone(
             {
@@ -840,8 +1063,11 @@ class SongPointSegNet(nn.Module):
                 "grid_size": self.grid_size,
             }
         )
-        point_feat = point.feat.reshape(bsize, n_points, -1)
-        return self.head(point_feat)
+        valid_logits = self.head(point.feat)
+        logits = valid_logits.new_zeros(bsize, n_points, valid_logits.shape[-1])
+        valid_batch_indices = torch.nonzero(valid_batch, as_tuple=False).flatten()
+        logits[valid_batch_indices[valid_local[:, 0]], valid_local[:, 1]] = valid_logits
+        return logits
 
     def forward(
         self,
@@ -851,20 +1077,35 @@ class SongPointSegNet(nn.Module):
         future_is_pad: Tensor | None = None,
         *,
         priors: Tensor | None = None,
+        point_is_pad: Tensor | None = None,
+        future_point_is_pad: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if priors is None:
-            if future_pc is None or future_poses is None:
-                raise ValueError("future_pc and future_poses are required when priors are not provided.")
-            prior_dict = compute_motion_priors(current_pc, future_pc, future_poses, future_is_pad)
-            priors = prior_dict["priors"]
+            if future_pc is not None and future_poses is not None:
+                prior_dict = compute_motion_priors(
+                    current_pc,
+                    future_pc,
+                    future_poses,
+                    future_is_pad,
+                    current_is_pad=point_is_pad,
+                    future_point_is_pad=future_point_is_pad,
+                )
+            else:
+                prior_dict = {}
+                if point_is_pad is not None:
+                    prior_dict["point_is_pad"] = point_is_pad
         else:
             prior_dict = {"priors": priors}
+            if point_is_pad is not None:
+                prior_dict["point_is_pad"] = point_is_pad
 
-        features = self._make_features(current_pc, priors)
+        features = self._make_features(current_pc)
         if self.backbone_type == "litept":
-            role_logits = self._forward_litept(current_pc, features)
+            role_logits = self._forward_litept(current_pc, features, point_is_pad)
         else:
             role_logits = self.head(self.backbone(features))
+            if point_is_pad is not None:
+                role_logits = role_logits.masked_fill(point_is_pad[..., None].to(device=role_logits.device), 0.0)
         role_probs = role_logits.softmax(dim=-1)
         return {
             **prior_dict,
@@ -916,22 +1157,31 @@ def _foreground_bce(logits: Tensor, labels: Tensor, weights: Tensor, ignore_inde
     return torch.stack(parts).mean()
 
 
-def _voxel_smoothness_loss(logits: Tensor, xyz: Tensor, voxel_size: float) -> Tensor:
+def _voxel_smoothness_loss(
+    logits: Tensor, xyz: Tensor, voxel_size: float, point_is_pad: Tensor | None = None
+) -> Tensor:
     probs = logits.softmax(dim=-1)
     total = logits.sum() * 0.0
     used = 0
     for bidx in range(logits.shape[0]):
-        voxel = torch.floor(xyz[bidx] / voxel_size).to(dtype=torch.long)
+        valid = ~point_is_pad[bidx] if point_is_pad is not None else torch.ones(
+            xyz.shape[1], dtype=torch.bool, device=xyz.device
+        )
+        if int(valid.sum().item()) <= 1:
+            continue
+        xyz_b = xyz[bidx, valid]
+        probs_b = probs[bidx, valid]
+        voxel = torch.floor(xyz_b / voxel_size).to(dtype=torch.long)
         _, inverse = torch.unique(voxel, dim=0, return_inverse=True)
         groups = int(inverse.max().item()) + 1 if inverse.numel() > 0 else 0
         if groups <= 1:
             continue
         sums = torch.zeros(groups, probs.shape[-1], device=probs.device, dtype=probs.dtype)
         counts = torch.zeros(groups, 1, device=probs.device, dtype=probs.dtype)
-        sums.scatter_add_(0, inverse[:, None].expand(-1, probs.shape[-1]), probs[bidx])
+        sums.scatter_add_(0, inverse[:, None].expand(-1, probs.shape[-1]), probs_b)
         counts.scatter_add_(0, inverse[:, None], torch.ones_like(counts[inverse]))
         means = sums / counts.clamp_min(1.0)
-        total = total + (probs[bidx] - means[inverse]).square().mean()
+        total = total + (probs_b - means[inverse]).square().mean()
         used += 1
     if used == 0:
         return total
@@ -942,6 +1192,9 @@ def _motion_consistency_loss(logits: Tensor, pseudo: dict[str, Tensor]) -> Tenso
     probs = logits.softmax(dim=-1)
     class_scores = pseudo["class_scores"].to(device=logits.device, dtype=logits.dtype)
     foreground_scores = class_scores[..., ROLE_FOREGROUND]
+    point_is_pad = pseudo.get("point_is_pad")
+    if point_is_pad is not None:
+        foreground_scores = foreground_scores.masked_fill(point_is_pad.to(device=logits.device, dtype=torch.bool), 0.0)
     if not bool((foreground_scores > 0).any()):
         return logits.sum() * 0.0
     losses = (probs[..., ROLE_FOREGROUND] - foreground_scores).square()
@@ -957,10 +1210,19 @@ class SongPointSegLoss(nn.Module):
         logits = outputs["role_logits"]
         labels = pseudo["labels"].to(device=logits.device)
         weights = pseudo["weights"].to(device=logits.device, dtype=logits.dtype)
+        point_is_pad = pseudo.get("point_is_pad", outputs.get("point_is_pad"))
+        if point_is_pad is not None:
+            point_is_pad = point_is_pad.to(device=logits.device, dtype=torch.bool)
+            labels = torch.where(point_is_pad, torch.full_like(labels, self.config.ignore_index), labels)
+            weights = torch.where(point_is_pad, torch.zeros_like(weights), weights)
+        valid = labels != self.config.ignore_index
+        valid_f = valid.to(dtype=torch.float32)
 
         ce = _weighted_cross_entropy(logits, labels, weights, self.config)
         fg_bce = _foreground_bce(logits, labels, weights, self.config.ignore_index)
-        smoothness = _voxel_smoothness_loss(logits, current_pc[..., :3], self.config.smooth_voxel_size)
+        smoothness = _voxel_smoothness_loss(
+            logits, current_pc[..., :3], self.config.smooth_voxel_size, point_is_pad
+        )
         motion = _motion_consistency_loss(logits, pseudo)
         loss = (
             self.config.ce_weight * ce
@@ -974,23 +1236,31 @@ class SongPointSegLoss(nn.Module):
             "loss_foreground_bce": fg_bce.detach(),
             "loss_smoothness": smoothness.detach(),
             "loss_motion": motion.detach(),
-            "pseudo_valid_ratio": (labels != self.config.ignore_index).to(dtype=torch.float32).mean().detach(),
+            "pseudo_valid_ratio": valid_f.mean().detach(),
             "pseudo_valid_foreground_ratio": (
                 (labels == ROLE_FOREGROUND)
                 .to(dtype=torch.float32)
                 .sum()
-                / (labels != self.config.ignore_index).to(dtype=torch.float32).sum().clamp_min(1.0)
+                / valid_f.sum().clamp_min(1.0)
             ).detach(),
-            "pseudo_background_ratio": (labels == ROLE_BACKGROUND).to(dtype=torch.float32).mean().detach(),
+            "pseudo_background_ratio": (
+                (labels == ROLE_BACKGROUND).to(dtype=torch.float32).sum() / valid_f.sum().clamp_min(1.0)
+            ).detach(),
             "pseudo_foreground_ratio": (labels == ROLE_FOREGROUND)
             .to(dtype=torch.float32)
-            .mean()
+            .sum()
+            .div(valid_f.sum().clamp_min(1.0))
             .detach(),
-            "pred_foreground_ratio": (outputs["role_probs"].argmax(dim=-1) == ROLE_FOREGROUND)
-            .to(dtype=torch.float32)
-            .mean()
-            .detach(),
-            "pred_operation_prob": outputs["operation_prob"].mean().detach(),
+            "pred_foreground_ratio": (
+                ((outputs["role_probs"].argmax(dim=-1) == ROLE_FOREGROUND) & valid)
+                .to(dtype=torch.float32)
+                .sum()
+                / valid_f.sum().clamp_min(1.0)
+            ).detach(),
+            "pred_operation_prob": (
+                (outputs["operation_prob"] * valid_f.to(dtype=outputs["operation_prob"].dtype)).sum()
+                / valid_f.to(dtype=outputs["operation_prob"].dtype).sum().clamp_min(1.0)
+            ).detach(),
         }
         if "teacher_accept_mask" in pseudo:
             metrics["teacher_accept_ratio"] = pseudo["teacher_accept_mask"].to(dtype=torch.float32).mean().detach()

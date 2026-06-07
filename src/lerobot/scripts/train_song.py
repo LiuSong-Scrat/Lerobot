@@ -40,7 +40,12 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.smolvla.song_pointseg import ROLE_FOREGROUND, SongPointSegCachedDataset, write_role_ply
+from lerobot.policies.smolvla.song_pointseg import (
+    ROLE_FOREGROUND,
+    SongPointSegCachedDataset,
+    song_pointseg_collate,
+    write_role_ply,
+)
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -792,6 +797,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        collate_fn=song_pointseg_collate,
     )
 
     # Prepare everything with accelerator
@@ -1018,7 +1024,7 @@ def _apply_song_debug_defaults() -> None:
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
         "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
-        "--batch_size=6",
+        "--batch_size=8",
         "--steps=500000",
         "--log_freq=1",
         "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e",
@@ -1032,11 +1038,11 @@ def _apply_song_debug_defaults() -> None:
         "--policy.pointseg_backbone_type=litept",
         "--policy.pointseg_grid_size=0.01",
         "--policy.pointseg_feature_dim=64",
-        "--policy.pointseg_aux_loss_weight=0.02",
+        "--policy.pointseg_aux_loss_weight=0.002",
         "--policy.pointseg_foreground_ratio=0.08",
         "--policy.pointseg_background_ratio=0.08",
-        "--policy.pointseg_min_foreground_points=512",
-        "--policy.pointseg_min_background_points=512",
+        "--policy.pointseg_min_foreground_points=4000",
+        "--policy.pointseg_min_background_points=0",
         "--policy.pointseg_use_temporal_priors_as_input=false",
         "--policy.pointseg_use_pseudo_selection=false",
     ]
@@ -1064,4 +1070,3 @@ if __name__ == "__main__":
 # action_pred = self.predict_action_chunk(batch)
 # vis_umi_data(action_pred.cpu().numpy()[0],batch['observation.point_cloud'].cpu().numpy()[0])
 # print(action_pred[0][:,-1])
-

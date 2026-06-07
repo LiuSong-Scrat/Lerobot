@@ -21,15 +21,16 @@ from tqdm import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
-    MOTION_PRIOR_DIM,
     POINTSEG_CACHE_FIELDS,
     POINTSEG_CACHE_VERSION,
     ROLE_NAMES,
     PseudoLabelConfig,
     SongTemporalPointCloudDataset,
+    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     move_batch_to_device,
     parse_future_offsets,
+    song_pointseg_collate,
     write_role_ply,
 )
 from lerobot.utils.random_utils import set_seed
@@ -138,53 +139,6 @@ def _make_shard_manifest(total_samples: int, shard_size: int) -> list[dict[str, 
     return shards
 
 
-def _open_memmap(path: Path, shape: tuple[int, ...], dtype: np.dtype) -> np.memmap:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
-
-
-def _open_shard_arrays(
-    output_dir: Path,
-    shard: dict[str, Any],
-    *,
-    current_points: int,
-    storage_dtype: np.dtype,
-) -> dict[str, np.memmap]:
-    shard_dir = output_dir / shard["path"]
-    length = int(shard["length"])
-    return {
-        "point_cloud": _open_memmap(
-            shard_dir / "point_cloud.npy", (length, current_points, 6), storage_dtype
-        ),
-        "priors": _open_memmap(
-            shard_dir / "priors.npy", (length, current_points, MOTION_PRIOR_DIM), storage_dtype
-        ),
-        "labels": _open_memmap(shard_dir / "labels.npy", (length, current_points), np.int16),
-        "weights": _open_memmap(shard_dir / "weights.npy", (length, current_points), storage_dtype),
-        "class_scores": _open_memmap(
-            shard_dir / "class_scores.npy", (length, current_points, len(ROLE_NAMES)), storage_dtype
-        ),
-        "role_scores": _open_memmap(shard_dir / "role_scores.npy", (length, current_points, 3), storage_dtype),
-        "foreground_score": _open_memmap(
-            shard_dir / "foreground_score.npy", (length, current_points), storage_dtype
-        ),
-        "episode_index": _open_memmap(shard_dir / "episode_index.npy", (length,), np.int64),
-        "frame_index": _open_memmap(shard_dir / "frame_index.npy", (length,), np.int64),
-        "dataset_index": _open_memmap(shard_dir / "dataset_index.npy", (length,), np.int64),
-    }
-
-
-def _flush_arrays(arrays: dict[str, np.memmap] | None) -> None:
-    if arrays is None:
-        return
-    for array in arrays.values():
-        array.flush()
-
-
-def _to_numpy(tensor: torch.Tensor, dtype: np.dtype) -> np.ndarray:
-    return tensor.detach().cpu().numpy().astype(dtype, copy=False)
-
-
 def _slice_batch_to_size(batch: dict[str, Any], batch_size: int) -> dict[str, Any]:
     sliced = {}
     for key, value in batch.items():
@@ -195,27 +149,57 @@ def _slice_batch_to_size(batch: dict[str, Any], batch_size: int) -> dict[str, An
     return sliced
 
 
-def _write_batch_slice(
-    arrays: dict[str, np.memmap],
-    dst: slice,
-    src: slice,
+def _save_variable_shard(
+    output_dir: Path,
+    shard: dict[str, Any],
+    samples: list[dict[str, np.ndarray | int]],
     *,
+    storage_dtype: np.dtype,
+) -> dict[str, Any]:
+    shard_dir = output_dir / shard["path"]
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    lengths = [int(sample["point_cloud"].shape[0]) for sample in samples]
+    offsets = np.zeros(len(samples) + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths, dtype=np.int64)
+
+    np.save(shard_dir / "sample_offsets.npy", offsets)
+    np.save(shard_dir / "point_cloud.npy", np.concatenate([sample["point_cloud"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "priors.npy", np.concatenate([sample["priors"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "labels.npy", np.concatenate([sample["labels"] for sample in samples], axis=0).astype(np.int16, copy=False))
+    np.save(shard_dir / "weights.npy", np.concatenate([sample["weights"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "class_scores.npy", np.concatenate([sample["class_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "role_scores.npy", np.concatenate([sample["role_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "foreground_score.npy", np.concatenate([sample["foreground_score"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "episode_index.npy", np.asarray([sample["episode_index"] for sample in samples], dtype=np.int64))
+    np.save(shard_dir / "frame_index.npy", np.asarray([sample["frame_index"] for sample in samples], dtype=np.int64))
+    np.save(shard_dir / "dataset_index.npy", np.asarray([sample["dataset_index"] for sample in samples], dtype=np.int64))
+    shard["num_points"] = int(offsets[-1])
+    return shard
+
+
+def _sample_from_batch(
     current_pc: torch.Tensor,
     pseudo: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-    dataset_indices: np.ndarray,
-    storage_dtype: np.dtype,
-) -> None:
-    arrays["point_cloud"][dst] = _to_numpy(current_pc[src], storage_dtype)
-    arrays["priors"][dst] = _to_numpy(pseudo["priors"][src], storage_dtype)
-    arrays["labels"][dst] = _to_numpy(pseudo["labels"][src], np.int16)
-    arrays["weights"][dst] = _to_numpy(pseudo["weights"][src], storage_dtype)
-    arrays["class_scores"][dst] = _to_numpy(pseudo["class_scores"][src], storage_dtype)
-    arrays["role_scores"][dst] = _to_numpy(pseudo["role_scores"][src], storage_dtype)
-    arrays["foreground_score"][dst] = _to_numpy(pseudo["foreground_score"][src], storage_dtype)
-    arrays["episode_index"][dst] = _to_numpy(batch["episode_index"][src], np.int64)
-    arrays["frame_index"][dst] = _to_numpy(batch["frame_index"][src], np.int64)
-    arrays["dataset_index"][dst] = dataset_indices
+    batch_index: int,
+    dataset_index: int,
+) -> dict[str, np.ndarray | int]:
+    is_pad = batch.get("observation.point_cloud_is_pad")
+    valid = ~is_pad[batch_index].bool().detach().cpu() if is_pad is not None else torch.ones(
+        current_pc.shape[1], dtype=torch.bool
+    )
+    return {
+        "point_cloud": current_pc[batch_index].detach().cpu()[valid].numpy(),
+        "priors": pseudo["priors"][batch_index].detach().cpu()[valid].numpy(),
+        "labels": pseudo["labels"][batch_index].detach().cpu()[valid].numpy(),
+        "weights": pseudo["weights"][batch_index].detach().cpu()[valid].numpy(),
+        "class_scores": pseudo["class_scores"][batch_index].detach().cpu()[valid].numpy(),
+        "role_scores": pseudo["role_scores"][batch_index].detach().cpu()[valid].numpy(),
+        "foreground_score": pseudo["foreground_score"][batch_index].detach().cpu()[valid].numpy(),
+        "episode_index": int(batch["episode_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
+        "frame_index": int(batch["frame_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
+        "dataset_index": int(dataset_index),
+    }
 
 
 def _save_preview(
@@ -260,6 +244,9 @@ def cache_samples(args: argparse.Namespace) -> None:
         "future_offsets": list(args.future_offsets),
         "current_points": args.current_points,
         "future_points": args.future_points,
+        "variable_num_points": True,
+        "point_count_policy": "cap_without_repeat",
+        "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
         "storage_dtype": args.storage_dtype,
         "pseudo_label_config": asdict(pseudo_cfg),
         "args": _jsonable(vars(args)),
@@ -275,16 +262,11 @@ def cache_samples(args: argparse.Namespace) -> None:
         drop_last=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
+        collate_fn=song_pointseg_collate,
     )
 
     current_shard_index = 0
-    shard_cursor = 0
-    arrays: dict[str, np.memmap] | None = _open_shard_arrays(
-        args.output_dir,
-        shards[current_shard_index],
-        current_points=args.current_points,
-        storage_dtype=storage_dtype,
-    )
+    shard_samples: list[dict[str, np.ndarray | int]] = []
     written = 0
     previews = 0
     progress = tqdm(total=total_samples, desc="Cache Song pointseg", unit="sample")
@@ -302,57 +284,56 @@ def cache_samples(args: argparse.Namespace) -> None:
                 batch["observation.point_cloud_future"],
                 batch["future_ee_poses"],
                 batch["future_is_pad"],
+                current_is_pad=batch.get("observation.point_cloud_is_pad"),
+                future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
                 config=pseudo_cfg,
+            )
+            pseudo = force_small_current_clouds_foreground(
+                pseudo,
+                current_pc,
+                args.current_points,
+                batch.get("observation.point_cloud_is_pad"),
             )
 
             if previews < args.vis_count:
                 preview_count = min(args.vis_count - previews, batch_size)
                 for batch_index in range(preview_count):
+                    current_is_pad = batch.get("observation.point_cloud_is_pad")
+                    valid = ~current_is_pad[batch_index].bool() if current_is_pad is not None else torch.ones(
+                        current_pc.shape[1], dtype=torch.bool, device=current_pc.device
+                    )
                     _save_preview(
                         args.output_dir,
                         written + batch_index,
-                        current_pc[batch_index],
-                        {key: value[batch_index] for key, value in pseudo.items() if torch.is_tensor(value)},
+                        current_pc[batch_index][valid],
+                        {key: value[batch_index][valid] for key, value in pseudo.items() if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == current_pc.shape[:2]},
                     )
                 previews += preview_count
 
-            src_start = 0
-            while src_start < batch_size:
-                if arrays is None:
-                    arrays = _open_shard_arrays(
+            for batch_index in range(batch_size):
+                shard_samples.append(
+                    _sample_from_batch(current_pc, pseudo, batch, batch_index, written)
+                )
+                written += 1
+                progress.update(1)
+                if len(shard_samples) == int(shards[current_shard_index]["length"]):
+                    _save_variable_shard(
                         args.output_dir,
                         shards[current_shard_index],
-                        current_points=args.current_points,
+                        shard_samples,
                         storage_dtype=storage_dtype,
                     )
-                shard_length = int(shards[current_shard_index]["length"])
-                take = min(batch_size - src_start, shard_length - shard_cursor)
-                dst = slice(shard_cursor, shard_cursor + take)
-                src = slice(src_start, src_start + take)
-                dataset_indices = np.arange(written, written + take, dtype=np.int64)
-                _write_batch_slice(
-                    arrays,
-                    dst,
-                    src,
-                    current_pc=current_pc,
-                    pseudo=pseudo,
-                    batch=batch,
-                    dataset_indices=dataset_indices,
-                    storage_dtype=storage_dtype,
-                )
-                src_start += take
-                shard_cursor += take
-                written += take
-                progress.update(take)
-
-                if shard_cursor == shard_length:
-                    _flush_arrays(arrays)
-                    arrays = None
-                    shard_cursor = 0
+                    shard_samples = []
                     current_shard_index += 1
 
     progress.close()
-    _flush_arrays(arrays)
+    if shard_samples:
+        _save_variable_shard(
+            args.output_dir,
+            shards[current_shard_index],
+            shard_samples,
+            storage_dtype=storage_dtype,
+        )
     with open(args.output_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"Cached {written} Song pointseg samples to {args.output_dir}")

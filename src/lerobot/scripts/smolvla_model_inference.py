@@ -683,25 +683,25 @@ sys.argv = [
 ]
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
 
 
 
-model_va = SmolVLA_ModelInference(
-    policy_path="/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
-    policy_repo_id="/home/liusong/scp_receive/smolvla",
-    device="cuda",
-)
-with open("/home/liusong/temp/obs_dict_50000_mug.pkl", "rb") as f:
-    cur_model_observation = pickle.load(f)
-action = model_va.single_inference(
-    cur_model_observation,
-    visualize=True,
-    task="Place the Red Cube on the Blue Cube",
-)
-print(f"Predicted single action shape: {tuple(action.shape)}")
-print(action)
+# model_va = SmolVLA_ModelInference(
+#     policy_path="/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
+#     policy_repo_id="/home/liusong/scp_receive/smolvla",
+#     device="cuda",
+# )
+# with open("/home/liusong/temp/obs_dict_50000_mug.pkl", "rb") as f:
+#     cur_model_observation = pickle.load(f)
+# action = model_va.single_inference(
+#     cur_model_observation,
+#     visualize=True,
+#     task="Place the Red Cube on the Blue Cube",
+# )
+# print(f"Predicted single action shape: {tuple(action.shape)}")
+# print(action)
 
 
 

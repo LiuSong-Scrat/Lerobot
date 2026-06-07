@@ -23,6 +23,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLossConfig,
     SongPointSegNet,
     SongTemporalPointCloudDataset,
+    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     move_batch_to_device,
     parse_future_offsets,
@@ -30,6 +31,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     refine_pseudo_labels_with_teacher,
     save_pointseg_config,
     save_pointseg_npz,
+    song_pointseg_collate,
     write_role_ply,
 )
 from lerobot.utils.random_utils import set_seed
@@ -56,9 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-cache-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
-    parser.add_argument("--current-points", type=int, default=8192)
+    parser.add_argument("--current-points", type=int, default=50000)
     parser.add_argument("--future-points", type=int, default=16384)
-    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -191,6 +193,7 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
+        collate_fn=song_pointseg_collate,
     )
     iterator = iter(dataloader)
 
@@ -210,6 +213,7 @@ def train(args: argparse.Namespace) -> None:
 
         batch = move_batch_to_device(batch, device)
         current_pc = batch["observation.point_cloud"]
+        current_is_pad = batch.get("observation.point_cloud_is_pad")
         uses_cached_pseudo = "pointseg.priors" in batch
 
         with torch.no_grad():
@@ -221,14 +225,24 @@ def train(args: argparse.Namespace) -> None:
                     batch["observation.point_cloud_future"],
                     batch["future_ee_poses"],
                     batch["future_is_pad"],
+                    current_is_pad=current_is_pad,
+                    future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
                     config=pseudo_cfg,
                 )
+                pseudo = force_small_current_clouds_foreground(
+                    pseudo,
+                    current_pc,
+                    args.current_points,
+                    current_is_pad,
+                )
+            if current_is_pad is not None:
+                pseudo["point_is_pad"] = current_is_pad
             if teacher is not None:
-                teacher_outputs = teacher.model(current_pc, priors=pseudo["priors"])
+                teacher_outputs = teacher.model(current_pc, priors=pseudo["priors"], point_is_pad=current_is_pad)
                 pseudo = refine_pseudo_labels_with_teacher(pseudo, teacher_outputs["role_logits"], config=pseudo_cfg)
 
         model.train()
-        outputs = model(current_pc, priors=pseudo["priors"])
+        outputs = model(current_pc, priors=pseudo["priors"], point_is_pad=current_is_pad)
         loss, metrics = criterion(outputs, pseudo, current_pc)
 
         optimizer.zero_grad(set_to_none=True)

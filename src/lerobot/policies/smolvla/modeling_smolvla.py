@@ -54,6 +54,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict
 
@@ -71,6 +72,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.song_pointseg import (
     MOTION_PRIOR_DIM,
     PseudoLabelConfig,
+    ROLE_FOREGROUND,
     SongPointSegLoss,
     SongPointSegLossConfig,
     SongPointSegNet,
@@ -83,6 +85,54 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 from lerobot.utils.utils import get_safe_dtype
 
 from .litept.model import LitePT
+
+
+@contextmanager
+def _batchnorm_eval_on_single_value(module: nn.Module):
+    batchnorm_modules = [
+        child for child in module.modules() if isinstance(child, nn.modules.batchnorm._BatchNorm)
+    ]
+    training_states = [child.training for child in batchnorm_modules]
+    handles = []
+
+    def pre_hook(child: nn.modules.batchnorm._BatchNorm, inputs: tuple[Tensor, ...]) -> None:
+        if not inputs:
+            return
+        input_tensor = inputs[0]
+        if not torch.is_tensor(input_tensor) or input_tensor.ndim < 2 or input_tensor.shape[1] <= 0:
+            return
+        values_per_channel = input_tensor.numel() // int(input_tensor.shape[1])
+        use_running_stats = (
+            child.training
+            and values_per_channel <= 1
+            and child.running_mean is not None
+            and child.running_var is not None
+        )
+        child._song_restore_training = child.training
+        child._song_force_eval = use_running_stats
+        if use_running_stats:
+            child.eval()
+
+    def post_hook(child: nn.modules.batchnorm._BatchNorm, inputs: tuple[Tensor, ...], output: Tensor) -> None:
+        if bool(getattr(child, "_song_force_eval", False)):
+            child.train(bool(getattr(child, "_song_restore_training", True)))
+        for attr in ("_song_force_eval", "_song_restore_training"):
+            if hasattr(child, attr):
+                delattr(child, attr)
+
+    try:
+        for child in batchnorm_modules:
+            handles.append(child.register_forward_pre_hook(pre_hook))
+            handles.append(child.register_forward_hook(post_hook))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        for child, was_training in zip(batchnorm_modules, training_states, strict=True):
+            child.train(was_training)
+            for attr in ("_song_force_eval", "_song_restore_training"):
+                if hasattr(child, attr):
+                    delattr(child, attr)
 
 
 def create_frame(position, rot_matrix, scale=0.03):
@@ -496,9 +546,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
 
         pc = batch["observation.point_cloud"]
+        point_is_pad = batch.get("observation.point_cloud_is_pad")
         if pc.ndim == 4 and pc.shape[1] == 1:
             # Some preprocessors pad a singleton time/channel axis: (B, 1, N, C)
             pc = pc.squeeze(1)
+            if torch.is_tensor(point_is_pad) and point_is_pad.ndim == 3 and point_is_pad.shape[1] == 1:
+                point_is_pad = point_is_pad.squeeze(1)
         elif pc.ndim != 3:
             raise ValueError(f"Expected observation.point_cloud shape (B, N, C), got {pc.shape}")
         if pc.shape[-1] != 6:
@@ -519,8 +572,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "pointseg.role_scores",
             "pointseg.foreground_score",
         )
-        if self.model.pointseg_conditioner is not None or any(key in batch for key in pointseg_keys):
+        if self.model.pointseg_conditioner is not None or torch.is_tensor(point_is_pad) or any(key in batch for key in pointseg_keys):
             payload = {"point_cloud": pc}
+            if torch.is_tensor(point_is_pad):
+                payload["point_is_pad"] = point_is_pad.to(device=device, dtype=torch.bool)
             for key in pointseg_keys:
                 if key not in batch:
                     continue
@@ -715,9 +770,15 @@ class LitePTTokenizer(nn.Module):
 
         return coord, feat, batch
 
-    def forward(self, pc):
+    def forward(self, pc, point_is_pad=None):
         B, N, C = pc.shape
         device = pc.device
+        if point_is_pad is None:
+            point_is_pad = torch.zeros(B, N, dtype=torch.bool, device=device)
+        else:
+            point_is_pad = point_is_pad.to(device=device, dtype=torch.bool)
+            if point_is_pad.shape != pc.shape[:2]:
+                raise ValueError(f"Expected point_is_pad shape {pc.shape[:2]}, got {point_is_pad.shape}.")
 
         # ========= 输出 =========
         empty_len = 1
@@ -729,26 +790,29 @@ class LitePTTokenizer(nn.Module):
         # ========= mask valid =========
         valid_mask = []
         for b in range(B):
-            valid_mask.append(not self._is_degenerate(pc[b, :, :3]))
+            point_valid = ~point_is_pad[b]
+            valid_mask.append(bool(point_valid.any().item()) and not self._is_degenerate(pc[b, point_valid, :3]))
         valid_mask = torch.tensor(valid_mask, device=device)
 
         if valid_mask.sum() == 0:
             return global_xyz_tok, tok, g, tok_mask
 
         pc_v = pc[valid_mask]  # (Bv,N,C)
+        point_is_pad_v = point_is_pad[valid_mask]
         Bv = pc_v.shape[0]
 
         # ========= flatten =========
-        coord = pc_v[:, :, :3].reshape(-1, 3).contiguous()
+        flat_valid = (~point_is_pad_v).reshape(-1)
+        coord = pc_v[:, :, :3].reshape(-1, 3)[flat_valid].contiguous()
 
-        feat = pc_v.reshape(-1, C).contiguous()
+        feat = pc_v.reshape(-1, C)[flat_valid].contiguous()
         if C > 3:
             feat = torch.cat([feat[:, :3], feat[:, 3:] / 255.0], dim=1)
         else:
             feat = feat[:, :3]
 
         # batch index
-        batch = torch.arange(Bv, device=device).repeat_interleave(N)
+        batch = torch.arange(Bv, device=device).repeat_interleave((~point_is_pad_v).sum(dim=1))
 
         # ========= grid sample =========
         coord, feat, batch = self._grid_sample_batch(coord, feat, batch)
@@ -859,15 +923,15 @@ class LitePTEncoder(nn.Module):
         denom = weights.sum(dim=1, keepdim=True).clamp_min(torch.finfo(weights.dtype).tiny)
         return weights / denom
 
-    def forward(self, scene_pc):
-        scene_xyz, scene_tok, _scene_g, scene_mask = self.pc_backbone(scene_pc)
+    def forward(self, scene_pc, point_is_pad=None):
+        scene_xyz, scene_tok, _scene_g, scene_mask = self.pc_backbone(scene_pc, point_is_pad)
         scene_tok = self.attention(scene_tok, scene_mask)
         alpha = self._masked_softmax(self.att[0](scene_tok), scene_mask)
         center = (scene_xyz * alpha).sum(dim=1)
 
         centroid_xyz = scene_pc[..., :3] - center.unsqueeze(-2)
         scene_pc1 = torch.cat([centroid_xyz, scene_pc[..., 3:]], dim=-1)
-        _scene_xyz1, scene_tok1, _scene_g1, scene_mask1 = self.pc_backbone1(scene_pc1)
+        _scene_xyz1, scene_tok1, _scene_g1, scene_mask1 = self.pc_backbone1(scene_pc1, point_is_pad)
         scene_tok1 = self.attention1(scene_tok1, scene_mask1)
         alpha1 = self._masked_softmax(self.att1[0](scene_tok1), scene_mask1)
 
@@ -911,8 +975,6 @@ class SongPointCloudConditioner(nn.Module):
         self.min_foreground_points = int(config.pointseg_min_foreground_points)
         self.min_background_points = int(config.pointseg_min_background_points)
         self.aux_loss_weight = float(config.pointseg_aux_loss_weight)
-        self.use_temporal_priors_as_input = bool(config.pointseg_use_temporal_priors_as_input)
-        self.use_pseudo_selection = bool(config.pointseg_use_pseudo_selection)
 
         self.segmenter = SongPointSegNet(
             backbone_type=config.pointseg_backbone_type,
@@ -926,6 +988,7 @@ class SongPointCloudConditioner(nn.Module):
             grid_size=config.pointseg_grid_size,
         )
         self.background_encoder = LitePTTokenizer(in_dim=6, dim=self.feature_dim, n_tokens=256, grid_size=config.pointseg_grid_size,enc_mode=True)
+        self.null_background_feat = nn.Parameter(torch.zeros(self.feature_dim))
         self.pseudo_config = PseudoLabelConfig()
         self.pointseg_loss = SongPointSegLoss(SongPointSegLossConfig())
 
@@ -937,7 +1000,14 @@ class SongPointCloudConditioner(nn.Module):
             raise FileNotFoundError(f"Song pointseg checkpoint is missing: {path}")
         checkpoint = torch.load(path, map_location="cpu")
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        missing, unexpected = self.segmenter.load_state_dict(state_dict, strict=False)
+        try:
+            missing, unexpected = self.segmenter.load_state_dict(state_dict, strict=False)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to load SongPointSegNet checkpoint. The segmentation network now uses only "
+                "6-channel XYZRGB point features; checkpoints trained with motion-prior input channels "
+                "must be retrained."
+            ) from exc
         if missing:
             print(f"SongPointSegNet checkpoint missing keys: {missing}")
         if unexpected:
@@ -946,68 +1016,126 @@ class SongPointCloudConditioner(nn.Module):
             param.requires_grad_(True)
 
     @staticmethod
-    def current_frame_priors(point_cloud: Tensor) -> Tensor:
-        xyz = point_cloud[..., :3].to(dtype=torch.float32)
-        ee_dist = torch.linalg.norm(xyz, dim=-1)
-        min_traj_dist = ee_dist
-        approach_delta = torch.zeros_like(ee_dist)
-        held_residual = torch.full_like(ee_dist, 0.05)
-        static_residual = torch.full_like(ee_dist, 0.05)
-        residual_gap = torch.zeros_like(ee_dist)
-        priors = torch.stack(
-            [
-                ee_dist,
-                min_traj_dist,
-                approach_delta,
-                held_residual,
-                static_residual,
-                residual_gap,
-                torch.exp(-held_residual / 0.05),
-                torch.exp(-static_residual / 0.05),
-            ],
-            dim=-1,
-        )
-        if priors.shape[-1] != MOTION_PRIOR_DIM:
-            raise RuntimeError(f"Expected fallback priors dim={MOTION_PRIOR_DIM}, got {priors.shape[-1]}.")
-        return priors
-
-    @staticmethod
     def _squeeze_optional_temporal_axis(value: Tensor) -> Tensor:
         if value.ndim >= 3 and value.shape[1] == 1:
             return value.squeeze(1)
         return value
 
     @staticmethod
-    def _select_points(point_cloud: Tensor, scores: Tensor, count: int, *, largest: bool) -> tuple[Tensor, Tensor]:
+    def _select_points(
+        point_cloud: Tensor,
+        scores: Tensor,
+        count: int,
+        *,
+        largest: bool,
+        point_is_pad: Tensor | None = None,
+        candidate_mask: Tensor | None = None,
+        return_has_candidates: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         if point_cloud.ndim != 3:
             raise ValueError(f"Expected point_cloud shape (B,N,C), got {point_cloud.shape}.")
         if scores.shape != point_cloud.shape[:2]:
             raise ValueError(f"Expected scores shape {point_cloud.shape[:2]}, got {scores.shape}.")
+        if candidate_mask is not None and candidate_mask.shape != point_cloud.shape[:2]:
+            raise ValueError(f"Expected candidate_mask shape {point_cloud.shape[:2]}, got {candidate_mask.shape}.")
 
         bsize, n_points, channels = point_cloud.shape
         if n_points <= 0:
             raise ValueError("Cannot select points from an empty point cloud.")
         count = max(1, int(count))
-        topk_count = min(count, n_points)
-        indices = torch.topk(scores, k=topk_count, dim=1, largest=largest).indices
-        if count > topk_count:
-            repeats = math.ceil(count / topk_count)
-            indices = indices.repeat(1, repeats)[:, :count]
-        selected = point_cloud.gather(1, indices[..., None].expand(bsize, indices.shape[1], channels))
-        selected_scores = scores.gather(1, indices)
+        if candidate_mask is not None:
+            candidate_mask = candidate_mask.to(device=point_cloud.device, dtype=torch.bool)
+        if point_is_pad is not None:
+            point_is_pad = point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
+            selected = []
+            selected_scores = []
+            has_candidates = []
+            for bidx in range(bsize):
+                valid_idx = torch.nonzero(~point_is_pad[bidx], as_tuple=False).flatten()
+                if valid_idx.numel() == 0:
+                    valid_idx = torch.zeros(1, dtype=torch.long, device=point_cloud.device)
+                source_idx = valid_idx
+                if candidate_mask is not None:
+                    candidate_idx = valid_idx[candidate_mask[bidx, valid_idx]]
+                    if candidate_idx.numel() > 0:
+                        source_idx = candidate_idx
+                        has_candidates.append(torch.tensor(True, device=point_cloud.device))
+                    else:
+                        source_idx = valid_idx[:1]
+                        has_candidates.append(torch.tensor(False, device=point_cloud.device))
+                else:
+                    has_candidates.append(torch.tensor(True, device=point_cloud.device))
+                scores_b = scores[bidx, source_idx]
+                k = min(count, int(source_idx.numel()))
+                local_idx = torch.topk(scores_b, k=k, dim=0, largest=largest).indices
+                idx = source_idx[local_idx]
+                if count > k:
+                    repeats = math.ceil(count / k)
+                    idx = idx.repeat(repeats)[:count]
+                selected.append(point_cloud[bidx, idx])
+                selected_scores.append(scores[bidx, idx])
+            selected = torch.stack(selected, dim=0)
+            selected_scores = torch.stack(selected_scores, dim=0)
+            if return_has_candidates:
+                return selected, selected_scores, torch.stack(has_candidates, dim=0)
+            return selected, selected_scores
+
+        if candidate_mask is None:
+            topk_count = min(count, n_points)
+            indices = torch.topk(scores, k=topk_count, dim=1, largest=largest).indices
+            if count > topk_count:
+                repeats = math.ceil(count / topk_count)
+                indices = indices.repeat(1, repeats)[:, :count]
+            selected = point_cloud.gather(1, indices[..., None].expand(bsize, indices.shape[1], channels))
+            selected_scores = scores.gather(1, indices)
+            if return_has_candidates:
+                return selected, selected_scores, torch.ones(bsize, dtype=torch.bool, device=point_cloud.device)
+            return selected, selected_scores
+
+        selected = []
+        selected_scores = []
+        has_candidates = []
+        all_idx = torch.arange(n_points, device=point_cloud.device)
+        for bidx in range(bsize):
+            candidate_idx = all_idx[candidate_mask[bidx]]
+            if candidate_idx.numel() > 0:
+                source_idx = candidate_idx
+                has_candidates.append(torch.tensor(True, device=point_cloud.device))
+            else:
+                source_idx = all_idx[:1]
+                has_candidates.append(torch.tensor(False, device=point_cloud.device))
+            scores_b = scores[bidx, source_idx]
+            k = min(count, int(source_idx.numel()))
+            local_idx = torch.topk(scores_b, k=k, dim=0, largest=largest).indices
+            idx = source_idx[local_idx]
+            if count > k:
+                repeats = math.ceil(count / k)
+                idx = idx.repeat(repeats)[:count]
+            selected.append(point_cloud[bidx, idx])
+            selected_scores.append(scores[bidx, idx])
+        selected = torch.stack(selected, dim=0)
+        selected_scores = torch.stack(selected_scores, dim=0)
+        if return_has_candidates:
+            return selected, selected_scores, torch.stack(has_candidates, dim=0)
         return selected, selected_scores
 
     def _target_count(self, n_points: int, ratio: float, minimum: int) -> int:
         return max(int(minimum), math.ceil(n_points * float(ratio)))
 
-    def _make_pseudo(self, payload: dict[str, Tensor], priors: Tensor) -> dict[str, Tensor]:
+    def _make_pseudo(self, payload: dict[str, Tensor], priors: Tensor | None) -> dict[str, Tensor] | None:
         labels = payload.get("pointseg.labels")
         weights = payload.get("pointseg.weights")
         class_scores = payload.get("pointseg.class_scores")
         if labels is not None and weights is not None and class_scores is not None:
+            labels = self._squeeze_optional_temporal_axis(labels).to(dtype=torch.long)
+            pseudo_priors = (
+                priors
+                if priors is not None
+                else torch.zeros(*labels.shape, MOTION_PRIOR_DIM, device=labels.device, dtype=torch.float32)
+            )
             pseudo = {
-                "priors": priors,
-                "labels": self._squeeze_optional_temporal_axis(labels).to(dtype=torch.long),
+                "priors": pseudo_priors,
+                "labels": labels,
                 "weights": self._squeeze_optional_temporal_axis(weights).to(dtype=torch.float32),
                 "class_scores": self._squeeze_optional_temporal_axis(class_scores).to(dtype=torch.float32),
             }
@@ -1016,12 +1144,14 @@ class SongPointCloudConditioner(nn.Module):
                     payload["pointseg.foreground_score"]
                 ).to(dtype=torch.float32)
             else:
-                pseudo["foreground_score"] = pseudo["class_scores"][..., 1]
+                pseudo["foreground_score"] = pseudo["class_scores"][..., ROLE_FOREGROUND]
             if "pointseg.role_scores" in payload:
                 pseudo["role_scores"] = self._squeeze_optional_temporal_axis(payload["pointseg.role_scores"]).to(
                     dtype=torch.float32
                 )
             return pseudo
+        if priors is None:
+            return None
         return generate_pseudo_labels_from_priors(priors, config=self.pseudo_config)
 
     def _get_temporal_priors(self, payload: dict[str, Tensor], point_cloud: Tensor) -> Tensor | None:
@@ -1036,45 +1166,51 @@ class SongPointCloudConditioner(nn.Module):
             )
         return priors
 
-    def _selection_scores(self, payload: dict[str, Tensor], operation_prob: Tensor) -> Tensor:
-        if not (self.training and self.use_pseudo_selection):
-            return operation_prob
-        foreground_score = payload.get("pointseg.foreground_score")
-        if foreground_score is None:
-            class_scores = payload.get("pointseg.class_scores")
-            if class_scores is None:
-                return operation_prob
-            class_scores = self._squeeze_optional_temporal_axis(class_scores).to(
-                device=operation_prob.device, dtype=operation_prob.dtype
-            )
-            if class_scores.shape[:2] != operation_prob.shape or class_scores.shape[-1] < 2:
-                return operation_prob
-            foreground_score = class_scores[..., 1]
-        else:
-            foreground_score = self._squeeze_optional_temporal_axis(foreground_score).to(
-                device=operation_prob.device, dtype=operation_prob.dtype
-            )
-            if foreground_score.shape != operation_prob.shape:
-                return operation_prob
-        return torch.maximum(operation_prob, foreground_score.detach())
+    def _selection_scores(self, operation_prob: Tensor) -> Tensor:
+        return operation_prob
+
+    def _background_candidate_mask(
+        self,
+        selection_scores: Tensor,
+        point_is_pad: Tensor | None = None,
+    ) -> Tensor:
+        candidate = selection_scores <= 0.5
+        if point_is_pad is not None:
+            candidate = candidate & ~point_is_pad.to(device=selection_scores.device, dtype=torch.bool)
+        return candidate
 
     def forward(self, payload: dict[str, Tensor]) -> dict[str, Tensor]:
         point_cloud = payload["point_cloud"].to(dtype=torch.float32)
+        point_is_pad = payload.get("point_is_pad")
+        if point_is_pad is not None:
+            point_is_pad = point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
+            if point_is_pad.ndim == 3 and point_is_pad.shape[1] == 1:
+                point_is_pad = point_is_pad.squeeze(1)
         temporal_priors = self._get_temporal_priors(payload, point_cloud)
-        fallback_priors = self.current_frame_priors(point_cloud)
-        priors = temporal_priors if (self.use_temporal_priors_as_input and temporal_priors is not None) else fallback_priors
-        pseudo_priors = temporal_priors if temporal_priors is not None else priors
 
-        seg_outputs = self.segmenter(point_cloud, priors=priors)
+        with _batchnorm_eval_on_single_value(self.segmenter):
+            seg_outputs = self.segmenter(point_cloud, priors=temporal_priors, point_is_pad=point_is_pad)
         operation_prob = seg_outputs["operation_prob"]
-        selection_scores = self._selection_scores(payload, operation_prob)
-        foreground_count = self._target_count(point_cloud.shape[1], self.foreground_ratio, self.min_foreground_points)
-        background_count = self._target_count(point_cloud.shape[1], self.background_ratio, self.min_background_points)
-        foreground_pc, foreground_prob = self._select_points(
-            point_cloud, selection_scores, foreground_count, largest=True
+        selection_scores = self._selection_scores(operation_prob)
+        valid_points = (
+            (~point_is_pad).sum(dim=1).max().item()
+            if point_is_pad is not None
+            else point_cloud.shape[1]
         )
-        background_pc, background_prob = self._select_points(
-            point_cloud, selection_scores, background_count, largest=False
+        foreground_count = self._target_count(int(valid_points), self.foreground_ratio, self.min_foreground_points)
+        background_count = self._target_count(int(valid_points), self.background_ratio, self.min_background_points)
+        foreground_pc, foreground_prob = self._select_points(
+            point_cloud, selection_scores, foreground_count, largest=True, point_is_pad=point_is_pad
+        )
+        background_candidate_mask = self._background_candidate_mask(selection_scores, point_is_pad)
+        background_pc, background_prob, background_has_candidates = self._select_points(
+            point_cloud,
+            selection_scores,
+            background_count,
+            largest=False,
+            point_is_pad=point_is_pad,
+            candidate_mask=background_candidate_mask,
+            return_has_candidates=True,
         )
 
         fg_weight = foreground_prob
@@ -1082,22 +1218,36 @@ class SongPointCloudConditioner(nn.Module):
         bg_weight = 1.0 - background_prob
         bg_weight = torch.where(bg_weight >= 0.1, bg_weight, torch.zeros_like(bg_weight))
 
-        object_feat = self.foreground_encoder(foreground_pc)
-        scene_xyz, scene_tok, background_feat, scene_mask = self.background_encoder(background_pc)
+        with _batchnorm_eval_on_single_value(self.foreground_encoder):
+            object_feat = self.foreground_encoder(foreground_pc)
+        background_feat = self.null_background_feat.to(
+            device=object_feat.device, dtype=object_feat.dtype
+        ).unsqueeze(0).expand(point_cloud.shape[0], -1).clone()
+        if bool(background_has_candidates.any().item()):
+            background_pc_to_encode = background_pc[background_has_candidates]
+            with _batchnorm_eval_on_single_value(self.background_encoder):
+                _scene_xyz, _scene_tok, encoded_background_feat, _scene_mask = self.background_encoder(
+                    background_pc_to_encode
+                )
+            background_feat[background_has_candidates] = encoded_background_feat.to(dtype=background_feat.dtype)
 
         result = {
             "object_feat": object_feat,
             "background_feat": background_feat,
             "operation_prob": operation_prob,
             "pointseg_outputs": seg_outputs,
-            "pointseg_priors": priors,
+            "pointseg_priors": temporal_priors,
             "pointseg_selection_scores": selection_scores,
+            "pointseg_background_has_candidates": background_has_candidates,
         }
         if self.training and self.aux_loss_weight > 0:
-            pseudo = self._make_pseudo(payload, pseudo_priors)
-            aux_loss, aux_metrics = self.pointseg_loss(seg_outputs, pseudo, point_cloud)
-            result["pointseg_aux_loss"] = aux_loss
-            result["pointseg_aux_metrics"] = aux_metrics
+            pseudo = self._make_pseudo(payload, temporal_priors)
+            if pseudo is not None:
+                if point_is_pad is not None:
+                    pseudo["point_is_pad"] = point_is_pad
+                aux_loss, aux_metrics = self.pointseg_loss(seg_outputs, pseudo, point_cloud)
+                result["pointseg_aux_loss"] = aux_loss
+                result["pointseg_aux_metrics"] = aux_metrics
         return result
 
 
@@ -1247,18 +1397,34 @@ class VLAFlowMatching(nn.Module):
                 self.last_pointseg_aux_loss = conditioned.get("pointseg_aux_loss")
                 operation_prob = conditioned["operation_prob"].detach()
                 selection_scores = conditioned["pointseg_selection_scores"].detach()
+                point_is_pad = payload.get("point_is_pad")
+                if torch.is_tensor(point_is_pad):
+                    valid_points = (~point_is_pad.to(device=operation_prob.device, dtype=torch.bool)).to(
+                        dtype=operation_prob.dtype
+                    )
+                else:
+                    valid_points = torch.ones_like(operation_prob)
+                valid_denom = valid_points.sum().clamp_min(1.0)
                 self.last_pointseg_metrics = {
-                    "pointseg_foreground_ratio": (operation_prob >= 0.5).to(dtype=torch.float32).mean(),
-                    "pointseg_operation_prob_mean": operation_prob.mean(),
-                    "pointseg_selection_score_mean": selection_scores.mean(),
+                    "pointseg_foreground_ratio": (
+                        ((operation_prob >= 0.5).to(dtype=operation_prob.dtype) * valid_points).sum()
+                        / valid_denom
+                    ),
+                    "pointseg_operation_prob_mean": (operation_prob * valid_points).sum() / valid_denom,
+                    "pointseg_selection_score_mean": (selection_scores * valid_points).sum() / valid_denom,
                 }
+                background_has_candidates = conditioned.get("pointseg_background_has_candidates")
+                if torch.is_tensor(background_has_candidates):
+                    self.last_pointseg_metrics["pointseg_background_candidate_ratio"] = (
+                        background_has_candidates.to(device=operation_prob.device, dtype=operation_prob.dtype).mean()
+                    )
                 for key, value in conditioned.get("pointseg_aux_metrics", {}).items():
                     if torch.is_tensor(value):
                         self.last_pointseg_metrics[key] = value.detach()
             else:
                 if self.extractor is None or self.pointcloud_proj is None:
                     raise RuntimeError("Point cloud extractor is not initialized.")
-                global_feat = self.extractor(pc)  # (B, C)
+                global_feat = self.extractor(pc, payload.get("point_is_pad"))  # (B, C)
                 pc_emb = self.pointcloud_proj(global_feat).unsqueeze(1)
             pc_emb_dim = pc_emb.shape[-1]
             pc_emb = pc_emb * math.sqrt(pc_emb_dim)
