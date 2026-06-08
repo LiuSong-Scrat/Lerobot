@@ -90,6 +90,15 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_use_temporal_priors_as_input: bool = False
     pointseg_use_pseudo_selection: bool = True
 
+    # World-frame trajectory auxiliary supervision.
+    worldflow_enable: bool = False
+    worldflow_feature_dim: int = 64
+    worldflow_grid_size: float = 0.01
+    worldflow_loss_weight: float = 0.05
+    worldflow_geo_loss_weight: float = 0.05
+    worldflow_trans_weight: float = 1.0
+    worldflow_rot_weight: float = 1.0
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)

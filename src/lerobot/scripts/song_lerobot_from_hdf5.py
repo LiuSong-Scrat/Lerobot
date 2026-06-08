@@ -22,6 +22,7 @@ ROOT = Path("/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_t
 HDF5_FOLDER = Path("/home/liusong/temp/temp")
 POINT_CLOUD_DIR_NAME = "point_clouds"
 POINT_CLOUD_KEY = "observation.point_cloud"
+WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 POINT_CLOUD_CHANNELS = 6
 FPS_BATCH_SIZE = int(os.environ.get("SONG_FPS_BATCH_SIZE", "128"))
 USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
@@ -223,6 +224,10 @@ def point_cloud_file(root: Path, episode_index: int) -> Path:
     return root / POINT_CLOUD_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
+def world_ee_pose_file(root: Path, episode_index: int) -> Path:
+    return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
+
+
 def write_point_cloud_meta(root: Path) -> None:
     pc_dir = root / POINT_CLOUD_DIR_NAME
     pc_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +243,20 @@ def write_point_cloud_meta(root: Path) -> None:
         json.dump(meta, f, indent=2)
 
 
+def write_worldflow_meta(root: Path) -> None:
+    pose_dir = root / WORLD_EE_POSE_DIR_NAME
+    pose_dir.mkdir(parents=True, exist_ok=True)
+    pose_meta = {
+        "key": "worldflow.ee_poses",
+        "dtype": "float32",
+        "shape": [9],
+        "layout": "episode_npy",
+        "path_format": f"{WORLD_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy",
+    }
+    with open(pose_dir / "meta.json", "w") as f:
+        json.dump(pose_meta, f, indent=2)
+
+
 def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.ndarray) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
@@ -251,6 +270,16 @@ def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.n
     pc_path = point_cloud_file(root, episode_index)
     pc_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(pc_path, point_clouds)
+
+
+def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.ndarray) -> None:
+    world_ee_poses = np.ascontiguousarray(world_ee_poses, dtype=np.float32)
+    if world_ee_poses.ndim != 2 or world_ee_poses.shape[-1] != 9:
+        raise ValueError(f"Expected world ee poses shape (T, 9), got {world_ee_poses.shape}")
+
+    pose_path = world_ee_pose_file(root, episode_index)
+    pose_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(pose_path, world_ee_poses)
 
 
 def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, point_clouds: np.ndarray, timestamps: np.ndarray) -> dict:
@@ -302,6 +331,7 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
         "task": task_name,
         "actions": actions,
         "point_clouds": point_clouds,
+        "world_ee_poses": obs_pose9_eff_to_world,
         "timestamps": timestamps,
     }
 
@@ -309,6 +339,11 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
 def save_converted_episode(dataset: LeRobotDataset, episode: dict) -> None:
     episode_index = dataset.meta.total_episodes
     save_episode_point_clouds(dataset.root, episode_index, episode["point_clouds"])
+    save_episode_worldflow(
+        dataset.root,
+        episode_index,
+        episode["world_ee_poses"],
+    )
     episode_buffer = make_episode_buffer(
         dataset,
         episode["task"],
@@ -385,6 +420,7 @@ def main():
         use_videos=False,
     )
     write_point_cloud_meta(dataset.root)
+    write_worldflow_meta(dataset.root)
 
     h5_paths = sorted(HDF5_FOLDER.glob("*.hdf5"))
     if len(h5_paths) == 0:

@@ -205,6 +205,7 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     keys = set().union(*(item.keys() for item in batch))
     current_point_fields = {
         "observation.point_cloud": 0,
+        "observation.point_cloud_world": 0,
         "pointseg.priors": 0,
         "pointseg.labels": ROLE_IGNORE,
         "pointseg.weights": 0,
@@ -223,6 +224,11 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             if torch.is_tensor(first) and first.ndim == 3 and first.shape[0] == 1:
                 out[key], out["observation.point_cloud_is_pad"] = _pad_single_axis_tensors(values, 1, 0)
+                continue
+        if key == "observation.point_cloud_world":
+            first = values[0]
+            if torch.is_tensor(first) and first.ndim == 2:
+                out[key], out["observation.point_cloud_world_is_pad"] = _pad_point_tensors(values, 0)
                 continue
         if key in current_point_fields and torch.is_tensor(values[0]) and values[0].ndim >= 1:
             out[key], _ = _pad_point_tensors(values, current_point_fields[key])

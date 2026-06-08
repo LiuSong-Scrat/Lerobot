@@ -120,6 +120,87 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         return item
 
 
+class WorldFlowMemmapDataset(torch.utils.data.Dataset):
+    """Inject world-frame end-effector pose chunks for worldflow supervision."""
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        root: str | Path,
+        *,
+        chunk_size: int,
+        mmap_mode: str = "r",
+    ):
+        self.dataset = dataset
+        self.root = Path(root)
+        self.pose_dir = self.root / "world_ee_poses"
+        self.chunk_size = int(chunk_size)
+        self.mmap_mode = mmap_mode
+        self._pose_cache: dict[int, np.ndarray] = {}
+
+        if not self.pose_dir.is_dir():
+            raise FileNotFoundError(f"Worldflow is enabled but world ee pose directory is missing: {self.pose_dir}")
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_pose_cache"] = {}
+        return state
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @staticmethod
+    def _to_int(value) -> int:
+        if torch.is_tensor(value):
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, np.ndarray):
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def _episode_poses(self, episode_index: int) -> np.ndarray:
+        poses = self._pose_cache.get(episode_index)
+        if poses is None:
+            path = self.pose_dir / f"episode_{episode_index:06d}.npy"
+            if not path.exists():
+                raise FileNotFoundError(f"Worldflow ee pose memmap file is missing: {path}")
+            poses = np.load(path, mmap_mode=self.mmap_mode)
+            if poses.ndim != 2 or poses.shape[-1] != 9:
+                raise ValueError(f"Expected world ee poses shape (T,9), got {poses.shape}.")
+            self._pose_cache[episode_index] = poses
+        return poses
+
+    def __getitem__(self, idx):
+        item = dict(self.dataset[idx])
+        episode_index = self._to_int(item["episode_index"])
+        frame_index = self._to_int(item["frame_index"])
+        poses = self._episode_poses(episode_index)
+        episode_len = int(len(poses))
+        if episode_len <= 0:
+            raise ValueError(f"Worldflow episode {episode_index} is empty.")
+
+        current_index = min(max(frame_index, 0), episode_len - 1)
+        current_pose = np.array(poses[current_index], dtype=np.float32, copy=True)
+        item["worldflow.current_ee_pose"] = torch.from_numpy(
+            current_pose
+        )
+
+        action = item.get("action")
+        if (torch.is_tensor(action) or isinstance(action, np.ndarray)) and action.ndim >= 2:
+            chunk_size = int(action.shape[0])
+        else:
+            chunk_size = self.chunk_size
+        frame_indices = frame_index + np.arange(chunk_size, dtype=np.int64)
+        clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
+        item["worldflow.ee_poses"] = torch.from_numpy(
+            np.array(poses[clamped_indices], dtype=np.float32, copy=True)
+        )
+        item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
+        return item
+
+
 class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
     """Inject offline temporal pointseg samples into the action-training dataset."""
 
@@ -218,6 +299,20 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset):
     logging.info(f"Loading point clouds from per-episode memmap files in {point_cloud_dir}")
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
+
+
+def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
+    if not bool(getattr(policy_cfg, "worldflow_enable", False)):
+        return dataset
+    root = Path(getattr(dataset, "root", dataset.meta.root))
+    mmap_mode = os.environ.get("SONG_WORLDFLOW_MMAP_MODE", os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r"))
+    logging.info(f"Injecting worldflow supervision from {root}")
+    return WorldFlowMemmapDataset(
+        dataset,
+        root=root,
+        chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        mmap_mode=mmap_mode,
+    )
 
 
 def visualize_res(batch, result, batch_idx=0, ood_test_sno=0, step=0, output_dir: str | Path | None = None):
@@ -393,40 +488,143 @@ def save_joint_pointseg_visualization(
         logging.info(f"Joint pointseg visualization saved to {vis_dir} ({tag}, step {step}, {saved} item(s))")
 
 
-def ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir: str | Path | None = None):
-    ######这里的Batch已经预处理过，因此不能再preprocess(转umi归一化等)
-    batch['action'] = (torch.ones(batch['action'].shape)/3).to(batch['action'].device)
+def ood_case_inference(
+    policy,
+    preprocessor,
+    postprocessor,
+    batch,
+    step,
+    output_dir: str | Path | None = None,
+    ood_num_points: int = 50000,
+    ood_tasks: dict[int, str] | list[str] | tuple[str, ...] | None = None,
+):
+    ######OOD task may differ from the training batch, so rebuild language tokens with processor.
     import open3d as o3d
-    def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
+    ood_num_points = int(os.environ.get("SONG_OOD_NUM_POINTS", str(ood_num_points)))
+    if ood_num_points <= 0:
+        raise ValueError(f"ood_num_points should be positive, got {ood_num_points}.")
+
+    def clone_first_batch_item(src: dict[str, Any]) -> dict[str, Any]:
+        cloned = {}
+        pc = src.get("observation.point_cloud")
+        batch_size = int(pc.shape[0]) if torch.is_tensor(pc) and pc.ndim >= 3 else 1
+        for key, value in src.items():
+            if torch.is_tensor(value):
+                if value.ndim > 0 and int(value.shape[0]) == batch_size:
+                    cloned[key] = value[:1].clone()
+                else:
+                    cloned[key] = value.clone()
+            elif isinstance(value, list):
+                cloned[key] = [value[0]] if len(value) == batch_size and batch_size > 0 else list(value)
+            elif isinstance(value, tuple):
+                cloned[key] = (value[0],) if len(value) == batch_size and batch_size > 0 else tuple(value)
+            elif isinstance(value, dict):
+                cloned[key] = dict(value)
+            else:
+                cloned[key] = value
+        return cloned
+
+    def random_repeat_sample_points(xyzrgb: np.ndarray, M: int, rng: np.random.Generator):
         N = xyzrgb.shape[0]
         if N == 0:
             return xyzrgb
         if N >= M:
-            idx = np.random.choice(N, M, replace=False)
+            idx = rng.choice(N, M, replace=False)
             return xyzrgb[idx]
+        extra = rng.choice(N, M - N, replace=True)
+        return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)
+
+    def load_ply_xyzrgb(path: Path) -> np.ndarray | None:
+        if not path.exists():
+            logging.warning(f"OOD ply file is missing: {path}")
+            return None
+        scene_pcd = o3d.io.read_point_cloud(str(path))
+        points = np.asarray(scene_pcd.points, dtype=np.float32)
+        if points.size == 0:
+            logging.warning(f"OOD ply file has no points: {path}")
+            return None
+        colors = np.asarray(scene_pcd.colors, dtype=np.float32)
+        if colors.shape != points.shape:
+            colors = np.zeros_like(points, dtype=np.float32)
+        elif colors.max(initial=0.0) <= 1.0:
+            colors = colors * 255.0
+        colors = np.clip(colors, 0.0, 255.0)
+        return np.concatenate((points, colors), axis=1).astype(np.float32, copy=False)
+
+    def load_ood_task(sno: int) -> str:
+        if isinstance(ood_tasks, dict) and sno in ood_tasks:
+            task = ood_tasks[sno]
+        elif isinstance(ood_tasks, (list, tuple)) and 0 <= sno - 1 < len(ood_tasks):
+            task = ood_tasks[sno - 1]
         else:
-            extra = np.random.choice(N, M - N, replace=True)
-            return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)     
-    ood_test_sno = list(range(1,6))
-    for sno in ood_test_sno:
-        scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new{sno}.ply",)
-        scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
-        point_cloud_value = batch["observation.point_cloud"]
-        target_points = point_cloud_value[0, 0].shape[0] if point_cloud_value.ndim == 4 else point_cloud_value[0].shape[0]
-        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, target_points)
-        scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
+            task_path = Path(f"/home/liusong/temp/ood_test_new{sno}.txt")
+            if task_path.exists():
+                task = task_path.read_text(encoding="utf-8").strip()
+            else:
+                task = os.environ.get("SONG_OOD_TASK", "place, red_cube, eff_open, None")
+        task = str(task).strip()
+        return task if task.endswith("\n") else f"{task}\n"
+
+    def set_ood_point_cloud(dst_batch: dict[str, Any], scene_tensor: torch.Tensor) -> None:
+        point_cloud_value = dst_batch["observation.point_cloud"]
         if point_cloud_value.ndim == 4:
-            batch["observation.point_cloud"][0][0] = scene_tensor
+            dst_batch["observation.point_cloud"] = scene_tensor.unsqueeze(0).unsqueeze(0)
+            dst_batch["observation.point_cloud_is_pad"] = torch.zeros(
+                1, 1, scene_tensor.shape[0], dtype=torch.bool, device=scene_tensor.device
+            )
+        elif point_cloud_value.ndim == 3:
+            dst_batch["observation.point_cloud"] = scene_tensor.unsqueeze(0)
+            dst_batch["observation.point_cloud_is_pad"] = torch.zeros(
+                1, scene_tensor.shape[0], dtype=torch.bool, device=scene_tensor.device
+            )
+        elif point_cloud_value.ndim == 2:
+            dst_batch["observation.point_cloud"] = scene_tensor
+            dst_batch["observation.point_cloud_is_pad"] = torch.zeros(
+                scene_tensor.shape[0], dtype=torch.bool, device=scene_tensor.device
+            )
         else:
-            batch["observation.point_cloud"][0] = scene_tensor
-        batch['task'][0] = 'place, red_cube, eff_open, None\n'
-        model_batch = preprocessor(batch)
-        for key in list(model_batch):
+            raise ValueError(f"Expected observation.point_cloud ndim 2/3/4, got {point_cloud_value.shape}")
+
+    def remove_stale_pointseg_fields(dst_batch: dict[str, Any]) -> None:
+        for key in list(dst_batch):
             if key.startswith("pointseg."):
-                del model_batch[key]
+                del dst_batch[key]
+
+    def remove_language_token_fields(dst_batch: dict[str, Any]) -> None:
+        dst_batch.pop("observation.language.tokens", None)
+        dst_batch.pop("observation.language.attention_mask", None)
+
+    result_dir = Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song")
+    result_dir = result_dir / "visualizations" / "ood"
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    ood_test_sno = list(range(1,7))
+    for sno in ood_test_sno:
+        ply_path = Path(f"/home/liusong/temp/ood_test_new{sno}.ply")
+        scene_point_cloud = load_ply_xyzrgb(ply_path)
+        if scene_point_cloud is None:
+            continue
+
+        ood_batch = clone_first_batch_item(batch)
+        if torch.is_tensor(ood_batch.get("action")):
+            ood_batch["action"] = torch.ones_like(ood_batch["action"]) / 3
+        ood_batch["task"] = [load_ood_task(sno)]
+
+        point_cloud_value = ood_batch["observation.point_cloud"]
+        rng = np.random.default_rng(1000 + int(step) * 31 + sno)
+        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, int(ood_num_points), rng)
+        scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
+        set_ood_point_cloud(ood_batch, scene_tensor)
+        remove_stale_pointseg_fields(ood_batch)
+        remove_language_token_fields(ood_batch)
+
+        model_batch = preprocessor(ood_batch)
+        remove_stale_pointseg_fields(model_batch)
+
         action_chunk = policy.predict_action_chunk(model_batch)
         action_chunk = postprocessor(action_chunk)
-        visualize_res(batch, action_chunk, ood_test_sno=sno, step=step, output_dir=output_dir)
+        visualize_res(ood_batch, action_chunk, ood_test_sno=sno, step=step, output_dir=output_dir)
         save_joint_pointseg_visualization(
             policy,
             model_batch,
@@ -435,6 +633,25 @@ def ood_case_inference(policy,preprocessor,postprocessor,batch,step, output_dir:
             tag=f"ood{sno}",
             max_items=1,
         )
+        npz_path = result_dir / f"step{step}_ood{sno}.npz"
+        np.savez_compressed(
+            npz_path,
+            source_ply=np.asarray(str(ply_path)),
+            task=np.asarray(ood_batch["task"][0]),
+            point_cloud=scene_point_cloud,
+            action=action_chunk[0].detach().cpu().numpy(),
+        )
+        results.append(
+            {
+                "sno": sno,
+                "source_ply": str(ply_path),
+                "result_npz": str(npz_path),
+                "merged_ply": str(Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song") / "visualizations" / f"step{step}_{sno}.ply"),
+            }
+        )
+    return results
+
+
 
 def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
     N = xyzrgb.shape[0]
@@ -649,6 +866,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataset = make_dataset(cfg)
         dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
+        dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
     accelerator.wait_for_everyone()
 
@@ -657,6 +875,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataset = make_dataset(cfg)
         dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
+        dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -873,6 +1092,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 debug_keys = (
                     "loss_action",
                     "loss_pointseg_aux",
+                    "loss_worldflow_g",
+                    "loss_worldflow_geo",
+                    "worldflow_trans_err",
+                    "worldflow_rot_err_deg",
+                    "worldflow_valid_ratio",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
@@ -1027,13 +1251,13 @@ def _apply_song_debug_defaults() -> None:
         "--batch_size=8",
         "--steps=500000",
         "--log_freq=1",
-        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e",
-        "--job_name=my_smolvla_pointseg_e2e",
+        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_worldflow_e2e",
+        "--job_name=my_smolvla_pointseg_worldflow_e2e",
         "--policy.device=cuda",
         "--wandb.enable=true",
-        "--save_freq=5000",
+        "--save_freq=500",
         "--eval_freq=1000",
-        "--num_workers=6",
+        "--num_workers=8",
         "--policy.pointseg_enable=true",
         "--policy.pointseg_backbone_type=litept",
         "--policy.pointseg_grid_size=0.01",
@@ -1045,6 +1269,13 @@ def _apply_song_debug_defaults() -> None:
         "--policy.pointseg_min_background_points=0",
         "--policy.pointseg_use_temporal_priors_as_input=false",
         "--policy.pointseg_use_pseudo_selection=false",
+        "--policy.worldflow_enable=false",
+        "--policy.worldflow_feature_dim=64",
+        "--policy.worldflow_grid_size=0.01",
+        "--policy.worldflow_loss_weight=0.05",
+        "--policy.worldflow_geo_loss_weight=0.05",
+        "--policy.worldflow_trans_weight=1.0",
+        "--policy.worldflow_rot_weight=1.0",
     ]
 
 if __name__ == "__main__":

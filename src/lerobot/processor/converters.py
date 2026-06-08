@@ -173,6 +173,7 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
     pointseg_keys = {k: v for k, v in batch.items() if k.startswith("pointseg.")}
+    worldflow_keys = {k: v for k, v in batch.items() if k.startswith("worldflow.")}
 
     return {
         **pad_keys,
@@ -182,6 +183,7 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         **task_index_key,
         **episode_index_key,
         **pointseg_keys,
+        **worldflow_keys,
     }
 
 

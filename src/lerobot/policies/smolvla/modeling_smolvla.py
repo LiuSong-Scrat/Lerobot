@@ -77,6 +77,8 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLossConfig,
     SongPointSegNet,
     generate_pseudo_labels_from_priors,
+    invert_transform,
+    pose9_to_matrix,
 )
 from lerobot.policies.utils import (
     populate_queues,
@@ -492,6 +494,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for key, value in self.model.last_pointseg_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
+        worldflow_aux = self.model.compute_worldflow_aux_loss(batch, lang_tokens, lang_masks, actions_is_pad)
+        for key, value in self.model.last_worldflow_metrics.items():
+            if torch.is_tensor(value):
+                loss_dict[key] = value.detach().item()
 
         # Remove padding
         original_action_dim = self.config.action_feature.shape[0]
@@ -521,6 +527,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             per_sample_loss = per_sample_action_loss
             if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
                 per_sample_loss = per_sample_loss + pointseg_aux_weight * pointseg_aux_loss
+            if worldflow_aux is not None:
+                per_sample_loss = per_sample_loss + worldflow_aux["per_sample_loss"]
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -530,6 +538,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss = action_loss
             if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
                 loss = loss + pointseg_aux_weight * pointseg_aux_loss
+            if worldflow_aux is not None:
+                loss = loss + worldflow_aux["per_sample_loss"].mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -963,6 +973,104 @@ class LitePTEncoder(nn.Module):
 
 
 
+class WorldFlowTrajectoryHead(nn.Module):
+    """Predict world-frame left-multiplied relative transforms from scene and language only."""
+
+    def __init__(self, config: SmolVLAConfig, language_dim: int):
+        super().__init__()
+        self.chunk_size = int(config.chunk_size)
+        self.feature_dim = int(config.worldflow_feature_dim)
+        self.pc_encoder = LitePTEncoder(
+            in_dim=6,
+            dim=self.feature_dim,
+            n_tokens=256,
+            grid_size=float(config.worldflow_grid_size),
+        )
+        self.lang_proj = nn.Linear(language_dim, self.feature_dim)
+        self.fusion = nn.Sequential(
+            nn.Linear(self.feature_dim * 2, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, self.feature_dim),
+        )
+        self.time_embedding = nn.Embedding(self.chunk_size, self.feature_dim)
+        self.pose_head = nn.Sequential(
+            nn.Linear(self.feature_dim * 2, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, 9),
+        )
+        self._init_identity_output()
+
+    def _init_identity_output(self) -> None:
+        final = self.pose_head[-1]
+        if not isinstance(final, nn.Linear):
+            return
+        nn.init.zeros_(final.weight)
+        with torch.no_grad():
+            final.bias.zero_()
+            final.bias[3] = 1.0
+            final.bias[7] = 1.0
+
+    @staticmethod
+    def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
+        mask = lang_masks.to(device=lang_emb.device, dtype=torch.bool)
+        weights = mask.unsqueeze(-1).to(dtype=lang_emb.dtype)
+        denom = weights.sum(dim=1).clamp_min(torch.finfo(lang_emb.dtype).tiny)
+        return (lang_emb * weights).sum(dim=1) / denom
+
+    def forward(
+        self,
+        point_cloud_world: Tensor,
+        lang_emb: Tensor,
+        lang_masks: Tensor,
+        point_is_pad: Tensor | None = None,
+    ) -> Tensor:
+        pc_feat = self.pc_encoder(point_cloud_world.to(dtype=torch.float32), point_is_pad)
+
+        lang_feat = self._masked_language_mean(lang_emb, lang_masks).to(dtype=pc_feat.dtype)
+        lang_feat = self.lang_proj(lang_feat)
+        fused = self.fusion(torch.cat([pc_feat, lang_feat], dim=-1))
+
+        bsize = point_cloud_world.shape[0]
+        time_ids = torch.arange(self.chunk_size, device=point_cloud_world.device)
+        time_feat = self.time_embedding(time_ids).unsqueeze(0).expand(bsize, -1, -1)
+        fused = fused.unsqueeze(1).expand(-1, self.chunk_size, -1)
+        return self.pose_head(torch.cat([fused, time_feat], dim=-1))
+
+
+def _rotation_geodesic(pred_rot: Tensor, target_rot: Tensor) -> Tensor:
+    rel = pred_rot.transpose(-1, -2) @ target_rot
+    trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    sine_vec = torch.stack(
+        [
+            rel[..., 2, 1] - rel[..., 1, 2],
+            rel[..., 0, 2] - rel[..., 2, 0],
+            rel[..., 1, 0] - rel[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = 0.5 * torch.linalg.norm(sine_vec, dim=-1)
+    return torch.atan2(sine, cosine)
+
+
+def _masked_step_mean(values: Tensor, valid: Tensor) -> Tensor:
+    valid_f = valid.to(device=values.device, dtype=values.dtype)
+    return (values * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp_min(1.0)
+
+
+def _ego_point_cloud_to_world(point_cloud_ego: Tensor, current_pose_world: Tensor) -> Tensor:
+    if point_cloud_ego.ndim != 3 or point_cloud_ego.shape[-1] != 6:
+        raise ValueError(f"Expected ego point cloud shape (B,N,6), got {point_cloud_ego.shape}.")
+    if current_pose_world.ndim != 2 or current_pose_world.shape[-1] != 9:
+        raise ValueError(f"Expected current world pose shape (B,9), got {current_pose_world.shape}.")
+    transform = pose9_to_matrix(current_pose_world.to(device=point_cloud_ego.device, dtype=torch.float32))
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    xyz_world = torch.matmul(point_cloud_ego[..., :3].to(dtype=torch.float32), rot.transpose(-1, -2))
+    xyz_world = xyz_world + trans.unsqueeze(1)
+    return torch.cat([xyz_world, point_cloud_ego[..., 3:6].to(dtype=torch.float32)], dim=-1)
+
+
 class SongPointCloudConditioner(nn.Module):
     """Trainable SongPointSeg front-end that emits object/background point-cloud features."""
 
@@ -1234,6 +1342,10 @@ class SongPointCloudConditioner(nn.Module):
         result = {
             "object_feat": object_feat,
             "background_feat": background_feat,
+            "foreground_pc": foreground_pc,
+            "background_pc": background_pc,
+            "foreground_prob": foreground_prob,
+            "background_prob": background_prob,
             "operation_prob": operation_prob,
             "pointseg_outputs": seg_outputs,
             "pointseg_priors": temporal_priors,
@@ -1299,6 +1411,11 @@ class VLAFlowMatching(nn.Module):
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
         use_pointseg = self.config.pointseg_enable or self.config.pointseg_checkpoint_path is not None
+        if self.config.worldflow_enable and not use_pointseg:
+            raise ValueError(
+                "worldflow_enable requires pointseg_enable=True or pointseg_checkpoint_path because "
+                "worldflow uses SongPointCloudConditioner foreground/background selections as its point cloud input."
+            )
         self.extractor = None if use_pointseg else LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
         self.pointcloud_proj = (
             None if use_pointseg else nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
@@ -1316,6 +1433,13 @@ class VLAFlowMatching(nn.Module):
         )
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
+        self.last_worldflow_point_cloud_ego: Tensor | None = None
+        self.worldflow_head = (
+            WorldFlowTrajectoryHead(config, self.vlm_with_expert.config.text_config.hidden_size)
+            if self.config.worldflow_enable
+            else None
+        )
+        self.last_worldflow_metrics: dict[str, Tensor] = {}
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -1372,6 +1496,7 @@ class VLAFlowMatching(nn.Module):
         """
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
+        self.last_worldflow_point_cloud_ego = None
         embs = []
         pad_masks = []
         att_masks = []
@@ -1394,6 +1519,12 @@ class VLAFlowMatching(nn.Module):
                 object_emb = self.pointseg_object_proj(conditioned["object_feat"])
                 background_emb = self.pointseg_background_proj(conditioned["background_feat"])
                 pc_emb = torch.stack([object_emb, background_emb], dim=1)
+                if self.worldflow_head is not None:
+                    foreground_pc = conditioned.get("foreground_pc")
+                    background_pc = conditioned.get("background_pc")
+                    # Only foreground point_cloud is used for worldflow
+                    if torch.is_tensor(foreground_pc) and torch.is_tensor(background_pc):
+                        self.last_worldflow_point_cloud_ego = foreground_pc
                 self.last_pointseg_aux_loss = conditioned.get("pointseg_aux_loss")
                 operation_prob = conditioned["operation_prob"].detach()
                 selection_scores = conditioned["pointseg_selection_scores"].detach()
@@ -1524,6 +1655,102 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
+
+    def compute_worldflow_aux_loss(
+        self,
+        batch: dict[str, Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        actions_is_pad: Tensor | None = None,
+    ) -> dict[str, Tensor] | None:
+        self.last_worldflow_metrics = {}
+        if self.worldflow_head is None:
+            return None
+
+        required = (
+            "worldflow.current_ee_pose",
+            "worldflow.ee_poses",
+            "worldflow.step_is_pad",
+        )
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise ValueError(f"Worldflow is enabled but batch is missing required keys: {missing}")
+
+        point_cloud_ego = self.last_worldflow_point_cloud_ego
+        if not torch.is_tensor(point_cloud_ego):
+            raise ValueError(
+                "Worldflow is enabled but no SongPointCloudConditioner foreground/background points were "
+                "cached in the current forward pass."
+            )
+        point_cloud_ego = point_cloud_ego.to(dtype=torch.float32)
+        current_pose = batch["worldflow.current_ee_pose"].to(device=point_cloud_ego.device, dtype=torch.float32)
+        point_cloud_world = _ego_point_cloud_to_world(point_cloud_ego, current_pose)
+        point_is_pad = None
+
+        target_poses = batch["worldflow.ee_poses"].to(device=point_cloud_world.device, dtype=torch.float32)
+        step_is_pad = batch["worldflow.step_is_pad"].to(device=point_cloud_world.device, dtype=torch.bool)
+        if target_poses.ndim != 3 or target_poses.shape[-1] != 9:
+            raise ValueError(f"Expected worldflow.ee_poses shape (B,T,9), got {target_poses.shape}.")
+        if current_pose.ndim != 2 or current_pose.shape[-1] != 9:
+            raise ValueError(f"Expected worldflow.current_ee_pose shape (B,9), got {current_pose.shape}.")
+        if target_poses.shape[1] != self.config.chunk_size:
+            raise ValueError(
+                f"Expected worldflow.ee_poses time dim={self.config.chunk_size}, got {target_poses.shape[1]}."
+            )
+        if step_is_pad.shape != target_poses.shape[:2]:
+            raise ValueError(f"Expected worldflow.step_is_pad shape {target_poses.shape[:2]}, got {step_is_pad.shape}.")
+
+        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+        pred_pose9 = self.worldflow_head(point_cloud_world, lang_emb, lang_masks, point_is_pad)
+
+        pred_g = pose9_to_matrix(pred_pose9)
+        current = pose9_to_matrix(current_pose)
+        target = pose9_to_matrix(target_poses)
+        current_inv = invert_transform(current)
+        gt_g = target @ current_inv.unsqueeze(1)
+        delta_geo = current_inv.unsqueeze(1) @ pred_g @ current.unsqueeze(1)
+        delta_gt = current_inv.unsqueeze(1) @ target
+
+        valid = ~step_is_pad
+        if torch.is_tensor(actions_is_pad):
+            action_pad = actions_is_pad.to(device=valid.device, dtype=torch.bool)
+            if action_pad.shape[1] != valid.shape[1]:
+                raise ValueError(f"Expected actions_id_pad shape {valid.shape}, got {action_pad.shape}.")
+            valid = valid & ~action_pad
+        valid_count = valid.sum(dim=1).clamp_min(1)
+
+        g_trans = F.smooth_l1_loss(pred_g[..., :3, 3], gt_g[..., :3, 3], reduction="none").sum(dim=-1)
+        g_rot = _rotation_geodesic(pred_g[..., :3, :3], gt_g[..., :3, :3])
+        geo_trans = F.smooth_l1_loss(delta_geo[..., :3, 3], delta_gt[..., :3, 3], reduction="none").sum(dim=-1)
+        geo_rot = _rotation_geodesic(delta_geo[..., :3, :3], delta_gt[..., :3, :3])
+
+        g_step = self.config.worldflow_trans_weight * g_trans + self.config.worldflow_rot_weight * g_rot
+        geo_step = self.config.worldflow_trans_weight * geo_trans + self.config.worldflow_rot_weight * geo_rot
+        per_sample_g = _masked_step_mean(g_step, valid)
+        per_sample_geo = _masked_step_mean(geo_step, valid)
+        loss_g = per_sample_g.mean()
+        loss_geo = per_sample_geo.mean()
+        per_sample_total = self.config.worldflow_loss_weight * per_sample_g + self.config.worldflow_geo_loss_weight * per_sample_geo
+
+        valid_f = valid.to(dtype=pred_pose9.dtype)
+        valid_denom = valid_f.sum().clamp_min(1.0)
+        trans_err = (torch.linalg.norm(pred_g[..., :3, 3] - gt_g[..., :3, 3], dim=-1) * valid_f).sum() / valid_denom
+        rot_err = (g_rot * valid_f).sum() / valid_denom
+        self.last_worldflow_metrics = {
+            "loss_worldflow_g": loss_g.detach(),
+            "loss_worldflow_geo": loss_geo.detach(),
+            "worldflow_trans_err": trans_err.detach(),
+            "worldflow_rot_err_deg": torch.rad2deg(rot_err.detach()),
+            "worldflow_valid_ratio": valid_f.mean().detach(),
+        }
+        return {
+            "loss_g": loss_g,
+            "loss_geo": loss_geo,
+            "per_sample_loss": per_sample_total,
+            "valid_counts": valid_count,
+            "pred_pose9": pred_pose9,
+        }
 
     def forward(
         self, pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
