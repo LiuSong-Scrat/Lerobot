@@ -78,6 +78,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegNet,
     generate_pseudo_labels_from_priors,
     invert_transform,
+    matrix_to_pose9,
     pose9_to_matrix,
 )
 from lerobot.policies.utils import (
@@ -153,6 +154,156 @@ def rot6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     b2 = F.normalize(b2, dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack([b1, b2, b3], dim=-1)  # columns
+
+
+def _skew(vec: Tensor) -> Tensor:
+    x, y, z = vec.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+    return torch.stack(
+        [
+            torch.stack([zeros, -z, y], dim=-1),
+            torch.stack([z, zeros, -x], dim=-1),
+            torch.stack([-y, x, zeros], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _eye4_like(shape: torch.Size | tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    eye = torch.eye(4, device=device, dtype=dtype)
+    return eye.expand(*shape, 4, 4).clone()
+
+
+def so3_exp(omega: Tensor, eps: float = 1e-6) -> Tensor:
+    omega = omega.to(dtype=torch.float32)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    a = torch.where(
+        small,
+        1.0 - theta2 / 6.0 + theta2 * theta2 / 120.0,
+        torch.sin(theta) / theta.clamp_min(eps),
+    )
+    b = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(eps),
+    )
+    eye = torch.eye(3, device=omega.device, dtype=omega.dtype).expand(*omega.shape[:-1], 3, 3)
+    return eye + a.unsqueeze(-1) * k + b.unsqueeze(-1) * k2
+
+
+def so3_log(rot: Tensor, eps: float = 1e-6) -> Tensor:
+    rot = rot.to(dtype=torch.float32)
+    trace = rot.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    vee = torch.stack(
+        [
+            rot[..., 2, 1] - rot[..., 1, 2],
+            rot[..., 0, 2] - rot[..., 2, 0],
+            rot[..., 1, 0] - rot[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = 0.5 * torch.linalg.norm(vee, dim=-1)
+    theta = torch.atan2(sine, cosine)
+    theta2 = theta * theta
+    factor = torch.where(
+        sine > eps,
+        theta / (2.0 * sine.clamp_min(eps)),
+        0.5 + theta2 / 12.0 + theta2 * theta2 / 720.0,
+    )
+    return factor.unsqueeze(-1) * vee
+
+
+def se3_exp(xi: Tensor, eps: float = 1e-6) -> Tensor:
+    xi = xi.to(dtype=torch.float32)
+    v = xi[..., :3]
+    omega = xi[..., 3:6]
+    rot = so3_exp(omega, eps=eps)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    a = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(eps),
+    )
+    b = torch.where(
+        small,
+        1.0 / 6.0 - theta2 / 120.0 + theta2 * theta2 / 5040.0,
+        (theta - torch.sin(theta)) / (theta2 * theta).clamp_min(eps),
+    )
+    eye3 = torch.eye(3, device=xi.device, dtype=xi.dtype).expand(*xi.shape[:-1], 3, 3)
+    v_matrix = eye3 + a.unsqueeze(-1) * k + b.unsqueeze(-1) * k2
+    trans = (v_matrix @ v.unsqueeze(-1)).squeeze(-1)
+    out = _eye4_like(xi.shape[:-1], device=xi.device, dtype=xi.dtype)
+    out[..., :3, :3] = rot
+    out[..., :3, 3] = trans
+    return out
+
+
+def se3_log(transform: Tensor, eps: float = 1e-6) -> Tensor:
+    transform = transform.to(dtype=torch.float32)
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    omega = so3_log(rot, eps=eps)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    half_theta = 0.5 * theta
+    c = torch.where(
+        small,
+        1.0 / 12.0 + theta2 / 720.0 + theta2 * theta2 / 30240.0,
+        (1.0 / theta2.clamp_min(eps))
+        - (1.0 + torch.cos(theta)) / (2.0 * theta * torch.sin(theta).clamp_min(eps)),
+    )
+    eye3 = torch.eye(3, device=transform.device, dtype=transform.dtype).expand(*transform.shape[:-2], 3, 3)
+    v_inv = eye3 - 0.5 * k + c.unsqueeze(-1) * k2
+    v = (v_inv @ trans.unsqueeze(-1)).squeeze(-1)
+    # `half_theta` is kept to make the small-angle branch explicit and silence over-eager simplifiers.
+    _ = half_theta
+    return torch.cat([v, omega], dim=-1)
+
+
+def se3_left_apply(delta_xi: Tensor, transform: Tensor) -> Tensor:
+    return se3_exp(delta_xi) @ transform
+
+
+def se3_geodesic_loss(pred: Tensor, target: Tensor, trans_weight: float = 1.0, rot_weight: float = 1.0) -> Tensor:
+    trans = F.smooth_l1_loss(pred[..., :3, 3], target[..., :3, 3], reduction="none").sum(dim=-1)
+    rot = _rotation_geodesic(pred[..., :3, :3], target[..., :3, :3])
+    return trans_weight * trans + rot_weight * rot
+
+
+def _transform_point_cloud_xyzrgb(point_cloud: Tensor, transform: Tensor) -> Tensor:
+    xyz = point_cloud[..., :3].to(dtype=torch.float32)
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    xyz_out = torch.matmul(xyz, rot.transpose(-1, -2)) + trans.unsqueeze(-2)
+    return torch.cat([xyz_out, point_cloud[..., 3:6].to(dtype=torch.float32)], dim=-1)
+
+
+def _sample_random_se3(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    *,
+    trans_scale: float = 0.20,
+    rot_scale: float = 0.75,
+) -> Tensor:
+    xi = torch.randn(batch_size, 6, device=device, dtype=dtype)
+    xi[..., :3] = xi[..., :3] * float(trans_scale)
+    xi[..., 3:6] = xi[..., 3:6] * float(rot_scale)
+    return se3_exp(xi)
+
+
 def vis_umi_data(action,pointcloud):
     ##########UMI
     # ================= Pred =================
@@ -484,7 +635,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time, actions_is_pad=actions_is_pad
+        )
         pointseg_aux_loss = self.model.last_pointseg_aux_loss
         pointseg_aux_weight = self.config.pointseg_aux_loss_weight if pointseg_aux_loss is not None else 0.0
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -492,6 +645,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             pointseg_aux_loss.detach().item() if torch.is_tensor(pointseg_aux_loss) else 0.0
         )
         for key, value in self.model.last_pointseg_metrics.items():
+            if torch.is_tensor(value):
+                loss_dict[key] = value.detach().item()
+        for key, value in self.model.last_se3_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
         worldflow_aux = self.model.compute_worldflow_aux_loss(batch, lang_tokens, lang_masks, actions_is_pad)
@@ -643,7 +799,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SmolVLA fine-tuning."""
         common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+            "state_proj|action_in_proj|action_out_proj|se3_action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
@@ -971,6 +1127,168 @@ class LitePTEncoder(nn.Module):
 
         # return global_feat
 
+
+class _MaskedPointMLPEncoder(nn.Module):
+    def __init__(self, in_dim: int, dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+        )
+
+    def forward(self, point_cloud: Tensor, point_is_pad: Tensor | None = None) -> Tensor:
+        feat = point_cloud.to(dtype=torch.float32).clone()
+        if feat.shape[-1] > 3:
+            feat[..., 3:] = feat[..., 3:] / 255.0
+        feat = self.net(feat)
+        if point_is_pad is None:
+            return feat.mean(dim=1)
+        valid = ~point_is_pad.to(device=feat.device, dtype=torch.bool)
+        weights = valid.unsqueeze(-1).to(dtype=feat.dtype)
+        denom = weights.sum(dim=1).clamp_min(1.0)
+        return (feat * weights).sum(dim=1) / denom
+
+
+class SE3CanonicalTrajectoryHead(nn.Module):
+    """ET-SEED-style canonical-frame trajectory head with explicit pose reconstruction."""
+
+    def __init__(
+        self,
+        config: SmolVLAConfig,
+        language_dim: int,
+        *,
+        feature_dim: int | None = None,
+        grid_size: float | None = None,
+        use_coarse_pose: bool = False,
+    ):
+        super().__init__()
+        self.chunk_size = int(config.chunk_size)
+        self.feature_dim = int(feature_dim or config.worldflow_feature_dim)
+        self.use_coarse_pose = bool(use_coarse_pose)
+        if config.pointseg_backbone_type == "mlp":
+            self.pc_encoder = _MaskedPointMLPEncoder(6, self.feature_dim)
+        else:
+            self.pc_encoder = LitePTEncoder(
+                in_dim=6,
+                dim=self.feature_dim,
+                n_tokens=256,
+                grid_size=float(grid_size or config.worldflow_grid_size),
+            )
+        self.lang_proj = nn.Linear(language_dim, self.feature_dim)
+        self.coarse_proj = nn.Linear(9, self.feature_dim) if self.use_coarse_pose else None
+        fusion_in = self.feature_dim * (3 if self.use_coarse_pose else 2)
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_in, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, self.feature_dim),
+        )
+        self.time_embedding = nn.Embedding(self.chunk_size, self.feature_dim)
+        self.local_pose_head = nn.Sequential(
+            nn.Linear(self.feature_dim * 2, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, 9),
+        )
+        self._init_local_identity()
+        self.last_degenerate_mask: Tensor | None = None
+
+    def _init_local_identity(self) -> None:
+        final = self.local_pose_head[-1]
+        if not isinstance(final, nn.Linear):
+            return
+        nn.init.zeros_(final.weight)
+        with torch.no_grad():
+            final.bias.zero_()
+            final.bias[3] = 1.0
+            final.bias[7] = 1.0
+
+    @staticmethod
+    def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
+        mask = lang_masks.to(device=lang_emb.device, dtype=torch.bool)
+        weights = mask.unsqueeze(-1).to(dtype=lang_emb.dtype)
+        denom = weights.sum(dim=1).clamp_min(torch.finfo(lang_emb.dtype).tiny)
+        return (lang_emb * weights).sum(dim=1) / denom
+
+    @staticmethod
+    def _canonical_frame(point_cloud: Tensor, point_is_pad: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        xyz = point_cloud[..., :3].to(dtype=torch.float32)
+        bsize, n_points = xyz.shape[:2]
+        if point_is_pad is None:
+            valid = torch.ones(bsize, n_points, dtype=torch.bool, device=xyz.device)
+        else:
+            valid = ~point_is_pad.to(device=xyz.device, dtype=torch.bool)
+        weights = valid.unsqueeze(-1).to(dtype=xyz.dtype)
+        counts = weights.sum(dim=1).clamp_min(1.0)
+        center = (xyz * weights).sum(dim=1) / counts
+        centered = xyz - center.unsqueeze(1)
+        centered_valid = centered * weights
+        cov = centered_valid.transpose(1, 2) @ centered_valid / counts.unsqueeze(-1).clamp_min(1.0)
+        eye = torch.eye(3, dtype=xyz.dtype, device=xyz.device).expand(bsize, 3, 3)
+        eigvals, eigvecs = torch.linalg.eigh(cov + 1e-6 * eye)
+        order = torch.argsort(eigvals, dim=-1, descending=True)
+        gather_idx = order.unsqueeze(-2).expand(-1, 3, -1)
+        eigvals = eigvals.gather(-1, order)
+        frame = eigvecs.gather(-1, gather_idx)
+
+        # Fix eigenvector sign using invariant point projections, then enforce right-handedness.
+        proj = centered @ frame
+        proj = proj.masked_fill(~valid.unsqueeze(-1), 0.0)
+        sign_score = (proj**3).sum(dim=1)
+        max_idx = proj.abs().argmax(dim=1)
+        fallback = proj.gather(1, max_idx.unsqueeze(1)).squeeze(1)
+        sign_score = torch.where(sign_score.abs() > 1e-6, sign_score, fallback)
+        signs = torch.where(sign_score < 0, -torch.ones_like(sign_score), torch.ones_like(sign_score))
+        frame = frame * signs.unsqueeze(-2)
+        det = torch.linalg.det(frame)
+        frame = torch.where((det < 0).view(bsize, 1, 1), frame * torch.tensor([1.0, 1.0, -1.0], device=xyz.device, dtype=xyz.dtype).view(1, 1, 3), frame)
+
+        eigengap = torch.minimum(eigvals[:, 0] - eigvals[:, 1], eigvals[:, 1] - eigvals[:, 2])
+        degenerate = (counts.squeeze(-1) < 3) | (eigengap < 1e-5) | ~torch.isfinite(frame).flatten(1).all(dim=1)
+        frame = torch.where(degenerate.view(bsize, 1, 1), eye, frame)
+        return center, frame, degenerate
+
+    def forward(
+        self,
+        point_cloud: Tensor,
+        lang_emb: Tensor,
+        lang_masks: Tensor,
+        point_is_pad: Tensor | None = None,
+        coarse_pose9: Tensor | None = None,
+    ) -> Tensor:
+        center, frame, degenerate = self._canonical_frame(point_cloud, point_is_pad)
+        self.last_degenerate_mask = degenerate.detach()
+        local_xyz = torch.matmul(point_cloud[..., :3].to(dtype=torch.float32) - center.unsqueeze(1), frame)
+        local_pc = torch.cat([local_xyz, point_cloud[..., 3:6].to(dtype=torch.float32)], dim=-1)
+        pc_feat = self.pc_encoder(local_pc, point_is_pad)
+        lang_feat = self.lang_proj(self._masked_language_mean(lang_emb, lang_masks).to(dtype=pc_feat.dtype))
+        fused_inputs = [pc_feat, lang_feat]
+        if self.coarse_proj is not None:
+            if coarse_pose9 is None:
+                coarse_feat = torch.zeros_like(pc_feat)
+            else:
+                coarse = coarse_pose9.to(device=pc_feat.device, dtype=pc_feat.dtype)
+                if coarse.ndim == 3:
+                    coarse = coarse.mean(dim=1)
+                elif coarse.ndim != 2:
+                    raise ValueError(f"Expected coarse_pose9 shape (B,9) or (B,T,9), got {coarse_pose9.shape}.")
+                coarse_feat = self.coarse_proj(coarse)
+            fused_inputs.append(coarse_feat)
+        fused = self.fusion(torch.cat(fused_inputs, dim=-1))
+        bsize = point_cloud.shape[0]
+        time_ids = torch.arange(self.chunk_size, device=point_cloud.device)
+        time_feat = self.time_embedding(time_ids).unsqueeze(0).expand(bsize, -1, -1)
+        fused = fused.unsqueeze(1).expand(-1, self.chunk_size, -1)
+        local_pose = self.local_pose_head(torch.cat([fused, time_feat], dim=-1))
+
+        local_offset = local_pose[..., :3]
+        local_rot = rot6d_to_matrix(local_pose[..., 3:9])
+        rot = frame.unsqueeze(1) @ local_rot
+        trans = center.unsqueeze(1) + (frame.unsqueeze(1) @ local_offset.unsqueeze(-1)).squeeze(-1)
+        transform = _eye4_like(local_pose.shape[:2], device=point_cloud.device, dtype=torch.float32)
+        transform[..., :3, :3] = rot
+        transform[..., :3, 3] = trans
+        return matrix_to_pose9(transform)
 
 
 class WorldFlowTrajectoryHead(nn.Module):
@@ -1410,11 +1728,22 @@ class VLAFlowMatching(nn.Module):
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        self.se3_action_out_proj = (
+            nn.Linear(self.vlm_with_expert.expert_hidden_size, 7) if self.config.se3_enable else None
+        )
         use_pointseg = self.config.pointseg_enable or self.config.pointseg_checkpoint_path is not None
         if self.config.worldflow_enable and not use_pointseg:
             raise ValueError(
                 "worldflow_enable requires pointseg_enable=True or pointseg_checkpoint_path because "
                 "worldflow uses SongPointCloudConditioner foreground/background selections as its point cloud input."
+            )
+        if self.config.se3_enable and self.config.max_action_dim < 10:
+            raise ValueError("se3_enable=True requires max_action_dim >= 10 for pose9 + gripper actions.")
+        if self.config.se3_enable and self._rtc_enabled():
+            raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        if self.config.se3_enable and self.config.se3_final_correction_enable and not use_pointseg:
+            raise ValueError(
+                "se3_final_correction_enable=True requires pointseg_enable=True or pointseg_checkpoint_path."
             )
         self.extractor = None if use_pointseg else LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
         self.pointcloud_proj = (
@@ -1434,12 +1763,27 @@ class VLAFlowMatching(nn.Module):
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
         self.last_worldflow_point_cloud_ego: Tensor | None = None
-        self.worldflow_head = (
-            WorldFlowTrajectoryHead(config, self.vlm_with_expert.config.text_config.hidden_size)
-            if self.config.worldflow_enable
+        if self.config.worldflow_enable and self.config.worldflow_se3_head_enable:
+            self.worldflow_head = SE3CanonicalTrajectoryHead(
+                config, self.vlm_with_expert.config.text_config.hidden_size
+            )
+        elif self.config.worldflow_enable:
+            self.worldflow_head = WorldFlowTrajectoryHead(config, self.vlm_with_expert.config.text_config.hidden_size)
+        else:
+            self.worldflow_head = None
+        self.last_worldflow_metrics: dict[str, Tensor] = {}
+        self.se3_final_correction_head = (
+            SE3CanonicalTrajectoryHead(
+                config,
+                self.vlm_with_expert.config.text_config.hidden_size,
+                feature_dim=config.worldflow_feature_dim,
+                grid_size=config.worldflow_grid_size,
+                use_coarse_pose=True,
+            )
+            if self.config.se3_enable and self.config.se3_final_correction_enable
             else None
         )
-        self.last_worldflow_metrics: dict[str, Tensor] = {}
+        self.last_se3_metrics: dict[str, Tensor] = {}
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -1489,6 +1833,95 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def sample_se3_action_noise(self, actions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if actions.shape[-1] < 10:
+            raise ValueError(f"se3_enable=True expects action dim >= 10, got {actions.shape[-1]}.")
+        xi_noise = torch.randn(*actions.shape[:2], 6, device=actions.device, dtype=torch.float32)
+        xi_noise[..., :3] = xi_noise[..., :3] * float(self.config.se3_noise_trans_scale)
+        xi_noise[..., 3:6] = xi_noise[..., 3:6] * float(self.config.se3_noise_rot_scale)
+        pose_noise = se3_exp(xi_noise)
+        gripper_noise = self.sample_noise((*actions.shape[:2], 1), actions.device)
+        noise_action = torch.cat([matrix_to_pose9(pose_noise), gripper_noise], dim=-1)
+        if actions.shape[-1] > 10:
+            noise_action = pad_vector(noise_action, actions.shape[-1])
+        return pose_noise, gripper_noise, noise_action
+
+    @staticmethod
+    def _masked_scalar_mean(values: Tensor, valid: Tensor | None = None) -> Tensor:
+        if valid is None:
+            return values.mean()
+        valid_f = valid.to(device=values.device, dtype=values.dtype)
+        return (values * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+    def _se3_predict_from_suffix(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        x_t: Tensor,
+        time: Tensor,
+    ) -> Tensor:
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+        if self.se3_action_out_proj is None:
+            raise RuntimeError("se3_action_out_proj is not initialized.")
+        return self.se3_action_out_proj(suffix_out)
+
+    def _compute_final_correction_loss(
+        self,
+        foreground_pc: Tensor,
+        lang_emb: Tensor,
+        lang_masks: Tensor,
+        h_endpoint: Tensor,
+        h_gt: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        zero = h_gt.new_zeros(h_gt.shape[:2])
+        if self.se3_final_correction_head is None:
+            return zero, zero, h_endpoint
+        coarse_pose9 = matrix_to_pose9(h_endpoint)
+        pred_geo_pose9 = self.se3_final_correction_head(
+            foreground_pc,
+            lang_emb,
+            lang_masks,
+            coarse_pose9=coarse_pose9,
+        )
+        h_geo = pose9_to_matrix(pred_geo_pose9)
+        h_final = se3_left_apply(se3_log(h_geo @ invert_transform(h_endpoint)), h_endpoint)
+        final_step = se3_geodesic_loss(h_final, h_gt)
+        equiv_step = zero
+        if self.config.se3_equivariance_loss_weight > 0:
+            transform = _sample_random_se3(
+                foreground_pc.shape[0],
+                foreground_pc.device,
+                foreground_pc.dtype,
+                trans_scale=0.20,
+                rot_scale=0.75,
+            )
+            foreground_aug = _transform_point_cloud_xyzrgb(foreground_pc, transform)
+            h_endpoint_aug = transform.unsqueeze(1) @ h_endpoint
+            pred_aug_pose9 = self.se3_final_correction_head(
+                foreground_aug,
+                lang_emb,
+                lang_masks,
+                coarse_pose9=matrix_to_pose9(h_endpoint_aug),
+            )
+            h_aug = pose9_to_matrix(pred_aug_pose9)
+            expected = transform.unsqueeze(1) @ h_geo.detach()
+            equiv_step = se3_geodesic_loss(h_aug, expected)
+        return final_step, equiv_step, h_final
+
     def embed_prefix(
         self, point_clouds, point_cloud_masks, lang_tokens, lang_masks, state: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1519,7 +1952,7 @@ class VLAFlowMatching(nn.Module):
                 object_emb = self.pointseg_object_proj(conditioned["object_feat"])
                 background_emb = self.pointseg_background_proj(conditioned["background_feat"])
                 pc_emb = torch.stack([object_emb, background_emb], dim=1)
-                if self.worldflow_head is not None:
+                if self.worldflow_head is not None or self.se3_final_correction_head is not None:
                     foreground_pc = conditioned.get("foreground_pc")
                     background_pc = conditioned.get("background_pc")
                     # Only foreground point_cloud is used for worldflow
@@ -1702,12 +2135,18 @@ class VLAFlowMatching(nn.Module):
 
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        pred_pose9 = self.worldflow_head(point_cloud_world, lang_emb, lang_masks, point_is_pad)
-
-        pred_g = pose9_to_matrix(pred_pose9)
         current = pose9_to_matrix(current_pose)
         target = pose9_to_matrix(target_poses)
         current_inv = invert_transform(current)
+        if isinstance(self.worldflow_head, SE3CanonicalTrajectoryHead):
+            pred_target_pose9 = self.worldflow_head(point_cloud_world, lang_emb, lang_masks, point_is_pad)
+            pred_target = pose9_to_matrix(pred_target_pose9)
+            pred_g = pred_target @ current_inv.unsqueeze(1)
+            pred_pose9 = matrix_to_pose9(pred_g)
+        else:
+            pred_pose9 = self.worldflow_head(point_cloud_world, lang_emb, lang_masks, point_is_pad)
+            pred_g = pose9_to_matrix(pred_pose9)
+            pred_target = pred_g @ current.unsqueeze(1)
         gt_g = target @ current_inv.unsqueeze(1)
         delta_geo = current_inv.unsqueeze(1) @ pred_g @ current.unsqueeze(1)
         delta_gt = current_inv.unsqueeze(1) @ target
@@ -1727,11 +2166,31 @@ class VLAFlowMatching(nn.Module):
 
         g_step = self.config.worldflow_trans_weight * g_trans + self.config.worldflow_rot_weight * g_rot
         geo_step = self.config.worldflow_trans_weight * geo_trans + self.config.worldflow_rot_weight * geo_rot
+        equiv_step = torch.zeros_like(g_step)
+        if isinstance(self.worldflow_head, SE3CanonicalTrajectoryHead) and self.config.worldflow_equiv_loss_weight > 0:
+            transform = _sample_random_se3(
+                point_cloud_world.shape[0],
+                point_cloud_world.device,
+                point_cloud_world.dtype,
+                trans_scale=0.20,
+                rot_scale=0.75,
+            )
+            point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud_world, transform)
+            pred_aug_pose9 = self.worldflow_head(point_cloud_aug, lang_emb, lang_masks, point_is_pad)
+            pred_aug = pose9_to_matrix(pred_aug_pose9)
+            expected_aug = transform.unsqueeze(1) @ pred_target.detach()
+            equiv_step = se3_geodesic_loss(pred_aug, expected_aug)
         per_sample_g = _masked_step_mean(g_step, valid)
         per_sample_geo = _masked_step_mean(geo_step, valid)
+        per_sample_equiv = _masked_step_mean(equiv_step, valid)
         loss_g = per_sample_g.mean()
         loss_geo = per_sample_geo.mean()
-        per_sample_total = self.config.worldflow_loss_weight * per_sample_g + self.config.worldflow_geo_loss_weight * per_sample_geo
+        loss_equiv = per_sample_equiv.mean()
+        per_sample_total = (
+            self.config.worldflow_loss_weight * per_sample_g
+            + self.config.worldflow_geo_loss_weight * per_sample_geo
+            + self.config.worldflow_equiv_loss_weight * per_sample_equiv
+        )
 
         valid_f = valid.to(dtype=pred_pose9.dtype)
         valid_denom = valid_f.sum().clamp_min(1.0)
@@ -1740,6 +2199,7 @@ class VLAFlowMatching(nn.Module):
         self.last_worldflow_metrics = {
             "loss_worldflow_g": loss_g.detach(),
             "loss_worldflow_geo": loss_geo.detach(),
+            "loss_worldflow_equiv": loss_equiv.detach(),
             "worldflow_trans_err": trans_err.detach(),
             "worldflow_rot_err_deg": torch.rad2deg(rot_err.detach()),
             "worldflow_valid_ratio": valid_f.mean().detach(),
@@ -1747,15 +2207,125 @@ class VLAFlowMatching(nn.Module):
         return {
             "loss_g": loss_g,
             "loss_geo": loss_geo,
+            "loss_equiv": loss_equiv,
             "per_sample_loss": per_sample_total,
             "valid_counts": valid_count,
             "pred_pose9": pred_pose9,
         }
 
+    def forward_se3(
+        self,
+        pc_feats,
+        pc_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        actions_is_pad: Tensor | None = None,
+    ) -> Tensor:
+        if actions.shape[-1] < 10:
+            raise ValueError(f"se3_enable=True expects pose9 + gripper actions, got {actions.shape}.")
+        self.last_se3_metrics = {}
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+        h_gt = pose9_to_matrix(actions[..., :9])
+        gripper_gt = actions[..., 9:10].to(dtype=torch.float32)
+        if noise is None:
+            h_noise, gripper_noise, _noise_action = self.sample_se3_action_noise(actions)
+        else:
+            if noise.shape[-1] < 10:
+                raise ValueError(f"SE(3) noise must have dim >= 10, got {noise.shape}.")
+            h_noise = pose9_to_matrix(noise[..., :9])
+            gripper_noise = noise[..., 9:10].to(dtype=torch.float32)
+
+        time_pose = time[:, None, None]
+        h_delta = h_gt @ invert_transform(h_noise)
+        xi_total = se3_log(h_delta)
+        h_t = se3_exp(time_pose * xi_total) @ h_noise
+        remaining = (1.0 - time).clamp_min(1e-3)
+        xi_target = se3_log(h_gt @ invert_transform(h_t)) / remaining[:, None, None]
+        gripper_t = (1.0 - time_pose) * gripper_noise + time_pose * gripper_gt
+        gripper_target = gripper_gt - gripper_noise
+        x_t = torch.cat([matrix_to_pose9(h_t), gripper_t], dim=-1)
+        if actions.shape[-1] > 10:
+            x_t = pad_vector(x_t, actions.shape[-1])
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+        )
+        pred = self._se3_predict_from_suffix(prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, time)
+        twist_pred = pred[..., :6]
+        gripper_vel_pred = pred[..., 6:7]
+
+        twist_step = F.smooth_l1_loss(twist_pred, xi_target, reduction="none").mean(dim=-1)
+        h_endpoint = se3_left_apply((remaining[:, None, None] * twist_pred), h_t)
+        endpoint_step = se3_geodesic_loss(h_endpoint, h_gt)
+        gripper_step = F.mse_loss(gripper_vel_pred, gripper_target, reduction="none").mean(dim=-1)
+
+        final_step = torch.zeros_like(twist_step)
+        equiv_step = torch.zeros_like(twist_step)
+        h_final = h_endpoint
+        if self.se3_final_correction_head is not None:
+            foreground_pc = self.last_worldflow_point_cloud_ego
+            if not torch.is_tensor(foreground_pc):
+                raise ValueError(
+                    "se3_final_correction_enable=True requires SongPointCloudConditioner foreground points."
+                )
+            lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+            final_step, equiv_step, h_final = self._compute_final_correction_loss(
+                foreground_pc.to(dtype=torch.float32),
+                lang_emb,
+                lang_masks,
+                h_endpoint,
+                h_gt,
+            )
+
+        step_total = (
+            self.config.se3_pose_loss_weight * twist_step
+            + self.config.se3_endpoint_loss_weight * endpoint_step
+            + self.config.se3_gripper_loss_weight * gripper_step
+            + self.config.se3_final_correction_loss_weight * final_step
+            + self.config.se3_equivariance_loss_weight * equiv_step
+        )
+
+        valid = None
+        if torch.is_tensor(actions_is_pad):
+            valid = ~actions_is_pad.to(device=step_total.device, dtype=torch.bool)
+        trans_err = torch.linalg.norm(h_final[..., :3, 3] - h_gt[..., :3, 3], dim=-1)
+        rot_err = _rotation_geodesic(h_final[..., :3, :3], h_gt[..., :3, :3])
+        self.last_se3_metrics = {
+            "loss_se3_twist": self._masked_scalar_mean(twist_step, valid).detach(),
+            "loss_se3_endpoint": self._masked_scalar_mean(endpoint_step, valid).detach(),
+            "loss_se3_gripper": self._masked_scalar_mean(gripper_step, valid).detach(),
+            "loss_se3_final_correction": self._masked_scalar_mean(final_step, valid).detach(),
+            "loss_se3_equivariance": self._masked_scalar_mean(equiv_step, valid).detach(),
+            "se3_action_trans_err": self._masked_scalar_mean(trans_err, valid).detach(),
+            "se3_action_rot_err_deg": torch.rad2deg(self._masked_scalar_mean(rot_err, valid).detach()),
+        }
+
+        losses = actions.new_zeros(actions.shape)
+        losses[..., 0] = step_total * actions.shape[-1]
+        return losses
+
     def forward(
-        self, pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, actions_is_pad=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        if self.config.se3_enable:
+            return self.forward_se3(
+                pc_feats,
+                pc_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                actions,
+                noise=noise,
+                time=time,
+                actions_is_pad=actions_is_pad,
+            )
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1801,6 +2371,10 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        if self.config.se3_enable:
+            return self.sample_actions_se3(
+                pc_feats, pc_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            )
         bsize = state.shape[0]
         device = state.device
 
@@ -1861,6 +2435,85 @@ class VLAFlowMatching(nn.Module):
 
         return x_t
 
+    def sample_actions_se3(
+        self,
+        pc_feats,
+        pc_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        if self._rtc_enabled():
+            raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        bsize = state.shape[0]
+        device = state.device
+        if noise is None:
+            dummy_actions = torch.zeros(bsize, self.config.chunk_size, self.config.max_action_dim, device=device)
+            _h_noise, _gripper_noise, x_t = self.sample_se3_action_noise(dummy_actions)
+        else:
+            x_t = noise.to(device=device, dtype=torch.float32)
+            if x_t.shape[-1] < 10:
+                raise ValueError(f"SE(3) inference noise must have dim >= 10, got {x_t.shape}.")
+            if x_t.shape[-1] < self.config.max_action_dim:
+                x_t = pad_vector(x_t, self.config.max_action_dim)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        num_steps = self.config.num_steps
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            time = step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            pred = self.denoise_step(
+                x_t=x_t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                timestep=time_tensor,
+            )
+            twist = pred[..., :6]
+            gripper_vel = pred[..., 6:7]
+            h_t = pose9_to_matrix(x_t[..., :9])
+            h_next = se3_left_apply(dt * twist, h_t)
+            gripper_next = x_t[..., 9:10] + dt * gripper_vel
+            x_t = torch.cat([matrix_to_pose9(h_next), gripper_next], dim=-1)
+            if x_t.shape[-1] < self.config.max_action_dim:
+                x_t = pad_vector(x_t, self.config.max_action_dim)
+
+        if self.se3_final_correction_head is not None:
+            foreground_pc = self.last_worldflow_point_cloud_ego
+            if not torch.is_tensor(foreground_pc):
+                raise ValueError(
+                    "se3_final_correction_enable=True requires SongPointCloudConditioner foreground points."
+                )
+            lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+            h_pred = pose9_to_matrix(x_t[..., :9])
+            geo_pose9 = self.se3_final_correction_head(
+                foreground_pc.to(dtype=torch.float32),
+                lang_emb,
+                lang_masks,
+                coarse_pose9=x_t[..., :9],
+            )
+            h_geo = pose9_to_matrix(geo_pose9)
+            h_final = se3_left_apply(se3_log(h_geo @ invert_transform(h_pred)), h_pred)
+            x_t = torch.cat([matrix_to_pose9(h_final), x_t[..., 9:10]], dim=-1)
+            if x_t.shape[-1] < self.config.max_action_dim:
+                x_t = pad_vector(x_t, self.config.max_action_dim)
+        return x_t
+
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -1893,5 +2546,10 @@ class VLAFlowMatching(nn.Module):
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
+        if self.config.se3_enable:
+            if self.se3_action_out_proj is None:
+                raise RuntimeError("se3_action_out_proj is not initialized.")
+            v_t = self.se3_action_out_proj(suffix_out)
+        else:
+            v_t = self.action_out_proj(suffix_out)
         return v_t

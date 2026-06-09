@@ -98,6 +98,19 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_geo_loss_weight: float = 0.05
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
+    worldflow_se3_head_enable: bool = True
+    worldflow_equiv_loss_weight: float = 0.02
+
+    # ET-SEED-style SE(3) action generation.
+    se3_enable: bool = False
+    se3_noise_trans_scale: float = 0.15
+    se3_noise_rot_scale: float = 0.75
+    se3_pose_loss_weight: float = 1.0
+    se3_gripper_loss_weight: float = 1.0
+    se3_endpoint_loss_weight: float = 0.25
+    se3_final_correction_enable: bool = True
+    se3_final_correction_loss_weight: float = 0.20
+    se3_equivariance_loss_weight: float = 0.02
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -148,6 +161,12 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.se3_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
