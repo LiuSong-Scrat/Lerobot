@@ -16,7 +16,6 @@
 import dataclasses
 import logging
 import os
-import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -1258,63 +1257,7 @@ def main():
     train()
 
 
-def _apply_song_debug_defaults() -> None:
-    if len(sys.argv) > 1 and os.environ.get("SONG_TRAIN_DEBUG_DEFAULTS") != "1":
-        return
-    sys.argv = [
-        "train_song.py",
-        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
-        # "--policy.type=smolvla",
-        # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
-        "--policy.push_to_hub=false",
-        "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
-        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
-        "--policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct",
-        "--policy.load_vlm_weights=false",
-        "--batch_size=8",
-        "--steps=500000",
-        "--log_freq=1",
-        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla_temp",
-        "--job_name=my_smolvla_pointseg_worldflow_e2e",
-        "--policy.device=cuda",
-        "--wandb.enable=true",
-        "--wandb.disable_artifact=true",
-        "--save_freq=10000",
-        "--eval_freq=1000",
-        "--num_workers=8",
-        "--policy.pointseg_enable=true",
-        "--policy.pointseg_backbone_type=litept",
-        "--policy.pointseg_grid_size=0.01",
-        "--policy.pointseg_feature_dim=64",
-        "--policy.pointseg_aux_loss_weight=0.002",
-        "--policy.pointseg_foreground_ratio=0.08",
-        "--policy.pointseg_background_ratio=0.08",
-        "--policy.pointseg_min_foreground_points=4000",
-        "--policy.pointseg_min_background_points=0",
-        "--policy.pointseg_use_temporal_priors_as_input=false",
-        "--policy.pointseg_use_pseudo_selection=false",
-        "--policy.worldflow_enable=false",
-        "--policy.worldflow_feature_dim=64",
-        "--policy.worldflow_grid_size=0.01",
-        "--policy.worldflow_loss_weight=0.05",
-        "--policy.worldflow_geo_loss_weight=0.05",
-        "--policy.worldflow_trans_weight=1.0",
-        "--policy.worldflow_rot_weight=1.0",
-        "--policy.worldflow_se3_head_enable=false",
-        "--policy.worldflow_equiv_loss_weight=0.02",
-        "--policy.se3_enable=false",
-        "--policy.se3_noise_trans_scale=0.15",
-        "--policy.se3_noise_rot_scale=0.75",
-        "--policy.se3_pose_loss_weight=1.0",
-        "--policy.se3_gripper_loss_weight=1.0",
-        "--policy.se3_endpoint_loss_weight=0.25",
-        "--policy.se3_final_correction_enable=false",
-        "--policy.se3_final_correction_loss_weight=0.20",
-        "--policy.se3_equivariance_loss_weight=0.02",
-    ]
-
 if __name__ == "__main__":
-    _apply_song_debug_defaults()
     main()
 
 

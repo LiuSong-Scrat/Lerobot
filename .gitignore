@@ -177,3 +177,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# hdf5
+*.hdf5

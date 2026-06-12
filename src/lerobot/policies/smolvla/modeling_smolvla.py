@@ -304,30 +304,110 @@ def _sample_random_se3(
     return se3_exp(xi)
 
 
-def vis_umi_data(action,pointcloud):
-    ##########UMI
-    # ================= Pred =================
+def _to_numpy_array(value) -> np.ndarray:
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
 
-    geometries =[]
-    origin_frame = create_frame(np.array([0,0,0]), np.eye(3), scale=0.03)
-    geometries.append(origin_frame)
-    for per_pred_action in action: ####GT
-        per_pred_action = per_pred_action
-        pred_xyz = per_pred_action[:3]
-        pred_rot6d = per_pred_action[3:9]
-        pred_rotmat = rot6d_to_matrix(torch.tensor(pred_rot6d)).cpu().numpy()
-        frame = create_frame(pred_xyz, pred_rotmat, scale=0.03)
-        geometries.append(frame)
 
-    # ================= Scene Point Cloud =================
-    cloud = pointcloud
+def _time_gradient(num_steps: int) -> np.ndarray:
+    if num_steps <= 1:
+        return np.array([[0.1, 0.75, 0.25]], dtype=np.float64)
+    t = np.linspace(0.0, 1.0, num_steps, dtype=np.float64)[:, None]
+    start = np.array([0.05, 0.55, 1.0], dtype=np.float64)
+    middle = np.array([0.10, 0.85, 0.25], dtype=np.float64)
+    end = np.array([1.0, 0.18, 0.05], dtype=np.float64)
+    first_half = (1.0 - 2.0 * t) * start + (2.0 * t) * middle
+    second_half = (2.0 - 2.0 * t) * middle + (2.0 * t - 1.0) * end
+    return np.where(t <= 0.5, first_half, second_half).clip(0.0, 1.0)
+
+
+def _make_sphere(center: np.ndarray, radius: float, color: np.ndarray) -> o3d.geometry.TriangleMesh:
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=12)
+    sphere.translate(center)
+    sphere.paint_uniform_color(color.tolist())
+    return sphere
+
+
+def _make_trajectory_lines(positions: np.ndarray, colors: np.ndarray) -> o3d.geometry.LineSet | None:
+    if positions.shape[0] < 2:
+        return None
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(positions)
+    line_set.lines = o3d.utility.Vector2iVector([[idx, idx + 1] for idx in range(positions.shape[0] - 1)])
+    line_colors = 0.5 * (colors[:-1] + colors[1:])
+    line_set.colors = o3d.utility.Vector3dVector(line_colors)
+    return line_set
+
+
+def vis_umi_data(
+    action,
+    pointcloud,
+    *,
+    frame_stride: int | None = None,
+    max_frames: int = 12,
+    frame_scale: float = 0.035,
+    point_radius: float = 0.008,
+):
+    """Visualize a UMI pose9 trajectory with explicit temporal order.
+
+    The trajectory is colored from blue/green at the beginning to red at the end.
+    Coordinate frames are drawn sparsely so dense chunks remain readable.
+    """
+    actions = _to_numpy_array(action).astype(np.float32, copy=False)
+    while actions.ndim > 2 and actions.shape[0] == 1:
+        actions = actions[0]
+    if actions.ndim != 2 or actions.shape[-1] < 9:
+        raise ValueError(f"Expected action shape (T, >=9), got {actions.shape}.")
+
+    cloud = _to_numpy_array(pointcloud).astype(np.float32, copy=False)
+    while cloud.ndim > 2 and cloud.shape[0] == 1:
+        cloud = cloud[0]
+    if cloud.ndim != 2 or cloud.shape[-1] < 3:
+        raise ValueError(f"Expected pointcloud shape (N, >=3), got {cloud.shape}.")
+
+    positions = actions[:, :3]
+    colors = _time_gradient(positions.shape[0])
+    if frame_stride is None:
+        frame_stride = max(1, int(math.ceil(positions.shape[0] / max(1, max_frames))))
+    frame_indices = list(range(0, positions.shape[0], max(1, int(frame_stride))))
+    if positions.shape[0] - 1 not in frame_indices:
+        frame_indices.append(positions.shape[0] - 1)
+
+    geometries = [create_frame(np.array([0.0, 0.0, 0.0]), np.eye(3), scale=frame_scale * 1.2)]
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(cloud[:, :3])
-    pcd.colors = o3d.utility.Vector3dVector(cloud[:, 3:] / 255)
+    if cloud.shape[-1] >= 6:
+        rgb = np.clip(cloud[:, 3:6] / 255.0, 0.0, 1.0)
+    else:
+        rgb = np.full((cloud.shape[0], 3), 0.55, dtype=np.float32)
+    pcd.colors = o3d.utility.Vector3dVector(rgb)
     geometries.append(pcd)
 
-    o3d.visualization.draw_geometries(geometries)
-    ##########UMI
+    trajectory_lines = _make_trajectory_lines(positions, colors)
+    if trajectory_lines is not None:
+        geometries.append(trajectory_lines)
+
+    # Small colored beads make the time direction visible even when frames overlap.
+    for idx, (position, color) in enumerate(zip(positions, colors, strict=True)):
+        radius = point_radius * (1.6 if idx in (0, positions.shape[0] - 1) else 1.0)
+        geometries.append(_make_sphere(position, radius, color))
+
+    for idx in frame_indices:
+        rot6d = torch.as_tensor(actions[idx, 3:9], dtype=torch.float32)
+        rotmat = rot6d_to_matrix(rot6d).cpu().numpy()
+        scale = frame_scale * (1.35 if idx in (0, positions.shape[0] - 1) else 1.0)
+        geometries.append(create_frame(positions[idx], rotmat, scale=scale))
+
+    print(
+        f"Visualizing {positions.shape[0]} poses: blue/green=start, red=end, "
+        f"frames={frame_indices}, start={positions[0].round(4)}, end={positions[-1].round(4)}"
+    )
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name="UMI trajectory: blue/green=start, red=end",
+    )
 
 
 class ActionSelectKwargs(TypedDict, total=False):

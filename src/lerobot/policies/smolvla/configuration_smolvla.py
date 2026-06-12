@@ -66,7 +66,7 @@ class SmolVLAConfig(PreTrainedConfig):
     # Decoding
     # Number of denoising steps during flow matching inference.
     # Recommended values: 8-10 (fast), 20-30 (balanced), 50+ (high-quality)
-    num_steps: int = 30
+    num_steps: int = 10
 
     # Attention utils
     use_cache: bool = True
@@ -120,7 +120,7 @@ class SmolVLAConfig(PreTrainedConfig):
     optimizer_grad_clip_norm: float = 10
 
     scheduler_warmup_steps: int = 100 #1_000
-    scheduler_decay_steps: int = 10000 #30_000
+    scheduler_decay_steps: int = 30_000 #30_000
     scheduler_decay_lr: float = 2.5e-6
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.

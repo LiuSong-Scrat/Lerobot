@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pickle
+import time
 from pathlib import Path
 from typing import Any
 from collections import deque
@@ -27,6 +29,12 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
+)
+
+from libero_pointcloud_utils import (
+    add_local_gripper_cloud_to_point_cloud,
+    add_world_gripper_cloud_to_point_cloud,
+    gripper_width_percent_from_scalar,
 )
 
 
@@ -256,6 +264,7 @@ class SmolVLA_ModelInference:
         )
         self.dataset: torch.utils.data.Dataset | None = None
         self.predict_action_queue = deque()
+        self.last_model_point_cloud: np.ndarray | None = None
         self.policy.n_action_steps = 16
         self.policy.horizon = 32
     def _resolve_processor_path(self, processor_path: str | Path | None) -> str | None:
@@ -268,6 +277,22 @@ class SmolVLA_ModelInference:
                 return str(candidate_path)
         return None
 
+    @staticmethod
+    def _resolve_dataset_location(dataset_repo_id: str | Path, root: str | Path | None = None) -> tuple[str, Path | None]:
+        if root is not None:
+            return str(dataset_repo_id), Path(root).expanduser().resolve()
+
+        candidate = Path(dataset_repo_id).expanduser()
+        if candidate.exists():
+            resolved = candidate.resolve()
+            if not (resolved / "meta" / "info.json").exists():
+                raise FileNotFoundError(
+                    f"Local dataset path exists but is missing meta/info.json: {resolved}"
+                )
+            return resolved.name, resolved
+
+        return str(dataset_repo_id), None
+
     def load_dataset(
         self,
         dataset_repo_id: str | Path,
@@ -275,11 +300,12 @@ class SmolVLA_ModelInference:
         root: str | Path | None = None,
         episodes: list[int] | None = None,
     ) -> torch.utils.data.Dataset:
-        meta = LeRobotDatasetMetadata(str(dataset_repo_id), root=root)
+        repo_id, root_path = self._resolve_dataset_location(dataset_repo_id, root)
+        meta = LeRobotDatasetMetadata(repo_id, root=root_path)
         delta_timestamps = resolve_delta_timestamps(self.policy.config, meta)
         dataset = LeRobotDataset(
-            str(dataset_repo_id),
-            root=root,
+            repo_id,
+            root=root_path,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
@@ -369,6 +395,14 @@ class SmolVLA_ModelInference:
         visualize: bool = False,
         *,
         task: str = "",
+        num_points: int = 50000,
+        add_gripper_cloud: bool = True,
+        gripper_points: int = 500,
+        gripper_len: float = 0.06,
+        gripper_template: str = "reap",
+        gripper_drop_strategy: str = "tail",
+        gripper_shuffle_points: bool = False,
+        gripper_qpos_max_width: float = 0.04,
     ) -> np.ndarray:
         """Run one real-robot style inference step.
 
@@ -379,10 +413,39 @@ class SmolVLA_ModelInference:
         """
         one_step_agent_pos = self._real_observation_to_pose9_gripper(cur_model_observation)
         point_cloud_world = self._to_numpy(cur_model_observation["point_cloud"]).astype(np.float32)
-        one_step_point_cloud = self._world_point_cloud_to_current_eff(
-            point_cloud_world,
-            one_step_agent_pos,
+        gripper_width_percent = gripper_width_percent_from_scalar(
+            float(one_step_agent_pos[-1]),
+            max_physical_width=gripper_qpos_max_width,
         )
+        if add_gripper_cloud:
+            one_step_point_cloud = add_world_gripper_cloud_to_point_cloud(
+                point_cloud_world,
+                one_step_agent_pos,
+                gripper_width_percent,
+                total_points=num_points,
+                gripper_points=gripper_points,
+                gripper_len=gripper_len,
+                gripper_template=gripper_template,
+                drop_strategy=gripper_drop_strategy,
+                shuffle_points=gripper_shuffle_points,
+            )
+        else:
+            one_step_point_cloud = self._world_point_cloud_to_current_eff(
+                point_cloud_world,
+                one_step_agent_pos,
+            )
+            one_step_point_cloud = prepare_inference_point_cloud(
+                one_step_point_cloud,
+                num_points=num_points,
+                add_gripper_cloud=False,
+                gripper_width_percent=gripper_width_percent,
+                gripper_points=gripper_points,
+                gripper_len=gripper_len,
+                gripper_template=gripper_template,
+                gripper_drop_strategy=gripper_drop_strategy,
+                gripper_shuffle_points=gripper_shuffle_points,
+            )
+        self.last_model_point_cloud = one_step_point_cloud
         if len(self.predict_action_queue)==0:
             action_chunk = self.predict_action_chunk_obs(
                 {
@@ -403,7 +466,7 @@ class SmolVLA_ModelInference:
             )
             self.predict_action_queue.extend(pred_world_pose9_gripper)
             if visualize:
-                vis_umi_data(pred_world_pose9_gripper,point_cloud_world)
+                vis_umi_data(pred_world_pose9_gripper, one_step_point_cloud)
 
         pred_action = self.predict_action_queue.popleft()
         pred_pose9_gripper_np = pred_action
@@ -620,13 +683,145 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset.repo_id", "--dataset_repo_id", dest="dataset_repo_id", default=None)
     parser.add_argument("--dataset.root", "--dataset_root", dest="dataset_root", default=None)
     parser.add_argument("--obs.path", "--obs_path", dest="obs_path", default=None)
+    parser.add_argument("--ply.path", "--ply_path", dest="ply_path", default=None)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--action-index", type=int, default=0)
     parser.add_argument("--task", default="")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--num-points", type=int, default=50000)
+    parser.add_argument("--add-gripper-cloud", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gripper-points", type=int, default=500)
+    parser.add_argument("--gripper-len", type=float, default=0.06)
+    parser.add_argument("--gripper-template", choices=("reap", "panda"), default="reap")
+    parser.add_argument("--gripper-drop-strategy", choices=("tail", "random", "near_gripper"), default="tail")
+    parser.add_argument("--gripper-shuffle-points", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gripper-width-percent", type=float, default=1.0)
+    parser.add_argument("--gripper-qpos-max-width", type=float, default=0.04)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--save-trajectory-ply", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-postprocess", action="store_true")
     return parser.parse_args()
+
+
+def sample_or_repeat_points(xyzrgb: np.ndarray, num_points: int, seed: int = 0) -> np.ndarray:
+    xyzrgb = np.asarray(xyzrgb, dtype=np.float32)
+    if xyzrgb.ndim != 2 or xyzrgb.shape[1] != 6:
+        raise ValueError(f"Expected point cloud shape (N, 6), got {xyzrgb.shape}")
+    if num_points <= 0 or xyzrgb.shape[0] == num_points:
+        return xyzrgb
+    if xyzrgb.shape[0] == 0:
+        raise ValueError("Cannot sample from an empty point cloud.")
+    rng = np.random.default_rng(seed)
+    replace = xyzrgb.shape[0] < num_points
+    indices = rng.choice(xyzrgb.shape[0], num_points, replace=replace)
+    return xyzrgb[indices].astype(np.float32, copy=False)
+
+
+def prepare_inference_point_cloud(
+    xyzrgb_eff: np.ndarray,
+    *,
+    num_points: int,
+    add_gripper_cloud: bool,
+    gripper_width_percent: float,
+    gripper_points: int,
+    gripper_len: float,
+    gripper_template: str,
+    gripper_drop_strategy: str,
+    gripper_shuffle_points: bool,
+    seed: int = 0,
+) -> np.ndarray:
+    if add_gripper_cloud:
+        return add_local_gripper_cloud_to_point_cloud(
+            xyzrgb_eff,
+            gripper_width_percent,
+            total_points=int(num_points),
+            gripper_points=int(gripper_points),
+            gripper_len=float(gripper_len),
+            gripper_template=str(gripper_template),
+            seed=int(seed),
+            drop_strategy=str(gripper_drop_strategy),
+            shuffle_points=bool(gripper_shuffle_points),
+        )
+    return sample_or_repeat_points(xyzrgb_eff, int(num_points), seed=int(seed))
+
+
+def read_ply_xyzrgb(path: str | Path, num_points: int) -> np.ndarray:
+    pcd = o3d.io.read_point_cloud(str(path))
+    xyz = np.asarray(pcd.points, dtype=np.float32)
+    if xyz.size == 0:
+        raise ValueError(f"PLY contains no points: {path}")
+    colors = np.asarray(pcd.colors, dtype=np.float32)
+    if colors.shape != xyz.shape:
+        colors = np.full_like(xyz, 0.5, dtype=np.float32)
+    if colors.max(initial=0.0) <= 1.0:
+        colors = colors * 255.0
+    return sample_or_repeat_points(np.concatenate([xyz, colors], axis=1), num_points)
+
+
+def identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
+    state = np.zeros(10, dtype=np.float32)
+    state[3] = 1.0
+    state[7] = 1.0
+    state[-1] = float(gripper)
+    return state
+
+
+def write_trajectory_ply(path: Path, actions: np.ndarray) -> None:
+    actions = np.asarray(actions, dtype=np.float32)
+    if actions.ndim == 1:
+        actions = actions[None]
+    if actions.shape[-1] < 3:
+        raise ValueError(f"Expected actions with xyz in first 3 dims, got {actions.shape}")
+    points = actions[:, :3]
+    lines = np.asarray([[idx, idx + 1] for idx in range(max(0, len(points) - 1))], dtype=np.int32)
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    if len(lines) > 0:
+        line_set.colors = o3d.utility.Vector3dVector(np.tile(np.asarray([[0.0, 0.7, 1.0]]), (len(lines), 1)))
+    o3d.io.write_line_set(str(path), line_set)
+
+
+def save_inference_outputs(
+    output_dir: Path | None,
+    *,
+    action: np.ndarray,
+    task: str,
+    source: str,
+    save_trajectory_ply: bool,
+    model_point_cloud: np.ndarray | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if output_dir is None:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    action = np.asarray(action, dtype=np.float32)
+    np.save(output_dir / "action.npy", action)
+    if model_point_cloud is not None:
+        model_point_cloud = np.asarray(model_point_cloud, dtype=np.float32)
+        np.save(output_dir / "model_point_cloud.npy", model_point_cloud)
+
+    result = {
+        "source": source,
+        "task": task,
+        "action_shape": list(action.shape),
+        "created_unix_s": time.time(),
+    }
+    if model_point_cloud is not None:
+        result["model_point_cloud_shape"] = list(model_point_cloud.shape)
+        result["model_point_cloud_path"] = "model_point_cloud.npy"
+    if metadata:
+        result.update(metadata)
+    with open(output_dir / "result.json", "w", encoding="utf-8") as f:
+        json.dump(
+            result,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    if save_trajectory_ply:
+        write_trajectory_ply(output_dir / "trajectory.ply", action)
 
 
 def main() -> None:
@@ -641,21 +836,87 @@ def main() -> None:
     if args.obs_path is not None:
         with open(args.obs_path, "rb") as f:
             cur_model_observation = pickle.load(f)
-        # task="place, red_cube, eff_open, None"
-        task="move_towards, broom, eff_open, None"
-        visualize=True
         action = infer.single_inference(
             cur_model_observation,
-            visualize=visualize,
-            task=task,
+            visualize=args.visualize,
+            task=args.task,
+            num_points=args.num_points,
+            add_gripper_cloud=args.add_gripper_cloud,
+            gripper_points=args.gripper_points,
+            gripper_len=args.gripper_len,
+            gripper_template=args.gripper_template,
+            gripper_drop_strategy=args.gripper_drop_strategy,
+            gripper_shuffle_points=args.gripper_shuffle_points,
+            gripper_qpos_max_width=args.gripper_qpos_max_width,
         )
         print(f"Predicted single action shape: {tuple(action.shape)}")
         print(action)
-        # return
+        save_inference_outputs(
+            args.output_dir,
+            action=action,
+            task=args.task,
+            source=str(args.obs_path),
+            save_trajectory_ply=args.save_trajectory_ply,
+            model_point_cloud=infer.last_model_point_cloud,
+            metadata={
+                "point_cloud_contract": {
+                    "num_points": args.num_points,
+                    "add_gripper_cloud": args.add_gripper_cloud,
+                    "gripper_points": args.gripper_points,
+                    "gripper_template": args.gripper_template,
+                    "coordinate_frame": "current_end_effector",
+                }
+            },
+        )
+        return
+
+    if args.ply_path is not None:
+        point_cloud = read_ply_xyzrgb(args.ply_path, args.num_points)
+        point_cloud = prepare_inference_point_cloud(
+            point_cloud,
+            num_points=args.num_points,
+            add_gripper_cloud=args.add_gripper_cloud,
+            gripper_width_percent=float(args.gripper_width_percent),
+            gripper_points=args.gripper_points,
+            gripper_len=args.gripper_len,
+            gripper_template=args.gripper_template,
+            gripper_drop_strategy=args.gripper_drop_strategy,
+            gripper_shuffle_points=args.gripper_shuffle_points,
+        )
+        action_chunk = infer.predict_action_chunk_obs(
+            {"point_cloud": point_cloud, "state": identity_pose9_gripper(float(args.gripper_width_percent))},
+            task=args.task,
+            postprocess=not args.no_postprocess,
+            state_pose_mode="identity",
+        )
+        action_np = action_chunk[0].detach().cpu().numpy().astype(np.float32)
+        print(f"Predicted action chunk shape: {tuple(action_np.shape)}")
+        print(action_np)
+        save_inference_outputs(
+            args.output_dir,
+            action=action_np,
+            task=args.task,
+            source=str(args.ply_path),
+            save_trajectory_ply=args.save_trajectory_ply,
+            model_point_cloud=point_cloud,
+            metadata={
+                "point_cloud_contract": {
+                    "num_points": args.num_points,
+                    "add_gripper_cloud": args.add_gripper_cloud,
+                    "gripper_points": args.gripper_points,
+                    "gripper_template": args.gripper_template,
+                    "coordinate_frame": "current_end_effector",
+                    "gripper_width_percent": float(args.gripper_width_percent),
+                }
+            },
+        )
+        if args.visualize:
+            vis_umi_data(action_np, point_cloud)
+        return
 
     if args.dataset_repo_id is None:
         print("Model loaded. Pass --obs.path or --dataset.repo_id to run inference.")
-        # return
+        return
 
     result = infer.predict_from_dataset(
         args.index,
@@ -669,59 +930,14 @@ def main() -> None:
     print(f"Predicted action chunk shape: {tuple(result['action_chunk'].shape)}")
     if result["gt_action_chunk"] is not None:
         print(f"Ground-truth action chunk shape: {tuple(result['gt_action_chunk'].shape)}")
-
-
-import sys
-sys.argv = [
-    "train.py",  # dummy script name
-    "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song_pointseg_e2e1/checkpoints/last/pretrained_model",
-    # "--policy.type=smolvla",
-    "--policy.repo_id=/home/liusong/scp_receive/smolvla",
-    "--obs.path=/home/liusong/temp/obs_dict_umi_trash.pkl",
-    "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
-    "--device=cuda",
-]
+    save_inference_outputs(
+        args.output_dir,
+        action=result["action_chunk"].detach().cpu().numpy(),
+        task=args.task,
+        source=str(args.dataset_repo_id),
+        save_trajectory_ply=args.save_trajectory_ply,
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-
-# model_va = SmolVLA_ModelInference(
-#     policy_path="/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
-#     policy_repo_id="/home/liusong/scp_receive/smolvla",
-#     device="cuda",
-# )
-# with open("/home/liusong/temp/obs_dict_50000_mug.pkl", "rb") as f:
-#     cur_model_observation = pickle.load(f)
-# action = model_va.single_inference(
-#     cur_model_observation,
-#     visualize=True,
-#     task="Place the Red Cube on the Blue Cube",
-# )
-# print(f"Predicted single action shape: {tuple(action.shape)}")
-# print(action)
-
-
-
-
-# def random_repeat_sample_points(xyzrgb: np.ndarray, M: int):
-#     N = xyzrgb.shape[0]
-#     if N == 0:
-#         return xyzrgb
-#     if N >= M:
-#         idx = np.random.choice(N, M, replace=False)
-#         return xyzrgb[idx]
-#     else:
-#         extra = np.random.choice(N, M - N, replace=True)
-#         return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)   
-# batch['task'][0] = 'place, red_cube, eff_open, None\n'
-# scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new1.ply",)
-# scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
-# scene_point_cloud = random_repeat_sample_points(scene_point_cloud, 1024)
-# batch['observation.point_cloud'][0][0] = torch.tensor(scene_point_cloud).to("cuda")
-# model_batch = self.preprocessor(batch)
-# action_pred = self.policy.predict_action_chunk(model_batch)
-# vis_umi_data(action_pred.cpu().numpy()[0],model_batch['observation.point_cloud'].cpu().numpy()[0][0])
-# print(action_pred[0][:,-1])
