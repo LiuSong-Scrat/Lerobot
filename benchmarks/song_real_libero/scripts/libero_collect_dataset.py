@@ -51,7 +51,8 @@ DATASET_FEATURES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert LIBERO demonstrations into the Song point-cloud LeRobot format.")
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "configs" / "libero.json")
-    parser.add_argument("--suite", default="libero_object")
+    parser.add_argument("--suite", action="append", default=None)
+    parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--demo-root", type=Path, default=None)
     parser.add_argument("--demo-file", type=Path, action="append", default=None)
@@ -81,6 +82,42 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) -> Any:
     return cli_value if cli_value is not None else cfg.get(key, default)
+
+
+def resolve_suite_names(cli_suites: list[str] | None, cfg: dict[str, Any]) -> list[str]:
+    suites = cli_suites if cli_suites is not None else cfg.get("suites", cfg.get("suite", "libero_object"))
+    if isinstance(suites, str):
+        suites = [suites]
+    suites = [str(suite) for suite in suites]
+    if not suites:
+        raise ValueError("At least one LIBERO suite must be configured.")
+    return suites
+
+
+def resolve_task_ids_for_suite(
+    *,
+    suite_name: str,
+    task_count: int,
+    cli_task_ids: list[int] | None,
+    cfg: dict[str, Any],
+) -> list[int]:
+    if bool(cfg.get("all_tasks", False)):
+        return list(range(task_count))
+    if cli_task_ids is not None:
+        task_ids = cli_task_ids
+    else:
+        suite_task_ids = cfg.get("suite_task_ids", {})
+        if isinstance(suite_task_ids, dict) and suite_name in suite_task_ids:
+            task_ids = suite_task_ids[suite_name]
+        else:
+            task_ids = cfg.get("task_ids")
+    if task_ids is None:
+        return list(range(task_count))
+    resolved = [int(task_id) for task_id in task_ids]
+    invalid = [task_id for task_id in resolved if task_id < 0 or task_id >= task_count]
+    if invalid:
+        raise ValueError(f"Invalid task id(s) for {suite_name}: {invalid}; valid range is [0, {task_count - 1}]")
+    return resolved
 
 
 def camera_image_keys(camera_names: list[str]) -> list[str]:
@@ -668,6 +705,7 @@ def collect_demo_episode(
 
 def make_episode_record(
     *,
+    suite_name: str,
     task_id: int,
     task: Any,
     demo_file: Path,
@@ -675,6 +713,7 @@ def make_episode_record(
     frames: int,
 ) -> dict[str, Any]:
     return {
+        "suite": suite_name,
         "task_id": int(task_id),
         "task_name": task.name,
         "task_language": task.language,
@@ -688,11 +727,13 @@ def make_episode_record(
 
 def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(job["cfg"])
+    suite_name = str(job["suite"])
+    cfg["suite"] = suite_name
     ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
 
     from libero.libero import benchmark
 
-    suite_cls = benchmark.get_benchmark_dict()[cfg["suite"]]
+    suite_cls = benchmark.get_benchmark_dict()[suite_name]
     suite = suite_cls()
     task_id = int(job["task_id"])
     demo_file = Path(job["demo_file"])
@@ -720,6 +761,7 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         env.close()
 
     record = make_episode_record(
+        suite_name=suite_name,
         task_id=task_id,
         task=task,
         demo_file=demo_file,
@@ -772,7 +814,9 @@ def save_collected_temp_episode(
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
-    cfg["suite"] = cfg_get(cfg, args.suite, "suite")
+    suite_names = resolve_suite_names(args.suite, cfg)
+    cfg["suites"] = suite_names
+    cfg["all_tasks"] = bool(cfg_get(cfg, args.all_tasks, "all_tasks", False))
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 50000))
@@ -805,10 +849,6 @@ def main() -> None:
 
     from libero.libero import benchmark
 
-    suite_cls = benchmark.get_benchmark_dict()[cfg["suite"]]
-    suite = suite_cls()
-    task_ids = cfg["task_ids"] if cfg["task_ids"] is not None else list(range(len(suite.tasks)))
-
     if output_root.exists():
         if not cfg["overwrite_dataset"]:
             raise FileExistsError(f"Output dataset already exists: {output_root}")
@@ -830,7 +870,7 @@ def main() -> None:
 
     summary: dict[str, Any] = {
         "created_unix_s": time.time(),
-        "suite": cfg["suite"],
+        "suites": suite_names,
         "demo_root": str(demo_root),
         "output_root": str(output_root),
         "camera_names": list(cfg.get("camera_names", [])),
@@ -845,27 +885,40 @@ def main() -> None:
 
     jobs: list[dict[str, Any]] = []
     job_index = 0
-    for task_id_value in task_ids:
-        task_id = int(task_id_value)
-        task = suite.get_task(task_id)
-        demo_file = find_demo_file(task, demo_root, args.demo_file, cfg)
-        demo_names = iter_demo_group_names(demo_file)[: int(cfg["episodes"])]
-        if not demo_names:
-            raise RuntimeError(f"No usable demos with states found in {demo_file}")
-        for converted_for_task, demo_name in enumerate(demo_names):
-            jobs.append(
-                {
-                    "job_index": job_index,
-                    "task_id": task_id,
-                    "demo_file": str(demo_file),
-                    "demo_name": demo_name,
-                    "episode_seed": task_id * 100000 + converted_for_task * 1000,
-                    "max_frames": max_frames,
-                    "cfg": cfg,
-                    "tmp_path": str(tmp_dir / f"episode_job_{job_index:06d}"),
-                }
-            )
-            job_index += 1
+    benchmark_dict = benchmark.get_benchmark_dict()
+    for suite_index, suite_name in enumerate(suite_names):
+        suite_cls = benchmark_dict[suite_name]
+        suite = suite_cls()
+        task_ids = resolve_task_ids_for_suite(
+            suite_name=suite_name,
+            task_count=len(suite.tasks),
+            cli_task_ids=args.task_id,
+            cfg=cfg,
+        )
+        suite_cfg = dict(cfg)
+        suite_cfg["suite"] = suite_name
+        for task_id_value in task_ids:
+            task_id = int(task_id_value)
+            task = suite.get_task(task_id)
+            demo_file = find_demo_file(task, demo_root, args.demo_file, suite_cfg)
+            demo_names = iter_demo_group_names(demo_file)[: int(cfg["episodes"])]
+            if not demo_names:
+                raise RuntimeError(f"No usable demos with states found in {demo_file}")
+            for converted_for_task, demo_name in enumerate(demo_names):
+                jobs.append(
+                    {
+                        "job_index": job_index,
+                        "suite": suite_name,
+                        "task_id": task_id,
+                        "demo_file": str(demo_file),
+                        "demo_name": demo_name,
+                        "episode_seed": suite_index * 10_000_000 + task_id * 100000 + converted_for_task * 1000,
+                        "max_frames": max_frames,
+                        "cfg": suite_cfg,
+                        "tmp_path": str(tmp_dir / f"episode_job_{job_index:06d}_{suite_name}_task_{task_id:03d}"),
+                    }
+                )
+                job_index += 1
 
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -882,8 +935,8 @@ def main() -> None:
             )
             summary["episodes"].append(record)
             print(
-                f"[OK] task={record['task_id']} demo={record['demo_name']} frames={record['frames']} "
-                f"episode_index={record['episode_index']}"
+                f"[OK] suite={record['suite']} task={record['task_id']} demo={record['demo_name']} "
+                f"frames={record['frames']} episode_index={record['episode_index']}"
             )
     else:
         print(f"[info] collecting {len(jobs)} LIBERO episode(s) with {cfg['num_workers']} worker(s)")
@@ -907,8 +960,8 @@ def main() -> None:
             )
             summary["episodes"].append(record)
             print(
-                f"[OK] task={record['task_id']} demo={record['demo_name']} frames={record['frames']} "
-                f"episode_index={record['episode_index']}"
+                f"[OK] suite={record['suite']} task={record['task_id']} demo={record['demo_name']} "
+                f"frames={record['frames']} episode_index={record['episode_index']}"
             )
 
     shutil.rmtree(tmp_dir, ignore_errors=True)

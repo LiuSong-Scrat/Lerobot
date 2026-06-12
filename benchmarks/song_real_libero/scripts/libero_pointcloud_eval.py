@@ -14,7 +14,12 @@ from smolvla_model_inference import (
     identity_pose9_gripper,
     write_trajectory_ply,
 )
-from libero_collect_dataset import append_video_frames, export_episode_videos
+from libero_collect_dataset import (
+    append_video_frames,
+    export_episode_videos,
+    resolve_suite_names,
+    resolve_task_ids_for_suite,
+)
 from libero_pointcloud_utils import (
     action_pose9_to_libero,
     add_world_gripper_cloud_to_point_cloud,
@@ -42,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "configs" / "libero.json")
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
-    parser.add_argument("--suite", default=None)
+    parser.add_argument("--suite", action="append", default=None)
+    parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default=None)
@@ -143,7 +149,10 @@ def main() -> None:
     cfg = load_config(args.config)
     cfg["policy_path"] = cfg_get(cfg, args.policy_path, "policy_path")
     cfg["policy_repo_id"] = args.policy_repo_id if args.policy_repo_id is not None else cfg.get("policy_repo_id")
-    cfg["suite"] = cfg_get(cfg, args.suite, "suite")
+    suite_names = resolve_suite_names(args.suite, cfg)
+    cfg["suites"] = suite_names
+    cfg["all_tasks"] = bool(args.all_tasks if args.all_tasks is not None else cfg.get("all_tasks", False))
+    cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes"))
     cfg["device"] = cfg_get(cfg, args.device, "device")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points"))
@@ -154,12 +163,6 @@ def main() -> None:
 
     from libero.libero import benchmark
 
-    suite_cls = benchmark.get_benchmark_dict()[cfg["suite"]]
-    suite = suite_cls()
-    task_ids = args.task_id if args.task_id is not None else cfg.get("task_ids")
-    if task_ids is None:
-        task_ids = list(range(len(suite.tasks)))
-
     infer = SmolVLA_ModelInference(
         policy_path=cfg["policy_path"],
         policy_repo_id=cfg.get("policy_repo_id"),
@@ -167,67 +170,78 @@ def main() -> None:
     )
 
     all_results = []
-    for task_id in task_ids:
-        env, task = make_libero_env(
-            suite,
-            int(task_id),
-            int(cfg["observation_height"]),
-            int(cfg["observation_width"]),
-            render_camera_names_from_config(cfg),
+    benchmark_dict = benchmark.get_benchmark_dict()
+    for suite_name in suite_names:
+        suite_cls = benchmark_dict[suite_name]
+        suite = suite_cls()
+        task_ids = resolve_task_ids_for_suite(
+            suite_name=suite_name,
+            task_count=len(suite.tasks),
+            cli_task_ids=args.task_id,
+            cfg=cfg,
         )
-        init_states = get_task_init_states(suite, int(task_id))
-        task_results = []
-        try:
-            for episode_idx in range(cfg["episodes"]):
-                episode_dir = output_dir / cfg["suite"] / f"task_{int(task_id):03d}" / f"episode_{episode_idx:03d}"
-                episode_dir.mkdir(parents=True, exist_ok=True)
-                result = run_episode(
-                    infer=infer,
-                    env=env,
-                    task_language=task.language,
-                    init_state=init_states[episode_idx % len(init_states)],
-                    cfg=cfg,
-                )
-                np.save(episode_dir / "libero_actions.npy", result["libero_actions"])
-                np.save(episode_dir / "pose_actions.npy", result["pose_actions"])
-                if cfg.get("save_trajectory", True):
-                    write_trajectory_ply(episode_dir / "trajectory.ply", result["pose_actions"])
-                record = {
-                    "episode_index": episode_idx,
-                    "demo_name": "rollout",
-                    "video_dir_name": episode_dir.name,
-                }
-                video_paths = export_episode_videos(result, episode_dir.parent, record, cfg)
-                task_results.append(
-                    {
-                        k: v
-                        for k, v in result.items()
-                        if not isinstance(v, np.ndarray) and k != "video_frames"
+        for task_id in task_ids:
+            env, task = make_libero_env(
+                suite,
+                int(task_id),
+                int(cfg["observation_height"]),
+                int(cfg["observation_width"]),
+                render_camera_names_from_config(cfg),
+            )
+            init_states = get_task_init_states(suite, int(task_id))
+            task_results = []
+            try:
+                for episode_idx in range(cfg["episodes"]):
+                    episode_dir = output_dir / suite_name / f"task_{int(task_id):03d}" / f"episode_{episode_idx:03d}"
+                    episode_dir.mkdir(parents=True, exist_ok=True)
+                    result = run_episode(
+                        infer=infer,
+                        env=env,
+                        task_language=task.language,
+                        init_state=init_states[episode_idx % len(init_states)],
+                        cfg=cfg,
+                    )
+                    np.save(episode_dir / "libero_actions.npy", result["libero_actions"])
+                    np.save(episode_dir / "pose_actions.npy", result["pose_actions"])
+                    if cfg.get("save_trajectory", True):
+                        write_trajectory_ply(episode_dir / "trajectory.ply", result["pose_actions"])
+                    record = {
+                        "episode_index": episode_idx,
+                        "demo_name": "rollout",
+                        "video_dir_name": episode_dir.name,
                     }
-                )
-                if video_paths:
-                    task_results[-1]["videos"] = video_paths
-                print(
-                    f"{cfg['suite']} task={task_id} episode={episode_idx} "
-                    f"success={result['success']} steps={result['steps']} reward={result['sum_reward']:.3f}"
-                )
-        finally:
-            env.close()
-        success_rate = float(np.mean([item["success"] for item in task_results])) if task_results else 0.0
-        all_results.append(
-            {
-                "suite": cfg["suite"],
-                "task_id": int(task_id),
-                "task_language": task.language,
-                "episodes": task_results,
-                "success_rate": success_rate,
-            }
-        )
+                    video_paths = export_episode_videos(result, episode_dir.parent, record, cfg)
+                    task_results.append(
+                        {
+                            k: v
+                            for k, v in result.items()
+                            if not isinstance(v, np.ndarray) and k != "video_frames"
+                        }
+                    )
+                    if video_paths:
+                        task_results[-1]["videos"] = video_paths
+                    print(
+                        f"{suite_name} task={task_id} episode={episode_idx} "
+                        f"success={result['success']} steps={result['steps']} reward={result['sum_reward']:.3f}"
+                    )
+            finally:
+                env.close()
+            success_rate = float(np.mean([item["success"] for item in task_results])) if task_results else 0.0
+            all_results.append(
+                {
+                    "suite": suite_name,
+                    "task_id": int(task_id),
+                    "task_name": task.name,
+                    "task_language": task.language,
+                    "episodes": task_results,
+                    "success_rate": success_rate,
+                }
+            )
 
     summary = {
         "created_unix_s": time.time(),
         "policy_path": cfg["policy_path"],
-        "suite": cfg["suite"],
+        "suites": suite_names,
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
         "render_camera_names": render_camera_names_from_config(cfg),

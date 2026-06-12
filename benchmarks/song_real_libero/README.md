@@ -307,6 +307,105 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --vis-count 1
 ```
 
+### Four-Suite Training Dataset
+
+If the demo HDF5 files are arranged under:
+
+```text
+benchmarks/song_real_libero/data/
+  libero_spatial/*.hdf5
+  libero_object/*.hdf5
+  libero_goal/*.hdf5
+  libero_10/*.hdf5
+```
+
+convert all tasks from the four suites into one LeRobot point-cloud dataset:
+
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
+  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_demos \
+  --suite libero_spatial \
+  --suite libero_object \
+  --suite libero_goal \
+  --suite libero_10 \
+  --all-tasks \
+  --episodes 5 \
+  --num-workers 10 \
+  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --repo-id song_libero_4suite_pointcloud \
+  --save-video \
+  --vis-count 2
+```
+
+Each episode keeps the task text from its own LIBERO task: LeRobot `task` uses `task.language`, and `libero_collect_summary.json` records `suite`, `task_id`, `task_name`, `task_language`, `problem_folder`, and `bddl_file`.
+
+Build pointseg cache for the four-suite dataset:
+
+```bash
+conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
+  --dataset.repo_id song_libero_4suite_pointcloud \
+  --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_pointseg_cache \
+  --overwrite
+```
+
+Train on the generated four-suite dataset by replacing only the dataset/cache/output paths:
+
+```bash
+conda run -n reap python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --policy.type=smolvla \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=song_libero_4suite_pointcloud \
+  --dataset.root=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_pointseg_cache \
+  --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
+  --policy.load_vlm_weights=false \
+  --batch_size=8 \
+  --steps=500000 \
+  --log_freq=1 \
+  --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_4suite_fresh \
+  --job_name=song_libero_4suite_pointseg \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --wandb.disable_artifact=true \
+  --save_freq=10000 \
+  --eval_freq=1000 \
+  --num_workers=8 \
+  --policy.pointseg_enable=true \
+  --policy.pointseg_backbone_type=litept \
+  --policy.pointseg_grid_size=0.01 \
+  --policy.pointseg_feature_dim=64 \
+  --policy.pointseg_aux_loss_weight=0.002 \
+  --policy.pointseg_foreground_ratio=0.08 \
+  --policy.pointseg_background_ratio=0.08 \
+  --policy.pointseg_min_foreground_points=4000 \
+  --policy.pointseg_min_background_points=0 \
+  --policy.pointseg_use_temporal_priors_as_input=false \
+  --policy.pointseg_use_pseudo_selection=false \
+  --policy.worldflow_enable=false \
+  --policy.worldflow_se3_head_enable=false \
+  --policy.se3_enable=false \
+  --policy.se3_final_correction_enable=false
+```
+
+Run online evaluation on the four suites with each task's own LIBERO language prompt:
+
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
+  benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_4suite_fresh/checkpoints/000100/pretrained_model \
+  --suite libero_spatial \
+  --suite libero_object \
+  --suite libero_goal \
+  --suite libero_10 \
+  --all-tasks \
+  --episodes 10 \
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
+```
+
 
 Each worker creates its own LIBERO/robosuite environment and writes lightweight temporary episode artifacts. The main process moves the final point-cloud arrays into the LeRobot dataset sequentially, so dataset writes remain deterministic without duplicating large point clouds through pickle files.
 
