@@ -21,7 +21,7 @@ from tqdm import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
-    POINTSEG_CACHE_FIELDS,
+    POINTSEG_CACHE_LABEL_FIELDS,
     POINTSEG_CACHE_VERSION,
     ROLE_NAMES,
     PseudoLabelConfig,
@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-cloud-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
-    parser.add_argument("--current-points", type=int, default=8192)
-    parser.add_argument("--future-points", type=int, default=16384)
+    parser.add_argument("--current-points", type=int, default=10000)
+    parser.add_argument("--future-points", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=256)
@@ -158,17 +158,15 @@ def _save_variable_shard(
 ) -> dict[str, Any]:
     shard_dir = output_dir / shard["path"]
     shard_dir.mkdir(parents=True, exist_ok=True)
-    lengths = [int(sample["point_cloud"].shape[0]) for sample in samples]
+    lengths = [int(sample["point_indices"].shape[0]) for sample in samples]
     offsets = np.zeros(len(samples) + 1, dtype=np.int64)
     offsets[1:] = np.cumsum(lengths, dtype=np.int64)
 
     np.save(shard_dir / "sample_offsets.npy", offsets)
-    np.save(shard_dir / "point_cloud.npy", np.concatenate([sample["point_cloud"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "priors.npy", np.concatenate([sample["priors"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "point_indices.npy", np.concatenate([sample["point_indices"] for sample in samples], axis=0).astype(np.int64, copy=False))
     np.save(shard_dir / "labels.npy", np.concatenate([sample["labels"] for sample in samples], axis=0).astype(np.int16, copy=False))
     np.save(shard_dir / "weights.npy", np.concatenate([sample["weights"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "class_scores.npy", np.concatenate([sample["class_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "role_scores.npy", np.concatenate([sample["role_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "foreground_score.npy", np.concatenate([sample["foreground_score"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "episode_index.npy", np.asarray([sample["episode_index"] for sample in samples], dtype=np.int64))
     np.save(shard_dir / "frame_index.npy", np.asarray([sample["frame_index"] for sample in samples], dtype=np.int64))
@@ -188,13 +186,16 @@ def _sample_from_batch(
     valid = ~is_pad[batch_index].bool().detach().cpu() if is_pad is not None else torch.ones(
         current_pc.shape[1], dtype=torch.bool
     )
+    point_indices = batch.get("observation.point_cloud_indices")
+    if point_indices is None:
+        point_indices_np = torch.arange(current_pc.shape[1], dtype=torch.long)[valid].numpy()
+    else:
+        point_indices_np = point_indices[batch_index].detach().cpu()[valid].to(dtype=torch.long).numpy()
     return {
-        "point_cloud": current_pc[batch_index].detach().cpu()[valid].numpy(),
-        "priors": pseudo["priors"][batch_index].detach().cpu()[valid].numpy(),
+        "point_indices": point_indices_np,
         "labels": pseudo["labels"][batch_index].detach().cpu()[valid].numpy(),
         "weights": pseudo["weights"][batch_index].detach().cpu()[valid].numpy(),
         "class_scores": pseudo["class_scores"][batch_index].detach().cpu()[valid].numpy(),
-        "role_scores": pseudo["role_scores"][batch_index].detach().cpu()[valid].numpy(),
         "foreground_score": pseudo["foreground_score"][batch_index].detach().cpu()[valid].numpy(),
         "episode_index": int(batch["episode_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
         "frame_index": int(batch["frame_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
@@ -239,7 +240,8 @@ def cache_samples(args: argparse.Namespace) -> None:
         "version": POINTSEG_CACHE_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "role_names": list(ROLE_NAMES),
-        "fields": list(POINTSEG_CACHE_FIELDS),
+        "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+        "cache_mode": "indices",
         "num_samples": total_samples,
         "future_offsets": list(args.future_offsets),
         "current_points": args.current_points,

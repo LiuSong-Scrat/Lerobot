@@ -8,6 +8,11 @@ import threading
 import h5py
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.smolvla.song_pointseg import (
+    episode_point_cloud_npy_path,
+    episode_point_cloud_zarr_path,
+    save_episode_point_clouds_zarr,
+)
 import torch.nn.functional as F
 import open3d as o3d
 
@@ -27,6 +32,10 @@ POINT_CLOUD_CHANNELS = 6
 FPS_BATCH_SIZE = int(os.environ.get("SONG_FPS_BATCH_SIZE", "128"))
 USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
 CONVERT_WORKERS = int(os.environ.get("SONG_CONVERT_WORKERS", str(min(20, os.cpu_count() or 1))))
+POINT_CLOUD_STORAGE = os.environ.get("SONG_POINT_CLOUD_STORAGE", "zarr").strip().lower()
+ZARR_COMPRESSION_LEVEL = int(os.environ.get("SONG_ZARR_COMPRESSION_LEVEL", "3"))
+POINT_CLOUD_POINTS = int(os.environ.get("SONG_POINT_CLOUD_POINTS", "10000"))
+GRIPPER_POINTS = int(os.environ.get("SONG_GRIPPER_POINTS", "500"))
 _FPS_CUDA_LOCK = threading.Lock()
 
 def from_H_to_trajectory(H):
@@ -221,24 +230,34 @@ def recreate_empty_dir(path: str | Path) -> Path:
 
 
 def point_cloud_file(root: Path, episode_index: int) -> Path:
-    return root / POINT_CLOUD_DIR_NAME / f"episode_{episode_index:06d}.npy"
+    return episode_point_cloud_npy_path(root / POINT_CLOUD_DIR_NAME, episode_index)
+
+
+def point_cloud_storage_path(root: Path, episode_index: int, storage: str) -> Path:
+    if storage == "zarr":
+        return episode_point_cloud_zarr_path(root / POINT_CLOUD_DIR_NAME, episode_index)
+    return point_cloud_file(root, episode_index)
 
 
 def world_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
-def write_point_cloud_meta(root: Path) -> None:
+def write_point_cloud_meta(root: Path, storage: str = POINT_CLOUD_STORAGE) -> None:
     pc_dir = root / POINT_CLOUD_DIR_NAME
     pc_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "zarr" if storage == "zarr" else "npy"
     meta = {
         "key": POINT_CLOUD_KEY,
         "dtype": "float32",
         "shape": [None, POINT_CLOUD_CHANNELS],
         "variable_num_points": True,
-        "layout": "episode_npy",
-        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.npy",
+        "layout": "episode_array",
+        "storage_format": storage,
+        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
     }
+    if storage == "zarr":
+        meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
     with open(pc_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -257,7 +276,14 @@ def write_worldflow_meta(root: Path) -> None:
         json.dump(pose_meta, f, indent=2)
 
 
-def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.ndarray) -> None:
+def save_episode_point_clouds(
+    root: Path,
+    episode_index: int,
+    point_clouds: np.ndarray,
+    *,
+    storage: str = POINT_CLOUD_STORAGE,
+    zarr_compression_level: int = ZARR_COMPRESSION_LEVEL,
+) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
         raise ValueError(
@@ -267,9 +293,17 @@ def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.n
     if point_clouds.shape[1] <= 0:
         raise ValueError(f"Point cloud episodes must contain at least one point, got {point_clouds.shape}.")
 
-    pc_path = point_cloud_file(root, episode_index)
-    pc_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(pc_path, point_clouds)
+    if storage == "zarr":
+        save_episode_point_clouds_zarr(
+            root / POINT_CLOUD_DIR_NAME,
+            episode_index,
+            point_clouds,
+            compression_level=int(zarr_compression_level),
+        )
+    else:
+        pc_path = point_cloud_storage_path(root, episode_index, storage)
+        pc_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(pc_path, point_clouds)
 
 
 def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.ndarray) -> None:
@@ -280,6 +314,40 @@ def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.nd
     pose_path = world_ee_pose_file(root, episode_index)
     pose_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(pose_path, world_ee_poses)
+
+
+def downsample_point_clouds_keep_tail(
+    point_clouds: np.ndarray,
+    num_points: int = POINT_CLOUD_POINTS,
+    *,
+    gripper_points: int = GRIPPER_POINTS,
+    seed: int = 1000,
+) -> np.ndarray:
+    point_clouds = np.asarray(point_clouds, dtype=np.float32)
+    num_points = int(num_points)
+    if num_points <= 0 or point_clouds.shape[1] == num_points:
+        return np.ascontiguousarray(point_clouds, dtype=np.float32)
+    frame_count, total_points, channels = point_clouds.shape
+    if total_points <= 0:
+        raise ValueError(f"Point clouds must contain points, got {point_clouds.shape}")
+    tail_count = max(0, min(int(gripper_points), total_points, num_points))
+    scene_target = max(0, num_points - tail_count)
+    scene_count = max(0, total_points - tail_count)
+    out = np.empty((frame_count, num_points, channels), dtype=np.float32)
+    for frame_idx in range(frame_count):
+        rng = np.random.default_rng(seed + frame_idx)
+        if scene_target > 0:
+            if scene_count > 0:
+                replace = scene_count < scene_target
+                scene_indices = rng.choice(scene_count, scene_target, replace=replace)
+                out[frame_idx, :scene_target] = point_clouds[frame_idx, scene_indices]
+            else:
+                replace = total_points < scene_target
+                scene_indices = rng.choice(total_points, scene_target, replace=replace)
+                out[frame_idx, :scene_target] = point_clouds[frame_idx, scene_indices]
+        if tail_count > 0:
+            out[frame_idx, scene_target:] = point_clouds[frame_idx, total_points - tail_count : total_points]
+    return out
 
 
 def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, point_clouds: np.ndarray, timestamps: np.ndarray) -> dict:
@@ -319,7 +387,7 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
         gripper_width = f["observations/eff_angular"][:].astype(np.float32).reshape(-1, 1) * 0.5
         actions = np.concatenate((obs_pose9_data_eff_2_eff0, gripper_width), axis=1).astype(np.float32, copy=False)
         # point_clouds = batched_fps(P_eff, use_cuda=USE_CUDA_FPS)
-        point_clouds = P_eff
+        point_clouds = downsample_point_clouds_keep_tail(P_eff)
 
         timestamps_dataset = f.get("timestamp")
         if timestamps_dataset is not None:
@@ -419,7 +487,9 @@ def main():
         root=ROOT,
         use_videos=False,
     )
-    write_point_cloud_meta(dataset.root)
+    if POINT_CLOUD_STORAGE not in {"zarr", "npy"}:
+        raise ValueError(f"Unsupported SONG_POINT_CLOUD_STORAGE={POINT_CLOUD_STORAGE!r}; expected zarr or npy.")
+    write_point_cloud_meta(dataset.root, POINT_CLOUD_STORAGE)
     write_worldflow_meta(dataset.root)
 
     h5_paths = sorted(HDF5_FOLDER.glob("*.hdf5"))

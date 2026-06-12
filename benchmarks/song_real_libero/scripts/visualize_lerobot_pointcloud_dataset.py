@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from lerobot.policies.smolvla.song_pointseg import find_episode_point_cloud_path, open_episode_point_clouds
+
 from libero_collect_dataset import write_ascii_ply_lines, write_ascii_ply_points
 
 
@@ -38,14 +40,13 @@ def main() -> None:
     output_dir = (args.output_dir or dataset_root / "visualizations").expanduser().resolve()
     episode = int(args.episode)
 
-    pc_path = dataset_root / "point_clouds" / f"episode_{episode:06d}.npy"
+    point_cloud_dir = dataset_root / "point_clouds"
+    pc_path = find_episode_point_cloud_path(point_cloud_dir, episode)
     pose_path = dataset_root / "world_ee_poses" / f"episode_{episode:06d}.npy"
-    if not pc_path.exists():
-        raise FileNotFoundError(f"Missing point cloud episode file: {pc_path}")
     if not pose_path.exists():
         raise FileNotFoundError(f"Missing world pose episode file: {pose_path}")
 
-    point_clouds = np.load(pc_path, mmap_mode="r")
+    point_clouds = open_episode_point_clouds(point_cloud_dir, episode, mmap_mode="r")
     world_poses = np.load(pose_path, mmap_mode="r")
     frame_ids = parse_frame_ids(args.frames, len(point_clouds), args.stride, args.count)
     episode_dir = output_dir / f"episode_{episode:06d}"

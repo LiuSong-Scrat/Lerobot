@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.policies.smolvla.song_pointseg import open_episode_point_clouds
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -46,7 +47,7 @@ DEFAULT_POLICY_REPO_ID = "/home/liusong/scp_receive/smolvla"
 
 
 class PointCloudMemmapDataset(torch.utils.data.Dataset):
-    """Inject point clouds from per-episode .npy memmaps into a LeRobotDataset item."""
+    """Inject point clouds from per-episode zarr/npy arrays into a LeRobotDataset item."""
 
     def __init__(
         self,
@@ -83,10 +84,11 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
     def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
         point_clouds = self._point_cloud_cache.get(episode_index)
         if point_clouds is None:
-            path = self.point_cloud_dir / f"episode_{episode_index:06d}.npy"
-            if not path.exists():
-                raise FileNotFoundError(f"Point cloud memmap file is missing: {path}")
-            point_clouds = np.load(path, mmap_mode=self.mmap_mode)
+            point_clouds = open_episode_point_clouds(
+                self.point_cloud_dir,
+                episode_index,
+                mmap_mode=self.mmap_mode,
+            )
             self._point_cloud_cache[episode_index] = point_clouds
         return point_clouds
 
@@ -100,7 +102,10 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 
 
 def maybe_wrap_point_cloud_memmap_dataset(dataset):
-    root = Path(getattr(dataset, "root", dataset.meta.root))
+    root_value = getattr(dataset, "root", None)
+    if root_value is None:
+        root_value = dataset.meta.root
+    root = Path(root_value)
     point_cloud_dir = root / "point_clouds"
     if not point_cloud_dir.is_dir():
         return dataset
@@ -395,7 +400,7 @@ class SmolVLA_ModelInference:
         visualize: bool = False,
         *,
         task: str = "",
-        num_points: int = 50000,
+        num_points: int = 10000,
         add_gripper_cloud: bool = True,
         gripper_points: int = 500,
         gripper_len: float = 0.06,
@@ -688,7 +693,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--action-index", type=int, default=0)
     parser.add_argument("--task", default="")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-points", type=int, default=50000)
+    parser.add_argument("--num-points", type=int, default=10000)
     parser.add_argument("--add-gripper-cloud", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gripper-points", type=int, default=500)
     parser.add_argument("--gripper-len", type=float, default=0.06)

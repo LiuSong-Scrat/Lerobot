@@ -36,7 +36,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 1
+POINTSEG_CACHE_VERSION = 2
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -44,6 +44,16 @@ POINTSEG_CACHE_FIELDS = (
     "weights",
     "class_scores",
     "role_scores",
+    "foreground_score",
+    "episode_index",
+    "frame_index",
+    "dataset_index",
+)
+POINTSEG_CACHE_LABEL_FIELDS = (
+    "point_indices",
+    "labels",
+    "weights",
+    "class_scores",
     "foreground_score",
     "episode_index",
     "frame_index",
@@ -159,6 +169,187 @@ def _sample_rows(array: np.ndarray, count: int, rng: np.random.Generator) -> np.
     return np.ascontiguousarray(array[indices], dtype=np.float32)
 
 
+def _sample_rows_with_indices(
+    array: np.ndarray, count: int, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
+    n_points = array.shape[0]
+    if n_points == 0:
+        channels = array.shape[-1] if array.ndim >= 2 else 6
+        return np.zeros((0, channels), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    if count <= 0 or n_points <= count:
+        indices = np.arange(n_points, dtype=np.int64)
+        return np.ascontiguousarray(array, dtype=np.float32), indices
+    indices = rng.choice(n_points, count, replace=False).astype(np.int64, copy=False)
+    return np.ascontiguousarray(array[indices], dtype=np.float32), indices
+
+
+def _require_zarr():
+    try:
+        import zarr  # type: ignore
+        from numcodecs import Blosc  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional environment package
+        raise ImportError(
+            "Compressed point-cloud storage requires `zarr` and `numcodecs`. "
+            "Install them in the active environment, e.g. `conda install -n reap -c conda-forge zarr numcodecs`."
+        ) from exc
+    return zarr, Blosc
+
+
+class PackedPointCloudZarr:
+    """Read packed xyz=float16, rgb=uint8 zarr point clouds as float32 XYZRGB."""
+
+    def __init__(self, group: Any):
+        self.group = group
+        self.xyz = group["xyz"]
+        self.rgb = group["rgb"]
+        self.shape = (*self.xyz.shape[:-1], 6)
+        self.dtype = np.dtype(np.float32)
+        self.ndim = len(self.shape)
+
+    def __len__(self) -> int:
+        return int(self.shape[0])
+
+    def __getitem__(self, item):
+        xyz = np.asarray(self.xyz[item], dtype=np.float32)
+        rgb = np.asarray(self.rgb[item], dtype=np.float32)
+        return np.concatenate([xyz, rgb], axis=-1)
+
+    def __array__(self, dtype=None):
+        array = self[:]
+        if dtype is not None:
+            array = array.astype(dtype, copy=False)
+        return array
+
+
+def episode_point_cloud_npy_path(point_cloud_dir: str | Path, episode_index: int) -> Path:
+    return Path(point_cloud_dir) / f"episode_{int(episode_index):06d}.npy"
+
+
+def episode_point_cloud_zarr_path(point_cloud_dir: str | Path, episode_index: int) -> Path:
+    return Path(point_cloud_dir) / f"episode_{int(episode_index):06d}.zarr"
+
+
+def find_episode_point_cloud_path(point_cloud_dir: str | Path, episode_index: int) -> Path:
+    zarr_path = episode_point_cloud_zarr_path(point_cloud_dir, episode_index)
+    if zarr_path.exists():
+        return zarr_path
+    npy_path = episode_point_cloud_npy_path(point_cloud_dir, episode_index)
+    if npy_path.exists():
+        return npy_path
+    raise FileNotFoundError(
+        f"Point cloud episode file is missing: expected {zarr_path} or {npy_path}"
+    )
+
+
+def open_episode_point_clouds(
+    point_cloud_dir: str | Path,
+    episode_index: int,
+    *,
+    mmap_mode: str = "r",
+) -> Any:
+    path = find_episode_point_cloud_path(point_cloud_dir, episode_index)
+    if path.suffix == ".zarr":
+        zarr, _ = _require_zarr()
+        zarr_obj = zarr.open(str(path), mode="r")
+        if hasattr(zarr_obj, "array_keys") and "xyz" in zarr_obj and "rgb" in zarr_obj:
+            return PackedPointCloudZarr(zarr_obj)
+        return zarr_obj
+    return np.load(path, mmap_mode=mmap_mode)
+
+
+def _pack_point_cloud_rgb(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(rgb, dtype=np.float32)
+    finite_rgb = rgb[np.isfinite(rgb)]
+    if finite_rgb.size > 0 and float(finite_rgb.max(initial=0.0)) <= 1.0:
+        rgb = rgb * 255.0
+    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8, copy=False)
+
+
+def save_point_clouds_zarr(
+    path: str | Path,
+    point_clouds: np.ndarray,
+    *,
+    chunks: tuple[int, int, int] | None = None,
+    compressor_name: str = "zstd",
+    compression_level: int = 3,
+    packed: bool = True,
+) -> Path:
+    zarr, Blosc = _require_zarr()
+    point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
+    if point_clouds.ndim != 3 or point_clouds.shape[-1] != 6:
+        raise ValueError(f"Expected point clouds shape (T,N,6), got {point_clouds.shape}")
+    path = Path(path)
+    if path.exists():
+        import shutil
+
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    compressor = Blosc(cname=compressor_name, clevel=int(compression_level), shuffle=Blosc.BITSHUFFLE)
+    if packed:
+        if chunks is None:
+            chunks = (1, min(int(point_clouds.shape[1]), 16384), 3)
+        group = zarr.open_group(str(path), mode="w")
+        group.attrs.update(
+            {
+                "format": "song_point_cloud_packed_v1",
+                "shape": list(point_clouds.shape),
+                "xyz_dtype": "float16",
+                "rgb_dtype": "uint8",
+                "rgb_scale": "0_255",
+            }
+        )
+        xyz = group.create_dataset(
+            "xyz",
+            shape=point_clouds[..., :3].shape,
+            chunks=chunks,
+            dtype=np.float16,
+            compressor=compressor,
+        )
+        rgb = group.create_dataset(
+            "rgb",
+            shape=point_clouds[..., 3:6].shape,
+            chunks=chunks,
+            dtype=np.uint8,
+            compressor=compressor,
+        )
+        xyz[:] = point_clouds[..., :3].astype(np.float16)
+        rgb[:] = _pack_point_cloud_rgb(point_clouds[..., 3:6])
+        return path
+
+    if chunks is None:
+        chunks = (1, min(int(point_clouds.shape[1]), 16384), 6)
+    array = zarr.open(
+        str(path),
+        mode="w",
+        shape=point_clouds.shape,
+        chunks=chunks,
+        dtype=point_clouds.dtype,
+        compressor=compressor,
+    )
+    array[:] = point_clouds
+    return path
+
+
+def save_episode_point_clouds_zarr(
+    point_cloud_dir: str | Path,
+    episode_index: int,
+    point_clouds: np.ndarray,
+    *,
+    chunks: tuple[int, int, int] | None = None,
+    compressor_name: str = "zstd",
+    compression_level: int = 3,
+    packed: bool = True,
+) -> Path:
+    return save_point_clouds_zarr(
+        episode_point_cloud_zarr_path(point_cloud_dir, episode_index),
+        point_clouds,
+        chunks=chunks,
+        compressor_name=compressor_name,
+        compression_level=compression_level,
+        packed=packed,
+    )
+
+
 def _pad_point_tensors(tensors: list[Tensor], pad_value: float | int = 0) -> tuple[Tensor, Tensor]:
     if not tensors:
         raise ValueError("Cannot collate an empty point tensor list.")
@@ -212,6 +403,7 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "pointseg.class_scores": 0,
         "pointseg.role_scores": 0,
         "pointseg.foreground_score": 0,
+        "observation.point_cloud_indices": -1,
     }
     for key in sorted(keys):
         values = [item[key] for item in batch if key in item]
@@ -293,10 +485,11 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
         point_clouds = self._point_cloud_cache.get(episode_index)
         if point_clouds is None:
-            path = self.point_cloud_dir / f"episode_{episode_index:06d}.npy"
-            if not path.exists():
-                raise FileNotFoundError(f"Point cloud memmap file is missing: {path}")
-            point_clouds = np.load(path, mmap_mode=self.mmap_mode)
+            point_clouds = open_episode_point_clouds(
+                self.point_cloud_dir,
+                episode_index,
+                mmap_mode=self.mmap_mode,
+            )
             self._point_cloud_cache[episode_index] = point_clouds
         return point_clouds
 
@@ -326,9 +519,9 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         rng = np.random.default_rng(self.seed + idx)
 
         current_full = np.asarray(point_clouds[frame_index], dtype=np.float32)
-        item["observation.point_cloud"] = torch.from_numpy(
-            _sample_rows(current_full, self.current_points, rng)
-        )
+        current_sample, current_indices = _sample_rows_with_indices(current_full, self.current_points, rng)
+        item["observation.point_cloud"] = torch.from_numpy(current_sample)
+        item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
 
         future_samples = []
         future_point_masks = []
@@ -374,13 +567,20 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             self.manifest = json.load(f)
 
         version = int(self.manifest.get("version", -1))
-        if version != POINTSEG_CACHE_VERSION:
+        if version not in {1, POINTSEG_CACHE_VERSION}:
             raise ValueError(
-                f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}."
+                f"Unsupported Song pointseg cache version {version}; expected 1 or {POINTSEG_CACHE_VERSION}."
             )
 
         fields = tuple(self.manifest.get("fields", ()))
-        missing_fields = [field for field in POINTSEG_CACHE_FIELDS if field not in fields]
+        self.cache_mode = str(
+            self.manifest.get(
+                "cache_mode",
+                "embedded_point_cloud" if "point_cloud" in fields else "indices",
+            )
+        )
+        expected_fields = POINTSEG_CACHE_FIELDS if self.cache_mode == "embedded_point_cloud" else POINTSEG_CACHE_LABEL_FIELDS
+        missing_fields = [field for field in expected_fields if field not in fields]
         if missing_fields:
             raise ValueError(f"Song pointseg cache is missing fields: {missing_fields}")
         self.fields = fields
@@ -444,18 +644,24 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             point_slice = slice(int(offsets[local_index]), int(offsets[local_index + 1]))
         else:
             point_slice = local_index
-        return {
-            "observation.point_cloud": self._float_tensor(arrays["point_cloud"][point_slice]),
-            "pointseg.priors": self._float_tensor(arrays["priors"][point_slice]),
+        item = {
             "pointseg.labels": self._long_tensor(arrays["labels"][point_slice]),
             "pointseg.weights": self._float_tensor(arrays["weights"][point_slice]),
             "pointseg.class_scores": self._float_tensor(arrays["class_scores"][point_slice]),
-            "pointseg.role_scores": self._float_tensor(arrays["role_scores"][point_slice]),
             "pointseg.foreground_score": self._float_tensor(arrays["foreground_score"][point_slice]),
             "episode_index": torch.tensor(int(arrays["episode_index"][local_index]), dtype=torch.long),
             "frame_index": torch.tensor(int(arrays["frame_index"][local_index]), dtype=torch.long),
             "dataset_index": torch.tensor(int(arrays["dataset_index"][local_index]), dtype=torch.long),
         }
+        if "priors" in arrays:
+            item["pointseg.priors"] = self._float_tensor(arrays["priors"][point_slice])
+        if "role_scores" in arrays:
+            item["pointseg.role_scores"] = self._float_tensor(arrays["role_scores"][point_slice])
+        if self.cache_mode == "embedded_point_cloud":
+            item["observation.point_cloud"] = self._float_tensor(arrays["point_cloud"][point_slice])
+        else:
+            item["observation.point_cloud_indices"] = self._long_tensor(arrays["point_indices"][point_slice])
+        return item
 
 
 def _use_pointops_knn(device: torch.device) -> bool:

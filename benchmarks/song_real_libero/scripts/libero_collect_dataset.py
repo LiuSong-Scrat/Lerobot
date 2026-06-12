@@ -15,6 +15,13 @@ import h5py
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.smolvla.song_pointseg import (
+    episode_point_cloud_npy_path,
+    episode_point_cloud_zarr_path,
+    open_episode_point_clouds,
+    save_episode_point_clouds_zarr,
+    save_point_clouds_zarr,
+)
 
 from libero_pointcloud_utils import (
     add_world_gripper_clouds_to_episode,
@@ -61,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-frames-per-demo", type=int, default=None)
     parser.add_argument("--num-points", type=int, default=None)
+    parser.add_argument("--point-cloud-storage", choices=("zarr", "npy"), default=None)
+    parser.add_argument("--zarr-compression-level", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--replay-mode", choices=("states", "step"), default=None)
     parser.add_argument("--download-demos", action=argparse.BooleanOptionalAction, default=None)
@@ -211,24 +220,34 @@ def natural_key(path: Path):
 
 
 def point_cloud_file(root: Path, episode_index: int) -> Path:
-    return root / POINT_CLOUD_DIR_NAME / f"episode_{episode_index:06d}.npy"
+    return episode_point_cloud_npy_path(root / POINT_CLOUD_DIR_NAME, episode_index)
+
+
+def point_cloud_storage_path(root: Path, episode_index: int, storage: str) -> Path:
+    if storage == "zarr":
+        return episode_point_cloud_zarr_path(root / POINT_CLOUD_DIR_NAME, episode_index)
+    return point_cloud_file(root, episode_index)
 
 
 def world_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
-def write_point_cloud_meta(root: Path) -> None:
+def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
     pc_dir = root / POINT_CLOUD_DIR_NAME
     pc_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "zarr" if storage == "zarr" else "npy"
     meta = {
         "key": "observation.point_cloud",
         "dtype": "float32",
         "shape": [None, POINT_CLOUD_CHANNELS],
         "variable_num_points": True,
-        "layout": "episode_npy",
-        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.npy",
+        "layout": "episode_array",
+        "storage_format": storage,
+        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
     }
+    if storage == "zarr":
+        meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
     with open(pc_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
@@ -247,13 +266,28 @@ def write_worldflow_meta(root: Path) -> None:
         json.dump(meta, f, indent=2)
 
 
-def save_episode_point_clouds(root: Path, episode_index: int, point_clouds: np.ndarray) -> None:
+def save_episode_point_clouds(
+    root: Path,
+    episode_index: int,
+    point_clouds: np.ndarray,
+    *,
+    storage: str = "zarr",
+    zarr_compression_level: int = 3,
+) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
         raise ValueError(f"Expected point clouds shape (T, N, 6), got {point_clouds.shape}")
-    path = point_cloud_file(root, episode_index)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, point_clouds)
+    if storage == "zarr":
+        save_episode_point_clouds_zarr(
+            root / POINT_CLOUD_DIR_NAME,
+            episode_index,
+            point_clouds,
+            compression_level=int(zarr_compression_level),
+        )
+    else:
+        path = point_cloud_file(root, episode_index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, point_clouds)
 
 
 def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.ndarray) -> None:
@@ -308,7 +342,9 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict[str, Any]) -> 
 
 def move_episode_array(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
+    if dst.is_dir():
+        shutil.rmtree(dst)
+    elif dst.exists():
         dst.unlink()
     shutil.move(str(src), str(dst))
 
@@ -317,7 +353,14 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    np.save(artifact_dir / "point_clouds.npy", np.ascontiguousarray(episode["point_clouds"], dtype=np.float32))
+    if str(cfg.get("point_cloud_storage", "zarr")) == "zarr":
+        save_point_clouds_zarr(
+            artifact_dir / "point_clouds.zarr",
+            episode["point_clouds"],
+            compression_level=int(cfg.get("zarr_compression_level", 3)),
+        )
+    else:
+        np.save(artifact_dir / "point_clouds.npy", np.ascontiguousarray(episode["point_clouds"], dtype=np.float32))
     np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
     np.save(artifact_dir / "timestamps.npy", np.asarray(episode["timestamps"], dtype=np.float32))
@@ -787,9 +830,26 @@ def save_collected_temp_episode(
     timestamps = np.load(artifact_dir / "timestamps.npy")
     episode_index = int(dataset.meta.total_episodes)
 
-    final_point_cloud_path = point_cloud_file(dataset.root, episode_index)
+    point_cloud_storage = str(cfg.get("point_cloud_storage", "zarr"))
+    final_point_cloud_path = point_cloud_storage_path(dataset.root, episode_index, point_cloud_storage)
     final_world_ee_pose_path = world_ee_pose_file(dataset.root, episode_index)
-    move_episode_array(artifact_dir / "point_clouds.npy", final_point_cloud_path)
+    artifact_point_cloud_path = artifact_dir / "point_clouds.npy"
+    artifact_point_cloud_zarr_path = artifact_dir / "point_clouds.zarr"
+    if point_cloud_storage == "zarr":
+        if artifact_point_cloud_zarr_path.exists():
+            move_episode_array(artifact_point_cloud_zarr_path, final_point_cloud_path)
+        elif artifact_point_cloud_path.exists():
+            save_episode_point_clouds_zarr(
+                dataset.root / POINT_CLOUD_DIR_NAME,
+                episode_index,
+                np.load(artifact_point_cloud_path, mmap_mode="r"),
+                compression_level=int(cfg.get("zarr_compression_level", 3)),
+            )
+            artifact_point_cloud_path.unlink(missing_ok=True)
+        else:
+            raise FileNotFoundError(f"Missing point cloud artifact under {artifact_dir}")
+    else:
+        move_episode_array(artifact_point_cloud_path, final_point_cloud_path)
     move_episode_array(artifact_dir / "world_ee_poses.npy", final_world_ee_pose_path)
     dataset.save_episode(
         episode_data=make_episode_buffer(
@@ -803,7 +863,7 @@ def save_collected_temp_episode(
     if int(cfg.get("vis_count", 0) or 0) > 0:
         preview_episode = {
             "actions": actions,
-            "point_clouds": np.load(final_point_cloud_path, mmap_mode="r"),
+            "point_clouds": open_episode_point_clouds(dataset.root / POINT_CLOUD_DIR_NAME, episode_index),
             "world_ee_poses": np.load(final_world_ee_pose_path, mmap_mode="r"),
         }
         export_episode_preview(preview_episode, vis_dir, record, cfg)
@@ -819,7 +879,9 @@ def main() -> None:
     cfg["all_tasks"] = bool(cfg_get(cfg, args.all_tasks, "all_tasks", False))
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
-    cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 50000))
+    cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 10000))
+    cfg["point_cloud_storage"] = str(cfg_get(cfg, args.point_cloud_storage, "point_cloud_storage", "zarr"))
+    cfg["zarr_compression_level"] = int(cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3))
     cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 30))
     cfg["replay_mode"] = cfg_get(cfg, args.replay_mode, "replay_mode", "states")
     cfg["download_demos"] = bool(cfg_get(cfg, args.download_demos, "download_demos", True))
@@ -865,7 +927,7 @@ def main() -> None:
         root=output_root,
         use_videos=False,
     )
-    write_point_cloud_meta(dataset.root)
+    write_point_cloud_meta(dataset.root, storage=str(cfg["point_cloud_storage"]))
     write_worldflow_meta(dataset.root)
 
     summary: dict[str, Any] = {
@@ -879,6 +941,9 @@ def main() -> None:
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
         "gripper_template": str(cfg.get("gripper_template", "reap")),
+        "point_cloud_storage": str(cfg.get("point_cloud_storage", "zarr")),
+        "point_cloud_zarr_encoding": "packed_xyz_float16_rgb_uint8",
+        "zarr_compression_level": int(cfg.get("zarr_compression_level", 3)),
         "num_workers": int(cfg["num_workers"]),
         "episodes": [],
     }

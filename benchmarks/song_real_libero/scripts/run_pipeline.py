@@ -175,6 +175,12 @@ def command_for_stage(stage: str, cfg: dict[str, Any], args: argparse.Namespace)
             task,
             "--point-cloud-key",
             convert["point_cloud_key"],
+            "--num-points",
+            str(convert.get("num_points", 10000)),
+            "--gripper-points",
+            str(cfg.get("gripper", {}).get("gripper_points", convert.get("gripper_points", 500))),
+            "--point-cloud-storage",
+            convert.get("point_cloud_storage", "zarr"),
             "--overwrite",
         ]
         return cmd

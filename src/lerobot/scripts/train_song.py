@@ -43,6 +43,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.song_pointseg import (
     ROLE_FOREGROUND,
     SongPointSegCachedDataset,
+    open_episode_point_clouds,
     song_pointseg_collate,
     write_role_ply,
 )
@@ -67,7 +68,7 @@ from lerobot.utils.utils import (
 
 
 class PointCloudMemmapDataset(torch.utils.data.Dataset):
-    """Inject point clouds from per-episode .npy memmaps into a LeRobotDataset item."""
+    """Inject point clouds from per-episode zarr/npy arrays into a LeRobotDataset item."""
 
     def __init__(
         self,
@@ -104,10 +105,11 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
     def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
         point_clouds = self._point_cloud_cache.get(episode_index)
         if point_clouds is None:
-            path = self.point_cloud_dir / f"episode_{episode_index:06d}.npy"
-            if not path.exists():
-                raise FileNotFoundError(f"Point cloud memmap file is missing: {path}")
-            point_clouds = np.load(path, mmap_mode=self.mmap_mode)
+            point_clouds = open_episode_point_clouds(
+                self.point_cloud_dir,
+                episode_index,
+                mmap_mode=self.mmap_mode,
+            )
             self._point_cloud_cache[episode_index] = point_clouds
         return point_clouds
 
@@ -214,10 +216,25 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         "pointseg.foreground_score",
     )
 
-    def __init__(self, dataset: torch.utils.data.Dataset, cache_dir: str | Path, *, strict: bool = True):
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        cache_dir: str | Path,
+        *,
+        point_cloud_dir: str | Path | None = None,
+        strict: bool = True,
+        mmap_mode: str = "r",
+    ):
         self.dataset = dataset
         self.cache = SongPointSegCachedDataset(cache_dir)
+        root_value = getattr(dataset, "root", None)
+        if root_value is None:
+            root_value = dataset.meta.root
+        root = Path(root_value)
+        self.point_cloud_dir = Path(point_cloud_dir) if point_cloud_dir is not None else root / "point_clouds"
         self.strict = strict
+        self.mmap_mode = mmap_mode
+        self._point_cloud_cache: dict[int, np.ndarray] = {}
         if self.strict and len(self.cache) < len(self.dataset):
             raise ValueError(
                 f"Song pointseg cache has {len(self.cache)} samples but action dataset has {len(self.dataset)}. "
@@ -226,6 +243,11 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_point_cloud_cache"] = {}
+        return state
 
     def __len__(self):
         return len(self.dataset)
@@ -237,6 +259,17 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         if isinstance(value, np.ndarray):
             return int(value.reshape(-1)[0].item())
         return int(value)
+
+    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
+        point_clouds = self._point_cloud_cache.get(episode_index)
+        if point_clouds is None:
+            point_clouds = open_episode_point_clouds(
+                self.point_cloud_dir,
+                episode_index,
+                mmap_mode=self.mmap_mode,
+            )
+            self._point_cloud_cache[episode_index] = point_clouds
+        return point_clouds
 
     def _check_alignment(self, item: dict[str, Any], cache_item: dict[str, torch.Tensor], idx: int) -> None:
         if "episode_index" in item and "episode_index" in cache_item:
@@ -265,8 +298,18 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
 
         cache_item = self.cache[idx]
         self._check_alignment(item, cache_item, idx)
+        if "observation.point_cloud" not in cache_item and "observation.point_cloud_indices" in cache_item:
+            episode_index = self._to_int(cache_item["episode_index"])
+            frame_index = self._to_int(cache_item["frame_index"])
+            indices = cache_item["observation.point_cloud_indices"].detach().cpu().numpy().astype(np.int64)
+            point_clouds = self._episode_point_clouds(episode_index)
+            point_cloud = np.asarray(point_clouds[frame_index][indices], dtype=np.float32).copy()
+            cache_item["observation.point_cloud"] = torch.from_numpy(point_cloud)
         for key in self.pointseg_keys:
-            item[key] = cache_item[key]
+            if key in cache_item:
+                item[key] = cache_item[key]
+        if "observation.point_cloud_indices" in cache_item:
+            item["observation.point_cloud_indices"] = cache_item["observation.point_cloud_indices"]
         return item
 
 
@@ -285,8 +328,17 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         return dataset
 
     strict = os.environ.get("SONG_POINTSEG_CACHE_STRICT", "1") != "0"
+    root = Path(getattr(dataset, "root", dataset.meta.root))
+    point_cloud_dir = root / "point_clouds"
+    mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     logging.info(f"Injecting Song pointseg temporal cache from {cache_dir}")
-    return PointSegCacheInjectedDataset(dataset, cache_dir=cache_dir, strict=strict)
+    return PointSegCacheInjectedDataset(
+        dataset,
+        cache_dir=cache_dir,
+        point_cloud_dir=point_cloud_dir,
+        strict=strict,
+        mmap_mode=mmap_mode,
+    )
 
 
 def maybe_wrap_point_cloud_memmap_dataset(dataset):
@@ -495,7 +547,7 @@ def ood_case_inference(
     batch,
     step,
     output_dir: str | Path | None = None,
-    ood_num_points: int = 50000,
+    ood_num_points: int = 10000,
     ood_tasks: dict[int, str] | list[str] | tuple[str, ...] | None = None,
 ):
     ######OOD task may differ from the training batch, so rebuild language tokens with processor.
@@ -1331,7 +1383,7 @@ if __name__ == "__main__":
 # batch['task'][0] = "Place the Red Cube on the Blue Cube"
 # scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new4.ply",)
 # scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
-# scene_point_cloud = random_repeat_sample_points(scene_point_cloud, 50000)
+# scene_point_cloud = random_repeat_sample_points(scene_point_cloud, 10000)
 # batch['observation.point_cloud'][0] = torch.tensor(scene_point_cloud).to("cuda")
 # action_pred = self.predict_action_chunk(batch)
 # vis_umi_data(action_pred.cpu().numpy()[0],batch['observation.point_cloud'].cpu().numpy()[0])

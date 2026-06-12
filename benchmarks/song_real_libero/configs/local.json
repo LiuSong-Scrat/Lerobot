@@ -28,7 +28,7 @@
   },
   "hdf5": {
     "camera_names": "overhead,hand",
-    "max_points": 50000,
+    "max_points": 10000,
     "pose_frame": "world",
     "camera_to_world_preset": "humanhand_l515",
     "segments": "",
@@ -50,7 +50,10 @@
     "fps": 30,
     "workers": 4,
     "repo_id": "song_real_libero_local",
-    "point_cloud_key": "observations/cloud_rgb/overhead"
+    "point_cloud_key": "observations/cloud_rgb/overhead",
+    "num_points": 10000,
+    "gripper_points": 500,
+    "point_cloud_storage": "zarr"
   },
   "cache": {
     "current_points": 8192,
@@ -76,7 +79,7 @@
   "infer": {
     "obs_path": "",
     "ply_path": "",
-    "num_points": 50000,
+    "num_points": 10000,
     "device": "cuda",
     "visualize": false
   }
