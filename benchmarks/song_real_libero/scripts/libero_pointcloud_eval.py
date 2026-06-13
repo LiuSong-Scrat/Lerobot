@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -68,6 +68,7 @@ def run_episode(
 ) -> dict[str, Any]:
     control = cfg["control"]
     max_steps = control.get("max_steps")
+    env.reset()
     raw_obs = env.set_init_state(init_state)
     for _ in range(5):
         raw_obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
@@ -81,10 +82,11 @@ def run_episode(
     video_frames: dict[str, list[np.ndarray]] = {}
     max_steps = int(max_steps or getattr(env, "horizon", 500))
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
+    save_video = bool(cfg.get("save_video", True))
+    if save_video:
+        append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
 
     for step in range(max_steps):
-        if cfg.get("save_video", False):
-            append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
         point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
             env,
             raw_obs,
@@ -127,6 +129,8 @@ def run_episode(
             float(control["gripper_threshold"]),
         )
         raw_obs, reward, done, _ = env.step(libero_action)
+        if save_video:
+            append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
         success = bool(env.check_success())
         libero_actions.append(libero_action)
         pose_actions.append(pose_action)
@@ -156,7 +160,7 @@ def main() -> None:
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes"))
     cfg["device"] = cfg_get(cfg, args.device, "device")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points"))
-    cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video"))
+    cfg["save_video"] = bool(args.save_video)
     ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
     output_dir = Path(args.output_dir or cfg["output_dir"]).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

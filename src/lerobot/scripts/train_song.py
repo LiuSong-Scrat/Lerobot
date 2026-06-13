@@ -41,8 +41,13 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.song_pointseg import (
+    DEFAULT_FUTURE_OFFSETS,
+    PseudoLabelConfig,
     ROLE_FOREGROUND,
     SongPointSegCachedDataset,
+    SongTemporalPointCloudDataset,
+    force_small_current_clouds_foreground,
+    generate_pseudo_labels,
     open_episode_point_clouds,
     song_pointseg_collate,
     write_role_ply,
@@ -313,19 +318,169 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         return item
 
 
-def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | None = None):
+class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
+    """Adds temporal point-cloud fields for batch-level online pseudo-label generation."""
+
+    transient_keys = (
+        "observation.point_cloud_future",
+        "observation.point_cloud_future_is_pad",
+        "future_is_pad",
+        "future_offsets",
+        "future_ee_poses",
+    )
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        *,
+        point_cloud_dir: str | Path,
+        policy_cfg: Any,
+        mmap_mode: str = "r",
+    ):
+        self.dataset = SongTemporalPointCloudDataset(
+            dataset,
+            point_cloud_dir=point_cloud_dir,
+            future_offsets=self._future_offsets(policy_cfg),
+            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10_000),
+            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
+            seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
+            mmap_mode=mmap_mode,
+        )
+        self.current_points = int(self.dataset.current_points)
+        default_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(os.environ.get("SONG_POINTSEG_ONLINE_DEVICE", default_device))
+        self.pseudo_config = PseudoLabelConfig(
+            nn_chunk_size=self._env_int("SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE", 512)
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["device"] = torch.device("cpu")
+        return state
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None or str(value).strip() == "":
+            return int(default)
+        return int(value)
+
+    @staticmethod
+    def _future_offsets(policy_cfg: Any) -> tuple[int, ...]:
+        env_value = os.environ.get("SONG_POINTSEG_ONLINE_FUTURE_OFFSETS")
+        if env_value:
+            offsets = tuple(int(part) for part in env_value.replace(";", ",").split(",") if part.strip())
+        else:
+            offsets = DEFAULT_FUTURE_OFFSETS
+        chunk_size = int(getattr(policy_cfg, "chunk_size", max(offsets) + 1))
+        offsets = tuple(offset for offset in offsets if 0 < int(offset) < chunk_size)
+        if not offsets:
+            offsets = (1,)
+        return offsets
+
+    def __getitem__(self, idx):
+        return dict(self.dataset[idx])
+
+    def make_collate_fn(self):
+        return OnlinePointSegBatchCollator(
+            current_points=self.current_points,
+            device=self.device,
+            pseudo_config=self.pseudo_config,
+        )
+
+
+class OnlinePointSegBatchCollator:
+    """Collate samples, compute Song pseudo labels once for the whole batch, and drop future fields."""
+
+    transient_keys = OnlinePointSegPseudoDataset.transient_keys
+
+    def __init__(self, *, current_points: int, device: torch.device, pseudo_config: PseudoLabelConfig):
+        self.current_points = int(current_points)
+        self.device = torch.device(device)
+        self.pseudo_config = pseudo_config
+
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        batch = song_pointseg_collate(samples)
+        current_pc = batch["observation.point_cloud"].to(device=self.device, dtype=torch.float32)
+        future_pc = batch["observation.point_cloud_future"].to(device=self.device, dtype=torch.float32)
+        future_poses = batch["future_ee_poses"].to(device=self.device, dtype=torch.float32)
+        future_is_pad = batch["future_is_pad"].to(device=self.device, dtype=torch.bool)
+        current_is_pad = batch.get("observation.point_cloud_is_pad")
+        if torch.is_tensor(current_is_pad):
+            current_is_pad = current_is_pad.to(device=self.device, dtype=torch.bool)
+        future_point_is_pad = batch.get("observation.point_cloud_future_is_pad")
+        if torch.is_tensor(future_point_is_pad):
+            future_point_is_pad = future_point_is_pad.to(device=self.device, dtype=torch.bool)
+        with torch.inference_mode():
+            pseudo = generate_pseudo_labels(
+                current_pc,
+                future_pc,
+                future_poses,
+                future_is_pad,
+                current_is_pad=current_is_pad,
+                future_point_is_pad=future_point_is_pad,
+                config=self.pseudo_config,
+            )
+            pseudo = force_small_current_clouds_foreground(
+                pseudo,
+                current_pc,
+                self.current_points,
+                current_is_pad,
+            )
+        for source_key, dest_key in (
+            ("labels", "pointseg.labels"),
+            ("weights", "pointseg.weights"),
+            ("class_scores", "pointseg.class_scores"),
+            ("foreground_score", "pointseg.foreground_score"),
+        ):
+            if source_key in pseudo:
+                batch[dest_key] = pseudo[source_key].detach().cpu()
+        for key in self.transient_keys:
+            batch.pop(key, None)
+        return batch
+
+
+def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | None = None, policy_cfg=None):
+    def maybe_online_fallback(reason: str):
+        if not bool(getattr(policy_cfg, "pointseg_enable", False)):
+            logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
+            return dataset
+        if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
+            logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
+            return dataset
+        root = Path(getattr(dataset, "root", dataset.meta.root))
+        point_cloud_dir = root / "point_clouds"
+        if not point_cloud_dir.is_dir():
+            logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
+            return dataset
+        mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
+        logging.info(
+            f"{reason}; computing Song pointseg pseudo labels online from {point_cloud_dir}. "
+            "This matches the offline cache supervision but is much slower."
+        )
+        return OnlinePointSegPseudoDataset(
+            dataset,
+            point_cloud_dir=point_cloud_dir,
+            policy_cfg=policy_cfg,
+            mmap_mode=mmap_mode,
+        )
+
     if cache_dir_value is None:
         cache_dir_value = ""
     cache_dir_value = str(cache_dir_value).strip()
     if not cache_dir_value or cache_dir_value.lower() in {"0", "false", "none"}:
-        logging.info("Song pointseg cache is disabled; using online/fallback pointseg priors.")
-        return dataset
+        return maybe_online_fallback("Song pointseg cache is disabled")
 
     cache_dir = Path(cache_dir_value)
     manifest = cache_dir / "manifest.json"
     if not manifest.exists():
-        logging.info(f"Song pointseg cache not found at {cache_dir}; using online/fallback pointseg priors.")
-        return dataset
+        return maybe_online_fallback(f"Song pointseg cache not found at {cache_dir}")
 
     strict = os.environ.get("SONG_POINTSEG_CACHE_STRICT", "1") != "0"
     root = Path(getattr(dataset, "root", dataset.meta.root))
@@ -342,7 +497,7 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
 
 
 def maybe_wrap_point_cloud_memmap_dataset(dataset):
-    if isinstance(dataset, PointSegCacheInjectedDataset):
+    if isinstance(dataset, (PointSegCacheInjectedDataset, OnlinePointSegPseudoDataset)):
         return dataset
     root = Path(getattr(dataset, "root", dataset.meta.root))
     point_cloud_dir = root / "point_clouds"
@@ -351,6 +506,25 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset):
     logging.info(f"Loading point clouds from per-episode memmap files in {point_cloud_dir}")
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
+
+
+def _find_wrapped_dataset(dataset, cls):
+    current = dataset
+    while current is not None:
+        if isinstance(current, cls):
+            return current
+        next_dataset = getattr(current, "dataset", None)
+        if next_dataset is None or next_dataset is current:
+            return None
+        current = next_dataset
+    return None
+
+
+def make_song_train_collate_fn(dataset):
+    online = _find_wrapped_dataset(dataset, OnlinePointSegPseudoDataset)
+    if online is not None:
+        return online.make_collate_fn()
+    return song_pointseg_collate
 
 
 def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
@@ -926,7 +1100,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -935,7 +1109,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir)
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -1069,16 +1243,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
+    collate_fn = make_song_train_collate_fn(dataset)
+    dataloader_num_workers = int(cfg.num_workers)
+    if is_main_process and isinstance(collate_fn, OnlinePointSegBatchCollator):
+        logging.info("Song pointseg online pseudo labels will be computed once per DataLoader batch.")
+    if isinstance(collate_fn, OnlinePointSegBatchCollator) and collate_fn.device.type == "cuda" and dataloader_num_workers > 0:
+        if is_main_process:
+            logging.warning(
+                "Song pointseg online pseudo labels use CUDA; setting DataLoader num_workers=0 "
+                "to avoid CUDA initialization in forked worker processes."
+            )
+        dataloader_num_workers = 0
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=cfg.num_workers,
+        num_workers=dataloader_num_workers,
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-        collate_fn=song_pointseg_collate,
+        prefetch_factor=2 if dataloader_num_workers > 0 else None,
+        collate_fn=collate_fn,
     )
 
     # Prepare everything with accelerator

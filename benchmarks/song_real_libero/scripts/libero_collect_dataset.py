@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--demo-root", type=Path, default=None)
     parser.add_argument("--demo-file", type=Path, action="append", default=None)
-    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--output-root", type=Path, default="/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/temp")
     parser.add_argument("--repo-id", default=None)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-frames-per-demo", type=int, default=None)
@@ -816,6 +816,58 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
     return {"job_index": int(job["job_index"]), "tmp_path": str(artifact_dir)}
 
 
+def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect multiple demos for one LIBERO task while reusing a single environment."""
+    cfg = dict(job["cfg"])
+    suite_name = str(job["suite"])
+    cfg["suite"] = suite_name
+    ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+
+    from libero.libero import benchmark
+
+    suite_cls = benchmark.get_benchmark_dict()[suite_name]
+    suite = suite_cls()
+    task_id = int(job["task_id"])
+    env, task = make_libero_env(
+        suite,
+        task_id,
+        int(cfg["observation_height"]),
+        int(cfg["observation_width"]),
+        render_camera_names_from_config(cfg),
+    )
+
+    results: list[dict[str, Any]] = []
+    try:
+        for episode_job in job["episodes"]:
+            demo_file = Path(episode_job["demo_file"])
+            demo_name = str(episode_job["demo_name"])
+            states, actions = load_demo_group(demo_file, demo_name)
+            episode = collect_demo_episode(
+                env=env,
+                states=states,
+                actions=actions,
+                task_language=task.language,
+                cfg=cfg,
+                max_frames=episode_job.get("max_frames"),
+                episode_seed=int(episode_job["episode_seed"]),
+            )
+            record = make_episode_record(
+                suite_name=suite_name,
+                task_id=task_id,
+                task=task,
+                demo_file=demo_file,
+                demo_name=demo_name,
+                frames=len(episode["actions"]),
+            )
+            artifact_dir = Path(episode_job["tmp_path"])
+            save_episode_artifact(artifact_dir, episode, record, cfg)
+            results.append({"job_index": int(episode_job["job_index"]), "tmp_path": str(artifact_dir)})
+    finally:
+        env.close()
+
+    return results
+
+
 def save_collected_temp_episode(
     *,
     temp_path: Path,
@@ -948,8 +1000,10 @@ def main() -> None:
         "episodes": [],
     }
 
-    jobs: list[dict[str, Any]] = []
+    episode_jobs: list[dict[str, Any]] = []
+    task_jobs: list[dict[str, Any]] = []
     job_index = 0
+    task_job_index = 0
     benchmark_dict = benchmark.get_benchmark_dict()
     for suite_index, suite_name in enumerate(suite_names):
         suite_cls = benchmark_dict[suite_name]
@@ -969,65 +1023,69 @@ def main() -> None:
             demo_names = iter_demo_group_names(demo_file)[: int(cfg["episodes"])]
             if not demo_names:
                 raise RuntimeError(f"No usable demos with states found in {demo_file}")
+            task_episode_jobs = []
             for converted_for_task, demo_name in enumerate(demo_names):
-                jobs.append(
-                    {
-                        "job_index": job_index,
-                        "suite": suite_name,
-                        "task_id": task_id,
-                        "demo_file": str(demo_file),
-                        "demo_name": demo_name,
-                        "episode_seed": suite_index * 10_000_000 + task_id * 100000 + converted_for_task * 1000,
-                        "max_frames": max_frames,
-                        "cfg": suite_cfg,
-                        "tmp_path": str(tmp_dir / f"episode_job_{job_index:06d}_{suite_name}_task_{task_id:03d}"),
-                    }
-                )
+                episode_job = {
+                    "job_index": job_index,
+                    "suite": suite_name,
+                    "task_id": task_id,
+                    "demo_file": str(demo_file),
+                    "demo_name": demo_name,
+                    "episode_seed": suite_index * 10_000_000 + task_id * 100000 + converted_for_task * 1000,
+                    "max_frames": max_frames,
+                    "cfg": suite_cfg,
+                    "tmp_path": str(tmp_dir / f"episode_job_{job_index:06d}_{suite_name}_task_{task_id:03d}"),
+                }
+                episode_jobs.append(episode_job)
+                task_episode_jobs.append(episode_job)
                 job_index += 1
+            task_jobs.append(
+                {
+                    "task_job_index": task_job_index,
+                    "suite": suite_name,
+                    "task_id": task_id,
+                    "cfg": suite_cfg,
+                    "episodes": task_episode_jobs,
+                }
+            )
+            task_job_index += 1
 
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    results: dict[int, Path] = {}
     if int(cfg["num_workers"]) <= 1:
-        for job in tqdm(jobs, desc="Collecting LIBERO episodes", unit="episode"):
-            result = collect_episode_worker(job)
-            record = save_collected_temp_episode(
-                temp_path=Path(result["tmp_path"]),
-                dataset=dataset,
-                vis_dir=vis_dir,
-                cfg=cfg,
-            )
-            summary["episodes"].append(record)
-            print(
-                f"[OK] suite={record['suite']} task={record['task_id']} demo={record['demo_name']} "
-                f"frames={record['frames']} episode_index={record['episode_index']}"
-            )
+        for task_job in tqdm(task_jobs, desc="Collecting LIBERO tasks", unit="task"):
+            for result in collect_task_worker(task_job):
+                results[int(result["job_index"])] = Path(result["tmp_path"])
     else:
-        print(f"[info] collecting {len(jobs)} LIBERO episode(s) with {cfg['num_workers']} worker(s)")
-        results: dict[int, Path] = {}
+        print(
+            f"[info] collecting {len(episode_jobs)} LIBERO episode(s) across {len(task_jobs)} task job(s) "
+            f"with {cfg['num_workers']} worker(s)"
+        )
         with ProcessPoolExecutor(
             max_workers=int(cfg["num_workers"]),
             mp_context=mp.get_context("spawn"),
         ) as executor:
-            futures = [executor.submit(collect_episode_worker, job) for job in jobs]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO episodes", unit="episode"):
-                result = future.result()
-                results[int(result["job_index"])] = Path(result["tmp_path"])
+            futures = [executor.submit(collect_task_worker, task_job) for task_job in task_jobs]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO tasks", unit="task"):
+                for result in future.result():
+                    results[int(result["job_index"])] = Path(result["tmp_path"])
 
-        for job in jobs:
-            temp_path = results[int(job["job_index"])]
-            record = save_collected_temp_episode(
-                temp_path=temp_path,
-                dataset=dataset,
-                vis_dir=vis_dir,
-                cfg=cfg,
-            )
-            summary["episodes"].append(record)
-            print(
-                f"[OK] suite={record['suite']} task={record['task_id']} demo={record['demo_name']} "
-                f"frames={record['frames']} episode_index={record['episode_index']}"
-            )
+    for episode_job in episode_jobs:
+        temp_path = results[int(episode_job["job_index"])]
+        record = save_collected_temp_episode(
+            temp_path=temp_path,
+            dataset=dataset,
+            vis_dir=vis_dir,
+            cfg=cfg,
+        )
+        summary["episodes"].append(record)
+        print(
+            f"[OK] suite={record['suite']} task={record['task_id']} demo={record['demo_name']} "
+            f"frames={record['frames']} episode_index={record['episode_index']}"
+        )
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 

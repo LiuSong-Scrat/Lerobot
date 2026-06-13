@@ -78,6 +78,8 @@ data/libero_lerobot_dataset/
 
 Pointseg cache v2 is index-only: each shard stores `point_indices`, pseudo labels, weights, and scores. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
 
+When `--policy.pointseg_enable=true` and `--pointseg_sample_cache_dir` is omitted or points to a missing cache, training now computes the same motion-prior pseudo labels online once per DataLoader batch from current/future point clouds. This fallback uses CUDA by default when available; if CUDA is used, the training script forces DataLoader `num_workers=0` to avoid CUDA initialization inside forked worker processes. Set `SONG_POINTSEG_ONLINE=0` to disable this fallback, or set `SONG_POINTSEG_ONLINE_DEVICE=cpu` to keep multi-worker CPU loading. Tune `SONG_POINTSEG_ONLINE_CURRENT_POINTS`, `SONG_POINTSEG_ONLINE_FUTURE_POINTS`, and `SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE` for debugging.
+
 ## Training
 
 Resume from the local `ep_vla` checkpoint with the benchmark defaults:
@@ -523,14 +525,14 @@ conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg
 
 ## ###########Train Policy################
 ```bash
+SONG_POINTSEG_ONLINE_DEVICE=cuda \
 python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.type=smolvla \
   --policy.push_to_hub=false \
   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
-  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_pointseg_cache \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
-  --batch_size=4 \
+  --batch_size=8 \
   --steps=500000 \
   --log_freq=1 \
   --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh \
@@ -540,7 +542,7 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --wandb.disable_artifact=true \
   --save_freq=1000 \
   --eval_freq=1000 \
-  --num_workers=4 \
+  --num_workers=0 \
   --policy.pointseg_enable=true \
   --policy.pointseg_backbone_type=litept \
   --policy.pointseg_grid_size=0.01 \
@@ -548,7 +550,7 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.pointseg_aux_loss_weight=0.002 \
   --policy.pointseg_foreground_ratio=0.08 \
   --policy.pointseg_background_ratio=0.08 \
-  --policy.pointseg_min_foreground_points=4000 \
+  --policy.pointseg_min_foreground_points=500 \
   --policy.pointseg_min_background_points=0 \
   --policy.pointseg_use_temporal_priors_as_input=false \
   --policy.pointseg_use_pseudo_selection=false \
@@ -570,10 +572,10 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --suite libero_spatial \
   --suite libero_object \
   --all-tasks \
-  --episodes 1 \
+  --episodes 25 \
   --num-workers 4 \
   --point-cloud-storage zarr \
-  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/temp_dataset \
   --repo-id song_libero_4suite_pointcloud \
   --save-video \
   --vis-count 2 
@@ -584,3 +586,18 @@ python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
   --output-dir benchmarks/song_real_libero/data/libero_pointseg_cache \
   --overwrite
+
+
+  ```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
+  benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
+  --suite libero_spatial \
+  --suite libero_object \
+  --all-tasks \
+  --episodes 10 \
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
+```
+
+`libero_pointcloud_eval.py` saves rollout videos by default. Add `--no-save-video` to disable video output for faster evaluation.
