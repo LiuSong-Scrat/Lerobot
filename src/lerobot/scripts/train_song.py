@@ -404,9 +404,14 @@ class OnlinePointSegBatchCollator:
         self.current_points = int(current_points)
         self.device = torch.device(device)
         self.pseudo_config = pseudo_config
+        self.profile_freq = int(os.environ.get("SONG_POINTSEG_PROFILE_FREQ", "0") or 0)
+        self._calls = 0
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        self._calls += 1
+        t0 = time.perf_counter()
         batch = song_pointseg_collate(samples)
+        t1 = time.perf_counter()
         current_pc = batch["observation.point_cloud"].to(device=self.device, dtype=torch.float32)
         future_pc = batch["observation.point_cloud_future"].to(device=self.device, dtype=torch.float32)
         future_poses = batch["future_ee_poses"].to(device=self.device, dtype=torch.float32)
@@ -416,7 +421,14 @@ class OnlinePointSegBatchCollator:
             current_is_pad = current_is_pad.to(device=self.device, dtype=torch.bool)
         future_point_is_pad = batch.get("observation.point_cloud_future_is_pad")
         if torch.is_tensor(future_point_is_pad):
-            future_point_is_pad = future_point_is_pad.to(device=self.device, dtype=torch.bool)
+            # Fixed-size zarr point clouds produce an all-False mask. Dropping it avoids a
+            # per-KNN CUDA synchronization in the fast pointops path.
+            future_point_is_pad = (
+                future_point_is_pad.to(device=self.device, dtype=torch.bool)
+                if bool(future_point_is_pad.any().item())
+                else None
+            )
+        t2 = time.perf_counter()
         with torch.inference_mode():
             pseudo = generate_pseudo_labels(
                 current_pc,
@@ -433,6 +445,7 @@ class OnlinePointSegBatchCollator:
                 self.current_points,
                 current_is_pad,
             )
+        t3 = time.perf_counter()
         for source_key, dest_key in (
             ("labels", "pointseg.labels"),
             ("weights", "pointseg.weights"),
@@ -443,6 +456,19 @@ class OnlinePointSegBatchCollator:
                 batch[dest_key] = pseudo[source_key].detach().cpu()
         for key in self.transient_keys:
             batch.pop(key, None)
+        t4 = time.perf_counter()
+        if self.profile_freq > 0 and self._calls % self.profile_freq == 0:
+            logging.info(
+                "Song pointseg online profile call=%s device=%s collate_s=%.3f to_device_s=%.3f "
+                "pseudo_s=%.3f cpu_copy_s=%.3f future_mask=%s",
+                self._calls,
+                self.device,
+                t1 - t0,
+                t2 - t1,
+                t3 - t2,
+                t4 - t3,
+                future_point_is_pad is not None,
+            )
         return batch
 
 

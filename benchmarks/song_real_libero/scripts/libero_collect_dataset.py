@@ -729,6 +729,7 @@ def collect_demo_episode(
             drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
             shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
             widths_are_normalized=False,
+            gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         )
     else:
         point_clouds = world_point_cloud_to_current_eff(point_clouds_world, world_ee_poses)

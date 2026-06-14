@@ -419,6 +419,12 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --suite libero_10 \
   --all-tasks \
   --episodes 10 \
+  --action-index 0 \
+  --exec-action-steps 16 \
+  --no-replan-every-step \
+  --gripper-wait-until-reached \
+  --gripper-wait-tolerance 0.004 \
+  --gripper-wait-max-steps 12 \
   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
 ```
 
@@ -521,11 +527,42 @@ conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg
 ```
 
 
+## ###########Train Policy################   Resume
+python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
+  --policy.load_vlm_weights=false \
+  --batch_size=8 \
+  --steps=500000 \
+  --log_freq=1 \
+  --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post \
+  --job_name=song_libero_pointseg_fresh1 \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --wandb.disable_artifact=true \
+  --save_freq=5000 \
+  --eval_freq=5000 \
+  --num_workers=0 \
+  --policy.pointseg_enable=true \
+  --policy.pointseg_backbone_type=litept \
+  --policy.pointseg_grid_size=0.01 \
+  --policy.pointseg_feature_dim=64 \
+  --policy.pointseg_aux_loss_weight=0.002 \
+  --policy.pointseg_foreground_ratio=0.08 \
+  --policy.pointseg_background_ratio=0.08 \
+  --policy.pointseg_min_foreground_points=500 \
+  --policy.pointseg_min_background_points=0 \
+  --policy.pointseg_use_temporal_priors_as_input=false \
+  --policy.pointseg_use_pseudo_selection=false \
+  --policy.worldflow_enable=false \
+  --policy.worldflow_se3_head_enable=false \
+  --policy.se3_enable=false \
+  --policy.se3_final_correction_enable=false
 
-
-## ###########Train Policy################
+## ###########Train Policy################ Full Train
 ```bash
-SONG_POINTSEG_ONLINE_DEVICE=cuda \
 python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.type=smolvla \
   --policy.push_to_hub=false \
@@ -540,8 +577,8 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.device=cuda \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
-  --save_freq=1000 \
-  --eval_freq=1000 \
+  --save_freq=5000 \
+  --eval_freq=5000 \
   --num_workers=0 \
   --policy.pointseg_enable=true \
   --policy.pointseg_backbone_type=litept \
@@ -561,7 +598,7 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 ```
 
 ### #######################
-### #######################
+### #######################Data Colletct#############
 
 
 ```bash
@@ -580,6 +617,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --save-video \
   --vis-count 2 
 ```
+### #######################Prior Cache Generation#############
 
 python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.repo_id song_libero_pointcloud \
@@ -588,6 +626,7 @@ python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --overwrite
 
 
+### #######################Benchmark Eval#############
   ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
@@ -597,7 +636,23 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --suite libero_object \
   --all-tasks \
   --episodes 10 \
+  --action-index 0 \
+  --exec-action-steps 8 \
+  --no-replan-every-step \
+  --gripper-wait-until-reached \
+  --gripper-wait-tolerance 0.004 \
+  --gripper-wait-max-steps 12 \
+  --save-video \
+  --render-mode viewer3d \
   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
 ```
 
+
 `libero_pointcloud_eval.py` saves rollout videos by default. Add `--no-save-video` to disable video output for faster evaluation.
+By default evaluation predicts one SmolVLA action chunk and executes the first 16 actions before replanning. Gripper execution follows the predicted continuous gripper width from the same action row as the arm target, with no smoothing, thresholding, deadband, or artificial open/close labels. When the gripper target width changes, the runner repeats that same action row until the measured gripper width reaches `gripper_wait_tolerance` or `gripper_wait_max_steps` is exhausted, so the arm does not advance to the next chunk row before the close/open command has been applied. Each episode saves `model_pose_actions.npy`, `gripper_targets.npy`, `gripper_actuals.npy`, `gripper_width_errors.npy`, `gripper_wait_flags.npy`, and `gripper_progress_indices.npy` for debugging this alignment.
+During interactive evaluation, press `v` in the terminal to save the latest predicted UMI action chunk visualization under `<output-dir>/keyboard_vis/`. The default mode writes PLY/NPZ files and is safe for `MUJOCO_GL=egl`; use `--keyboard-vis-mode window` only on a local desktop session with working Open3D/GLX.
+
+For local 3D debugging on a desktop session, use the MuJoCo viewer mode instead of EGL:
+
+`--headed` is equivalent to `--render-mode viewer3d`. Use `--render-mode onscreen` only if you want robosuite's OpenCV camera window instead of the interactive MuJoCo 3D viewer.
+Do not set `PYOPENGL_PLATFORM=glfw`; robosuite may still initialize an EGL context for offscreen RGB-D, and that combination causes an import error.

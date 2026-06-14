@@ -407,7 +407,7 @@ class SmolVLA_ModelInference:
         gripper_template: str = "reap",
         gripper_drop_strategy: str = "tail",
         gripper_shuffle_points: bool = False,
-        gripper_qpos_max_width: float = 0.04,
+        gripper_qpos_max_width: float = 0.08,
     ) -> np.ndarray:
         """Run one real-robot style inference step.
 
@@ -701,7 +701,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-drop-strategy", choices=("tail", "random", "near_gripper"), default="tail")
     parser.add_argument("--gripper-shuffle-points", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gripper-width-percent", type=float, default=1.0)
-    parser.add_argument("--gripper-qpos-max-width", type=float, default=0.04)
+    parser.add_argument("--gripper-qpos-max-width", type=float, default=0.08)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--save-trajectory-ply", action=argparse.BooleanOptionalAction, default=True)

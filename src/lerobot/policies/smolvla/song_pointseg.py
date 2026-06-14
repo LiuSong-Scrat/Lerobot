@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import warnings
 from bisect import bisect_right
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,13 @@ POINTSEG_CACHE_LABEL_FIELDS = (
 )
 
 _POINTOPS_KNN_FAILED = False
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -672,20 +681,71 @@ def _use_pointops_knn(device: torch.device) -> bool:
     )
 
 
-def _nearest_distances_pointops(query: Tensor, target: Tensor) -> Tensor:
+def _require_pointops_knn(device: torch.device) -> bool:
+    return device.type == "cuda" and _env_flag("SONG_POINTSEG_REQUIRE_POINTOPS", True)
+
+
+def _pointops_required_error() -> RuntimeError:
+    if _pointops_knn_query is None:
+        reason = "pointops.knn_query could not be imported"
+    elif _POINTOPS_KNN_FAILED:
+        reason = "pointops KNN was disabled by an earlier runtime failure"
+    else:
+        reason = "pointops KNN is unavailable"
+    return RuntimeError(
+        f"CUDA Song pointseg KNN requires pointops, but {reason}. "
+        "Set SONG_POINTSEG_REQUIRE_POINTOPS=0 to allow the slower torch GEMM fallback."
+    )
+
+
+def _nearest_distances_pointops(query: Tensor, target: Tensor, target_is_pad: Tensor | None = None) -> Tensor:
     """Return exact nearest L2 distance using the pointops CUDA KNN kernel."""
     group_count, query_count = query.shape[:2]
-    target_count = target.shape[1]
-    query_flat = query.reshape(group_count * query_count, 3).contiguous()
-    target_flat = target.reshape(group_count * target_count, 3).contiguous()
-    query_offset = (
-        torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * query_count
-    ).contiguous()
-    target_offset = (
-        torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * target_count
-    ).contiguous()
-    _, dist = _pointops_knn_query(1, target_flat, target_offset, query_flat, query_offset)
-    return dist.reshape(group_count, query_count)
+    if target_is_pad is not None:
+        target_is_pad = target_is_pad.to(device=query.device, dtype=torch.bool)
+        if target_is_pad.shape != target.shape[:2]:
+            raise ValueError(f"Expected target_is_pad shape {target.shape[:2]}, got {target_is_pad.shape}.")
+        if not bool(target_is_pad.any().item()):
+            target_is_pad = None
+
+    if target_is_pad is None:
+        target_count = target.shape[1]
+        query_flat = query.reshape(group_count * query_count, 3).contiguous()
+        target_flat = target.reshape(group_count * target_count, 3).contiguous()
+        query_offset = (
+            torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * query_count
+        ).contiguous()
+        target_offset = (
+            torch.arange(1, group_count + 1, device=query.device, dtype=torch.int32) * target_count
+        ).contiguous()
+        dist_out = None
+    else:
+        target_counts = (~target_is_pad).sum(dim=1)
+        valid_group = target_counts > 0
+        dist_out = query.new_full((group_count, query_count), float("inf"))
+        if not bool(valid_group.any().item()):
+            return dist_out
+
+        query = query[valid_group].contiguous()
+        target = target[valid_group].contiguous()
+        target_is_pad = target_is_pad[valid_group].contiguous()
+        target_counts = target_counts[valid_group]
+        valid_group_count = int(target_counts.numel())
+        query_flat = query.reshape(valid_group_count * query_count, 3).contiguous()
+        target_flat = target[~target_is_pad].reshape(-1, 3).contiguous()
+        query_offset = (
+            torch.arange(1, valid_group_count + 1, device=query.device, dtype=torch.int32) * query_count
+        ).contiguous()
+        target_offset = torch.cumsum(target_counts.to(dtype=torch.int32), dim=0).contiguous()
+
+    device_ctx = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
+    with device_ctx:
+        _, dist = _pointops_knn_query(1, target_flat, target_offset, query_flat, query_offset)
+    dist = dist.reshape(query.shape[0], query_count)
+    if dist_out is None:
+        return dist
+    dist_out[valid_group] = dist
+    return dist_out
 
 
 def _nearest_distances_from_grouped_queries(
@@ -696,17 +756,24 @@ def _nearest_distances_from_grouped_queries(
     query: (G, N, 3), target: (G, M, 3)
     """
     global _POINTOPS_KNN_FAILED
-    has_target_mask = target_is_pad is not None and bool(target_is_pad.any().item())
-    if _use_pointops_knn(query.device) and not has_target_mask:
+    if _use_pointops_knn(query.device):
         try:
-            return _nearest_distances_pointops(query, target)
+            return _nearest_distances_pointops(query, target, target_is_pad)
         except Exception as exc:
+            if _require_pointops_knn(query.device):
+                raise RuntimeError(
+                    "pointops KNN failed while computing Song pointseg motion priors. "
+                    "Keeping the fast CUDA path strict prevents silent mid-training slowdowns; "
+                    "set SONG_POINTSEG_REQUIRE_POINTOPS=0 to allow the slower torch GEMM fallback."
+                ) from exc
             _POINTOPS_KNN_FAILED = True
             warnings.warn(
                 f"pointops KNN failed; falling back to torch GEMM nearest-neighbor. Error: {exc}",
                 RuntimeWarning,
                 stacklevel=2,
             )
+    elif _require_pointops_knn(query.device):
+        raise _pointops_required_error()
 
     target_t = target.transpose(1, 2).contiguous()
     dist_sq = torch.bmm(query, target_t)
@@ -903,6 +970,8 @@ def compute_motion_priors(
             raise ValueError(
                 f"Expected future_point_is_pad shape {future_pc.shape[:3]}, got {future_point_is_pad.shape}."
             )
+        if not bool(future_point_is_pad.any().item()):
+            future_point_is_pad = None
     current_xyz = current_pc[..., :3].to(dtype=torch.float32)
     future_xyz = future_pc[..., :3].to(device=current_pc.device, dtype=torch.float32)
     future_poses = future_poses.to(device=current_pc.device, dtype=torch.float32)

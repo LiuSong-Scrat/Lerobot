@@ -79,6 +79,15 @@ def render_camera_names_from_config(cfg: dict[str, Any]) -> list[str]:
     return merged
 
 
+def normalize_render_camera_name(camera_name: str | None, fallback: str | None = None) -> str | None:
+    if camera_name is None:
+        return normalize_camera_name(fallback) if fallback else None
+    camera_name = str(camera_name).strip()
+    if not camera_name or camera_name.lower() in {"none", "free"}:
+        return None
+    return normalize_camera_name(camera_name)
+
+
 def sample_or_repeat_points(xyzrgb: np.ndarray, num_points: int, seed: int = 0) -> np.ndarray:
     xyzrgb = np.asarray(xyzrgb, dtype=np.float32)
     if xyzrgb.ndim != 2 or xyzrgb.shape[1] != 6:
@@ -93,12 +102,18 @@ def sample_or_repeat_points(xyzrgb: np.ndarray, num_points: int, seed: int = 0) 
     return xyzrgb[indices].astype(np.float32, copy=False)
 
 
-def normalize_gripper_widths(widths: np.ndarray, already_normalized: bool = False) -> np.ndarray:
+def normalize_gripper_widths(
+    widths: np.ndarray,
+    already_normalized: bool = False,
+    max_physical_width: float | None = None,
+) -> np.ndarray:
     widths = np.asarray(widths, dtype=np.float32).reshape(-1).copy()
     if widths.size == 0:
         return widths
     if already_normalized:
         return np.clip(widths, 0.0, 1.0)
+    if max_physical_width is not None and float(max_physical_width) > 0:
+        return np.clip(widths / float(max_physical_width), 0.0, 1.0)
 
     width_range = widths.max() - widths.min()
     if width_range != 0:
@@ -108,11 +123,12 @@ def normalize_gripper_widths(widths: np.ndarray, already_normalized: bool = Fals
     return np.clip(widths, 0.0, 1.0)
 
 
-def gripper_width_percent_from_scalar(width: float, max_physical_width: float = 0.04) -> float:
+def gripper_width_percent_from_scalar(width: float, max_physical_width: float = 0.08) -> float:
     width = float(width)
     if not np.isfinite(width):
         return 0.0
-    if 0.0 <= width <= 0.08:
+    physical_limit = max(float(max_physical_width), 1e-6)
+    if 0.0 <= width <= physical_limit * 1.25:
         return float(np.clip(width / max(max_physical_width, 1e-6), 0.0, 1.0))
     return float(np.clip(width, 0.0, 1.0))
 
@@ -355,9 +371,14 @@ def add_local_gripper_clouds_to_episode(
     drop_strategy: str = "tail",
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
+    gripper_max_width: float | None = None,
 ) -> np.ndarray:
     point_clouds_eff = np.asarray(point_clouds_eff, dtype=np.float32)
-    widths = normalize_gripper_widths(gripper_widths, already_normalized=widths_are_normalized)
+    widths = normalize_gripper_widths(
+        gripper_widths,
+        already_normalized=widths_are_normalized,
+        max_physical_width=gripper_max_width,
+    )
     if len(point_clouds_eff) != len(widths):
         raise ValueError(f"Point cloud frames {len(point_clouds_eff)} != gripper widths {len(widths)}")
     merged = np.empty((len(point_clouds_eff), int(total_points), 6), dtype=np.float32)
@@ -526,10 +547,15 @@ def add_world_gripper_clouds_to_episode(
     drop_strategy: str = "tail",
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
+    gripper_max_width: float | None = None,
 ) -> np.ndarray:
     point_clouds_world = np.asarray(point_clouds_world, dtype=np.float32)
     current_pose9_grippers = np.asarray(current_pose9_grippers, dtype=np.float32)
-    widths = normalize_gripper_widths(gripper_widths, already_normalized=widths_are_normalized)
+    widths = normalize_gripper_widths(
+        gripper_widths,
+        already_normalized=widths_are_normalized,
+        max_physical_width=gripper_max_width,
+    )
     if len(point_clouds_world) != len(current_pose9_grippers):
         raise ValueError(
             f"Point cloud frames {len(point_clouds_world)} != pose frames {len(current_pose9_grippers)}"
@@ -634,13 +660,37 @@ def observation_to_world_point_cloud(
     return point_cloud_world, eef_pose
 
 
-def action_pose9_to_libero(action_pose9_gripper: np.ndarray, trans_scale: float, rot_scale: float, gripper_threshold: float) -> np.ndarray:
+def action_pose9_to_libero(
+    action_pose9_gripper: np.ndarray,
+    trans_scale: float,
+    rot_scale: float,
+    gripper_threshold: float,
+    *,
+    gripper_max_width: float = 0.08,
+    current_eef_pose9_gripper: np.ndarray | None = None,
+) -> np.ndarray:
     action = np.asarray(action_pose9_gripper, dtype=np.float32).reshape(-1)
-    trans = np.clip(action[:3] / max(trans_scale, 1e-6), -1.0, 1.0)
-    rot = rot6d_to_matrix_np(action[3:9])
-    rotvec = R.from_matrix(rot).as_rotvec().astype(np.float32)
+    if current_eef_pose9_gripper is None:
+        delta_pos = action[:3]
+        delta_rot = rot6d_to_matrix_np(action[3:9])
+    else:
+        current_world = pose9_to_homo_np(np.asarray(current_eef_pose9_gripper, dtype=np.float32)[..., :9])
+        relative = pose9_to_homo_np(action[:9])
+        target_world = current_world @ relative
+        delta_pos = target_world[:3, 3] - current_world[:3, 3]
+        delta_rot = target_world[:3, :3] @ current_world[:3, :3].T
+
+    trans = np.clip(delta_pos / max(trans_scale, 1e-6), -1.0, 1.0)
+    rotvec = R.from_matrix(delta_rot).as_rotvec().astype(np.float32)
     rotvec = np.clip(rotvec / max(rot_scale, 1e-6), -1.0, 1.0)
-    gripper = 1.0 if float(action[-1]) >= gripper_threshold else -1.0
+    # LIBERO / robosuite PandaGripper convention is -1=open, 1=closed.
+    # The learned gripper label is stored as physical qpos width, so compare it
+    # in normalized width space to keep config thresholds portable.
+    gripper_width_percent = gripper_width_percent_from_scalar(
+        float(action[-1]),
+        max_physical_width=gripper_max_width,
+    )
+    gripper = -1.0 if gripper_width_percent + 1e-6 >= gripper_threshold else 1.0
     return np.concatenate([trans, rotvec, np.asarray([gripper], dtype=np.float32)]).astype(np.float32)
 
 
@@ -661,21 +711,156 @@ def make_libero_env(
     height: int,
     width: int,
     camera_names: list[str],
+    *,
+    render_mode: str = "offscreen",
+    render_camera: str | None = None,
+    render_gpu_device_id: int = -1,
+    control_delta: bool = True,
 ):
     from libero.libero import get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero.envs.env_wrapper import ControlEnv
 
     task = task_suite.get_task(task_id)
     bddl_file = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     cameras = [normalize_camera_name(camera_name) for camera_name in camera_names]
-    env = OffScreenRenderEnv(
-        bddl_file_name=str(bddl_file),
-        camera_heights=height,
-        camera_widths=width,
-        camera_names=cameras,
-        camera_depths=True,
-    )
+    render_mode = str(render_mode or "offscreen").lower()
+    common_kwargs = {
+        "bddl_file_name": str(bddl_file),
+        "camera_heights": height,
+        "camera_widths": width,
+        "camera_names": cameras,
+        "camera_depths": True,
+    }
+    viewer_camera = normalize_render_camera_name(render_camera, cameras[0])
+    if render_mode in {"viewer3d", "mujoco"}:
+        env = ControlEnv(
+            **common_kwargs,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            render_camera=viewer_camera,
+            render_gpu_device_id=int(render_gpu_device_id),
+        )
+    elif render_mode in {"onscreen", "headed", "human"}:
+        env = ControlEnv(
+            **common_kwargs,
+            has_renderer=True,
+            has_offscreen_renderer=True,
+            render_camera=viewer_camera,
+            render_gpu_device_id=int(render_gpu_device_id),
+        )
+    elif render_mode in {"offscreen", "headless"}:
+        env = OffScreenRenderEnv(**common_kwargs)
+    else:
+        raise ValueError(f"Unsupported LIBERO render_mode: {render_mode}")
     env.reset()
+    # Do not attach Viewer3D here.
+    # run_episode() will reset/set_init_state again, which may replace sim/data.
     for robot in env.robots:
-        robot.controller.use_delta = True
+        robot.controller.use_delta = bool(control_delta)
     return env, task
+
+def attach_mujoco_3d_viewer(env, render_camera="free"):
+    inner_env = env
+
+    while hasattr(inner_env, "env"):
+        next_env = inner_env.env
+        if next_env is inner_env:
+            break
+        inner_env = next_env
+
+    sim = inner_env.sim
+
+    # Current sim/model/data identity.
+    sim_id = id(sim)
+    model_obj = getattr(sim.model, "_model", sim.model)
+    data_obj = getattr(sim.data, "_data", sim.data)
+    model_id = id(model_obj)
+    data_id = id(data_obj)
+
+    existing_viewer = getattr(inner_env, "viewer", None)
+    old_key = getattr(inner_env, "_viewer3d_key", None)
+    new_key = (sim_id, model_id, data_id)
+
+    if existing_viewer is not None and hasattr(existing_viewer, "render") and old_key == new_key:
+        return existing_viewer
+
+    # If reset/set_init_state replaced sim/data, close old viewer and recreate.
+    if existing_viewer is not None and hasattr(existing_viewer, "close"):
+        try:
+            existing_viewer.close()
+        except Exception as e:
+            print("[WARN] failed to close stale Viewer3D:", repr(e))
+        inner_env.viewer = None
+
+    print("[DEBUG] inner_env:", type(inner_env), type(inner_env).__module__)
+    print("[DEBUG] sim:", type(sim), type(sim).__module__)
+    print("[DEBUG] viewer key:", new_key)
+
+    # New robosuite / DeepMind MuJoCo binding backend
+    if type(sim).__module__ == "robosuite.utils.binding_utils":
+        import mujoco
+        import mujoco.viewer
+
+        mj_model = model_obj
+        mj_data = data_obj
+
+        print("[DEBUG] mj_model:", type(mj_model), type(mj_model).__module__)
+        print("[DEBUG] mj_data:", type(mj_data), type(mj_data).__module__)
+        print("[DEBUG] Using mujoco.viewer.launch_passive")
+
+        viewer = mujoco.viewer.launch_passive(
+            mj_model,
+            mj_data,
+            show_left_ui=True,
+            show_right_ui=True,
+        )
+
+        try:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        except Exception as e:
+            print("[WARN] failed to set free camera:", repr(e))
+
+        class PassiveViewerWrapper:
+            def __init__(self, viewer):
+                self.viewer = viewer
+                self.sync_count = 0
+
+            def render(self):
+                self.update()
+
+            def update(self):
+                if self.viewer is not None and self.viewer.is_running():
+                    self.viewer.sync()
+                    self.sync_count += 1
+                    if self.sync_count % 100 == 0:
+                        print("[DEBUG] Viewer3D synced", self.sync_count)
+
+            def close(self):
+                if self.viewer is not None:
+                    self.viewer.close()
+                    self.viewer = None
+
+        inner_env.viewer = PassiveViewerWrapper(viewer)
+        inner_env._viewer3d_key = new_key
+        inner_env.has_renderer = True
+        inner_env.renderer = "viewer3d"
+
+        return inner_env.viewer
+
+    # Old mujoco-py backend fallback
+    try:
+        import mujoco_py
+        from robosuite.renderers.mujoco.mujoco_py_renderer import MujocoPyRenderer
+
+        if isinstance(sim, mujoco_py.cymj.MjSim):
+            print("[DEBUG] Using old MujocoPyRenderer")
+            inner_env.viewer = MujocoPyRenderer(sim)
+            inner_env._viewer3d_key = new_key
+            return inner_env.viewer
+    except Exception as e:
+        print("[DEBUG] old MujocoPyRenderer unavailable:", repr(e))
+
+    raise RuntimeError(
+        f"Unsupported sim type for Viewer3D: {type(sim)} from {type(sim).__module__}"
+    )
