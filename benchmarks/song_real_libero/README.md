@@ -637,7 +637,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --all-tasks \
   --episodes 10 \
   --action-index 0 \
-  --exec-action-steps 8 \
+  --exec-action-steps 16 \
   --no-replan-every-step \
   --gripper-wait-until-reached \
   --gripper-wait-tolerance 0.004 \

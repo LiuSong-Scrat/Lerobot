@@ -1900,7 +1900,7 @@ def main() -> None:
                     render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
                     control_delta=str(cfg.get("control", {}).get("control_mode", "absolute_pose")).lower()
                     == "delta_pose",
-                    control_freq=float(cfg.get("control_freq", 5)),
+                    control_freq=float(cfg.get("control_freq", cfg.get("control", {}).get("control_freq", 5))),
                 )
                 init_states = get_task_init_states(suite, int(task_id))
                 task_results = []
