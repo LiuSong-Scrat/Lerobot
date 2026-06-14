@@ -88,8 +88,6 @@ VSCODE_DEBUG_DEFAULT_ARGS = [
     "viewer3d",
     "--output-dir",
     "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite",
-    "--control-freq",
-    "20",
 ]
 
 import math
@@ -414,8 +412,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             os.environ.setdefault(key, value)
         argv = list(VSCODE_DEBUG_DEFAULT_ARGS)
         print("[debug] No CLI args detected; using built-in VSCode debug defaults.")
+
     parser = argparse.ArgumentParser(description="Evaluate the point-cloud SmolVLA policy on LIBERO.")
-    parser.add_argument("--control-freq", type=float, default=None)
     parser.add_argument("--config", type=Path, default=BENCHMARK_ROOT / "configs" / "libero.json")
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
@@ -1819,8 +1817,6 @@ def main() -> None:
         ["bottle", "sauce", "milk", "juice", "dressing", "ketchup", "soup", "pudding"],
     )
     cfg["control"].setdefault("gripper_side_grasp_top_quantile", 0.5)
-    if args.control_freq is not None:
-        cfg["control"]["control_freq"] = float(args.control_freq)
     if args.action_index is not None:
         cfg["control"]["action_index"] = int(args.action_index)
     if args.exec_action_steps is not None:
@@ -1900,7 +1896,6 @@ def main() -> None:
                     render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
                     control_delta=str(cfg.get("control", {}).get("control_mode", "absolute_pose")).lower()
                     == "delta_pose",
-                    control_freq=float(cfg.get("control_freq", 5)),
                 )
                 init_states = get_task_init_states(suite, int(task_id))
                 task_results = []
@@ -1918,33 +1913,33 @@ def main() -> None:
                                 cfg=cfg,
                                 key_watcher=key_watcher,
                             )
-                            # diagnostic_array_names = (
-                            #     "libero_actions",
-                            #     "pose_actions",
-                            #     "controller_pose_actions",
-                            #     "model_pose_actions",
-                            #     "pose_pos_errors",
-                            #     "pose_rot_errors",
-                            #     "pose_wait_flags",
-                            #     "gripper_targets",
-                            #     "gripper_actuals",
-                            #     "gripper_width_errors",
-                            #     "gripper_should_close_flags",
-                            #     "gripper_close_command_flags",
-                            #     "gripper_wait_flags",
-                            #     "gripper_contact_stall_flags",
-                            #     "gripper_rim_correction_flags",
-                            #     "gripper_rim_axis_shifts",
-                            #     "gripper_rim_depth_shifts",
-                            #     "gripper_rim_lifts",
-                            #     "gripper_rim_point_counts",
-                            #     "gripper_progress_indices",
-                            #     "gripper_close_hold_flags",
-                            #     "gripper_grasp_flags",
-                            #     "gripper_contact_flags",
-                            # )
-                            # for array_name in diagnostic_array_names:
-                            #     np.save(episode_dir / f"{array_name}.npy", result[array_name])
+                            diagnostic_array_names = (
+                                "libero_actions",
+                                "pose_actions",
+                                "controller_pose_actions",
+                                "model_pose_actions",
+                                "pose_pos_errors",
+                                "pose_rot_errors",
+                                "pose_wait_flags",
+                                "gripper_targets",
+                                "gripper_actuals",
+                                "gripper_width_errors",
+                                "gripper_should_close_flags",
+                                "gripper_close_command_flags",
+                                "gripper_wait_flags",
+                                "gripper_contact_stall_flags",
+                                "gripper_rim_correction_flags",
+                                "gripper_rim_axis_shifts",
+                                "gripper_rim_depth_shifts",
+                                "gripper_rim_lifts",
+                                "gripper_rim_point_counts",
+                                "gripper_progress_indices",
+                                "gripper_close_hold_flags",
+                                "gripper_grasp_flags",
+                                "gripper_contact_flags",
+                            )
+                            for array_name in diagnostic_array_names:
+                                np.save(episode_dir / f"{array_name}.npy", result[array_name])
                             # if cfg.get("save_trajectory", True):
                             #     write_trajectory_ply(episode_dir / "trajectory.ply", result["pose_actions"])
                             record = {

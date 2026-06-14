@@ -716,6 +716,7 @@ def make_libero_env(
     render_camera: str | None = None,
     render_gpu_device_id: int = -1,
     control_delta: bool = True,
+    control_freq=20,
 ):
     from libero.libero import get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
@@ -731,6 +732,7 @@ def make_libero_env(
         "camera_widths": width,
         "camera_names": cameras,
         "camera_depths": True,
+        "control_freq": control_freq,
     }
     viewer_camera = normalize_render_camera_name(render_camera, cameras[0])
     if render_mode in {"viewer3d", "mujoco"}:
