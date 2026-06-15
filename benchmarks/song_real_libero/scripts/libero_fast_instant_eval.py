@@ -1,10 +1,7 @@
-# # TEST COMMAND
-# # python benchmarks/song_real_libero/scripts/libero_fast_instant_eval.py   --config benchmarks/song_real_libero/configs/libero.json  --suite libero_goal --all-tasks --episodes 10    --max-steps 500   --exec-action-steps 12   --no-replan-every-step   --output-dir benchmarks/song_real_libero/outputs/temp    --gripper-control-mode threshold   --gripper-threshold 0.076   --gripper-close-width 0.0   --gripper-open-width 0.08  --settle-steps 120 --attach-geom-distance 0.005 --attach-distance 0.005 --physics-steps-per-action 6   --head --render-mode  viewer3d 
-
 #!/usr/bin/env python
 """Fast, non-blocking LIBERO point-cloud inference/evaluation runner.
 
-VERSION_MARKER: V14_GEOM_ATTACH_NO_CONTACT_TUNNEL
+VERSION_MARKER: V25_BETWEEN_FINGERS_CONTACT_ATTACH
 
 This script is intentionally *not* a LIBERO benchmark-compatible evaluator. It is
 for rapid policy sanity checks with the Song point-cloud SmolVLA contract:
@@ -16,8 +13,8 @@ for rapid policy sanity checks with the Song point-cloud SmolVLA contract:
 The default executor uses a kinematic MuJoCo IK step, so the model UMI
 trajectory is first converted to absolute world/controller targets, and the arm
 target plus continuous gripper target from the same action row are applied in
-the same simulation instant. A lightweight AttachManager keeps a grasped free-joint object
-rigidly attached to the EEF while the gripper stays closed, which is useful for
+the same simulation instant. A lightweight between-fingers contact-only AttachManager keeps a free-joint object
+rigidly attached to the EEF only after the object is both in real contact and inside the gripper finger gap, which is useful for
 fast task testing when you do not want to wait for robosuite controller dynamics.
 """
 from __future__ import annotations
@@ -1223,27 +1220,18 @@ def resolve_gripper_width_for_execution(
     close_width: float,
     qpos_max_width: float,
 ) -> tuple[float, str]:
-    """Map the model's continuous gripper-width prediction to an executed width.
+    """Use the model action's last dimension directly as physical gripper width.
 
-    The model output is a physical width in the same units used by the dataset.
-    For fast binary testing, threshold mode treats small predicted widths as
-    "close" and large predicted widths as "open".  Continuous mode writes the
-    model width directly after clipping.
+    V23 change: execution no longer binarizes the model gripper output with
+    --gripper-threshold / --gripper-open-width / --gripper-close-width.  The
+    action row's last dimension is clipped to [0, qpos_max_width], then
+    set_gripper_width() writes it symmetrically to the two finger slide joints as
+    +width/2 and -width/2.  The legacy arguments are intentionally accepted for
+    backward-compatible command lines, but they do not affect execution.
     """
     max_width = max(float(qpos_max_width), 0.0)
-    pred = float(np.clip(float(predicted_width), 0.0, max_width))
-    mode = str(mode).lower().strip()
-    if mode == "continuous":
-        return pred, "continuous"
-    if mode != "threshold":
-        raise ValueError(f"Unsupported gripper_control_mode={mode!r}; expected 'threshold' or 'continuous'.")
-
-    threshold = float(np.clip(float(threshold), 0.0, max_width))
-    close_width = float(np.clip(float(close_width), 0.0, max_width))
-    open_width = float(np.clip(float(open_width), 0.0, max_width))
-    if pred < threshold:
-        return close_width, "close"
-    return open_width, "open"
+    executed_width = float(np.clip(float(predicted_width), 0.0, max_width))
+    return executed_width, "model_action_last_dim"
 
 
 def _gripper_joint_sign(rec: dict[str, Any], sim: Any) -> float:
@@ -1269,13 +1257,13 @@ def _gripper_joint_sign(rec: dict[str, Any], sim: Any) -> float:
 
 
 def set_gripper_width(env: Any, width: float, qpos_max_width: float) -> float:
-    """Set a symmetric parallel-jaw physical opening width by direct qpos write.
+    """Write model gripper width W as mirrored left/right finger qpos.
 
-    For this LIBERO / Panda model the two slide joints are mirrored in qpos:
-    joint1 is positive when open and joint2 is negative when open.  A requested
-    physical width W is therefore written as [+W/2, -W/2].  This makes both
-    fingers move toward / away from the center instead of one finger chasing the
-    other.
+    The model action's last dimension is interpreted as the physical opening
+    width W.  For the Panda-style LIBERO gripper, the two slide joints are
+    mirrored, so execution writes approximately [+W/2, -W/2].  This function is
+    the only place that converts scalar model gripper width into MuJoCo finger
+    qpos; no threshold / binary open-close mapping is applied in V23.
     """
     sim = get_sim(env)
     width = float(np.clip(width, 0.0, float(qpos_max_width)))
@@ -1283,7 +1271,11 @@ def set_gripper_width(env: Any, width: float, qpos_max_width: float) -> float:
     if records:
         if len(records) >= 2:
             per_finger = width / 2.0
-            for rec in records[:2]:
+            # Sort by name for deterministic joint1/joint2 ordering, but still
+            # infer the sign from the joint name/current qpos for compatibility
+            # with models that label the fingers as left/right instead.
+            pair = sorted(records[:2], key=lambda r: str(r.get("name", "")))
+            for rec in pair:
                 sign = _gripper_joint_sign(rec, sim)
                 sim.data.qpos[int(rec["qpos_adr"])] = sign * per_finger
                 if hasattr(sim.data, "qvel"):
@@ -1298,7 +1290,7 @@ def set_gripper_width(env: Any, width: float, qpos_max_width: float) -> float:
                     if qvel_adr < len(sim.data.qvel):
                         sim.data.qvel[qvel_adr] = 0.0
         else:
-            # Single-joint fallback: keep old behavior.
+            # Single-joint fallback: write the scalar directly.
             rec = records[0]
             sim.data.qpos[int(rec["qpos_adr"])] = width
             if hasattr(sim.data, "qvel"):
@@ -1474,6 +1466,362 @@ def nearest_object_geom_to_eef(env: Any, eef_pos: np.ndarray, object_regex: str 
     }
 
 
+_ATTACH_GRIPPER_GEOM_CACHE: dict[int, set[int]] = {}
+_ATTACH_OBJECT_GEOM_CACHE: dict[tuple[int, str | None], dict[int, dict[str, Any]]] = {}
+
+
+def _geom_label(model: Any, geom_id: int) -> str:
+    geom_names = model_names(model, "geom")
+    body_names = model_names(model, "body")
+    gname = geom_names[int(geom_id)] if int(geom_id) < len(geom_names) else str(int(geom_id))
+    try:
+        bid = int(model.geom_bodyid[int(geom_id)])
+        bname = body_names[bid] if 0 <= bid < len(body_names) else str(bid)
+    except Exception:
+        bname = ""
+    return f"{gname} {bname}"
+
+
+def _finger_side_from_label(label: str) -> str | None:
+    """Infer a coarse gripper finger side from MuJoCo geom/body labels."""
+    label = str(label).lower()
+    # Panda / robosuite often uses finger_joint1 / finger_joint2 or left / right.
+    if re.search(r"finger[_\s-]*joint[_\s-]*1|finger1|left|l_finger|finger_left|leftfinger", label):
+        return "left"
+    if re.search(r"finger[_\s-]*joint[_\s-]*2|finger2|right|r_finger|finger_right|rightfinger", label):
+        return "right"
+    return None
+
+
+def attach_gripper_finger_geom_groups(env: Any) -> dict[str, set[int]]:
+    """Return MuJoCo geom ids for the two actual gripper fingers.
+
+    V25 attach must only latch when an object part is between the two finger
+    contact surfaces.  Therefore we intentionally avoid wrist / palm / eef geoms
+    here.  If the model names do not expose two finger groups, attach is disabled
+    rather than falling back to wrist proximity.
+    """
+    cache_key = id(env)
+    cached = _ATTACH_GRIPPER_GEOM_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return {"left": set(cached.get("left", set())), "right": set(cached.get("right", set()))}
+
+    sim = get_sim(env)
+    model = sim.model
+    try:
+        ngeom = int(model.ngeom)
+    except Exception:
+        ngeom = len(model_names(model, "geom"))
+
+    candidates: list[int] = []
+    left: set[int] = set()
+    right: set[int] = set()
+    unknown: list[int] = []
+    for gid in range(ngeom):
+        label = _geom_label(model, int(gid)).lower()
+        # Keep only physical finger / pad / tip geoms.  Palm/wrist/eef contacts
+        # are not enough for object attach because they do not mean the object is grasped.
+        if re.search(r"visual|vis|camera|agentview|eye_in_hand|mount|base|table|floor|arena", label):
+            continue
+        if not re.search(r"finger|fingerpad|finger_pad|pad|tip", label):
+            continue
+        candidates.append(int(gid))
+        side = _finger_side_from_label(label)
+        if side == "left":
+            left.add(int(gid))
+        elif side == "right":
+            right.add(int(gid))
+        else:
+            unknown.append(int(gid))
+
+    # If names did not split sides, cluster by current world position along the
+    # largest spread axis. This works for mirrored finger collision geoms.
+    if (not left or not right) and len(candidates) >= 2:
+        try:
+            pts = np.asarray([sim.data.geom_xpos[int(g)] for g in candidates], dtype=np.float64)
+            spread_axis = int(np.argmax(np.ptp(pts, axis=0)))
+            order = sorted(candidates, key=lambda g: float(sim.data.geom_xpos[int(g)][spread_axis]))
+            half = max(1, len(order) // 2)
+            left = set(order[:half])
+            right = set(order[half:])
+            if not right and len(order) >= 2:
+                right = {order[-1]}
+                left = set(order[:-1])
+        except Exception:
+            left, right = set(), set()
+
+    # Unknown geoms can be assigned to the closest named/clustered side.
+    if left and right and unknown:
+        try:
+            left_c = np.mean([sim.data.geom_xpos[int(g)] for g in left], axis=0)
+            right_c = np.mean([sim.data.geom_xpos[int(g)] for g in right], axis=0)
+            for gid in unknown:
+                p = np.asarray(sim.data.geom_xpos[int(gid)], dtype=np.float64)
+                if np.linalg.norm(p - left_c) <= np.linalg.norm(p - right_c):
+                    left.add(int(gid))
+                else:
+                    right.add(int(gid))
+        except Exception:
+            pass
+
+    # Require two non-empty sides.  This is deliberate: if we cannot identify the
+    # two fingers, we cannot safely decide whether an object is between them.
+    groups = {"left": set(left), "right": set(right)} if left and right else {"left": set(), "right": set()}
+    _ATTACH_GRIPPER_GEOM_CACHE[cache_key] = {"left": set(groups["left"]), "right": set(groups["right"])}
+    return groups
+
+
+def attach_gripper_geom_ids(env: Any) -> set[int]:
+    """Return the union of the two finger contact geom groups used for attach."""
+    groups = attach_gripper_finger_geom_groups(env)
+    return set(groups.get("left", set())) | set(groups.get("right", set()))
+
+
+def _geom_center(sim: Any, geom_id: int) -> np.ndarray | None:
+    try:
+        return np.asarray(sim.data.geom_xpos[int(geom_id)], dtype=np.float64).reshape(3)
+    except Exception:
+        return None
+
+
+def gripper_finger_pair_world(env: Any) -> tuple[np.ndarray, np.ndarray, dict[str, Any]] | None:
+    """Return representative left/right finger centers in world coordinates."""
+    sim = get_sim(env)
+    groups = attach_gripper_finger_geom_groups(env)
+    left_ids = sorted(groups.get("left", set()))
+    right_ids = sorted(groups.get("right", set()))
+    if not left_ids or not right_ids:
+        return None
+    left_pts = [_geom_center(sim, gid) for gid in left_ids]
+    right_pts = [_geom_center(sim, gid) for gid in right_ids]
+    left_pts = [p for p in left_pts if p is not None]
+    right_pts = [p for p in right_pts if p is not None]
+    if not left_pts or not right_pts:
+        return None
+    left_center = np.mean(np.asarray(left_pts, dtype=np.float64), axis=0)
+    right_center = np.mean(np.asarray(right_pts, dtype=np.float64), axis=0)
+    gap = float(np.linalg.norm(right_center - left_center))
+    if not np.isfinite(gap) or gap <= 1e-6:
+        return None
+    meta = {
+        "left_geom_count": len(left_ids),
+        "right_geom_count": len(right_ids),
+        "finger_gap_width": gap,
+    }
+    return left_center, right_center, meta
+
+
+def point_between_gripper_fingers(env: Any, point_world: Any, *, margin: float = 0.004) -> dict[str, Any]:
+    """Check whether a world point lies in the slab between the two finger centers.
+
+    This is a geometric gate on top of real MuJoCo contact: a contact is not
+    enough if it happens on the outside of one finger.  The contact/object point
+    must project onto the segment between the two finger centers, within a small
+    margin.  The perpendicular distance is reported for debugging but not used as
+    a hard gate because contacts can occur along the finger pad length.
+    """
+    pair = gripper_finger_pair_world(env)
+    if pair is None:
+        return {
+            "between_fingers": False,
+            "reason": "finger_pair_not_found",
+        }
+    left, right, meta = pair
+    p = np.asarray(point_world, dtype=np.float64).reshape(-1)[:3]
+    gap_vec = right - left
+    gap = float(np.linalg.norm(gap_vec))
+    if gap <= 1e-6:
+        return {"between_fingers": False, "reason": "zero_finger_gap", **meta}
+    axis = gap_vec / gap
+    proj = float(np.dot(p - left, axis))
+    t = proj / gap
+    closest = left + np.clip(proj, 0.0, gap) * axis
+    perp = float(np.linalg.norm(p - closest))
+    margin = max(0.0, float(margin))
+    between = (-margin <= proj <= gap + margin)
+    return {
+        "between_fingers": bool(between),
+        "reason": "ok" if between else "outside_finger_gap",
+        "finger_gap_width": gap,
+        "finger_gap_proj": proj,
+        "finger_gap_t": t,
+        "finger_gap_margin": margin,
+        "finger_gap_perp_dist": perp,
+        **meta,
+    }
+
+
+def attach_object_geom_map(env: Any, object_regex: str | None = None) -> dict[int, dict[str, Any]]:
+    """Map free-joint object geom id -> object root-body metadata."""
+    cache_key = (id(env), str(object_regex) if object_regex is not None else None)
+    cached = _ATTACH_OBJECT_GEOM_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    sim = get_sim(env)
+    model = sim.model
+    free_roots = set(candidate_object_bodies(env, object_regex))
+    body_to_root = _body_to_free_root_map(sim)
+    body_names = model_names(model, "body")
+    geom_names = model_names(model, "geom")
+    out: dict[int, dict[str, Any]] = {}
+    try:
+        ngeom = int(model.ngeom)
+    except Exception:
+        ngeom = len(geom_names)
+
+    for gid in range(ngeom):
+        try:
+            geom_body = int(model.geom_bodyid[int(gid)])
+        except Exception:
+            continue
+        root_body = body_to_root.get(int(geom_body))
+        if root_body is None or int(root_body) not in free_roots:
+            continue
+        out[int(gid)] = {
+            "body_id": int(root_body),
+            "body_name": body_names[int(root_body)] if int(root_body) < len(body_names) else str(root_body),
+            "geom_id": int(gid),
+            "geom_name": geom_names[int(gid)] if int(gid) < len(geom_names) else str(gid),
+            "geom_body_id": int(geom_body),
+        }
+
+    _ATTACH_OBJECT_GEOM_CACHE[cache_key] = dict(out)
+    return out
+
+
+def _sim_contact_count(sim: Any) -> int:
+    try:
+        return int(sim.data.ncon)
+    except Exception:
+        try:
+            return len(sim.data.contact)
+        except Exception:
+            return 0
+
+
+def _contact_geom_ids(contact: Any) -> tuple[int, int] | None:
+    try:
+        return int(contact.geom1), int(contact.geom2)
+    except Exception:
+        try:
+            return int(contact[0]), int(contact[1])
+        except Exception:
+            return None
+
+
+def _contact_distance(contact: Any) -> float:
+    try:
+        return float(contact.dist)
+    except Exception:
+        return 0.0
+
+
+def _contact_position(contact: Any) -> list[float] | None:
+    try:
+        return np.asarray(contact.pos, dtype=np.float64).reshape(-1)[:3].astype(float).tolist()
+    except Exception:
+        return None
+
+
+def _object_geom_center(sim: Any, geom_id: int) -> list[float] | None:
+    p = _geom_center(sim, int(geom_id))
+    if p is None:
+        return None
+    return p.astype(float).tolist()
+
+
+def gripper_object_contact(
+    env: Any,
+    object_regex: str | None = None,
+    *,
+    max_contact_distance: float = 0.003,
+    between_fingers_margin: float = 0.004,
+    require_between_fingers: bool = True,
+) -> dict[str, Any] | None:
+    """Return a real MuJoCo gripper-object contact that is inside the finger gap.
+
+    V25 latch rule for free-object attach:
+      1. A gripper finger geom and a free-object geom must have a MuJoCo contact.
+      2. The contact point, or the object geom center if contact.pos is unavailable,
+         must project between the two finger centers.
+
+    This avoids object-specific gripper-width thresholds and prevents a side rub
+    on the outside of one finger from causing teleport-style attach.
+    """
+    sim = get_sim(env)
+    try:
+        sim.forward()
+    except Exception:
+        pass
+
+    gripper_groups = attach_gripper_finger_geom_groups(env)
+    gripper_geoms = set(gripper_groups.get("left", set())) | set(gripper_groups.get("right", set()))
+    object_geoms = attach_object_geom_map(env, object_regex)
+    if not gripper_geoms or not object_geoms:
+        return None
+
+    model = sim.model
+    geom_names = model_names(model, "geom")
+    best: dict[str, Any] | None = None
+    ncon = _sim_contact_count(sim)
+    for ci in range(ncon):
+        try:
+            c = sim.data.contact[ci]
+        except Exception:
+            continue
+        pair = _contact_geom_ids(c)
+        if pair is None:
+            continue
+        g1, g2 = pair
+        obj_gid: int | None = None
+        grip_gid: int | None = None
+        if g1 in gripper_geoms and g2 in object_geoms:
+            grip_gid, obj_gid = int(g1), int(g2)
+        elif g2 in gripper_geoms and g1 in object_geoms:
+            grip_gid, obj_gid = int(g2), int(g1)
+        else:
+            continue
+        dist = _contact_distance(c)
+        if dist > float(max_contact_distance):
+            continue
+
+        contact_pos = _contact_position(c)
+        point_for_gap = contact_pos if contact_pos is not None else _object_geom_center(sim, int(obj_gid))
+        if point_for_gap is None:
+            continue
+        gap_info = point_between_gripper_fingers(
+            env,
+            point_for_gap,
+            margin=float(between_fingers_margin),
+        )
+        if bool(require_between_fingers) and not bool(gap_info.get("between_fingers", False)):
+            continue
+
+        obj = dict(object_geoms[int(obj_gid)])
+        item = {
+            **obj,
+            "contact_index": int(ci),
+            "contact_distance": float(dist),
+            "contact_pos": contact_pos,
+            "gap_test_point": np.asarray(point_for_gap, dtype=np.float64).reshape(-1)[:3].astype(float).tolist(),
+            "gripper_geom_id": int(grip_gid),
+            "gripper_geom_name": geom_names[int(grip_gid)] if int(grip_gid) < len(geom_names) else str(grip_gid),
+            "object_geom_id": int(obj_gid),
+            "object_geom_name": geom_names[int(obj_gid)] if int(obj_gid) < len(geom_names) else str(obj_gid),
+            **gap_info,
+        }
+        # Prefer deeper contacts that are centered between the fingers.
+        score = float(item["contact_distance"]) + 0.01 * abs(float(item.get("finger_gap_t", 0.5)) - 0.5)
+        if best is None:
+            best = item
+        else:
+            best_score = float(best["contact_distance"]) + 0.01 * abs(float(best.get("finger_gap_t", 0.5)) - 0.5)
+            if score < best_score:
+                best = item
+    return best
+
+
 class AttachManager:
     def __init__(
         self,
@@ -1484,71 +1832,851 @@ class AttachManager:
         release_width: float = 0.035,
         object_regex: str | None = None,
         geom_distance: float = 0.08,
+        contact_distance: float = 0.003,
+        detach_missing_steps: int = 8,
+        between_fingers_margin: float = 0.004,
+        require_between_fingers: bool = True,
         debug: bool = False,
     ):
         self.env = env
         self.sim = get_sim(env)
+        # Kept only for CLI backward compatibility / logging. v25 does not use
+        # gripper width or geometric distance for free-object attach decisions.
         self.attach_distance = float(attach_distance)
         self.close_width = float(close_width)
         self.release_width = float(release_width)
         self.object_regex = object_regex
         self.geom_distance = float(geom_distance)
+        self.contact_distance = float(contact_distance)
+        self.detach_missing_steps = max(1, int(detach_missing_steps))
+        self.between_fingers_margin = max(0.0, float(between_fingers_margin))
+        self.require_between_fingers = bool(require_between_fingers)
         self.debug = bool(debug)
         self.attached_body_id: int | None = None
         self.T_obj_in_eef: np.ndarray | None = None
         self.events: list[dict[str, Any]] = []
+        self._missing_contact_updates: int = 0
 
     def reset(self) -> None:
         self.attached_body_id = None
         self.T_obj_in_eef = None
+        self._missing_contact_updates = 0
         self.events.clear()
 
+    def _current_attached_contact(self) -> dict[str, Any] | None:
+        contact = gripper_object_contact(
+            self.env,
+            self.object_regex,
+            max_contact_distance=self.contact_distance,
+            between_fingers_margin=self.between_fingers_margin,
+            require_between_fingers=self.require_between_fingers,
+        )
+        if contact is None:
+            return None
+        if self.attached_body_id is not None and int(contact.get("body_id", -1)) != int(self.attached_body_id):
+            return None
+        return contact
+
     def update(self, eef_H_world: np.ndarray, gripper_width: float, step: int) -> None:
+        # gripper_width is intentionally ignored in v25.  The model action's last
+        # dimension still controls the visual/physical finger qpos, but attach
+        # latching/releasing is based on real MuJoCo contacts plus an in-finger-gap test only.
         if self.attached_body_id is not None:
-            if gripper_width >= self.release_width:
-                self.events.append({"step": int(step), "event": "detach", "body_id": int(self.attached_body_id)})
+            contact = self._current_attached_contact()
+            if contact is None:
+                self._missing_contact_updates += 1
+            else:
+                self._missing_contact_updates = 0
+            if self._missing_contact_updates >= self.detach_missing_steps:
+                self.events.append({
+                    "step": int(step),
+                    "event": "detach_contact_lost",
+                    "body_id": int(self.attached_body_id),
+                    "missing_contact_updates": int(self._missing_contact_updates),
+                })
                 self.attached_body_id = None
                 self.T_obj_in_eef = None
+                self._missing_contact_updates = 0
                 return
             assert self.T_obj_in_eef is not None
             set_free_body_pose(self.sim, self.attached_body_id, eef_H_world @ self.T_obj_in_eef)
             return
 
-        if gripper_width > self.close_width:
+        contact = gripper_object_contact(
+            self.env,
+            self.object_regex,
+            max_contact_distance=self.contact_distance,
+            between_fingers_margin=self.between_fingers_margin,
+            require_between_fingers=self.require_between_fingers,
+        )
+        if self.debug:
+            if contact is None:
+                print(
+                    "[debug] attach_contact_candidate "
+                    f"step={int(step)} contact=False max_contact_distance={self.contact_distance:.5f} "
+                    f"gripper_geoms={len(attach_gripper_geom_ids(self.env))} "
+                    f"object_geoms={len(attach_object_geom_map(self.env, self.object_regex))}"
+                )
+            else:
+                print(
+                    "[debug] attach_contact_candidate "
+                    f"step={int(step)} contact=True body={contact.get('body_name')} "
+                    f"object_geom={contact.get('object_geom_name')} gripper_geom={contact.get('gripper_geom_name')} "
+                    f"contact_dist={float(contact.get('contact_distance', 0.0)):.5f} "
+                    f"between_fingers={bool(contact.get('between_fingers', False))} "
+                    f"gap_t={float(contact.get('finger_gap_t', 0.0)):.3f} "
+                    f"gap_width={float(contact.get('finger_gap_width', 0.0)):.4f} attach=True"
+                )
+        if contact is None:
             return
+
+        bid = int(contact["body_id"])
+        obj_H = body_pose_hmat(self.sim, bid)
+        self.attached_body_id = int(bid)
+        self.T_obj_in_eef = hmat_inv(eef_H_world) @ obj_H
+        self._missing_contact_updates = 0
+        set_free_body_pose(self.sim, self.attached_body_id, eef_H_world @ self.T_obj_in_eef)
+        self.events.append({
+            "step": int(step),
+            "event": "attach_contact",
+            "body_id": int(bid),
+            "body_name": contact.get("body_name"),
+            "object_geom_id": contact.get("object_geom_id"),
+            "object_geom_name": contact.get("object_geom_name"),
+            "gripper_geom_id": contact.get("gripper_geom_id"),
+            "gripper_geom_name": contact.get("gripper_geom_name"),
+            "contact_index": contact.get("contact_index"),
+            "contact_distance": float(contact.get("contact_distance", 0.0)),
+            "contact_pos": contact.get("contact_pos"),
+            "gap_test_point": contact.get("gap_test_point"),
+            "between_fingers": bool(contact.get("between_fingers", False)),
+            "finger_gap_t": float(contact.get("finger_gap_t", 0.0)),
+            "finger_gap_width": float(contact.get("finger_gap_width", 0.0)),
+            "finger_gap_proj": float(contact.get("finger_gap_proj", 0.0)),
+            "finger_gap_perp_dist": float(contact.get("finger_gap_perp_dist", 0.0)),
+        })
+
+
+# -----------------------------------------------------------------------------
+# Articulated object helper (drawer / cabinet / door)
+# -----------------------------------------------------------------------------
+
+
+def _joint_name(model: Any, jid: int) -> str:
+    try:
+        names = model_names(model, "joint")
+        return names[int(jid)] if int(jid) < len(names) else str(int(jid))
+    except Exception:
+        return str(int(jid))
+
+
+def _body_ancestor_ids(model: Any, body_id: int) -> list[int]:
+    out: list[int] = []
+    try:
+        parents = np.asarray(model.body_parentid, dtype=np.int64).reshape(-1)
+        nbody = int(model.nbody)
+    except Exception:
+        return [int(body_id)]
+    cur = int(body_id)
+    for _ in range(nbody + 1):
+        if cur < 0 or cur >= nbody or cur in out:
+            break
+        out.append(cur)
+        parent = int(parents[cur])
+        if parent == cur:
+            break
+        cur = parent
+    return out
+
+
+def _body_joint_ids(model: Any, body_id: int) -> list[int]:
+    try:
+        adr = int(model.body_jntadr[int(body_id)])
+        num = int(model.body_jntnum[int(body_id)])
+        if adr < 0 or num <= 0:
+            return []
+        return [int(adr + i) for i in range(num)]
+    except Exception:
+        # Slow fallback for bindings without body_jntadr/body_jntnum.
+        out: list[int] = []
+        try:
+            for jid in range(int(model.njnt)):
+                if int(model.jnt_bodyid[jid]) == int(body_id):
+                    out.append(int(jid))
+        except Exception:
+            pass
+        return out
+
+
+def _joint_qpos_range(model: Any, jid: int) -> tuple[float, float] | None:
+    try:
+        if hasattr(model, "jnt_limited") and not bool(model.jnt_limited[int(jid)]):
+            return None
+        lo, hi = np.asarray(model.jnt_range[int(jid)], dtype=np.float64).reshape(-1)[:2]
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return float(lo), float(hi)
+    except Exception:
+        return None
+    return None
+
+
+def _clip_joint_qpos(model: Any, jid: int, value: float) -> float:
+    rng = _joint_qpos_range(model, int(jid))
+    if rng is None:
+        return float(value)
+    lo, hi = rng
+    return float(np.clip(float(value), lo, hi))
+
+
+def _articulated_joint_for_body(model: Any, body_id: int, *, regex: str | None = None) -> int | None:
+    """Find nearest ancestor slide/hinge joint for a body, excluding robot joints."""
+    body_names = model_names(model, "body")
+    joint_names = model_names(model, "joint")
+    blocked = re.compile(r"world|robot|panda|gripper|finger|mount|base|table|floor|arena|camera|vis", re.I)
+    user_re = re.compile(regex, re.I) if regex else None
+    for bid in _body_ancestor_ids(model, int(body_id)):
+        bname = body_names[bid] if bid < len(body_names) else str(bid)
+        if blocked.search(str(bname)):
+            continue
+        for jid in _body_joint_ids(model, bid):
+            try:
+                jtype = int(model.jnt_type[int(jid)])
+            except Exception:
+                continue
+            if jtype not in (2, 3):  # slide or hinge; free/ball are handled elsewhere
+                continue
+            jname = joint_names[jid] if jid < len(joint_names) else str(jid)
+            label = f"{bname} {jname}"
+            if blocked.search(str(label)):
+                continue
+            if user_re is not None and not user_re.search(str(label)):
+                # Do not require the joint name to match if the geom/body did;
+                # this function only sees body/joint labels, so caller may allow it.
+                pass
+            return int(jid)
+    return None
+
+
+def _body_descendant_ids(model: Any, root_body_id: int) -> list[int]:
+    """Return root body and all descendants."""
+    try:
+        parents = np.asarray(model.body_parentid, dtype=np.int64).reshape(-1)
+        nbody = int(model.nbody)
+    except Exception:
+        return [int(root_body_id)]
+    root = int(root_body_id)
+    out: list[int] = []
+    for bid in range(nbody):
+        cur = int(bid)
+        for _ in range(nbody + 1):
+            if cur == root:
+                out.append(int(bid))
+                break
+            if cur < 0 or cur >= len(parents):
+                break
+            parent = int(parents[cur])
+            if parent == cur:
+                break
+            cur = parent
+    return out or [root]
+
+
+def _nonrobot_articulated_joint_ids(model: Any, object_regex: str | None = None) -> list[int]:
+    """Find all non-robot slide / hinge joints that could belong to drawers, doors, cabinets."""
+    body_names = model_names(model, "body")
+    joint_names = model_names(model, "joint")
+    # Keep this blocklist focused on robot / static arena, not on furniture names.
+    blocked = re.compile(r"world|robot|panda|gripper|finger|mount|camera|vis|agentview|eye_in_hand", re.I)
+    user_re = re.compile(object_regex, re.I) if object_regex else None
+    strict_hits: list[int] = []
+    fallback: list[int] = []
+    try:
+        njnt = int(model.njnt)
+    except Exception:
+        njnt = len(joint_names)
+    for jid in range(njnt):
+        try:
+            jtype = int(model.jnt_type[int(jid)])
+        except Exception:
+            continue
+        if jtype not in (2, 3):  # slide / hinge only
+            continue
+        try:
+            body_id = int(model.jnt_bodyid[int(jid)])
+        except Exception:
+            body_id = -1
+        bname = body_names[body_id] if 0 <= body_id < len(body_names) else str(body_id)
+        jname = joint_names[jid] if jid < len(joint_names) else str(jid)
+        label = f"{bname} {jname}"
+        if blocked.search(str(label)):
+            continue
+        if user_re is not None and user_re.search(str(label)):
+            strict_hits.append(int(jid))
+        else:
+            fallback.append(int(jid))
+    # Return regex-matching joints first, but keep fallback joints so nameless LIBERO
+    # drawer joints can still latch based on geometry distance.
+    seen: set[int] = set()
+    return [j for j in strict_hits + fallback if not (j in seen or seen.add(j))]
+
+
+_ARTICULATED_GRIPPER_CONTACT_CACHE: dict[int, list[dict[str, Any]]] = {}
+
+
+def _contact_name_score(name: str) -> float:
+    """Lower is better for gripper contact points used by articulated latch."""
+    lname = str(name).lower()
+    # Never use the controller / wrist / center grip site for drawer latch.  In
+    # oblique grasps the wrist can be closer to the wrong drawer while the real
+    # fingertip is already at the intended handle.
+    if re.search(r"grip_site|eef|wrist|hand_root|palm|mount|base", lname):
+        return 1e6
+    score = 100.0
+    if re.search(r"tip|pad|fingerpad|finger_pad|contact", lname):
+        score -= 70.0
+    if re.search(r"finger|leftfinger|rightfinger|left_finger|right_finger", lname):
+        score -= 45.0
+    if re.search(r"left|right", lname):
+        score -= 10.0
+    if re.search(r"collision|col", lname):
+        score -= 5.0
+    if re.search(r"visual|vis|camera|sensor", lname):
+        score += 100.0
+    return score
+
+
+def _dedupe_contact_points(points: list[dict[str, Any]], *, max_points: int = 12) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for p in sorted(points, key=lambda x: float(x.get("score", 9999.0))):
+        try:
+            pos = np.asarray(p["pos"], dtype=np.float64).reshape(3)
+        except Exception:
+            continue
+        key = tuple(np.round(pos * 10000).astype(int).tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        item = dict(p)
+        item["pos"] = pos
+        out.append(item)
+        if len(out) >= int(max_points):
+            break
+    return out
+
+
+def gripper_articulated_contact_points(env: Any, eef_H_world: np.ndarray) -> list[dict[str, Any]]:
+    """Return fingertip / finger-pad points for drawer/cabinet latch.
+
+    Do not use the wrist/controller EEF position here.  The LIBERO fast runner's
+    controller frame is around the wrist / grip site.  For oblique cabinet pulls,
+    that point can be closer to the upper/first drawer while the actual fingers
+    are closest to the lower/second drawer handle.  Latching articulated joints
+    from fingertip/finger collision geom centers fixes that wrong-drawer opening.
+    """
+    sim = get_sim(env)
+    model = sim.model
+    cache_key = id(env)
+    cached = _ARTICULATED_GRIPPER_CONTACT_CACHE.get(cache_key)
+    points: list[dict[str, Any]] = []
+
+    if cached is None:
+        meta: list[dict[str, Any]] = []
+        site_names = model_names(model, "site")
+        body_names = model_names(model, "body")
+        geom_names = model_names(model, "geom")
+
+        for sid, name in enumerate(site_names):
+            label = str(name)
+            score = _contact_name_score(label)
+            if score >= 1e5:
+                continue
+            if not re.search(r"finger|tip|pad|contact|left|right", label, flags=re.I):
+                continue
+            meta.append({"kind": "site", "id": int(sid), "name": label, "score": float(score)})
+
+        try:
+            ngeom = int(model.ngeom)
+        except Exception:
+            ngeom = len(geom_names)
+        for gid in range(ngeom):
+            gname = geom_names[gid] if gid < len(geom_names) else str(gid)
+            try:
+                bid = int(model.geom_bodyid[int(gid)])
+            except Exception:
+                bid = -1
+            bname = body_names[bid] if 0 <= bid < len(body_names) else ""
+            label = f"{bname} {gname}"
+            score = min(_contact_name_score(str(gname)), _contact_name_score(str(label)))
+            if score >= 1e5:
+                continue
+            if not re.search(r"finger|tip|pad|contact|left|right", str(label), flags=re.I):
+                continue
+            # Exclude broad robot links; keep actual finger pads / collision geoms.
+            if re.search(r"forearm|upperarm|link0|link1|link2|link3|link4|link5|link6|link7|hand_visual|visual", str(label), flags=re.I):
+                continue
+            meta.append({"kind": "geom", "id": int(gid), "name": str(gname), "body_name": str(bname), "score": float(score)})
+
+        # Prefer left/right finger-like geoms.  If none exist in a particular
+        # robosuite build, the runtime fallback below creates synthetic jaw tips.
+        meta = sorted(meta, key=lambda x: float(x.get("score", 9999.0)))[:16]
+        _ARTICULATED_GRIPPER_CONTACT_CACHE[cache_key] = meta
+        cached = meta
+
+    for m in cached:
+        try:
+            if m.get("kind") == "site":
+                pos = np.asarray(sim.data.site_xpos[int(m["id"])], dtype=np.float64).reshape(3)
+            else:
+                pos = np.asarray(sim.data.geom_xpos[int(m["id"])], dtype=np.float64).reshape(3)
+        except Exception:
+            continue
+        item = dict(m)
+        item["pos"] = pos
+        points.append(item)
+
+    points = _dedupe_contact_points(points, max_points=10)
+    if points:
+        return points
+
+    # Last-resort synthetic jaw points.  This fallback is less accurate than real
+    # finger geom centers but still avoids using the wrist as the only latch point.
+    H = np.asarray(eef_H_world, dtype=np.float64)
+    width = 0.04
+    try:
+        width = float(measured_gripper_width(env, 0.08))
+    except Exception:
+        pass
+    origin = H[:3, 3]
+    x_axis = H[:3, 0]
+    y_axis = H[:3, 1]
+    z_axis = H[:3, 2]
+    offsets = [
+        0.055 * x_axis + (0.5 * width + 0.012) * y_axis,
+        0.055 * x_axis - (0.5 * width + 0.012) * y_axis,
+        0.065 * x_axis + (0.5 * width + 0.012) * y_axis,
+        0.065 * x_axis - (0.5 * width + 0.012) * y_axis,
+        0.055 * x_axis + 0.012 * z_axis,
+    ]
+    return [
+        {"kind": "synthetic", "id": int(i), "name": f"synthetic_fingertip_{i}", "score": 500.0, "pos": origin + off}
+        for i, off in enumerate(offsets)
+    ]
+
+
+def _closest_contact_point(contact_points: list[dict[str, Any]], target_pos: np.ndarray) -> dict[str, Any]:
+    target = np.asarray(target_pos, dtype=np.float64).reshape(3)
+    if not contact_points:
+        return {"kind": "eef", "name": "eef_fallback", "pos": target, "score": 1e6}
+    best = min(contact_points, key=lambda p: float(np.linalg.norm(np.asarray(p["pos"], dtype=np.float64).reshape(3) - target)))
+    return best
+
+
+
+_ARTICULATED_CANDIDATE_META_CACHE: dict[tuple[int, str, bool], list[dict[str, Any]]] = {}
+
+
+def _articulated_candidate_meta_list(
+    env: Any,
+    object_regex: str | None = None,
+    *,
+    include_unmatched: bool = True,
+) -> list[dict[str, Any]]:
+    """Cache static drawer / cabinet / door geom candidates for one env instance.
+
+    v21 fixed wrong-drawer latch by checking fingertip points, but it still scanned
+    every slide / hinge joint and every geom on every helper update.  With
+    physics_steps_per_action=6 the helper could run more than 10 times per action
+    step, making viewer runs noticeably slower.  v22 caches the static candidate
+    list once per env and only refreshes dynamic geom/contact positions each tick.
+    """
+    sim = get_sim(env)
+    model = sim.model
+    key = (id(env), str(object_regex or ""), bool(include_unmatched))
+    cached = _ARTICULATED_CANDIDATE_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    body_names = model_names(model, "body")
+    geom_names = model_names(model, "geom")
+    joint_names = model_names(model, "joint")
+    blocked_geom = re.compile(r"robot|panda|gripper|finger|mount|camera|vis|agentview|eye_in_hand", re.I)
+    user_re = re.compile(object_regex, re.I) if object_regex else None
+    try:
+        ngeom = int(model.ngeom)
+    except Exception:
+        ngeom = len(getattr(model, "geom_bodyid", []))
+
+    meta: list[dict[str, Any]] = []
+    for jid in _nonrobot_articulated_joint_ids(model, object_regex=object_regex):
+        try:
+            joint_body = int(model.jnt_bodyid[int(jid)])
+            jtype = int(model.jnt_type[int(jid)])
+            qpos_adr = int(model.jnt_qposadr[int(jid)])
+            qvel_adr = int(model.jnt_dofadr[int(jid)])
+        except Exception:
+            continue
+        jname = joint_names[jid] if jid < len(joint_names) else str(jid)
+        jbody_name = body_names[joint_body] if 0 <= joint_body < len(body_names) else str(joint_body)
+        descendant_bodies = set(_body_descendant_ids(model, joint_body))
+
+        for gid in range(ngeom):
+            try:
+                geom_body = int(model.geom_bodyid[int(gid)])
+            except Exception:
+                continue
+            if geom_body not in descendant_bodies:
+                continue
+            bname = body_names[geom_body] if geom_body < len(body_names) else str(geom_body)
+            gname = geom_names[gid] if gid < len(geom_names) else str(gid)
+            label = f"{jbody_name} {jname} {bname} {gname}"
+            if blocked_geom.search(str(label)):
+                continue
+            regex_match = bool(user_re.search(str(label))) if user_re is not None else True
+            if user_re is not None and not regex_match and not include_unmatched:
+                continue
+            try:
+                size = np.asarray(model.geom_size[int(gid)], dtype=np.float64).reshape(-1)
+                geom_size_max = float(np.nanmax(np.abs(size))) if size.size else 0.0
+                geom_size_min = float(np.nanmin(np.abs(size))) if size.size else 0.0
+                approx_radius = geom_size_max
+            except Exception:
+                geom_size_max = 0.0
+                geom_size_min = 0.0
+                approx_radius = 0.0
+            handle_name_like = bool(re.search(r"handle|knob|grip|pull", str(label), flags=re.I))
+            handle_size_like = bool((geom_size_max <= 0.12 and geom_size_min <= 0.035) or geom_size_max <= 0.055)
+            handle_like = bool(handle_name_like or handle_size_like)
+            panel_penalty = 0.0 if handle_like else 0.35 + max(0.0, geom_size_max - 0.12) * 2.0
+            meta.append({
+                "joint_id": int(jid),
+                "joint_name": str(jname),
+                "joint_type": _joint_type_name(model, int(jid)),
+                "joint_mj_type": int(jtype),
+                "qpos_adr": int(qpos_adr),
+                "qvel_adr": int(qvel_adr),
+                "joint_body_id": int(joint_body),
+                "joint_body_name": str(jbody_name),
+                "body_id": int(geom_body),
+                "body_name": str(bname),
+                "geom_id": int(gid),
+                "geom_name": str(gname),
+                "approx_radius": float(approx_radius),
+                "geom_size_max": float(geom_size_max),
+                "geom_size_min": float(geom_size_min),
+                "handle_like": bool(handle_like),
+                "handle_name_like": bool(handle_name_like),
+                "handle_size_like": bool(handle_size_like),
+                "regex_match": bool(regex_match),
+                "panel_penalty": float(panel_penalty),
+                "unmatched_penalty": float(0.10 if (user_re is not None and not regex_match) else 0.0),
+            })
+
+    _ARTICULATED_CANDIDATE_META_CACHE[key] = meta
+    return meta
+
+
+def nearest_articulated_geom_to_eef(
+    env: Any,
+    eef_pos: np.ndarray,
+    object_regex: str | None = None,
+    *,
+    include_unmatched: bool = True,
+    contact_points: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Find the nearest articulated geom using cached static metadata.
+
+    Dynamic work per tick is reduced to reading candidate geom positions and
+    nearest fingertip/contact point distances.  This keeps v21's fingertip latch
+    behavior but avoids repeated full model scans.
+    """
+    sim = get_sim(env)
+    eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
+    if contact_points is None:
+        contact_points = [{"kind": "eef", "name": "eef_fallback", "pos": eef_pos, "score": 1e6}]
+    else:
+        contact_points = [dict(p, pos=np.asarray(p["pos"], dtype=np.float64).reshape(3)) for p in contact_points]
+
+    best: dict[str, Any] | None = None
+    for meta in _articulated_candidate_meta_list(env, object_regex, include_unmatched=include_unmatched):
+        gid = int(meta["geom_id"])
+        try:
+            center = np.asarray(sim.data.geom_xpos[gid], dtype=np.float64).reshape(3)
+        except Exception:
+            continue
+        closest_cp = _closest_contact_point(contact_points, center)
+        closest_pos = np.asarray(closest_cp["pos"], dtype=np.float64).reshape(3)
+        center_dist = float(np.linalg.norm(center - closest_pos))
+        approx_radius = float(meta.get("approx_radius", 0.0))
+        surface_dist = float(center_dist - max(0.0, approx_radius))
+        score = (
+            center_dist
+            + 0.25 * max(surface_dist, 0.0)
+            + float(meta.get("panel_penalty", 0.0))
+            + float(meta.get("unmatched_penalty", 0.0))
+        )
+        item = dict(meta)
+        item.update({
+            "center_distance": center_dist,
+            "surface_distance": surface_dist,
+            "contact_point_name": str(closest_cp.get("name", "unknown")),
+            "contact_point_kind": str(closest_cp.get("kind", "unknown")),
+            "contact_point_score": float(closest_cp.get("score", 9999.0)),
+            "contact_point_pos": closest_pos.astype(float).tolist(),
+            "score": float(score),
+        })
+        if best is None or float(item["score"]) < float(best["score"]):
+            best = item
+    return best
+
+
+class ArticulatedJointManager:
+    """Kinematic helper for drawers / doors in instant-IK mode.
+
+    In this fast runner the gripper is moved by direct IK and qpos writes, so it
+    does not generate sustained contact forces.  This manager latches the nearest
+    non-robot slide/hinge joint when the EEF reaches a handle/fixture and then
+    numerically changes that joint qpos so the selected geom follows the EEF.
+    """
+
+    def __init__(
+        self,
+        env: Any,
+        *,
+        close_width: float = 0.018,
+        release_width: float = 0.035,
+        object_regex: str | None = r"drawer|cabinet|door|handle|slide|hinge",
+        geom_distance: float = 0.12,
+        center_distance: float = 0.22,
+        follow_iters: int = 12,
+        step_clip: float = 0.05,
+        eps: float = 1e-4,
+        require_closed: bool = False,
+        open_mode: str = "force",
+        force_step: float = 0.025,
+        debug: bool = False,
+    ):
+        self.env = env
+        self.sim = get_sim(env)
+        self.close_width = float(close_width)
+        self.release_width = float(release_width)
+        self.object_regex = object_regex
+        self.geom_distance = float(geom_distance)
+        self.center_distance = float(center_distance)
+        self.follow_iters = int(follow_iters)
+        self.step_clip = float(step_clip)
+        self.eps = float(eps)
+        self.require_closed = bool(require_closed)
+        self.open_mode = str(open_mode or "force").lower().strip()
+        if self.open_mode not in {"follow", "force", "hybrid"}:
+            self.open_mode = "force"
+        self.force_step = abs(float(force_step))
+        self.debug = bool(debug)
+        self.active: dict[str, Any] | None = None
+        self.events: list[dict[str, Any]] = []
+
+    def reset(self) -> None:
+        self.active = None
+        self.events.clear()
+
+    def _zero_joint_vel(self, jid: int) -> None:
+        try:
+            qvel_adr = int(self.sim.model.jnt_dofadr[int(jid)])
+            if 0 <= qvel_adr < len(self.sim.data.qvel):
+                self.sim.data.qvel[qvel_adr] = 0.0
+        except Exception:
+            pass
+
+    def _joint_qpos(self, jid: int) -> float:
+        return float(self.sim.data.qpos[int(self.sim.model.jnt_qposadr[int(jid)])])
+
+    def _set_joint_qpos(self, jid: int, value: float) -> float:
+        qpos_adr = int(self.sim.model.jnt_qposadr[int(jid)])
+        value = _clip_joint_qpos(self.sim.model, int(jid), float(value))
+        self.sim.data.qpos[qpos_adr] = value
+        self._zero_joint_vel(int(jid))
+        self.sim.forward()
+        return value
+
+    def _joint_open_target(self, jid: int, q_reference: float) -> float:
+        """Pick the farther limit from latch qpos as the intended open side.
+
+        Drawer / cabinet joints in LIBERO may open in either +q or -q direction.
+        v17 tried to infer this from a local handle-follow Jacobian; in the user
+        log that Jacobian wanted to move out of range, so qpos stayed exactly 0.
+        This direct helper chooses the farther valid joint limit and drives toward
+        it, which is the robust behavior we need for instant-IK evaluation.
+        """
+        rng = _joint_qpos_range(self.sim.model, int(jid))
+        if rng is None:
+            return float(q_reference + max(self.force_step, self.step_clip))
+        lo, hi = rng
+        q_reference = float(q_reference)
+        return float(hi if abs(hi - q_reference) >= abs(q_reference - lo) else lo)
+
+    def _force_open_active(self, step: int) -> None:
+        if self.active is None:
+            return
+        # update() is called multiple times inside one high-level action step.
+        # Apply the artificial drawer drive once per action step to keep it stable.
+        if int(self.active.get("_last_force_open_step", -999999)) == int(step):
+            return
+        jid = int(self.active["joint_id"])
+        q_before = self._joint_qpos(jid)
+        q_ref = float(self.active.get("qpos_at_latch", q_before))
+        target = self._joint_open_target(jid, q_ref)
+        dq = float(np.clip(target - q_before, -self.force_step, self.force_step))
+        if abs(dq) <= 1e-10:
+            return
+        q_after = self._set_joint_qpos(jid, q_before + dq)
+        self.active["_last_force_open_step"] = int(step)
+        self.active["last_qpos"] = float(q_after)
+        self.active["open_target_qpos"] = float(target)
+        if self.debug:
+            rng = _joint_qpos_range(self.sim.model, jid)
+            print(
+                f"[debug] articulated_force_open step={int(step)} "
+                f"joint={self.active.get('joint_name')} qpos={q_before:.5f}->{q_after:.5f} "
+                f"target={target:.5f} range={rng}"
+            )
+
+    def _follow_active(self, eef_pos: np.ndarray, step: int) -> None:
+        if self.active is None:
+            return
+        jid = int(self.active["joint_id"])
+        gid = int(self.active["geom_id"])
+        qpos_adr = int(self.active["qpos_adr"])
+        eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
+        q_start = self._joint_qpos(jid)
+
+        # Optionally do the old local numerical follow.  This is useful for some
+        # hinge/slide fixtures, but it can stall at a joint limit: the user log
+        # showed latch=True and qpos stuck at 0.00000 for dozens of steps.
+        if self.open_mode in {"follow", "hybrid"}:
+            for _ in range(max(1, int(self.follow_iters))):
+                self.sim.forward()
+                try:
+                    geom_pos = np.asarray(self.sim.data.geom_xpos[gid], dtype=np.float64).reshape(3)
+                except Exception:
+                    return
+                err = eef_pos - geom_pos
+                dist = float(np.linalg.norm(err))
+                if dist <= max(0.006, 0.20 * self.geom_distance):
+                    break
+                q0 = float(self.sim.data.qpos[qpos_adr])
+                eps = float(self.eps)
+                q_eps = self._set_joint_qpos(jid, q0 + eps)
+                if abs(q_eps - q0) < 1e-9:
+                    q_eps = self._set_joint_qpos(jid, q0 - eps)
+                try:
+                    geom_eps = np.asarray(self.sim.data.geom_xpos[gid], dtype=np.float64).reshape(3)
+                except Exception:
+                    self._set_joint_qpos(jid, q0)
+                    return
+                deriv = (geom_eps - geom_pos) / max(abs(q_eps - q0), 1e-9)
+                self._set_joint_qpos(jid, q0)
+                denom = float(np.dot(deriv, deriv))
+                if denom < 1e-12:
+                    break
+                dq = float(np.dot(err, deriv) / denom)
+                dq = float(np.clip(dq, -abs(self.step_clip), abs(self.step_clip)))
+                self._set_joint_qpos(jid, q0 + dq)
+
+        # In instant-IK mode there is no real contact force through the handle.
+        # Therefore drawers/cabinets must actually be driven by their own qpos.
+        # Default mode is force; hybrid falls back to force whenever follow stalls.
+        q_after_follow = self._joint_qpos(jid)
+        if self.open_mode == "force" or (self.open_mode == "hybrid" and abs(q_after_follow - q_start) < 1e-6):
+            self._force_open_active(step)
+
+        self.sim.forward()
+        if self.active is not None:
+            try:
+                q = float(self.sim.data.qpos[qpos_adr])
+                geom_pos = np.asarray(self.sim.data.geom_xpos[gid], dtype=np.float64).reshape(3)
+                dist = float(np.linalg.norm(eef_pos - geom_pos))
+                self.active["last_qpos"] = q
+                self.active["last_handle_dist"] = dist
+                self.active["last_step"] = int(step)
+                if self.debug:
+                    print(f"[debug] articulated_follow step={int(step)} joint={self.active.get('joint_name')} qpos={q:.5f} handle_dist={dist:.5f} mode={self.open_mode}")
+            except Exception:
+                pass
+
+    def update(self, eef_H_world: np.ndarray, gripper_width: float, step: int) -> None:
         eef_pos = np.asarray(eef_H_world[:3, 3], dtype=np.float64)
-        nearest = nearest_object_geom_to_eef(self.env, eef_pos, self.object_regex)
+        contact_points = gripper_articulated_contact_points(self.env, eef_H_world)
+
+        if self.active is not None:
+            if self.require_closed and gripper_width >= self.release_width:
+                self.events.append({"step": int(step), "event": "release", **_json_safe(self.active)})
+                self.active = None
+                return
+            try:
+                gid_active = int(self.active.get("geom_id"))
+                geom_pos_active = np.asarray(self.sim.data.geom_xpos[gid_active], dtype=np.float64).reshape(3)
+                active_cp = _closest_contact_point(contact_points, geom_pos_active)
+                target_pos = np.asarray(active_cp["pos"], dtype=np.float64).reshape(3)
+                self.active["last_contact_point_name"] = str(active_cp.get("name", "unknown"))
+                self.active["last_contact_point_kind"] = str(active_cp.get("kind", "unknown"))
+            except Exception:
+                target_pos = eef_pos
+            self._follow_active(target_pos, step)
+            return
+
+        if self.require_closed and gripper_width > self.close_width:
+            if self.debug:
+                print(f"[debug] articulated_wait_closed step={int(step)} gripper_width={float(gripper_width):.5f} close_width={self.close_width:.5f}")
+            return
+
+        nearest = nearest_articulated_geom_to_eef(self.env, eef_pos, self.object_regex, include_unmatched=True, contact_points=contact_points)
         if nearest is None:
+            if self.debug:
+                print(f"[debug] articulated_no_candidate step={int(step)} gripper_width={float(gripper_width):.5f}")
             return
         surface_dist = float(nearest.get("surface_distance", float("inf")))
         center_dist = float(nearest.get("center_distance", float("inf")))
-        should_attach = surface_dist <= self.geom_distance or center_dist <= self.attach_distance
+        # Regex matches get normal thresholds; unmatched candidates need to be quite close.
+        regex_match = bool(nearest.get("regex_match", False))
+        handle_like = bool(nearest.get("handle_like", False))
+        geom_size_max = float(nearest.get("geom_size_max", 0.0))
+        geom_limit = self.geom_distance if regex_match else min(self.geom_distance, 0.035)
+        center_limit = self.center_distance if regex_match else min(self.center_distance, 0.07)
+        surface_ok = surface_dist <= geom_limit
+        center_ok = center_dist <= center_limit
+        # v20: require BOTH surface and center gates, and only allow large non-handle
+        # geoms with a much stricter center gate.  This prevents the helper from
+        # opening drawer #1 while the policy is moving toward drawer #2.
+        if handle_like:
+            should_latch = bool(surface_ok and center_ok)
+        else:
+            should_latch = bool(surface_ok and center_ok and center_dist <= min(center_limit, 0.025) and geom_size_max <= 0.08)
         if self.debug:
             print(
-                "[debug] attach_candidate "
-                f"step={int(step)} body={nearest.get('body_name')} geom={nearest.get('geom_name')} "
+                "[debug] articulated_candidate "
+                f"step={int(step)} joint={nearest.get('joint_name')} type={nearest.get('joint_type')} "
+                f"body={nearest.get('body_name')} geom={nearest.get('geom_name')} regex_match={regex_match} "
+                f"handle_like={handle_like} size_max={geom_size_max:.4f} "
+                f"contact={nearest.get('contact_point_name')}({nearest.get('contact_point_kind')}) "
                 f"surface_dist={surface_dist:.4f} center_dist={center_dist:.4f} "
-                f"limits=({self.geom_distance:.4f},{self.attach_distance:.4f}) attach={should_attach}"
+                f"surface_ok={surface_ok} center_ok={center_ok} "
+                f"limits=({geom_limit:.4f},{center_limit:.4f}) latch={should_latch} "
+                f"gripper={float(gripper_width):.4f} require_closed={self.require_closed}"
             )
-        if should_attach:
-            bid = int(nearest["body_id"])
-            obj_H = body_pose_hmat(self.sim, bid)
-            self.attached_body_id = int(bid)
-            self.T_obj_in_eef = hmat_inv(eef_H_world) @ obj_H
-            # Snap immediately and zero free-joint velocity so the object cannot
-            # continue tunneling through the fingers on the next physics tick.
-            set_free_body_pose(self.sim, self.attached_body_id, eef_H_world @ self.T_obj_in_eef)
-            self.events.append({
-                "step": int(step),
-                "event": "attach",
-                "body_id": int(bid),
-                "body_name": nearest.get("body_name"),
-                "geom_id": nearest.get("geom_id"),
-                "geom_name": nearest.get("geom_name"),
-                "surface_distance": surface_dist,
-                "center_distance": center_dist,
-                "approx_radius": float(nearest.get("approx_radius", 0.0)),
-            })
+        if not should_latch:
+            return
+        self.active = dict(nearest)
+        self.active["event"] = "latch"
+        self.active["step"] = int(step)
+        self.active["latch_gripper_width"] = float(gripper_width)
+        self.active["require_closed"] = bool(self.require_closed)
+        self.active["qpos_at_latch"] = self._joint_qpos(int(self.active["joint_id"]))
+        self.events.append(_json_safe(dict(self.active)))
+        try:
+            latch_target = np.asarray(self.active.get("contact_point_pos", eef_pos), dtype=np.float64).reshape(3)
+        except Exception:
+            latch_target = eef_pos
+        self._follow_active(latch_target, step)
 
 
 # -----------------------------------------------------------------------------
@@ -2062,11 +3190,37 @@ def _mean_or_zero(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+def _json_safe(obj: Any) -> Any:
+    """Convert dataclasses / numpy / Path / argparse values into JSON-safe objects."""
+    if hasattr(obj, "__dataclass_fields__"):
+        try:
+            return {k: _json_safe(v) for k, v in asdict(obj).items()}
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(_json_safe(k)): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, argparse.Namespace):
+        return {k: _json_safe(v) for k, v in vars(obj).items() if not k.startswith("_")}
+    return obj
+
+
 def _json_atomic_write(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+        json.dump(_json_safe(payload), f, indent=2, ensure_ascii=False)
     tmp.replace(path)
 
 
@@ -2213,7 +3367,7 @@ def build_live_metrics(
         "task_metrics": task_metrics,
         "progress": progress,
         "results": result_dicts,
-        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if not k.startswith("_")},
+        "args": _json_safe({k: v for k, v in vars(args).items() if not k.startswith("_")}),
     }
 
 
@@ -2357,8 +3511,26 @@ def run_one_episode(
         release_width=float(args.attach_release_width),
         object_regex=args.attach_object_regex,
         geom_distance=float(args.attach_geom_distance),
+        contact_distance=float(args.attach_contact_distance),
+        detach_missing_steps=int(args.attach_detach_missing_steps),
+        between_fingers_margin=float(args.attach_between_fingers_margin),
+        require_between_fingers=bool(args.attach_require_between_fingers),
         debug=bool(args.debug_attach),
     ) if args.enable_attach else None
+    articulated = ArticulatedJointManager(
+        env,
+        close_width=float(args.attach_close_width),
+        release_width=float(args.attach_release_width),
+        object_regex=args.articulated_object_regex,
+        geom_distance=float(args.articulated_geom_distance),
+        center_distance=float(args.articulated_center_distance),
+        follow_iters=int(args.articulated_follow_iters),
+        step_clip=float(args.articulated_step_clip),
+        require_closed=bool(args.articulated_require_closed),
+        open_mode=str(args.articulated_open_mode),
+        force_step=float(args.articulated_force_step),
+        debug=bool(args.debug_articulated),
+    ) if bool(args.enable_articulated_helper) else None
 
     viewer = Open3DNonBlockingViewer(args.vis3d_every) if args.render_mode == "open3d" else None
     frames: list[np.ndarray] = []
@@ -2468,22 +3640,33 @@ def run_one_episode(
                 eef_H = executor.current_pose()
                 if attach is not None:
                     attach.update(eef_H, target_gripper, step)
+                if articulated is not None:
+                    articulated.update(eef_H, target_gripper, step)
                 # Advance MuJoCo a small configurable number of ticks without using
                 # robosuite's controller action queue. This keeps the test fast and
                 # avoids an extra blocking controller loop.
                 sim = get_sim(env)
                 for _ in range(int(args.physics_steps_per_action)):
                     try:
+                        current_eef_for_helpers = executor.current_pose()
                         if attach is not None:
-                            attach.update(executor.current_pose(), target_gripper, step)
+                            attach.update(current_eef_for_helpers, target_gripper, step)
+                        if articulated is not None and bool(getattr(args, "articulated_update_during_physics", False)):
+                            articulated.update(current_eef_for_helpers, target_gripper, step)
                         sim.step()
+                        current_eef_for_helpers = executor.current_pose()
                         if attach is not None:
-                            attach.update(executor.current_pose(), target_gripper, step)
+                            attach.update(current_eef_for_helpers, target_gripper, step)
+                        if articulated is not None and bool(getattr(args, "articulated_update_during_physics", False)):
+                            articulated.update(current_eef_for_helpers, target_gripper, step)
                     except Exception:
                         break
                 sim.forward()
+                current_eef_for_helpers = executor.current_pose()
                 if attach is not None:
-                    attach.update(executor.current_pose(), target_gripper, step)
+                    attach.update(current_eef_for_helpers, target_gripper, step)
+                if articulated is not None:
+                    articulated.update(current_eef_for_helpers, target_gripper, step)
                 raw_obs = get_raw_obs(env, force_update=True)
                 if bool(getattr(args, "debug_obs_refresh", False)):
                     try:
@@ -2545,6 +3728,9 @@ def run_one_episode(
     if attach is not None:
         with open(output_dir / "attach_events.json", "w", encoding="utf-8") as f:
             json.dump(attach.events, f, indent=2)
+    if articulated is not None:
+        with open(output_dir / "articulated_events.json", "w", encoding="utf-8") as f:
+            json.dump(articulated.events, f, indent=2)
     if args.save_video and frames:
         try:
             import imageio.v3 as iio
@@ -2633,6 +3819,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cfg["gripper_drop_strategy"] = str(cfg_get(cfg, args.gripper_drop_strategy, "gripper_drop_strategy", "tail"))
     cfg["gripper_shuffle_points"] = bool(cfg_get(cfg, args.gripper_shuffle_points, "gripper_shuffle_points", False))
     cfg["gripper_qpos_max_width"] = float(cfg_get(cfg, args.gripper_qpos_max_width, "gripper_qpos_max_width", 0.08))
+    # if args.render_mode == "none": 
+    #     args.render_mode = "viewer3d"
     if args.gripper_threshold is None:
         args.gripper_threshold = float(cfg.get("gripper_threshold", 0.5 * float(cfg["gripper_qpos_max_width"])))
     if args.gripper_open_width is None:
@@ -2652,12 +3840,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     specs = resolve_task_specs(args, cfg)
     bundle = load_policy_bundle(args)
-    print("[info] action_execution=fresh_obs_geom_attach_ref_umi_chunk_to_controller_frame_instant_ik")
+    print("[info] action_execution=fresh_obs_between_fingers_contact_attach_articulated_v25_action_lastdim_gripper_ref_umi_chunk_to_controller_frame_instant_ik")
     print(
-        f"[info] gripper_control mode={args.gripper_control_mode} "
-        f"threshold={float(args.gripper_threshold):.4f} "
-        f"close_width={float(args.gripper_close_width):.4f} "
-        f"open_width={float(args.gripper_open_width):.4f}"
+        f"[info] gripper_execution=model_action_last_dim_direct "
+        f"qpos_max_width={float(cfg['gripper_qpos_max_width']):.4f} "
+        f"finger_qpos=[+W/2,-W/2]; "
+        f"legacy_mode_arg={args.gripper_control_mode} threshold/open/close ignored"
+    )
+    print(
+        f"[info] attach_helper enabled={bool(args.enable_attach)} "
+        f"mode=contact_between_fingers_only gripper_width_ignored=True "
+        f"contact_distance={float(args.attach_contact_distance):.4f} "
+        f"between_fingers_margin={float(args.attach_between_fingers_margin):.4f} "
+        f"require_between_fingers={bool(args.attach_require_between_fingers)} "
+        f"detach_missing_steps={int(args.attach_detach_missing_steps)} "
+        f"legacy_geom_distance={float(args.attach_geom_distance):.4f} "
+        f"legacy_center_distance={float(args.attach_distance):.4f} "
+        f"legacy_close_width={float(args.attach_close_width):.4f} "
+        f"legacy_release_width={float(args.attach_release_width):.4f}"
+    )
+    print(
+        f"[info] articulated_helper enabled={bool(args.enable_articulated_helper)} "
+        f"mode={str(args.articulated_open_mode)} "
+        f"geom_distance={float(args.articulated_geom_distance):.4f} "
+        f"center_distance={float(args.articulated_center_distance):.4f} "
+        f"force_step={float(args.articulated_force_step):.4f} "
+        f"require_closed={bool(args.articulated_require_closed)} "
+        f"contact_points=fingertip_or_finger_geom cached_candidates=True "
+        f"update_during_physics={bool(getattr(args, 'articulated_update_during_physics', False))}"
     )
     print(
         f"[info] eval_plan tasks={len(specs)} episodes_per_task={int(args.episodes)} "
@@ -2821,11 +4031,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--task-id", type=int, action="append", default=None)
     p.add_argument("--first-n-tasks", type=int, default=None)
     p.add_argument("--require-four-tasks", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--episodes", type=int, default=1)
+    p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--recreate-env-per-episode", action=argparse.BooleanOptionalAction, default=True, help="Create/close a fresh LIBERO env for every episode so viewer/cache/direct-qpos state cannot block the next episode.")
     p.add_argument("--stop-on-error", action=argparse.BooleanOptionalAction, default=False, help="Stop immediately on an episode error instead of recording error.json and continuing.")
     p.add_argument("--seed", type=int, default=1000)
-    p.add_argument("--settle-steps", type=int, default=80, help="MuJoCo physics ticks after env.reset() before the first policy inference, so free objects can settle.")
+    p.add_argument("--settle-steps", type=int, default=5, help="MuJoCo physics ticks after env.reset() before the first policy inference, so free objects can settle.")
     p.add_argument("--settle-keep-robot-fixed", action=argparse.BooleanOptionalAction, default=True, help="During initial settling, restore arm/gripper qpos each sim tick so only free objects settle.")
     p.add_argument("--settle-render", action=argparse.BooleanOptionalAction, default=False, help="Render viewer during initial settling; useful only for visual debugging.")
     p.add_argument("--debug-settle", action="store_true", help="Print initial settle diagnostics.")
@@ -2846,24 +4056,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gripper-qpos-max-width", type=float, default=None)
     p.add_argument(
         "--gripper-control-mode",
-        choices=["threshold", "continuous"],
-        default="threshold",
-        help="threshold: predicted width < threshold closes, otherwise opens; continuous: write model width directly.",
+        choices=["model", "action", "continuous", "threshold"],
+        default="model",
+        help="V23 default: ignore thresholding and execute the model action's last dimension directly as gripper width. Legacy values are accepted but no longer change execution.",
     )
-    p.add_argument("--gripper-threshold", type=float, default=None, help="Physical width threshold. Default is 0.5 * gripper-qpos-max-width.")
-    p.add_argument("--gripper-open-width", type=float, default=None, help="Width written when predicted width >= threshold. Default is gripper-qpos-max-width.")
-    p.add_argument("--gripper-close-width", type=float, default=None, help="Width written when predicted width < threshold. Default is 0.0.")
+    p.add_argument("--gripper-threshold", type=float, default=None, help="Legacy only in V23; accepted for old commands but ignored by gripper execution.")
+    p.add_argument("--gripper-open-width", type=float, default=None, help="Legacy only in V23; accepted for old commands but ignored by gripper execution.")
+    p.add_argument("--gripper-close-width", type=float, default=None, help="Legacy only in V23; accepted for old commands but ignored by gripper execution.")
     p.add_argument("--debug-gripper-joints", action="store_true", help="Print selected MuJoCo gripper joints and their qpos/qvel addresses.")
     p.add_argument("--debug-obs-refresh", action="store_true", help="Print refreshed raw_obs EEF position after each direct IK/sim update.")
 
     # Action execution. Default is chunk execution without waiting: same row's
     # arm target and gripper width are applied together by IK + direct qpos.
-    p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument("--max-steps", type=int, default=500)
     p.add_argument("--action-index", type=int, default=0)
-    p.add_argument("--exec-action-steps", type=int, default=16)
+    p.add_argument("--exec-action-steps", type=int, default=12)
     p.add_argument("--replan-every-step", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--action-pose-frame", choices=["current_eff", "world"], default="current_eff")
-    p.add_argument("--physics-steps-per-action", type=int, default=1)
+    p.add_argument("--physics-steps-per-action", type=int, default=10)
 
     # IK knobs.
     p.add_argument("--ik-iters", type=int, default=80)
@@ -2876,16 +4086,32 @@ def parse_args() -> argparse.Namespace:
     # Attach logic. Widths are in the same continuous gripper-width units saved in
     # the dataset / predicted by the model.
     p.add_argument("--enable-attach", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--attach-distance", type=float, default=0.12, help="Fallback distance from EEF to object root/body center for fast attach.")
-    p.add_argument("--attach-geom-distance", type=float, default=0.08, help="Distance from EEF to nearest object geom surface that triggers fast attach when gripper is closed.")
-    p.add_argument("--attach-close-width", type=float, default=0.018)
-    p.add_argument("--attach-release-width", type=float, default=0.035)
+    p.add_argument("--attach-distance", type=float, default=0.12, help="Legacy only in v25: no longer triggers attach; contact-only attach ignores this distance.")
+    p.add_argument("--attach-geom-distance", type=float, default=0.08, help="Legacy only in v25: no longer triggers attach; contact-only attach ignores this distance.")
+    p.add_argument("--attach-close-width", type=float, default=0.018, help="Legacy only for articulated --articulated-require-closed; free-object attach ignores gripper width in v25.")
+    p.add_argument("--attach-release-width", type=float, default=0.035, help="Legacy only for articulated helper; free-object attach releases on lost contact in v25.")
+    p.add_argument("--attach-contact-distance", type=float, default=0.0005, help="Max MuJoCo contact distance for contact-only free-object attach. Negative/zero means true penetration contact; small positive values allow contact margins.")
+    p.add_argument("--attach-detach-missing-steps", type=int, default=3, help="Detach a contact-attached free object after this many consecutive AttachManager updates without gripper-object contact.")
+    p.add_argument("--attach-between-fingers-margin", type=float, default=0.005, help="V25: contact point/object part must project between the two finger centers within this margin before free-object attach latches.")
+    p.add_argument("--attach-require-between-fingers", action=argparse.BooleanOptionalAction, default=True, help="V25: require contacted object part to be between the two gripper fingers before free-object attach. Default true.")
     p.add_argument("--attach-object-regex", default=None)
-    p.add_argument("--debug-attach", action="store_true", help="Print nearest object geom distances used by AttachManager.")
+    p.add_argument("--debug-attach", action="store_true", help="Print real MuJoCo gripper-object contacts used by contact-only AttachManager.")
+    p.add_argument("--enable-articulated-helper", action=argparse.BooleanOptionalAction, default=True, help="Kinematically move nearby drawer/cabinet/door slide/hinge joints while the gripper is closed near a handle.")
+    p.add_argument("--articulated-object-regex", default=r"drawer|cabinet|door|handle|slide|hinge|joint", help="Regex for articulated geoms/joints that should be preferred by the drawer/door helper. v17 still falls back to nearby unnamed non-robot slide/hinge joints.")
+    p.add_argument("--articulated-geom-distance", type=float, default=0.01, help="Max fingertip-to-articulated-geom surface distance to latch a drawer/door handle. V21 uses finger/tip contact points instead of wrist EEF.")
+    p.add_argument("--articulated-center-distance", type=float, default=0.01, help="Fallback fingertip-to-articulated-geom center distance to latch a drawer/door handle. V21 uses finger/tip contact points instead of wrist EEF.")
+    p.add_argument("--articulated-follow-iters", type=int, default=12, help="Numerical joint-follow iterations per control tick for articulated helper.")
+    p.add_argument("--articulated-step-clip", type=float, default=0.025, help="Max slide/hinge qpos change per helper iteration.")
+    p.add_argument("--articulated-open-mode", choices=["force", "follow", "hybrid"], default="hybrid", help="How articulated drawer/door joints are moved after latch. force directly drives qpos toward the open joint limit; follow uses local handle following; hybrid falls back to force if follow stalls.")
+    p.add_argument("--articulated-force-step", type=float, default=0.006, help="Joint qpos increment per high-level action step in --articulated-open-mode force/hybrid. V19 default is conservative.")
+    p.add_argument("--articulated-require-closed", action=argparse.BooleanOptionalAction, default=False, help="Require gripper width <= --attach-close-width before latching articulated drawer/door joints. Default false because some fast policies do not close exactly on handles.")
+    p.add_argument("--debug-articulated", action="store_true", help="Print drawer/cabinet/door articulated helper diagnostics. Keep off for speed; v22 is quiet by default.")
+    p.add_argument("--articulated-update-during-physics", action=argparse.BooleanOptionalAction, default=False, help="Update articulated helper inside each MuJoCo physics substep. Default false for speed; the helper still updates before and after each high-level action row.")
 
     # Visualization: all modes are non-blocking; open3d uses poll_events.
     p.add_argument("--render-mode", choices=["none", "viewer3d", "onscreen", "open3d"], default="none")
     p.add_argument("--headed", action=argparse.BooleanOptionalAction, default=False, help="Alias for --render-mode viewer3d")
+    p.add_argument("--head", dest="headed", action="store_true", help="Alias for --headed, kept for compatibility with existing commands.")
     p.add_argument("--render-camera", default="agentview")
     p.add_argument("--render-every-n-steps", type=int, default=1)
     p.add_argument("--render-gpu-device-id", type=int, default=-1)
