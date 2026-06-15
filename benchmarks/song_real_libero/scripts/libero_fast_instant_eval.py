@@ -1,3 +1,6 @@
+# # TEST COMMAND
+# # python benchmarks/song_real_libero/scripts/libero_fast_instant_eval.py   --config benchmarks/song_real_libero/configs/libero.json  --suite libero_goal --all-tasks --episodes 10    --max-steps 500   --exec-action-steps 12   --no-replan-every-step   --output-dir benchmarks/song_real_libero/outputs/temp    --gripper-control-mode threshold   --gripper-threshold 0.076   --gripper-close-width 0.0   --gripper-open-width 0.08  --settle-steps 120 --attach-geom-distance 0.005 --attach-distance 0.005 --physics-steps-per-action 6   --head --render-mode  viewer3d 
+
 #!/usr/bin/env python
 """Fast, non-blocking LIBERO point-cloud inference/evaluation runner.
 
