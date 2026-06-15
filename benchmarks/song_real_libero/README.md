@@ -634,6 +634,8 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
+  --suite libero_goal \
+  --suite libero_10  \
   --all-tasks \
   --episodes 10 \
   --action-index 0 \
