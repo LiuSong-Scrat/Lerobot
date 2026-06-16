@@ -36,6 +36,7 @@
   "vis_stride": 20,
   "overwrite_dataset": true,
   "control": {
+    "gripper_threshold":0.075,
     "control_freq": 5,
     "trans_scale": 0.05,
     "rot_scale": 0.5,

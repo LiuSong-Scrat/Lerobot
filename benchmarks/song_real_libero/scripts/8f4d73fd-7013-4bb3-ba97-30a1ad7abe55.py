@@ -56,7 +56,7 @@ VSCODE_DEBUG_DEFAULT_ARGS = [
     "--config",
     str(BENCHMARK_ROOT / "configs" / "libero.json"),
     "--policy.path",
-    "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model",
+    "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model",
     "--suite",
     "libero_spatial",
     "--suite",
@@ -80,14 +80,14 @@ VSCODE_DEBUG_DEFAULT_ARGS = [
     "--no-replan-every-step",
     "--gripper-wait-until-reached",
     "--gripper-wait-tolerance",
-    "0.004",
+    "0.01",
     "--gripper-wait-max-steps",
     "12",
     "--save-video",
     "--render-mode",
     "viewer3d",
     "--output-dir",
-    "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite",
+    "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero_post/outputs/eval_libero_4suite",
     "--control-freq",
     "20",
 ]
@@ -417,7 +417,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate the point-cloud SmolVLA policy on LIBERO.")
     parser.add_argument("--control-freq", type=float, default=None)
     parser.add_argument("--config", type=Path, default=BENCHMARK_ROOT / "configs" / "libero.json")
-    parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
+    parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default="benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model")
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
@@ -425,10 +425,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default="/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default=None)
-    parser.add_argument("--headed", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default="viewer3d")
+    parser.add_argument("--recreate-env-per-episode", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--debug-episode-lifecycle", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--headed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--render-camera", default=None)
     parser.add_argument("--render-every-n-steps", type=int, default=None)
     parser.add_argument("--render-gpu-device-id", type=int, default=None)
@@ -451,6 +453,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gripper-close-hold-steps", type=int, default=None)
     parser.add_argument("--gripper-grasp-required-to-advance", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--gripper-grasp-wait-max-steps", type=int, default=None)
+    parser.add_argument("--execution-mode", choices=("sync_wait", "fast_physics"), default=None)
+    parser.add_argument("--fast-physics-min-steps", type=int, default=None)
+    parser.add_argument("--fast-physics-max-steps", type=int, default=None)
+    parser.add_argument("--fast-physics-max-duration-s", type=float, default=None)
+    parser.add_argument("--fast-physics-pos-step-m", type=float, default=None)
+    parser.add_argument("--fast-physics-rot-step-rad", type=float, default=None)
+    parser.add_argument("--fast-physics-close-steps", type=int, default=None)
+    parser.add_argument("--fast-physics-open-steps", type=int, default=None)
+    parser.add_argument("--fast-physics-close-after-pose", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--fast-physics-success-check-every", type=int, default=None)
+    parser.add_argument("--fast-physics-debug", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--keyboard-vis", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--keyboard-vis-mode", choices=("ply", "window"), default=None)
     return parser.parse_args(argv)
@@ -569,6 +582,29 @@ def canonical_gripper_width(width: float, *, max_physical_width: float) -> float
     )
 
 
+def resolve_gripper_width_for_execution(
+    predicted_width: float,
+    *,
+    mode: str | None = None,
+    threshold: float | None = None,
+    open_width: float | None = None,
+    close_width: float | None = None,
+    qpos_max_width: float,
+) -> tuple[float, str]:
+    """Use the model action's last dimension directly as physical gripper width.
+
+    Mirrors libero_fast_instant_eval V23+: no thresholding, no open/close class,
+    and no task-specific close threshold.  Legacy arguments are accepted only so
+    old configs / command lines keep running; they intentionally do not affect
+    execution.  The returned width is the postprocessed inference action value
+    clipped to the valid physical gripper-width range.
+    """
+    _ = (mode, threshold, open_width, close_width)
+    max_width = max(float(qpos_max_width), 0.0)
+    executed_width = float(np.clip(float(predicted_width), 0.0, max_width))
+    return executed_width, "model_action_last_dim"
+
+
 def _control_list(control: dict[str, Any], key: str, default: list[str]) -> list[str]:
     value = control.get(key, default)
     if value is None:
@@ -610,15 +646,140 @@ def gripper_close_threshold_for_task(task_language: str, control: dict[str, Any]
     return default_threshold
 
 
-def unwrap_libero_env(env: Any) -> Any:
-    inner_env = env
-    while hasattr(inner_env, "env"):
-        next_env = inner_env.env
-        if next_env is inner_env:
+def iter_libero_env_chain(env: Any, max_depth: int = 32) -> list[Any]:
+    """Return env plus wrapped inner envs, outermost first, with cycle protection."""
+    out: list[Any] = []
+    current = env
+    for _ in range(int(max_depth)):
+        if current is None or any(current is item for item in out):
             break
-        inner_env = next_env
-    return inner_env
+        out.append(current)
+        next_env = getattr(current, "env", None)
+        if next_env is None or next_env is current:
+            break
+        current = next_env
+    return out
 
+
+def unwrap_libero_env(env: Any) -> Any:
+    chain = iter_libero_env_chain(env)
+    return chain[-1] if chain else env
+
+
+def _viewer_attrs_to_clear() -> tuple[str, ...]:
+    return (
+        "viewer",
+        "_viewer",
+        "mujoco_viewer",
+        "_mujoco_viewer",
+        "viewer3d",
+        "_viewer3d",
+        "mujoco_3d_viewer",
+        "_mujoco_3d_viewer",
+        "passive_viewer",
+        "_passive_viewer",
+    )
+
+
+def _find_mujoco_viewer(env: Any) -> Any | None:
+    """Find a viewer handle attached anywhere in the wrapper chain."""
+    for obj in reversed(iter_libero_env_chain(env)):
+        for attr in _viewer_attrs_to_clear():
+            viewer = getattr(obj, attr, None)
+            if viewer is not None:
+                return viewer
+    return None
+
+
+def _viewer_running(viewer: Any) -> bool:
+    if viewer is None:
+        return False
+    for name in ("is_running", "is_alive"):
+        value = getattr(viewer, name, None)
+        try:
+            if callable(value):
+                return bool(value())
+            if value is not None:
+                return bool(value)
+        except Exception:
+            pass
+    for name in ("_closed", "closed"):
+        value = getattr(viewer, name, None)
+        if value is not None:
+            try:
+                return not bool(value)
+            except Exception:
+                pass
+    # Robosuite viewer wrappers often do not expose a running flag.  Treat a
+    # present handle as usable and let render/sync raise if it is stale.
+    return True
+
+
+def _clear_mujoco_viewer_refs(env: Any) -> None:
+    """Clear viewer handles / init flags on every wrapper layer.
+
+    attach_mujoco_3d_viewer() can attach the passive viewer to different objects
+    depending on the robosuite / LIBERO wrapper stack.  Clearing only the deepest
+    base_env.viewer leaves stale handles or "already attached" flags behind, so
+    the next episode may execute without opening/syncing a new 3D viewer.
+    """
+    for obj in iter_libero_env_chain(env):
+        for attr in _viewer_attrs_to_clear():
+            if hasattr(obj, attr):
+                try:
+                    setattr(obj, attr, None)
+                except Exception:
+                    pass
+        for attr in (
+            "viewer3d_attached",
+            "_viewer3d_attached",
+            "mujoco_3d_viewer_attached",
+            "_mujoco_3d_viewer_attached",
+            "viewer_initialized",
+            "_viewer_initialized",
+            "mujoco_viewer_initialized",
+            "_mujoco_viewer_initialized",
+        ):
+            if hasattr(obj, attr):
+                try:
+                    setattr(obj, attr, False)
+                except Exception:
+                    pass
+
+
+def close_mujoco_viewer_safely(env: Any) -> None:
+    """Close and fully detach MuJoCo's passive 3D viewer without closing env.
+
+    The important part is clearing viewer references on *all* wrapper layers.  If
+    a closed passive viewer object survives on any layer, the next episode can run
+    normally while attach_mujoco_3d_viewer() silently reuses that dead handle and
+    no new 3D window appears.
+    """
+    if env is None:
+        return
+    viewers: list[Any] = []
+    try:
+        for obj in iter_libero_env_chain(env):
+            for attr in _viewer_attrs_to_clear():
+                viewer = getattr(obj, attr, None)
+                if viewer is not None and not any(viewer is old for old in viewers):
+                    viewers.append(viewer)
+        for viewer in viewers:
+            for name in ("close", "finish", "destroy", "destroy_window"):
+                fn = getattr(viewer, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        break
+                    except Exception:
+                        pass
+        _clear_mujoco_viewer_refs(env)
+    except Exception as exc:
+        print(f"[WARN] failed to close MuJoCo viewer cleanly: {exc!r}")
+        try:
+            _clear_mujoco_viewer_refs(env)
+        except Exception:
+            pass
 
 def goal_predicate_status(env: Any) -> dict[str, Any]:
     base_env = unwrap_libero_env(env)
@@ -942,12 +1103,29 @@ def correct_rim_grasp_target_world(
     return corrected.astype(np.float32), metrics
 
 
+def _sync_or_render_viewer(viewer: Any) -> bool:
+    """Advance a MuJoCo passive viewer handle or robosuite viewer wrapper."""
+    if viewer is None:
+        return False
+    # mujoco.viewer.launch_passive returns a handle whose public method is sync().
+    for name in ("sync", "render"):
+        fn = getattr(viewer, name, None)
+        if callable(fn):
+            try:
+                fn()
+                return True
+            except Exception as exc:
+                print(f"[WARN] viewer.{name} failed: {exc!r}")
+                return False
+    return False
+
+
 def render_onscreen_env(env: Any, cfg: dict[str, Any], step: int, *, force: bool = False) -> None:
     render_mode = str(cfg.get("render_mode", "offscreen")).lower()
     if render_mode not in {"onscreen", "headed", "human", "viewer3d", "mujoco"}:
         return
 
-    every_n = int(cfg.get("render_every_n_steps", 1))
+    every_n = int(cfg.get("render_every_n_steps", 1) or 1)
     if every_n <= 0:
         return
     if not force and int(step) % every_n != 0:
@@ -956,36 +1134,58 @@ def render_onscreen_env(env: Any, cfg: dict[str, Any], step: int, *, force: bool
     render_camera = normalize_render_camera_name(str(cfg.get("render_camera", "agentview")))
 
     if render_mode in {"viewer3d", "mujoco"}:
-        attach_mujoco_3d_viewer(env, render_camera=render_camera)
+        viewer = _find_mujoco_viewer(env)
+        if viewer is not None and not _viewer_running(viewer):
+            close_mujoco_viewer_safely(env)
+            viewer = None
 
-        # Important: passive mujoco viewer needs explicit sync/render.
-        base_env = env
-        while hasattr(base_env, "env"):
-            next_env = base_env.env
-            if next_env is base_env:
-                break
-            base_env = next_env
+        if viewer is None:
+            try:
+                attach_mujoco_3d_viewer(env, render_camera=render_camera)
+            except Exception as exc:
+                print(f"[WARN] attach_mujoco_3d_viewer failed: {exc!r}")
+            viewer = _find_mujoco_viewer(env)
 
-        viewer = getattr(base_env, "viewer", None)
-        if viewer is not None and hasattr(viewer, "render"):
-            viewer.render()
+        if _sync_or_render_viewer(viewer):
+            time.sleep(1.0 / 60.0)
+            return
 
-        time.sleep(1 / 60)
-        return
+        # If the handle existed but could not sync/render, clear it once and try a
+        # fresh attach.  This fixes the episode-1 case where a closed passive
+        # viewer object was still cached on one wrapper layer.
+        if viewer is not None:
+            close_mujoco_viewer_safely(env)
+            try:
+                attach_mujoco_3d_viewer(env, render_camera=render_camera)
+            except Exception as exc:
+                print(f"[WARN] reattach_mujoco_3d_viewer failed: {exc!r}")
+            viewer = _find_mujoco_viewer(env)
+            if _sync_or_render_viewer(viewer):
+                time.sleep(1.0 / 60.0)
+                return
 
     render_fn = getattr(env, "render", None)
     if callable(render_fn):
-        render_fn()
-        return
+        try:
+            render_fn()
+            if render_mode in {"onscreen", "headed", "human", "viewer3d", "mujoco"}:
+                time.sleep(1.0 / 60.0)
+            return
+        except Exception as exc:
+            print(f"[WARN] env.render failed: {exc!r}")
+            return
 
     inner_env = getattr(env, "env", None)
     inner_render = getattr(inner_env, "render", None)
     if callable(inner_render):
-        inner_render()
-        return
+        try:
+            inner_render()
+            return
+        except Exception as exc:
+            print(f"[WARN] inner env.render failed: {exc!r}")
+            return
 
     raise AttributeError(f"The LIBERO environment does not expose a render() method for {render_mode} mode.")
-
 
 def _rgb_uint8(colors: np.ndarray) -> np.ndarray:
     colors = np.asarray(colors, dtype=np.float32)
@@ -1116,6 +1316,255 @@ class TerminalKeyWatcher:
         return requested
 
 
+
+def _control_freq_hz(cfg: dict[str, Any], control: dict[str, Any]) -> float:
+    """Return the robosuite control frequency used by make_libero_env()."""
+    try:
+        return float(cfg.get("control_freq", control.get("control_freq", 20.0)))
+    except Exception:
+        return 20.0
+
+
+def _fast_physics_action_budget(
+    *,
+    cfg: dict[str, Any],
+    control: dict[str, Any],
+    pre_pose_pos_error: float,
+    pre_pose_rot_error: float,
+    gripper_should_close: bool,
+) -> int:
+    """Compute a small physical-servo budget for one model action row.
+
+    This is not a separate pose/gripper wait loop.  It is a bounded number of
+    real robosuite/MuJoCo env.step() calls used to let OSC and gripper actuators
+    physically track one target before the next model action row is consumed.
+    The budget is adaptive, so tiny motions use only a few physics ticks while
+    large pose deltas still get enough simulated time to avoid action/EEF drift.
+    """
+    min_steps = max(1, int(control.get("fast_physics_min_steps", 2)))
+    max_steps_cfg = max(min_steps, int(control.get("fast_physics_max_steps", 12)))
+    max_duration_s = float(control.get("fast_physics_max_duration_s", 0.0) or 0.0)
+    if max_duration_s > 0.0:
+        hz = max(_control_freq_hz(cfg, control), 1.0)
+        # Duration is a cap expressed in physical control time.  Keep the explicit
+        # step cap as the user's upper bound when it is larger.
+        max_steps_cfg = max(max_steps_cfg, int(math.ceil(max_duration_s * hz)))
+
+    pos_per_step = max(1e-6, float(control.get("fast_physics_pos_step_m", 0.012)))
+    rot_per_step = max(1e-6, float(control.get("fast_physics_rot_step_rad", 0.18)))
+    estimated_pose_steps = int(
+        math.ceil(
+            max(
+                float(pre_pose_pos_error) / pos_per_step,
+                float(pre_pose_rot_error) / rot_per_step,
+            )
+        )
+    )
+    gripper_steps = int(
+        control.get(
+            "fast_physics_close_steps" if bool(gripper_should_close) else "fast_physics_open_steps",
+            6 if bool(gripper_should_close) else 2,
+        )
+    )
+    gripper_steps = max(0, gripper_steps)
+    return int(np.clip(max(min_steps, estimated_pose_steps + gripper_steps), min_steps, max_steps_cfg))
+
+
+def execute_fast_physics_action(
+    *,
+    env: Any,
+    cfg: dict[str, Any],
+    raw_obs: dict[str, Any],
+    motion_action: np.ndarray,
+    controller_target_world: np.ndarray,
+    gripper_target_width: float,
+    gripper_should_close: bool,
+    gripper_max_width: float,
+    pose_wait_pos_tolerance: float,
+    pose_wait_rot_tolerance: float,
+    gripper_wait_tolerance: float,
+    timing_totals: dict[str, float],
+    timing_counts: dict[str, int],
+    outer_step: int,
+) -> dict[str, Any]:
+    """Bounded physical execution of one model action row.
+
+    The original synchronized evaluator had two serial blockers: pose wait and
+    gripper wait.  This executor removes those separate wait states, but it still
+    uses real robosuite OSC + gripper actuator env.step() calls.  It repeatedly
+    commands the same absolute target for a short adaptive budget, re-measures the
+    actual EEF/gripper state after each physics tick, and only then advances the
+    model action queue.  Closing can be delayed until the EEF is near the target,
+    so the gripper does not clamp before the fingers are at the predicted grasp
+    pose.  No direct qpos teleporting or kinematic attach is used here.
+    """
+    control = cfg["control"]
+    motion_action = np.asarray(motion_action, dtype=np.float32).reshape(6)
+    controller_target_world = np.asarray(controller_target_world, dtype=np.float32)
+    close_after_pose = bool(control.get("fast_physics_close_after_pose", True))
+    success_check_every = max(1, int(control.get("fast_physics_success_check_every", 1)))
+    debug = bool(control.get("fast_physics_debug", False))
+
+    timing_start = time.perf_counter()
+    pre_controller_world = current_controller_eef_world(env)
+    add_timing(timing_totals, timing_counts, "controller_pose_read", timing_start)
+    pre_pose_pos_error, pre_pose_rot_error = pose_error_to_target(pre_controller_world, controller_target_world)
+    budget_steps = _fast_physics_action_budget(
+        cfg=cfg,
+        control=control,
+        pre_pose_pos_error=pre_pose_pos_error,
+        pre_pose_rot_error=pre_pose_rot_error,
+        gripper_should_close=bool(gripper_should_close),
+    )
+    required_active_gripper_steps = max(
+        0,
+        int(
+            control.get(
+                "fast_physics_close_steps" if bool(gripper_should_close) else "fast_physics_open_steps",
+                6 if bool(gripper_should_close) else 2,
+            )
+        ),
+    )
+    min_steps = max(1, int(control.get("fast_physics_min_steps", 2)))
+    active_gripper_steps = 0
+    physical_steps = 0
+    reward_sum = 0.0
+    max_reward = 0.0
+    done = False
+    success_now = False
+    terminated_value_error = False
+    last_libero_action = np.concatenate([motion_action, np.asarray([0.0], dtype=np.float32)]).astype(np.float32)
+    pose_pos_error = float(pre_pose_pos_error)
+    pose_rot_error = float(pre_pose_rot_error)
+    gripper_actual_width = canonical_gripper_width(float(gripper_scalar(raw_obs)), max_physical_width=gripper_max_width)
+    gripper_width_error = abs(gripper_actual_width - float(gripper_target_width))
+
+    # Guarantee that closing still gets a short physical actuation window even
+    # if the arm never reaches the pose tolerance within this bounded budget.
+    force_gripper_start = max(0, budget_steps - required_active_gripper_steps)
+
+    for local_idx in range(budget_steps):
+        timing_start = time.perf_counter()
+        current_controller_world = current_controller_eef_world(env)
+        add_timing(timing_totals, timing_counts, "controller_pose_read", timing_start)
+        pose_pos_error, pose_rot_error = pose_error_to_target(current_controller_world, controller_target_world)
+        pose_reached = pose_pos_error <= pose_wait_pos_tolerance and pose_rot_error <= pose_wait_rot_tolerance
+
+        current_width = canonical_gripper_width(float(gripper_scalar(raw_obs)), max_physical_width=gripper_max_width)
+        gripper_cmd = gripper_width_delta_action(
+            float(gripper_target_width),
+            current_width,
+            max_physical_width=gripper_max_width,
+        )
+        if bool(gripper_should_close):
+            gripper_cmd = max(float(gripper_cmd), 0.0)
+        else:
+            gripper_cmd = min(float(gripper_cmd), 0.0)
+
+        gripper_allowed = True
+        if bool(gripper_should_close) and close_after_pose and not pose_reached and local_idx < force_gripper_start:
+            gripper_allowed = False
+            gripper_cmd = 0.0
+        if abs(gripper_cmd) > 1e-6:
+            active_gripper_steps += 1
+
+        last_libero_action = np.concatenate(
+            [motion_action.astype(np.float32), np.asarray([gripper_cmd], dtype=np.float32)]
+        ).astype(np.float32)
+
+        try:
+            timing_start = time.perf_counter()
+            raw_obs, reward, done, _ = env.step(last_libero_action)
+            add_timing(timing_totals, timing_counts, "env_step", timing_start)
+            physical_steps += 1
+        except ValueError as exc:
+            if "terminated episode" in str(exc):
+                terminated_value_error = True
+                done = True
+                try:
+                    success_now = success_now or bool(env.check_success())
+                except Exception:
+                    pass
+                break
+            raise
+
+        reward = float(reward)
+        reward_sum += reward
+        max_reward = max(max_reward, reward)
+
+        if physical_steps % success_check_every == 0:
+            try:
+                timing_start = time.perf_counter()
+                success_now = success_now or bool(env.check_success())
+                add_timing(timing_totals, timing_counts, "success_check", timing_start)
+            except Exception:
+                pass
+        if done or success_now:
+            break
+
+        gripper_actual_width = canonical_gripper_width(
+            float(gripper_scalar(raw_obs)),
+            max_physical_width=gripper_max_width,
+        )
+        gripper_width_error = abs(gripper_actual_width - float(gripper_target_width))
+        # Stop early only after a minimum number of physical ticks and after the
+        # gripper has received the requested short actuator window.  For closing
+        # targets, gripper_width_error may stay nonzero because an object blocks
+        # the fingers; that is good, because the positive actuator command is what
+        # creates the physical grasp force.
+        enough_gripper = active_gripper_steps >= required_active_gripper_steps
+        gripper_reached_or_closing = gripper_width_error <= gripper_wait_tolerance or bool(gripper_should_close)
+        if local_idx + 1 >= min_steps and pose_reached and enough_gripper and gripper_reached_or_closing:
+            break
+
+    timing_start = time.perf_counter()
+    post_controller_world = current_controller_eef_world(env)
+    add_timing(timing_totals, timing_counts, "controller_pose_read", timing_start)
+    pose_pos_error, pose_rot_error = pose_error_to_target(post_controller_world, controller_target_world)
+    gripper_actual_width = canonical_gripper_width(
+        float(gripper_scalar(raw_obs)),
+        max_physical_width=gripper_max_width,
+    )
+    gripper_width_error = abs(gripper_actual_width - float(gripper_target_width))
+
+    grasp_status = {"any_contact": False, "any_grasped": False, "grasped_objects": [], "contact_objects": []}
+    if bool(gripper_should_close):
+        try:
+            timing_start = time.perf_counter()
+            grasp_status = gripper_grasp_status(env)
+            add_timing(timing_totals, timing_counts, "gripper_grasp_check", timing_start)
+        except Exception:
+            pass
+
+    if debug:
+        print(
+            "[debug] fast_physics "
+            f"step={outer_step} budget={budget_steps} used={physical_steps} "
+            f"pre_pos={pre_pose_pos_error:.4f} post_pos={pose_pos_error:.4f} "
+            f"pre_rot={pre_pose_rot_error:.3f} post_rot={pose_rot_error:.3f} "
+            f"grip_target={float(gripper_target_width):.4f} grip_actual={gripper_actual_width:.4f} "
+            f"active_grip_steps={active_gripper_steps} done={done} success={success_now}",
+            flush=True,
+        )
+
+    return {
+        "raw_obs": raw_obs,
+        "reward_sum": float(reward_sum),
+        "max_reward": float(max_reward),
+        "done": bool(done),
+        "success_now": bool(success_now),
+        "terminated_value_error": bool(terminated_value_error),
+        "physical_steps": int(physical_steps),
+        "budget_steps": int(budget_steps),
+        "active_gripper_steps": int(active_gripper_steps),
+        "last_libero_action": last_libero_action,
+        "pose_pos_error": float(pose_pos_error),
+        "pose_rot_error": float(pose_rot_error),
+        "gripper_actual_width": float(gripper_actual_width),
+        "gripper_width_error": float(gripper_width_error),
+        "grasp_status": grasp_status,
+    }
+
 def run_episode(
     *,
     infer: SmolVLA_ModelInference,
@@ -1127,15 +1576,20 @@ def run_episode(
 ) -> dict[str, Any]:
     control = cfg["control"]
     max_steps = control.get("max_steps")
+    lifecycle_debug = bool(cfg.get("debug_episode_lifecycle", False))
+    if lifecycle_debug:
+        print("[debug] episode_lifecycle: env.reset begin", flush=True)
     env.reset()
+    if lifecycle_debug:
+        print("[debug] episode_lifecycle: env.reset done; set_init_state begin", flush=True)
     raw_obs = env.set_init_state(init_state)
+    if lifecycle_debug:
+        print("[debug] episode_lifecycle: set_init_state done", flush=True)
     warmup_steps = int(control.get("warmup_steps", 0))
     for _ in range(max(0, warmup_steps)):
         raw_obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, 0])
         try:
-            base_env = env
-            while hasattr(base_env, "env"):
-                base_env = base_env.env
+            base_env = unwrap_libero_env(env)
             if hasattr(base_env, "viewer") and hasattr(base_env.viewer, "render"):
                 base_env.viewer.render()
         except Exception as e:
@@ -1152,6 +1606,7 @@ def run_episode(
     pose_wait_flags: list[bool] = []
     gripper_targets: list[float] = []
     gripper_actuals: list[float] = []
+    gripper_modes: list[str] = []
     gripper_width_errors: list[float] = []
     gripper_should_close_flags: list[bool] = []
     gripper_close_command_flags: list[bool] = []
@@ -1173,6 +1628,10 @@ def run_episode(
     timing_counts: dict[str, int] = defaultdict(int)
     episode_start_s = time.perf_counter()
     model_call_count = 0
+    total_physical_env_steps = 0
+    fast_physics_budget_steps: list[int] = []
+    fast_physics_used_steps: list[int] = []
+    fast_physics_active_gripper_steps: list[int] = []
     video_frames: dict[str, list[np.ndarray]] = {}
     max_steps = int(max_steps or getattr(env, "horizon", 500))
     action_index = max(0, int(control.get("action_index", 0)))
@@ -1180,6 +1639,10 @@ def run_episode(
     if control_mode not in {"absolute_pose", "delta_pose"}:
         raise ValueError(f"Unsupported control_mode={control_mode!r}; expected 'absolute_pose' or 'delta_pose'.")
     use_absolute_pose_control = control_mode == "absolute_pose"
+    execution_mode = str(control.get("execution_mode", "fast_physics")).lower()
+    if execution_mode not in {"sync_wait", "fast_physics"}:
+        raise ValueError(f"Unsupported execution_mode={execution_mode!r}; expected 'sync_wait' or 'fast_physics'.")
+    use_fast_physics_execution = execution_mode == "fast_physics"
     for robot in env.robots:
         robot.controller.use_delta = not use_absolute_pose_control
     replan_every_step = bool(control.get("replan_every_step", False))
@@ -1194,7 +1657,10 @@ def run_episode(
     gripper_wait_until_reached = bool(control.get("gripper_wait_until_reached", True))
     gripper_wait_tolerance = max(0.0, float(control.get("gripper_wait_tolerance", 0.004)))
     gripper_wait_max_steps = max(0, int(control.get("gripper_wait_max_steps", 12)))
-    gripper_close_threshold = gripper_close_threshold_for_task(task_language, control)
+    # Gripper execution follows libero_fast_instant_eval: the model action's
+    # last dimension is a continuous physical target width, not an open/close
+    # class.  Legacy threshold keys may still exist in old configs but are ignored.
+    gripper_close_threshold: float | None = None
     gripper_contact_stall_tolerance = max(0.0, float(control.get("gripper_contact_stall_tolerance", 0.0007)))
     gripper_contact_stall_steps = max(1, int(control.get("gripper_contact_stall_steps", 4)))
     gripper_close_hold_steps = max(0, int(control.get("gripper_close_hold_steps", 0)))
@@ -1245,6 +1711,8 @@ def run_episode(
     )
 
     for step in range(max_steps):
+        if total_physical_env_steps >= max_steps:
+            break
         if key_watcher is not None and key_watcher.consume_visualize_request():
             pending_visualization = True
         need_model_point_cloud = (replan_every_step and not gripper_waiting and not pose_waiting) or not action_queue
@@ -1359,12 +1827,31 @@ def run_episode(
         else:
             target_world = current_world @ pose9_to_homo_np(pose_action[:9])
 
-        gripper_target = float(pose_action[-1])
+        gripper_predicted_width = float(pose_action[-1])
+        gripper_target_width, gripper_mode = resolve_gripper_width_for_execution(
+            gripper_predicted_width,
+            mode=str(control.get("gripper_control_mode", "direct")),
+            threshold=control.get("gripper_close_threshold"),
+            open_width=control.get("gripper_open_width", gripper_max_width),
+            close_width=control.get("gripper_close_width", 0.0),
+            qpos_max_width=gripper_max_width,
+        )
+        # Keep pose_action's gripper slot equal to the value actually executed / logged.
+        pose_action[-1] = gripper_target_width
+        controller_pose_action[-1] = gripper_target_width
+        gripper_target = gripper_target_width
         gripper_width_before = canonical_gripper_width(
             float(gripper_scalar(raw_obs)),
             max_physical_width=gripper_max_width,
         )
-        gripper_should_close = gripper_target < gripper_close_threshold
+        gripper_command_raw = gripper_width_delta_action(
+            gripper_target_width,
+            gripper_width_before,
+            max_physical_width=gripper_max_width,
+        )
+        # This flag now means "the continuous target asks for a narrower width";
+        # it no longer comes from a task-specific threshold.
+        gripper_should_close = gripper_command_raw > 0.0
         rim_correction_metrics = {
             "applied": False,
             "axis_shift": 0.0,
@@ -1429,14 +1916,15 @@ def run_episode(
             )
             hold_motion_action = np.zeros(6, dtype=np.float32)
 
-        # Binary gripper execution is used for LIBERO Panda: +1 closes, -1 opens.
-        # The target width is used only for deciding whether the target is complete.
-        if gripper_should_close:
-            gripper_command = 1.0
-            gripper_target_width = 0.0
-        else:
-            gripper_command = -1.0
-            gripper_target_width = gripper_max_width
+        # Continuous gripper execution: convert the postprocessed model target
+        # width into robosuite's signed gripper command.  No threshold / binary
+        # open-close mapping is applied.
+        # Keep an un-gated target motion for fast_physics; the legacy sync_wait
+        # branch below may replace motion_action with a hold command while it is
+        # waiting for pose/gripper completion, but fast_physics performs its own
+        # bounded physical servo and must track the actual model target.
+        target_motion_action = motion_action.copy()
+        gripper_command = gripper_command_raw
 
         # Pre-step completion check. This prevents the controller from repeatedly
         # sending the same absolute pose target after the arm has already arrived,
@@ -1509,8 +1997,8 @@ def run_episode(
             motion_action = hold_motion_action.copy()
         if pre_close_hold_active or pre_grasp_wait_active:
             motion_action = hold_motion_action.copy()
-            gripper_command = 1.0
-            active_gripper_control = True
+            gripper_command = max(float(gripper_command_raw), 0.0)
+            active_gripper_control = abs(gripper_command) > 1e-6
         elif pre_pose_ready and pre_gripper_done:
             motion_action = hold_motion_action.copy()
             gripper_command = 0.0
@@ -1518,10 +2006,103 @@ def run_episode(
 
         libero_action = np.concatenate([motion_action.astype(np.float32), np.asarray([gripper_command], dtype=np.float32)])
 
+        if use_fast_physics_execution:
+            physics_result = execute_fast_physics_action(
+                env=env,
+                cfg=cfg,
+                raw_obs=raw_obs,
+                motion_action=target_motion_action,
+                controller_target_world=controller_target_world,
+                gripper_target_width=gripper_target_width,
+                gripper_should_close=bool(gripper_should_close),
+                gripper_max_width=gripper_max_width,
+                pose_wait_pos_tolerance=pose_wait_pos_tolerance,
+                pose_wait_rot_tolerance=pose_wait_rot_tolerance,
+                gripper_wait_tolerance=gripper_wait_tolerance,
+                timing_totals=timing_totals,
+                timing_counts=timing_counts,
+                outer_step=step,
+            )
+            raw_obs = physics_result["raw_obs"]
+            reward = float(physics_result["reward_sum"])
+            done = bool(physics_result["done"])
+            success_now = bool(physics_result["success_now"])
+            total_physical_env_steps += int(physics_result["physical_steps"])
+            fast_physics_budget_steps.append(int(physics_result["budget_steps"]))
+            fast_physics_used_steps.append(int(physics_result["physical_steps"]))
+            fast_physics_active_gripper_steps.append(int(physics_result["active_gripper_steps"]))
+            libero_action = np.asarray(physics_result["last_libero_action"], dtype=np.float32)
+            max_reward = max(max_reward, float(physics_result["max_reward"]))
+            success_ever = success_ever or success_now
+            success = success_now
+            pose_pos_error = float(physics_result["pose_pos_error"])
+            pose_rot_error = float(physics_result["pose_rot_error"])
+            gripper_actual_width = float(physics_result["gripper_actual_width"])
+            gripper_actual = float(gripper_scalar(raw_obs))
+            gripper_width_error = float(physics_result["gripper_width_error"])
+            grasp_status = physics_result.get("grasp_status", {}) or {}
+            gripper_grasped = bool(grasp_status.get("any_grasped", False))
+            gripper_contact_any = bool(grasp_status.get("any_contact", False))
+            gripper_contact_stalled = False
+            should_wait_pose = False
+            should_wait_gripper = False
+            should_hold_close = False
+            should_wait_grasp = False
+            pose_waiting = False
+            gripper_waiting = False
+
+            if action_queue:
+                action_queue.pop(0)
+            if action_target_indices:
+                action_target_indices.pop(0)
+            planned_step_index += 1
+            gripper_wait_steps = 0
+            pose_wait_steps = 0
+            gripper_close_stall_steps = 0
+            gripper_close_hold_counter = 0
+            gripper_grasp_wait_steps = 0
+            last_waited_gripper_target_width = gripper_target_width
+
+            timing_start = time.perf_counter()
+            render_onscreen_env(env, cfg, total_physical_env_steps)
+            add_timing(timing_totals, timing_counts, "render", timing_start)
+            if save_video:
+                timing_start = time.perf_counter()
+                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+                add_timing(timing_totals, timing_counts, "video_frame_append", timing_start)
+            libero_actions.append(libero_action)
+            pose_actions.append(pose_action)
+            controller_pose_actions.append(controller_pose_action)
+            pose_pos_errors.append(pose_pos_error)
+            pose_rot_errors.append(pose_rot_error)
+            pose_wait_flags.append(False)
+            gripper_targets.append(gripper_target)
+            gripper_actuals.append(gripper_actual)
+            gripper_modes.append(str(gripper_mode))
+            gripper_width_errors.append(gripper_width_error)
+            gripper_should_close_flags.append(bool(gripper_should_close))
+            gripper_close_command_flags.append(bool(libero_action[-1] > 0.0))
+            gripper_wait_flags.append(False)
+            gripper_contact_stall_flags.append(bool(gripper_contact_stalled))
+            gripper_rim_correction_flags.append(bool(rim_correction_metrics["applied"]))
+            gripper_rim_axis_shifts.append(float(rim_correction_metrics["axis_shift"]))
+            gripper_rim_depth_shifts.append(float(rim_correction_metrics["depth_shift"]))
+            gripper_rim_lifts.append(float(rim_correction_metrics["lift"]))
+            gripper_rim_point_counts.append(int(rim_correction_metrics["point_count"]))
+            gripper_progress_indices.append(gripper_progress_idx)
+            gripper_close_hold_flags.append(False)
+            gripper_grasp_flags.append(bool(gripper_grasped))
+            gripper_contact_flags.append(bool(gripper_contact_any))
+            rewards.append(float(reward))
+            if done or success or total_physical_env_steps >= max_steps:
+                break
+            continue
+
         try:
             timing_start = time.perf_counter()
             raw_obs, reward, done, _ = env.step(libero_action)
             add_timing(timing_totals, timing_counts, "env_step", timing_start)
+            total_physical_env_steps += 1
         except ValueError as exc:
             if "terminated episode" in str(exc):
                 # The env is already done. Do not count this as a policy failure.
@@ -1656,19 +2237,6 @@ def run_episode(
             gripper_close_hold_counter = 0
             gripper_grasp_wait_steps = 0
             last_waited_gripper_target_width = gripper_target_width
-        try:
-            timing_start = time.perf_counter()
-            base_env = env
-            while hasattr(base_env, "env"):
-                base_env = base_env.env
-
-            viewer = getattr(base_env, "viewer", None)
-            if viewer is not None and hasattr(viewer, "render"):
-                viewer.render()
-            add_timing(timing_totals, timing_counts, "viewer_sync", timing_start)
-        except Exception as e:
-            print("[WARN] viewer sync failed:", repr(e))
-
         timing_start = time.perf_counter()
         render_onscreen_env(env, cfg, step + 1)
         add_timing(timing_totals, timing_counts, "render", timing_start)
@@ -1684,6 +2252,7 @@ def run_episode(
         pose_wait_flags.append(bool(should_wait_pose))
         gripper_targets.append(gripper_target)
         gripper_actuals.append(gripper_actual)
+        gripper_modes.append(str(gripper_mode))
         gripper_width_errors.append(gripper_width_error)
         gripper_should_close_flags.append(bool(gripper_should_close))
         gripper_close_command_flags.append(bool(libero_action[-1] > 0.0))
@@ -1703,16 +2272,25 @@ def run_episode(
             break
 
     final_goal_status = goal_predicate_status(env)
+    if str(cfg.get("render_mode", "offscreen")).lower() in {"viewer3d", "mujoco"}:
+        close_mujoco_viewer_safely(env)
     wall_s = time.perf_counter() - episode_start_s
     return {
         "success": bool(success_ever),
-        "steps": step + 1,
+        "steps": int(total_physical_env_steps if total_physical_env_steps > 0 else step + 1),
+        "action_rows_executed": int(len(libero_actions)),
+        "execution_mode": str(execution_mode),
+        "fast_physics_budget_steps": np.asarray(fast_physics_budget_steps, dtype=np.int64),
+        "fast_physics_used_steps": np.asarray(fast_physics_used_steps, dtype=np.int64),
+        "fast_physics_active_gripper_steps": np.asarray(fast_physics_active_gripper_steps, dtype=np.int64),
         "model_call_count": int(model_call_count),
         "sum_reward": float(np.sum(rewards)),
         "max_reward": float(max_reward),
         "timings": summarize_timings(timing_totals, timing_counts, wall_s=wall_s),
         "goal_predicates_final": final_goal_status,
-        "gripper_close_threshold": float(gripper_close_threshold),
+        "gripper_execution_mode": "model_action_last_dim",
+        "gripper_thresholding_disabled": True,
+        "gripper_close_threshold": None,
         "gripper_side_grasp_enable": bool(side_grasp_enable),
         "gripper_close_pose_wait_max_steps": int(gripper_close_pose_wait_max_steps),
         "gripper_close_target_steps": int(np.sum(gripper_should_close_flags)),
@@ -1731,6 +2309,7 @@ def run_episode(
         "pose_wait_flags": np.asarray(pose_wait_flags, dtype=bool),
         "gripper_targets": np.asarray(gripper_targets, dtype=np.float32),
         "gripper_actuals": np.asarray(gripper_actuals, dtype=np.float32),
+        "gripper_modes": np.asarray(gripper_modes, dtype=object),
         "gripper_width_errors": np.asarray(gripper_width_errors, dtype=np.float32),
         "gripper_should_close_flags": np.asarray(gripper_should_close_flags, dtype=bool),
         "gripper_close_command_flags": np.asarray(gripper_close_command_flags, dtype=bool),
@@ -1772,6 +2351,22 @@ def main() -> None:
         cfg["render_every_n_steps"] = int(args.render_every_n_steps)
     if args.render_gpu_device_id is not None:
         cfg["render_gpu_device_id"] = int(args.render_gpu_device_id)
+    render_mode_for_lifecycle = str(cfg.get("render_mode", "offscreen")).lower()
+    if args.recreate_env_per_episode is not None:
+        cfg["recreate_env_per_episode"] = bool(args.recreate_env_per_episode)
+    else:
+        # MuJoCo passive viewer / GL contexts are safest when a LIBERO env is not
+        # reset and reused across episodes.  This mirrors libero_fast_instant_eval's
+        # default and avoids episode-1 hangs in viewer3d mode.
+        cfg["recreate_env_per_episode"] = bool(
+            cfg.get("recreate_env_per_episode", render_mode_for_lifecycle in {"viewer3d", "mujoco"})
+        )
+    if args.debug_episode_lifecycle is not None:
+        cfg["debug_episode_lifecycle"] = bool(args.debug_episode_lifecycle)
+    else:
+        cfg["debug_episode_lifecycle"] = bool(
+            cfg.get("debug_episode_lifecycle", render_mode_for_lifecycle in {"viewer3d", "mujoco"})
+        )
     configure_mujoco_render_backend(cfg)
     cfg.setdefault("control", {})
     for deprecated_gripper_key in (
@@ -1781,6 +2376,8 @@ def main() -> None:
         "gripper_width_gain",
         "gripper_smooth_window",
         "gripper_progress_lookahead",
+        "gripper_close_threshold",
+        "gripper_close_threshold_rules",
     ):
         cfg["control"].pop(deprecated_gripper_key, None)
     cfg["control"].setdefault("gripper_wait_until_reached", True)
@@ -1792,11 +2389,8 @@ def main() -> None:
     cfg["control"].setdefault("pose_wait_rot_tolerance", 0.25)
     cfg["control"].setdefault("pose_wait_max_steps", 8)
     cfg["control"].setdefault("gripper_close_pose_wait_max_steps", 20)
-    cfg["control"].setdefault("gripper_close_threshold", 0.07)
-    cfg["control"].setdefault(
-        "gripper_close_threshold_rules",
-        [{"keywords": ["bowl", "plate"], "threshold": 0.03}],
-    )
+    # Gripper threshold/rule defaults intentionally removed: execution uses
+    # the model action's last dimension directly as a continuous width target.
     cfg["control"].setdefault("gripper_contact_stall_tolerance", 0.0007)
     cfg["control"].setdefault("gripper_contact_stall_steps", 4)
     cfg["control"].setdefault("gripper_close_hold_steps", 8)
@@ -1819,6 +2413,21 @@ def main() -> None:
         ["bottle", "sauce", "milk", "juice", "dressing", "ketchup", "soup", "pudding"],
     )
     cfg["control"].setdefault("gripper_side_grasp_top_quantile", 0.5)
+    # Fast physical execution is the default for this evaluator: each model
+    # action row is tracked by a short adaptive robosuite/MuJoCo OSC rollout,
+    # instead of two serial pose/gripper wait loops.  It still uses env.step(),
+    # so object contacts, grasping, and release remain physical.
+    cfg["control"].setdefault("execution_mode", "fast_physics")
+    cfg["control"].setdefault("fast_physics_min_steps", 2)
+    cfg["control"].setdefault("fast_physics_max_steps", 12)
+    cfg["control"].setdefault("fast_physics_max_duration_s", 0.0)
+    cfg["control"].setdefault("fast_physics_pos_step_m", 0.012)
+    cfg["control"].setdefault("fast_physics_rot_step_rad", 0.18)
+    cfg["control"].setdefault("fast_physics_close_steps", 6)
+    cfg["control"].setdefault("fast_physics_open_steps", 2)
+    cfg["control"].setdefault("fast_physics_close_after_pose", True)
+    cfg["control"].setdefault("fast_physics_success_check_every", 1)
+    cfg["control"].setdefault("fast_physics_debug", False)
     if args.control_freq is not None:
         cfg["control"]["control_freq"] = float(args.control_freq)
     if args.action_index is not None:
@@ -1848,7 +2457,7 @@ def main() -> None:
     if args.gripper_wait_max_steps is not None:
         cfg["control"]["gripper_wait_max_steps"] = int(args.gripper_wait_max_steps)
     if args.gripper_close_threshold is not None:
-        cfg["control"]["gripper_close_threshold"] = float(args.gripper_close_threshold)
+        print("[info] --gripper-close-threshold is accepted for compatibility but ignored; gripper uses model action last dim directly.")
     if args.gripper_contact_stall_tolerance is not None:
         cfg["control"]["gripper_contact_stall_tolerance"] = float(args.gripper_contact_stall_tolerance)
     if args.gripper_contact_stall_steps is not None:
@@ -1859,6 +2468,28 @@ def main() -> None:
         cfg["control"]["gripper_grasp_required_to_advance"] = bool(args.gripper_grasp_required_to_advance)
     if args.gripper_grasp_wait_max_steps is not None:
         cfg["control"]["gripper_grasp_wait_max_steps"] = int(args.gripper_grasp_wait_max_steps)
+    if args.execution_mode is not None:
+        cfg["control"]["execution_mode"] = str(args.execution_mode)
+    if args.fast_physics_min_steps is not None:
+        cfg["control"]["fast_physics_min_steps"] = int(args.fast_physics_min_steps)
+    if args.fast_physics_max_steps is not None:
+        cfg["control"]["fast_physics_max_steps"] = int(args.fast_physics_max_steps)
+    if args.fast_physics_max_duration_s is not None:
+        cfg["control"]["fast_physics_max_duration_s"] = float(args.fast_physics_max_duration_s)
+    if args.fast_physics_pos_step_m is not None:
+        cfg["control"]["fast_physics_pos_step_m"] = float(args.fast_physics_pos_step_m)
+    if args.fast_physics_rot_step_rad is not None:
+        cfg["control"]["fast_physics_rot_step_rad"] = float(args.fast_physics_rot_step_rad)
+    if args.fast_physics_close_steps is not None:
+        cfg["control"]["fast_physics_close_steps"] = int(args.fast_physics_close_steps)
+    if args.fast_physics_open_steps is not None:
+        cfg["control"]["fast_physics_open_steps"] = int(args.fast_physics_open_steps)
+    if args.fast_physics_close_after_pose is not None:
+        cfg["control"]["fast_physics_close_after_pose"] = bool(args.fast_physics_close_after_pose)
+    if args.fast_physics_success_check_every is not None:
+        cfg["control"]["fast_physics_success_check_every"] = int(args.fast_physics_success_check_every)
+    if args.fast_physics_debug is not None:
+        cfg["control"]["fast_physics_debug"] = bool(args.fast_physics_debug)
     if args.keyboard_vis is not None:
         cfg["keyboard_vis"] = bool(args.keyboard_vis)
     if args.keyboard_vis_mode is not None:
@@ -1875,6 +2506,21 @@ def main() -> None:
         policy_repo_id=cfg.get("policy_repo_id"),
         device=cfg["device"],
     )
+    print(
+        f"[info] execution_mode={cfg['control'].get('execution_mode')} "
+        f"fast_physics_min/max={cfg['control'].get('fast_physics_min_steps')}/{cfg['control'].get('fast_physics_max_steps')} "
+        f"close_steps={cfg['control'].get('fast_physics_close_steps')} "
+        f"open_steps={cfg['control'].get('fast_physics_open_steps')}"
+    )
+    print(
+        f"[info] gripper_execution=model_action_last_dim_direct "
+        f"qpos_max_width={float(cfg.get('gripper_qpos_max_width', 0.08)):.4f}; "
+        "legacy threshold/open/close args ignored"
+    )
+    print(
+        f"[info] episode_lifecycle recreate_env_per_episode={bool(cfg.get('recreate_env_per_episode', False))} "
+        f"debug_episode_lifecycle={bool(cfg.get('debug_episode_lifecycle', False))}"
+    )
 
     all_results = []
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -1889,142 +2535,244 @@ def main() -> None:
                 cfg=cfg,
             )
             for task_id in task_ids:
-                env, task = make_libero_env(
-                    suite,
-                    int(task_id),
-                    int(cfg["observation_height"]),
-                    int(cfg["observation_width"]),
-                    render_camera_names_from_config(cfg),
-                    render_mode=str(cfg.get("render_mode", "offscreen")),
-                    render_camera=str(cfg.get("render_camera", "agentview")),
-                    render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
-                    control_delta=str(cfg.get("control", {}).get("control_mode", "absolute_pose")).lower()
-                    == "delta_pose",
-                    control_freq=float(cfg.get("control_freq", cfg.get("control", {}).get("control_freq", 5))),
-                )
                 init_states = get_task_init_states(suite, int(task_id))
                 task_results = []
-                try:
+                task_name = f"task_{int(task_id):03d}"
+                task_language = f"{suite_name}:{int(task_id)}"
+                recreate_env_per_episode = bool(cfg.get("recreate_env_per_episode", False))
+
+                def _make_env_for_task_episode() -> tuple[Any, Any]:
+                    if bool(cfg.get("debug_episode_lifecycle", False)):
+                        print(
+                            f"[debug] episode_lifecycle: make_env begin suite={suite_name} task={int(task_id)}",
+                            flush=True,
+                        )
+                    env_obj, task_obj = make_libero_env(
+                        suite,
+                        int(task_id),
+                        int(cfg["observation_height"]),
+                        int(cfg["observation_width"]),
+                        render_camera_names_from_config(cfg),
+                        render_mode=str(cfg.get("render_mode", "offscreen")),
+                        render_camera=str(cfg.get("render_camera", "agentview")),
+                        render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
+                        control_delta=str(cfg.get("control", {}).get("control_mode", "absolute_pose")).lower()
+                        == "delta_pose",
+                        control_freq=float(cfg.get("control_freq", cfg.get("control", {}).get("control_freq", 5))),
+                    )
+                    if bool(cfg.get("debug_episode_lifecycle", False)):
+                        print(
+                            f"[debug] episode_lifecycle: make_env done suite={suite_name} task={int(task_id)}",
+                            flush=True,
+                        )
+                    return env_obj, task_obj
+
+                def _write_success_and_reports(
+                    *,
+                    result: dict[str, Any],
+                    episode_idx: int,
+                    episode_dir: Path,
+                    current_task_name: str,
+                    current_task_language: str,
+                ) -> None:
+                    record = {
+                        "episode_index": episode_idx,
+                        "demo_name": "rollout",
+                        "video_dir_name": episode_dir.name,
+                    }
+                    video_paths = export_episode_videos(result, episode_dir.parent, record, cfg)
+                    episode_record = episode_result_record(result, episode_idx)
+                    if video_paths:
+                        episode_record["videos"] = video_paths
+                    write_json_atomic(episode_dir / "result.json", episode_record)
+                    task_results.append(episode_record)
+                    current_results = [
+                        *all_results,
+                        make_task_summary(
+                            suite_name=suite_name,
+                            task_id=int(task_id),
+                            task_name=current_task_name,
+                            task_language=current_task_language,
+                            task_results=task_results,
+                        ),
+                    ]
+                    write_eval_reports(
+                        output_dir=output_dir,
+                        cfg=cfg,
+                        suite_names=suite_names,
+                        all_results=current_results,
+                    )
+                    print(
+                        f"{suite_name} task={task_id} episode={episode_idx} "
+                        f"success={result['success']} "
+                        f"steps={result['steps']} "
+                        f"model_calls={result['model_call_count']} "
+                        f"sum_reward={result['sum_reward']:.3f} "
+                        f"max_reward={result['max_reward']:.3f}",
+                        flush=True,
+                    )
+
+                def _write_failure_and_reports(
+                    *,
+                    exc: Exception,
+                    episode_idx: int,
+                    episode_dir: Path,
+                    current_task_name: str,
+                    current_task_language: str,
+                ) -> None:
+                    failure = {
+                        "episode_index": int(episode_idx),
+                        "success": False,
+                        "steps": 0,
+                        "sum_reward": 0.0,
+                        "error": repr(exc),
+                    }
+                    task_results.append(failure)
+                    with open(episode_dir / "error.json", "w", encoding="utf-8") as f:
+                        json.dump(failure, f, indent=2, ensure_ascii=False)
+                    write_json_atomic(episode_dir / "result.json", failure)
+                    current_results = [
+                        *all_results,
+                        make_task_summary(
+                            suite_name=suite_name,
+                            task_id=int(task_id),
+                            task_name=current_task_name,
+                            task_language=current_task_language,
+                            task_results=task_results,
+                        ),
+                    ]
+                    write_eval_reports(
+                        output_dir=output_dir,
+                        cfg=cfg,
+                        suite_names=suite_names,
+                        all_results=current_results,
+                    )
+                    print(
+                        f"[WARN] {suite_name} task={task_id} episode={episode_idx} failed: {exc!r}. "
+                        "Continuing with the next episode/task.",
+                        flush=True,
+                    )
+
+                if recreate_env_per_episode:
+                    if bool(cfg.get("debug_episode_lifecycle", False)):
+                        print(
+                            f"[debug] episode_lifecycle: recreating env per episode for suite={suite_name} task={int(task_id)}",
+                            flush=True,
+                        )
                     for episode_idx in range(cfg["episodes"]):
                         episode_dir = output_dir / suite_name / f"task_{int(task_id):03d}" / f"episode_{episode_idx:03d}"
                         episode_dir.mkdir(parents=True, exist_ok=True)
-                        print(f"[eval] start {suite_name} task={task_id} episode={episode_idx}")
+                        env = None
+                        task = None
+                        print(f"[eval] start {suite_name} task={task_id} episode={episode_idx}", flush=True)
                         try:
+                            env, task = _make_env_for_task_episode()
+                            task_name = str(getattr(task, "name", task_name))
+                            task_language = str(getattr(task, "language", task_language))
                             result = run_episode(
                                 infer=infer,
                                 env=env,
-                                task_language=task.language,
+                                task_language=task_language,
                                 init_state=init_states[episode_idx % len(init_states)],
                                 cfg=cfg,
                                 key_watcher=key_watcher,
                             )
-                            # diagnostic_array_names = (
-                            #     "libero_actions",
-                            #     "pose_actions",
-                            #     "controller_pose_actions",
-                            #     "model_pose_actions",
-                            #     "pose_pos_errors",
-                            #     "pose_rot_errors",
-                            #     "pose_wait_flags",
-                            #     "gripper_targets",
-                            #     "gripper_actuals",
-                            #     "gripper_width_errors",
-                            #     "gripper_should_close_flags",
-                            #     "gripper_close_command_flags",
-                            #     "gripper_wait_flags",
-                            #     "gripper_contact_stall_flags",
-                            #     "gripper_rim_correction_flags",
-                            #     "gripper_rim_axis_shifts",
-                            #     "gripper_rim_depth_shifts",
-                            #     "gripper_rim_lifts",
-                            #     "gripper_rim_point_counts",
-                            #     "gripper_progress_indices",
-                            #     "gripper_close_hold_flags",
-                            #     "gripper_grasp_flags",
-                            #     "gripper_contact_flags",
-                            # )
-                            # for array_name in diagnostic_array_names:
-                            #     np.save(episode_dir / f"{array_name}.npy", result[array_name])
-                            # if cfg.get("save_trajectory", True):
-                            #     write_trajectory_ply(episode_dir / "trajectory.ply", result["pose_actions"])
-                            record = {
-                                "episode_index": episode_idx,
-                                "demo_name": "rollout",
-                                "video_dir_name": episode_dir.name,
-                            }
-                            video_paths = export_episode_videos(result, episode_dir.parent, record, cfg)
-                            episode_record = episode_result_record(result, episode_idx)
-                            if video_paths:
-                                episode_record["videos"] = video_paths
-                            write_json_atomic(episode_dir / "result.json", episode_record)
-                            task_results.append(episode_record)
-                            current_results = [
-                                *all_results,
-                                make_task_summary(
-                                    suite_name=suite_name,
-                                    task_id=int(task_id),
-                                    task_name=task.name,
-                                    task_language=task.language,
-                                    task_results=task_results,
-                                ),
-                            ]
-                            write_eval_reports(
-                                output_dir=output_dir,
-                                cfg=cfg,
-                                suite_names=suite_names,
-                                all_results=current_results,
-                            )
-                            print(
-                                f"{suite_name} task={task_id} episode={episode_idx} "
-                                f"success={result['success']} "
-                                f"steps={result['steps']} "
-                                f"model_calls={result['model_call_count']} "
-                                f"sum_reward={result['sum_reward']:.3f} "
-                                f"max_reward={result['max_reward']:.3f}"
+                            _write_success_and_reports(
+                                result=result,
+                                episode_idx=episode_idx,
+                                episode_dir=episode_dir,
+                                current_task_name=task_name,
+                                current_task_language=task_language,
                             )
                         except Exception as exc:
-                            failure = {
-                                "episode_index": int(episode_idx),
-                                "success": False,
-                                "steps": 0,
-                                "sum_reward": 0.0,
-                                "error": repr(exc),
-                            }
-                            task_results.append(failure)
-                            with open(episode_dir / "error.json", "w", encoding="utf-8") as f:
-                                json.dump(failure, f, indent=2, ensure_ascii=False)
-                            write_json_atomic(episode_dir / "result.json", failure)
-                            current_results = [
-                                *all_results,
-                                make_task_summary(
-                                    suite_name=suite_name,
-                                    task_id=int(task_id),
-                                    task_name=task.name,
-                                    task_language=task.language,
-                                    task_results=task_results,
-                                ),
-                            ]
-                            write_eval_reports(
-                                output_dir=output_dir,
-                                cfg=cfg,
-                                suite_names=suite_names,
-                                all_results=current_results,
+                            _write_failure_and_reports(
+                                exc=exc,
+                                episode_idx=episode_idx,
+                                episode_dir=episode_dir,
+                                current_task_name=task_name,
+                                current_task_language=task_language,
                             )
-                            print(
-                                f"[WARN] {suite_name} task={task_id} episode={episode_idx} failed: {exc!r}. "
-                                "Continuing with the next episode/task."
+                        finally:
+                            if bool(cfg.get("debug_episode_lifecycle", False)):
+                                print(
+                                    f"[debug] episode_lifecycle: close_env begin suite={suite_name} task={int(task_id)} episode={episode_idx}",
+                                    flush=True,
+                                )
+                            try:
+                                close_mujoco_viewer_safely(env)
+                            except Exception:
+                                pass
+                            try:
+                                if env is not None:
+                                    env.close()
+                            except Exception as exc:
+                                print(f"[WARN] failed to close env for {suite_name} task={task_id}: {exc!r}", flush=True)
+                            if bool(cfg.get("debug_episode_lifecycle", False)):
+                                print(
+                                    f"[debug] episode_lifecycle: close_env done suite={suite_name} task={int(task_id)} episode={episode_idx}",
+                                    flush=True,
+                                )
+                    all_results.append(
+                        make_task_summary(
+                            suite_name=suite_name,
+                            task_id=int(task_id),
+                            task_name=task_name,
+                            task_language=task_language,
+                            task_results=task_results,
+                        )
+                    )
+                    continue
+
+                env = None
+                task = None
+                try:
+                    env, task = _make_env_for_task_episode()
+                    task_name = str(getattr(task, "name", task_name))
+                    task_language = str(getattr(task, "language", task_language))
+                    for episode_idx in range(cfg["episodes"]):
+                        episode_dir = output_dir / suite_name / f"task_{int(task_id):03d}" / f"episode_{episode_idx:03d}"
+                        episode_dir.mkdir(parents=True, exist_ok=True)
+                        print(f"[eval] start {suite_name} task={task_id} episode={episode_idx}", flush=True)
+                        try:
+                            result = run_episode(
+                                infer=infer,
+                                env=env,
+                                task_language=task_language,
+                                init_state=init_states[episode_idx % len(init_states)],
+                                cfg=cfg,
+                                key_watcher=key_watcher,
+                            )
+                            _write_success_and_reports(
+                                result=result,
+                                episode_idx=episode_idx,
+                                episode_dir=episode_dir,
+                                current_task_name=task_name,
+                                current_task_language=task_language,
+                            )
+                        except Exception as exc:
+                            _write_failure_and_reports(
+                                exc=exc,
+                                episode_idx=episode_idx,
+                                episode_dir=episode_dir,
+                                current_task_name=task_name,
+                                current_task_language=task_language,
                             )
                 finally:
                     try:
-                        env.close()
+                        close_mujoco_viewer_safely(env)
+                    except Exception:
+                        pass
+                    try:
+                        if env is not None:
+                            env.close()
                     except Exception as exc:
-                        print(f"[WARN] failed to close env for {suite_name} task={task_id}: {exc!r}")
+                        print(f"[WARN] failed to close env for {suite_name} task={task_id}: {exc!r}", flush=True)
                 all_results.append(
                     make_task_summary(
                         suite_name=suite_name,
                         task_id=int(task_id),
-                        task_name=task.name,
-                        task_language=task.language,
+                        task_name=task_name,
+                        task_language=task_language,
                         task_results=task_results,
                     )
                 )
