@@ -1,3 +1,4 @@
+#  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python   benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model  --suite libero_10  --all-tasks   --episodes 10  --action-index 0   --exec-action-steps 12   --save-video --render-mode offscreen   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/10w_eval_long_temp
 #!/usr/bin/env python
 """Minimal LIBERO point-cloud evaluation with absolute-pose chunk execution.
 
@@ -64,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default="benchmarks/song_real_libero/outputs/temp_eval")
 
     parser.add_argument("--observation-height", type=int, default=None)
     parser.add_argument("--observation-width", type=int, default=None)
@@ -75,14 +76,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-freq", type=float, default=None)
 
     parser.add_argument("--action-index", type=int, default=None)
-    parser.add_argument("--exec-action-steps", type=int, default=None)
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--exec-action-steps", type=int, default=12)
+    parser.add_argument("--max-steps", type=int, default=800)
     parser.add_argument("--warmup-steps", type=int, default=None)
 
     parser.add_argument(
         "--gripper-threshold",
         type=float,
-        default=None,
+        default=0.075,
         help="Normalized gripper-width threshold. width_pct >= threshold => open(-1), else close(+1).",
     )
     parser.add_argument("--gripper-qpos-max-width", type=float, default=None)
@@ -265,11 +266,11 @@ def action_chunk_to_absolute_libero_actions(
 
     libero_actions: list[np.ndarray] = []
     target_controller_pose9: list[np.ndarray] = []
-    for row, target_model_world in zip(chunk, target_model_worlds, strict=True):
+    for idx, (row, target_model_world) in enumerate(zip(chunk, target_model_worlds, strict=True)):
         target_controller_world = target_model_world @ model_to_controller
         arm_action = world_pose_to_libero_absolute_action(target_controller_world)
-        pre_gripper_width = row[-1]
-        gripper_action = -1.0 if pre_gripper_width >= float(gripper_threshold) else 1.0
+        delta_pre_width = chunk[idx+1,-1]-chunk[idx,-1] if idx< chunk.shape[0]-1 else 0
+        gripper_action = -1.0 if delta_pre_width > 0.004 else (1.0 if delta_pre_width < -0.004 else 0.0)
         libero_actions.append(np.concatenate([arm_action, np.asarray([gripper_action], dtype=np.float32)]))
         target_controller_pose9.append(matrix_to_pose9(target_controller_world))
 
@@ -1099,9 +1100,9 @@ def run_episode(
         "model_action_rows": np.asarray(model_action_rows, dtype=np.float32),
         "target_model_worlds": np.asarray(target_model_worlds, dtype=np.float32),
         "target_controller_pose9": np.asarray(target_controller_pose9, dtype=np.float32),
-        "gripper_commands": np.asarray(gripper_commands, dtype=np.float32),
-        "gripper_raw_widths": np.asarray(gripper_raw_widths, dtype=np.float32),
-        "gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
+        #"gripper_commands": np.asarray(gripper_commands, dtype=np.float32),
+        #"gripper_raw_widths": np.asarray(gripper_raw_widths, dtype=np.float32),
+        #"gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
         "video_frames": video_frames,
     }
 
