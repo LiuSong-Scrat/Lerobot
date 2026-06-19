@@ -148,7 +148,7 @@
       --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache \
       --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
       --policy.load_vlm_weights=false \
-      --batch_size=8 \
+      --batch_size=4 \
       --steps=500000 \
       --log_freq=1 \
       --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/ep-vla \
@@ -168,7 +168,7 @@
       --policy.pointseg_background_ratio=0.08 \
       --policy.pointseg_min_foreground_points=500 \
       --policy.pointseg_min_background_points=0 \
-      --policy.worldflow_enable=false \
+      --policy.worldflow_enable=true \
       --policy.worldflow_se3_head_enable=false \
       --policy.se3_enable=false \
       --policy.se3_final_correction_enable=false
