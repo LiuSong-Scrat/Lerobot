@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 import concurrent.futures
 import json
@@ -23,8 +24,8 @@ import pytorch3d.ops as torch3d_ops
 from tqdm import tqdm
 
 
-ROOT = Path("/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp")
-HDF5_FOLDER = Path("/home/liusong/temp/temp")
+ROOT = Path("benchmarks/song_real_libero/data/real_setting/lerobot_dataset")
+HDF5_FOLDER = Path("benchmarks/song_real_libero/data/real_setting/hdf5_clean")
 POINT_CLOUD_DIR_NAME = "point_clouds"
 POINT_CLOUD_KEY = "observation.point_cloud"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
@@ -32,10 +33,10 @@ POINT_CLOUD_CHANNELS = 6
 FPS_BATCH_SIZE = int(os.environ.get("SONG_FPS_BATCH_SIZE", "128"))
 USE_CUDA_FPS = os.environ.get("SONG_USE_CUDA_FPS", "1") != "0"
 CONVERT_WORKERS = int(os.environ.get("SONG_CONVERT_WORKERS", str(min(20, os.cpu_count() or 1))))
-POINT_CLOUD_STORAGE = os.environ.get("SONG_POINT_CLOUD_STORAGE", "zarr").strip().lower()
-ZARR_COMPRESSION_LEVEL = int(os.environ.get("SONG_ZARR_COMPRESSION_LEVEL", "3"))
-POINT_CLOUD_POINTS = int(os.environ.get("SONG_POINT_CLOUD_POINTS", "10000"))
-GRIPPER_POINTS = int(os.environ.get("SONG_GRIPPER_POINTS", "500"))
+DEFAULT_POINT_CLOUD_STORAGE = os.environ.get("SONG_POINT_CLOUD_STORAGE", "zarr").strip().lower()
+DEFAULT_ZARR_COMPRESSION_LEVEL = int(os.environ.get("SONG_ZARR_COMPRESSION_LEVEL", "3"))
+DEFAULT_NUM_POINTS = int(os.environ.get("SONG_POINT_CLOUD_POINTS", "10000"))
+DEFAULT_GRIPPER_POINTS = int(os.environ.get("SONG_GRIPPER_POINTS", "500"))
 _FPS_CUDA_LOCK = threading.Lock()
 
 def from_H_to_trajectory(H):
@@ -243,7 +244,7 @@ def world_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
-def write_point_cloud_meta(root: Path, storage: str = POINT_CLOUD_STORAGE) -> None:
+def write_point_cloud_meta(root: Path, storage: str = DEFAULT_POINT_CLOUD_STORAGE) -> None:
     pc_dir = root / POINT_CLOUD_DIR_NAME
     pc_dir.mkdir(parents=True, exist_ok=True)
     suffix = "zarr" if storage == "zarr" else "npy"
@@ -281,8 +282,8 @@ def save_episode_point_clouds(
     episode_index: int,
     point_clouds: np.ndarray,
     *,
-    storage: str = POINT_CLOUD_STORAGE,
-    zarr_compression_level: int = ZARR_COMPRESSION_LEVEL,
+    storage: str = DEFAULT_POINT_CLOUD_STORAGE,
+    zarr_compression_level: int = DEFAULT_ZARR_COMPRESSION_LEVEL,
 ) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
@@ -318,9 +319,9 @@ def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.nd
 
 def downsample_point_clouds_keep_tail(
     point_clouds: np.ndarray,
-    num_points: int = POINT_CLOUD_POINTS,
+    num_points: int = DEFAULT_NUM_POINTS,
     *,
-    gripper_points: int = GRIPPER_POINTS,
+    gripper_points: int = DEFAULT_GRIPPER_POINTS,
     seed: int = 1000,
 ) -> np.ndarray:
     point_clouds = np.asarray(point_clouds, dtype=np.float32)
@@ -370,24 +371,48 @@ def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray,
     return episode_buffer
 
 
-def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
+def _read_task_name(h5_file: h5py.File, override: str | None) -> str:
+    if override:
+        return override
+    if "task_name" not in h5_file:
+        return "Place the Red Cube on the Blue Cube"
+    value = h5_file["task_name"][()]
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def convert_hdf5_file(
+    h5_path: Path,
+    fps: int,
+    *,
+    task: str | None = None,
+    pose_key: str = "observations/pose_eular",
+    point_cloud_key: str = "observations/cloud_rgb/overhead",
+    eff_angular_key: str = "observations/eff_angular",
+    num_points: int = DEFAULT_NUM_POINTS,
+    gripper_points: int = DEFAULT_GRIPPER_POINTS,
+) -> dict:
     with h5py.File(h5_path, "r") as f:
-        # task_name = f["task_name"][()].decode("utf-8")
-        task_name = "Place the Red Cube on the Blue Cube"
-        obs_pose_eular_eff_to_world = f["observations/pose_eular"][:].astype(np.float32)
-        pointcloud_world = f["observations/cloud_rgb/overhead"][:].astype(np.float32)
+        task_name = _read_task_name(f, task)
+        obs_pose_eular_eff_to_world = f[pose_key][:].astype(np.float32)
+        pointcloud_world = f[point_cloud_key][:].astype(np.float32)
 
         obs_pose9_eff_to_world = traj6_to_pose9(obs_pose_eular_eff_to_world)
         obs_pose9_data_eff_2_eff0 = from_world_to_umi_tra_pose9(obs_pose9_eff_to_world)
         P_eff = from_world_to_umi_pointcloud(obs_pose9_eff_to_world, pointcloud_world)
-       
+
         # UMI_VIS
         # vis_umi_data(obs_pose9_data_eff_2_eff0, P_eff[0])
 
-        gripper_width = f["observations/eff_angular"][:].astype(np.float32).reshape(-1, 1) * 0.5
+        gripper_width = f[eff_angular_key][:].astype(np.float32).reshape(-1, 1) * 0.5
         actions = np.concatenate((obs_pose9_data_eff_2_eff0, gripper_width), axis=1).astype(np.float32, copy=False)
         # point_clouds = batched_fps(P_eff, use_cuda=USE_CUDA_FPS)
-        point_clouds = downsample_point_clouds_keep_tail(P_eff)
+        point_clouds = downsample_point_clouds_keep_tail(
+            P_eff,
+            num_points,
+            gripper_points=gripper_points,
+        )
 
         timestamps_dataset = f.get("timestamp")
         if timestamps_dataset is not None:
@@ -404,9 +429,21 @@ def convert_hdf5_file(h5_path: Path, fps: int) -> dict:
     }
 
 
-def save_converted_episode(dataset: LeRobotDataset, episode: dict) -> None:
+def save_converted_episode(
+    dataset: LeRobotDataset,
+    episode: dict,
+    *,
+    storage: str = DEFAULT_POINT_CLOUD_STORAGE,
+    zarr_compression_level: int = DEFAULT_ZARR_COMPRESSION_LEVEL,
+) -> None:
     episode_index = dataset.meta.total_episodes
-    save_episode_point_clouds(dataset.root, episode_index, episode["point_clouds"])
+    save_episode_point_clouds(
+        dataset.root,
+        episode_index,
+        episode["point_clouds"],
+        storage=storage,
+        zarr_compression_level=zarr_compression_level,
+    )
     save_episode_worldflow(
         dataset.root,
         episode_index,
@@ -422,13 +459,27 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict) -> None:
     dataset.save_episode(episode_data=episode_buffer)
 
 
-def convert_and_save_sequential(dataset: LeRobotDataset, h5_paths: list[Path]) -> None:
+def convert_and_save_sequential(dataset: LeRobotDataset, h5_paths: list[Path], args: argparse.Namespace) -> None:
     for h5_path in tqdm(h5_paths, desc="Processing HDF5 files"):
-        episode = convert_hdf5_file(h5_path, dataset.fps)
-        save_converted_episode(dataset, episode)
+        episode = convert_hdf5_file(
+            h5_path,
+            dataset.fps,
+            task=args.task,
+            pose_key=args.pose_key,
+            point_cloud_key=args.point_cloud_key,
+            eff_angular_key=args.eff_angular_key,
+            num_points=args.num_points,
+            gripper_points=args.gripper_points,
+        )
+        save_converted_episode(
+            dataset,
+            episode,
+            storage=args.point_cloud_storage,
+            zarr_compression_level=args.zarr_compression_level,
+        )
 
 
-def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max_workers: int) -> None:
+def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max_workers: int, args: argparse.Namespace) -> None:
     # LeRobotDataset's parquet/meta writers are stateful, so conversion is parallelized
     # but episode saving remains ordered and single-threaded.
     total = len(h5_paths)
@@ -443,7 +494,17 @@ def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max
         def submit_until_full() -> None:
             nonlocal next_to_submit
             while next_to_submit < total and len(futures) + len(ready) < max_workers:
-                future = executor.submit(convert_hdf5_file, h5_paths[next_to_submit], dataset.fps)
+                future = executor.submit(
+                    convert_hdf5_file,
+                    h5_paths[next_to_submit],
+                    dataset.fps,
+                    task=args.task,
+                    pose_key=args.pose_key,
+                    point_cloud_key=args.point_cloud_key,
+                    eff_angular_key=args.eff_angular_key,
+                    num_points=args.num_points,
+                    gripper_points=args.gripper_points,
+                )
                 futures[future] = next_to_submit
                 next_to_submit += 1
 
@@ -461,7 +522,12 @@ def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max
 
                 while next_to_save in ready:
                     episode = ready.pop(next_to_save)
-                    save_converted_episode(dataset, episode)
+                    save_converted_episode(
+                        dataset,
+                        episode,
+                        storage=args.point_cloud_storage,
+                        zarr_compression_level=args.zarr_compression_level,
+                    )
                     del episode
                     next_to_save += 1
                     progress.set_postfix(
@@ -473,33 +539,59 @@ def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max
                 submit_until_full()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert Song HDF5 episodes to a local LeRobot dataset.")
+    parser.add_argument("--hdf5-folder", type=Path, default=HDF5_FOLDER)
+    parser.add_argument("--output-root", type=Path, default=ROOT)
+    parser.add_argument("--repo-id", default="local_hdf5_converted")
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--robot-type", default="my_robot")
+    parser.add_argument("--task", default=None, help="Override all episode task strings. Defaults to HDF5 task_name.")
+    parser.add_argument("--pose-key", default="observations/pose_eular")
+    parser.add_argument("--point-cloud-key", default="observations/cloud_rgb/overhead")
+    parser.add_argument("--eff-angular-key", default="observations/eff_angular")
+    parser.add_argument("--num-points", type=int, default=DEFAULT_NUM_POINTS)
+    parser.add_argument("--gripper-points", type=int, default=DEFAULT_GRIPPER_POINTS)
+    parser.add_argument("--point-cloud-storage", choices=("zarr", "npy"), default=DEFAULT_POINT_CLOUD_STORAGE)
+    parser.add_argument("--zarr-compression-level", type=int, default=DEFAULT_ZARR_COMPRESSION_LEVEL)
+    parser.add_argument("--workers", type=int, default=CONVERT_WORKERS)
+    parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pattern", default="*.hdf5")
+    return parser.parse_args()
+
+
 def main():
-    if ROOT.is_dir():
-        shutil.rmtree(ROOT)
-    elif ROOT.exists():
-        ROOT.unlink()
+    args = parse_args()
+    root = args.output_root.expanduser().resolve()
+    hdf5_folder = args.hdf5_folder.expanduser().resolve()
+
+    if root.exists():
+        if not args.overwrite:
+            raise FileExistsError(f"Output root already exists: {root}. Pass --overwrite to rebuild it.")
+        if root.is_dir():
+            shutil.rmtree(root)
+        else:
+            root.unlink()
 
     dataset = LeRobotDataset.create(
-        repo_id="local_hdf5_converted",  # 只要本地目录名即可
-        fps=30,
+        repo_id=args.repo_id,
+        fps=args.fps,
         features=dataset_features,
-        robot_type="my_robot",
-        root=ROOT,
+        robot_type=args.robot_type,
+        root=root,
         use_videos=False,
     )
-    if POINT_CLOUD_STORAGE not in {"zarr", "npy"}:
-        raise ValueError(f"Unsupported SONG_POINT_CLOUD_STORAGE={POINT_CLOUD_STORAGE!r}; expected zarr or npy.")
-    write_point_cloud_meta(dataset.root, POINT_CLOUD_STORAGE)
+    write_point_cloud_meta(dataset.root, args.point_cloud_storage)
     write_worldflow_meta(dataset.root)
 
-    h5_paths = sorted(HDF5_FOLDER.glob("*.hdf5"))
+    h5_paths = sorted(hdf5_folder.glob(args.pattern))
     if len(h5_paths) == 0:
-        raise FileNotFoundError(f"No .hdf5 files found in {HDF5_FOLDER}")
+        raise FileNotFoundError(f"No .hdf5 files found in {hdf5_folder}")
 
-    if CONVERT_WORKERS <= 1 or len(h5_paths) == 1:
-        convert_and_save_sequential(dataset, h5_paths)
+    if args.workers <= 1 or len(h5_paths) == 1:
+        convert_and_save_sequential(dataset, h5_paths, args)
     else:
-        convert_and_save_parallel(dataset, h5_paths, CONVERT_WORKERS)
+        convert_and_save_parallel(dataset, h5_paths, args.workers, args)
 
     dataset.finalize()
 

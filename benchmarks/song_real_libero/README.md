@@ -12,7 +12,26 @@ This project bundles the benchmark workflow for the local point-cloud SmolVLA po
 8. run local point-cloud inference
 9. run LIBERO online point-cloud inference/evaluation
 
-The scripts are copied into this benchmark directory so the workflow is reproducible without relying on personal debug entrypoints. The model and dataset classes are still imported from the current `lerobot` source tree.
+Environment-specific code and data are separated, while shared training, cache, inference, and visualization tools stay at the `scripts/` root. HDF5-to-LeRobot conversion uses the canonical `src/lerobot/scripts/song_lerobot_from_hdf5.py` implementation instead of keeping a duplicate benchmark copy.
+
+Paths inside `configs/*.json` may be absolute or relative. Relative paths are resolved from `benchmarks/song_real_libero`, so commands do not depend on the current shell directory.
+
+```text
+benchmarks/song_real_libero/
+  configs/
+    local.json                 # real-robot pipeline and machine-local dependencies
+    libero.json                # LIBERO collection/evaluation
+  data/
+    real_setting/              # RGB-D, HDF5, LeRobot dataset, pointseg cache
+    libero_setting/            # demos, LIBERO config, datasets, pointseg cache
+  scripts/
+    real_setting/              # real-robot-only stages
+    libero_setting/            # LIBERO-only stages and utilities
+    train_song_benchmark.py    # shared
+    song_cache_pointseg_samples.py
+    smolvla_model_inference.py
+    run_pipeline.py
+```
 
 ## Quick Start
 
@@ -63,15 +82,23 @@ conda run -n reap python benchmarks/song_real_libero/scripts/run_pipeline.py --s
 Expected converted dataset outputs:
 
 ```text
-data/lerobot_dataset/
+data/real_setting/lerobot_dataset/
   point_clouds/episode_000000.zarr
   world_ee_poses/episode_000000.npy
 ```
 
+The real-data path is calibration-free: `cloud_rgb/overhead` and
+`pose_eular` are kept in the fixed overhead-camera frame. That frame is treated
+as the model world/reference frame. The virtual gripper is added there, then
+the merged cloud is transformed into the current EEF frame for
+`observation.point_cloud`. The historical `world_ee_poses/` directory name is
+retained for training compatibility, but its values are overhead-camera-frame
+poses.
+
 Real-robot HDF5 conversion and LIBERO collection use compressed zarr point clouds by default:
 
 ```text
-data/libero_lerobot_dataset/
+data/libero_setting/libero_4suite_lerobot_dataset/
   point_clouds/episode_000000.zarr
   world_ee_poses/episode_000000.npy
 ```
@@ -94,8 +121,8 @@ Equivalent explicit command for `train_song_benchmark.py`:
 conda run -n reap python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model \
   --policy.push_to_hub=false \
-  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/lerobot_dataset \
-  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/pointseg_cache \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/lerobot_dataset \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/pointseg_cache \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=4 \
@@ -132,8 +159,8 @@ For the generated LIBERO dataset, replace the dataset, cache, and output paths:
 conda run -n reap python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model \
   --policy.push_to_hub=false \
-  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_lerobot_dataset \
-  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_pointseg_cache \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_lerobot_dataset \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_pointseg_cache \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=8 \
@@ -170,8 +197,8 @@ Fresh LIBERO training without loading a policy checkpoint:
 python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.type=smolvla \
   --policy.push_to_hub=false \
-  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_lerobot_dataset \
-  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_pointseg_cache \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_lerobot_dataset \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_pointseg_cache \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=4 \
@@ -240,7 +267,7 @@ Run from a LIBERO LeRobot dataset frame:
 ```bash
 python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
   --policy.path benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
-  --dataset.repo_id benchmarks/song_real_libero/data/libero_lerobot_dataset \
+  --dataset.repo_id benchmarks/song_real_libero/data/libero_setting/libero_lerobot_dataset \
   --index 0 \
   --task "pick up the alphabet soup and place it in the basket" \
   --output-dir benchmarks/song_real_libero/outputs/infer_libero_dataset
@@ -251,7 +278,7 @@ Run from a local PLY point cloud:
 ```bash
 python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
   --policy.path benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
-  --ply.path benchmarks/song_real_libero/outputs/libero_collect_vis/episode_000000_demo_0/frame_0000_point_cloud_eff.ply \
+  --ply.path benchmarks/song_real_libero/outputs/libero_setting/collect_vis/episode_000000_demo_0/frame_0000_point_cloud_eff.ply \
   --num-points 50000 \
   --add-gripper-cloud \
   --gripper-points 500 \
@@ -260,7 +287,13 @@ python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
   --output-dir benchmarks/song_real_libero/outputs/infer_ply
 ```
 
-For `obs.path`, the script adds the virtual gripper in the world frame using the current end-effector pose, then converts the merged cloud to the current end-effector frame. For `ply.path`, the input PLY is assumed to already be in the current end-effector frame. Dataset-frame inference uses the point cloud already stored in the LeRobot dataset. Outputs include `action.npy`, `result.json`, `trajectory.ply`, and, for observation/PLY inference, `model_point_cloud.npy`.
+For `obs.path`, the fixed overhead-camera frame is treated as the model
+reference/world frame. The script adds the virtual gripper in that frame using
+the camera-frame end-effector pose, then converts the merged cloud to the
+current end-effector frame. No real-camera extrinsic is required. For
+`ply.path`, the input PLY is assumed to already be in the current end-effector
+frame. Dataset-frame inference uses the point cloud already stored in the
+LeRobot dataset.
 
 ## LIBERO
 
@@ -274,7 +307,7 @@ Generate a LIBERO point-cloud LeRobot dataset from LIBERO demonstration HDF5 fil
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --suite libero_object \
   --task-id 0 \
@@ -283,7 +316,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
   --point-cloud-storage zarr
 ```
 
-The benchmark scripts create `data/libero_config/config.yaml` automatically before importing LIBERO, so LIBERO's first-run interactive dataset prompt is bypassed.
+The benchmark scripts create `data/libero_setting/libero_config/config.yaml` automatically before importing LIBERO, so LIBERO's first-run interactive dataset prompt is bypassed.
 
 Equivalent runner form:
 
@@ -299,7 +332,7 @@ For faster collection, use episode-level multiprocessing:
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --suite libero_object \
   --task-id 0 \
@@ -311,7 +344,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
 ### ALL Object Data One Episode
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --suite libero_object \
   --episodes 5 \
@@ -325,7 +358,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
 If the demo HDF5 files are arranged under:
 
 ```text
-benchmarks/song_real_libero/data/
+benchmarks/song_real_libero/data/libero_setting/libero_demos/
   libero_spatial/*.hdf5
   libero_object/*.hdf5
   libero_goal/*.hdf5
@@ -336,9 +369,9 @@ convert all tasks from the four suites into one LeRobot point-cloud dataset:
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_demos \
+  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_demos \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
@@ -347,7 +380,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --episodes 5 \
   --num-workers 10 \
   --point-cloud-storage zarr \
-  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
   --repo-id song_libero_4suite_pointcloud \
   --save-video \
   --vis-count 2
@@ -360,8 +393,8 @@ Build pointseg cache for the four-suite dataset:
 ```bash
 conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.repo_id song_libero_4suite_pointcloud \
-  --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
-  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_pointseg_cache \
+  --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_pointseg_cache \
   --overwrite
 ```
 
@@ -374,8 +407,8 @@ conda run -n reap python benchmarks/song_real_libero/scripts/train_song_benchmar
   --policy.type=smolvla \
   --policy.push_to_hub=false \
   --dataset.repo_id=song_libero_4suite_pointcloud \
-  --dataset.root=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
-  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_pointseg_cache \
+  --dataset.root=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_pointseg_cache \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=8 \
@@ -410,7 +443,7 @@ Run online evaluation on the four suites with each task's own LIBERO language pr
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
-  benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_4suite_fresh/checkpoints/000100/pretrained_model \
   --suite libero_spatial \
@@ -440,7 +473,7 @@ If no local demo HDF5 files are found, the default config downloads the matching
 The generated training dataset is written to `dataset_output_root` in `configs/libero.json` and contains:
 
 ```text
-data/libero_lerobot_dataset/
+data/libero_setting/libero_lerobot_dataset/
   point_clouds/episode_000000.zarr
   world_ee_poses/episode_000000.npy
   libero_collect_summary.json
@@ -452,7 +485,7 @@ The default config disables preview outputs for faster, smaller collection. To s
 frame_XXXX_point_cloud_eff.ply
 frame_XXXX_umi_action_frame.ply
 umi_action_trajectory.ply
-world_ee_trajectory.ply
+reference_ee_trajectory.ply
 agentview_image.mp4
 robot0_eye_in_hand_image.mp4
 preview.json
@@ -460,13 +493,21 @@ preview.json
 
 `camera_names` controls RGB-D rendering and MP4 previews. `pointcloud_camera_names` controls which rendered cameras are fused into `observation.point_cloud`; the default is only `["agentview"]` because directly mixing the static scene camera with the wrist camera can produce duplicate crossed scenes if the camera frames are not perfectly aligned.
 
-The LIBERO collector mirrors the real-robot point-cloud contract: it samples the scene cloud to `num_points`, adds the REAP-style virtual gripper at the current world end-effector pose, converts the merged cloud to the current end-effector frame, replaces the last `gripper_points` entries, and keeps the final shape at `(num_points, 6)`. With the default config this is `49500` scene points plus `500` virtual gripper points. The virtual gripper shape and offset follow the benchmark `add_gripper_cloud_to_hdf5.py` REAP template.
+The LIBERO collector mirrors the real-robot point-cloud contract.
+`pointcloud_reference_camera` selects the fixed Overview reference camera and
+is moved to the front of `pointcloud_camera_names` automatically.
+Rendered depth is back-projected directly in that camera frame, while the
+simulator extrinsic is used only to express the simulated EEF pose in the same
+camera frame. The virtual gripper is added there, and the merged cloud is then
+converted to the current EEF frame. With the default `num_points=10000` and
+`gripper_points=500`, the result contains 9500 scene points and 500 virtual
+gripper points. The final shape remains `(num_points, 6)`.
 
 Export previews from an already generated dataset without recollecting:
 
 ```bash
 conda run -n reap python benchmarks/song_real_libero/scripts/visualize_lerobot_pointcloud_dataset.py \
-  --dataset-root benchmarks/song_real_libero/data/libero_lerobot_dataset \
+  --dataset-root benchmarks/song_real_libero/data/libero_setting/libero_lerobot_dataset \
   --episode 0 \
   --stride 20 \
   --count 8
@@ -477,8 +518,8 @@ Build pointseg cache:
 ```bash
 conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.repo_id song_libero_pointcloud \
-  --dataset.root benchmarks/song_real_libero/data/libero_lerobot_dataset \
-  --output-dir benchmarks/song_real_libero/data/libero_pointseg_cache \
+  --dataset.root benchmarks/song_real_libero/data/libero_setting/libero_lerobot_dataset \
+  --output-dir benchmarks/song_real_libero/data/libero_setting/libero_pointseg_cache \
   --overwrite
 ```
 
@@ -486,7 +527,7 @@ Run online LIBERO inference/evaluation:
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
-  benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --policy.path benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
   --suite libero_object \
@@ -508,7 +549,7 @@ This online runner resets a LIBERO/robosuite environment, reads RGB-D observatio
 ## ###########Data Collection################
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --suite libero_object \
   --episodes 5 \
@@ -518,20 +559,16 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --vis-count 1
 ```
 ## ###########Prior Cache################
-```bash
-conda run -n reap python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
-  --dataset.repo_id song_libero_pointcloud \
-  --dataset.root benchmarks/song_real_libero/data/libero_lerobot_dataset \
-  --output-dir benchmarks/song_real_libero/data/libero_pointseg_cache \
-  --overwrite
-```
+
+# ######### MultiGPU  --nproc_per_node=4
+ torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset_cache   --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=0   --overwrite
 
 
 ## ###########Train Policy################   Resume
 python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
-  --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
+  --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model \
   --policy.push_to_hub=false \
-  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=8 \
@@ -566,7 +603,7 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.type=smolvla \
   --policy.push_to_hub=false \
-  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
   --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
   --policy.load_vlm_weights=false \
   --batch_size=8 \
@@ -603,16 +640,16 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 
 ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
-  benchmarks/song_real_libero/scripts/libero_collect_dataset.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_collect_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_demos \
+  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_demos \
   --suite libero_spatial \
   --suite libero_object \
   --all-tasks \
   --episodes 25 \
   --num-workers 4 \
   --point-cloud-storage zarr \
-  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/temp_dataset \
+  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/temp_dataset \
   --repo-id song_libero_4suite_pointcloud \
   --save-video \
   --vis-count 2 
@@ -621,17 +658,17 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
 
 python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.repo_id song_libero_pointcloud \
-  --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_4suite_lerobot_dataset \
-  --output-dir benchmarks/song_real_libero/data/libero_pointseg_cache \
+  --dataset.root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
+  --output-dir benchmarks/song_real_libero/data/libero_setting/libero_pointseg_cache \
   --overwrite
 
 
 ### #######################Benchmark Eval#############
   ```bash
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
-  benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh/checkpoints/last/pretrained_model \
+  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
@@ -646,7 +683,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --gripper-wait-max-steps 12 \
   --save-video \
   --render-mode viewer3d \
-  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
+  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite_temp
 ```
 
 

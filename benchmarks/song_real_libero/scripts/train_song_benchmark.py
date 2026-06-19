@@ -127,7 +127,12 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 
 
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
-    """Inject world-frame end-effector pose chunks for worldflow supervision."""
+    """Inject fixed-reference EEF pose chunks for WorldFlow supervision.
+
+    The on-disk directory keeps its historical ``world_ee_poses`` name. New
+    datasets store poses in the fixed Overview-camera frame, which is treated as
+    the model's world/reference frame and requires no real-robot extrinsic.
+    """
 
     def __init__(
         self,
@@ -145,7 +150,9 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         self._pose_cache: dict[int, np.ndarray] = {}
 
         if not self.pose_dir.is_dir():
-            raise FileNotFoundError(f"Worldflow is enabled but world ee pose directory is missing: {self.pose_dir}")
+            raise FileNotFoundError(
+                f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
+            )
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -171,10 +178,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         if poses is None:
             path = self.pose_dir / f"episode_{episode_index:06d}.npy"
             if not path.exists():
-                raise FileNotFoundError(f"Worldflow ee pose memmap file is missing: {path}")
+                raise FileNotFoundError(f"WorldFlow reference-frame ee pose memmap file is missing: {path}")
             poses = np.load(path, mmap_mode=self.mmap_mode)
             if poses.ndim != 2 or poses.shape[-1] != 9:
-                raise ValueError(f"Expected world ee poses shape (T,9), got {poses.shape}.")
+                raise ValueError(f"Expected reference-frame ee poses shape (T,9), got {poses.shape}.")
             self._pose_cache[episode_index] = poses
         return poses
 

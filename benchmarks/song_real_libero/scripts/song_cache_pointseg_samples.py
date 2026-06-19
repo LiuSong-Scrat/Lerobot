@@ -6,16 +6,18 @@ import argparse
 import json
 import os
 import shutil
+import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/lerobot_hf_datasets_cache")
+os.environ.setdefault("SONG_POINTSEG_REQUIRE_POINTOPS", "1")
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -35,17 +37,21 @@ from lerobot.policies.smolvla.song_pointseg import (
 )
 from lerobot.utils.random_utils import set_seed
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if __package__:
+    from ._paths import REAL_DATA_ROOT
+else:
+    from _paths import REAL_DATA_ROOT
+
 DEFAULT_DATASET_ROOT = Path(
     os.environ.get(
         "SONG_POINTSEG_DATASET",
-        str(PROJECT_ROOT / "data" / "lerobot_dataset"),
+        str(REAL_DATA_ROOT / "lerobot_dataset"),
     )
 )
 DEFAULT_CACHE_DIR = Path(
     os.environ.get(
         "SONG_POINTSEG_SAMPLE_CACHE",
-        str(PROJECT_ROOT / "data" / "pointseg_cache"),
+        str(REAL_DATA_ROOT / "pointseg_cache"),
     )
 )
 
@@ -59,17 +65,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
     parser.add_argument("--current-points", type=int, default=10000)
     parser.add_argument("--future-points", type=int, default=10000)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=256)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--storage-dtype", choices=["float16", "float32"], default="float16")
-    parser.add_argument("--nn-chunk-size", type=int, default=512)
+    parser.add_argument("--nn-chunk-size", type=int, default=1024)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--vis-count", type=int, default=8)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--rank-wait-timeout-sec", type=int, default=0, help="Timeout while rank0 waits for rank done marker files. 0 means wait forever.")
     return parser.parse_args()
 
 
@@ -83,28 +90,9 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _resolve_dataset_location(args: argparse.Namespace) -> tuple[str, Path | None]:
-    repo_id = str(args.dataset_repo_id)
-    if args.dataset_root:
-        return repo_id, Path(args.dataset_root).expanduser().resolve()
-
-    candidate = Path(repo_id).expanduser()
-    if candidate.exists():
-        root = candidate.resolve()
-        if not (root / "meta" / "info.json").exists():
-            raise FileNotFoundError(
-                f"Local dataset path exists but is missing meta/info.json: {root}. "
-                "Pass a valid LeRobot dataset root, or use a Hugging Face dataset repo id."
-            )
-        args.dataset_root = str(root)
-        args.dataset_repo_id = root.name
-        return args.dataset_repo_id, root
-
-    return repo_id, None
-
-
 def _make_lerobot_dataset(args: argparse.Namespace) -> LeRobotDataset:
-    repo_id, root = _resolve_dataset_location(args)
+    repo_id = args.dataset_repo_id
+    root = Path(args.dataset_root) if args.dataset_root else None
     max_offset = max(args.future_offsets)
     metadata = LeRobotDatasetMetadata(repo_id, root=root)
     fps = int(metadata.fps)
@@ -236,6 +224,121 @@ def _save_preview(
     )
 
 
+
+def _is_torchrun_env() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def _init_multiprocess(args: argparse.Namespace) -> tuple[int, int, int, torch.device]:
+    """Read torchrun rank env vars and choose one GPU per rank.
+
+    This cache job does not need gradient collectives, so it intentionally avoids
+    torch.distributed/NCCL. Synchronization is done with marker files to prevent
+    NCCL watchdog timeouts when some ranks finish much earlier than others.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    wants_cuda = str(args.device).startswith("cuda") and torch.cuda.is_available()
+    if wants_cuda:
+        visible_count = torch.cuda.device_count()
+        if visible_count <= 0:
+            raise RuntimeError("args.device requests CUDA but torch.cuda.device_count() is 0")
+        device_index = local_rank % visible_count
+        torch.cuda.set_device(device_index)
+        device = torch.device(f"cuda:{device_index}")
+    else:
+        device = torch.device(args.device)
+
+    return rank, local_rank, world_size, device
+
+
+def _sync_dir(output_dir: Path) -> Path:
+    return output_dir / "_dist_sync"
+
+
+def _write_marker(path: Path, text: str = "ok") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _wait_for_marker(path: Path, *, timeout_sec: int = 0, poll_sec: float = 2.0) -> None:
+    start = time.time()
+    while not path.exists():
+        if timeout_sec > 0 and (time.time() - start) > timeout_sec:
+            raise TimeoutError(f"Timed out waiting for marker: {path}")
+        time.sleep(poll_sec)
+
+
+def _wait_for_all_rank_done(output_dir: Path, world_size: int, *, timeout_sec: int = 0) -> None:
+    sync = _sync_dir(output_dir)
+    start = time.time()
+    missing_report_t = 0.0
+    while True:
+        missing = [r for r in range(world_size) if not (sync / f"rank_{r:03d}.done").exists()]
+        failed = sorted(sync.glob("rank_*.failed"))
+        if failed:
+            details = []
+            for path in failed:
+                try:
+                    details.append(f"{path.name}: {path.read_text()[:2000]}")
+                except Exception:
+                    details.append(str(path))
+            raise RuntimeError("One or more ranks failed:\n" + "\n".join(details))
+        if not missing:
+            return
+        now = time.time()
+        if now - missing_report_t > 60:
+            print(f"[rank 0] waiting for done markers from ranks: {missing}", flush=True)
+            missing_report_t = now
+        if timeout_sec > 0 and (now - start) > timeout_sec:
+            raise TimeoutError(f"Timed out waiting for ranks {missing} to finish")
+        time.sleep(2.0)
+
+
+def _rank_bounds(total: int, world_size: int, rank: int) -> tuple[int, int]:
+    """Contiguous split, preserving global dataset/cache order."""
+    base = total // world_size
+    rem = total % world_size
+    start = rank * base + min(rank, rem)
+    length = base + (1 if rank < rem else 0)
+    return start, start + length
+
+
+def _make_rank_shards(total_samples: int, shard_size: int, world_size: int, rank: int) -> list[dict[str, Any]]:
+    start_index, end_index = _rank_bounds(total_samples, world_size, rank)
+    local_samples = end_index - start_index
+    local_shards = _make_shard_manifest(local_samples, shard_size)
+    for shard in local_shards:
+        shard["path"] = f"rank_{rank:03d}/{shard['path']}"
+        shard["start"] = start_index + int(shard["start"])
+    return local_shards
+
+
+def _build_all_shards_from_disk(output_dir: Path, total_samples: int, shard_size: int, world_size: int) -> list[dict[str, Any]]:
+    """Rank0 rebuilds manifest shard list after all ranks have written shard arrays."""
+    all_shards: list[dict[str, Any]] = []
+    for rank in range(world_size):
+        for shard in _make_rank_shards(total_samples, shard_size, world_size, rank):
+            offsets_path = output_dir / shard["path"] / "sample_offsets.npy"
+            if not offsets_path.exists():
+                raise FileNotFoundError(f"Missing shard offsets written by rank {rank}: {offsets_path}")
+            offsets = np.load(offsets_path, mmap_mode="r")
+            shard["num_points"] = int(offsets[-1])
+            all_shards.append(shard)
+    return all_shards
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
 def cache_samples(args: argparse.Namespace) -> None:
     if args.smoke_test:
         args.current_points = min(args.current_points, 256)
@@ -245,35 +348,85 @@ def cache_samples(args: argparse.Namespace) -> None:
         args.max_samples = 4 if args.max_samples is None else min(args.max_samples, 4)
         args.vis_count = min(args.vis_count, 2)
 
-    set_seed(args.seed)
-    device = torch.device(args.device)
+    rank, local_rank, world_size, device = _init_multiprocess(args)
+    is_main = rank == 0
+
+    # Make each rank deterministic but distinct for DataLoader workers.
+    set_seed(args.seed + rank)
     storage_dtype = np.dtype(args.storage_dtype)
-    _prepare_output_dir(args.output_dir, args.overwrite)
+
+    sync = _sync_dir(args.output_dir)
+    if is_main:
+        _prepare_output_dir(args.output_dir, args.overwrite)
+        sync.mkdir(parents=True, exist_ok=True)
+        for marker in sync.glob("rank_*.done"):
+            marker.unlink(missing_ok=True)
+        for marker in sync.glob("rank_*.failed"):
+            marker.unlink(missing_ok=True)
+        _write_marker(sync / "ready", f"ready pid={os.getpid()} time={time.time()}\n")
+    else:
+        _wait_for_marker(sync / "ready", timeout_sec=args.rank_wait_timeout_sec)
 
     pseudo_cfg = replace(PseudoLabelConfig(), nn_chunk_size=args.nn_chunk_size)
-    dataset = make_dataset(args)
-    total_samples = len(dataset) if args.max_samples is None else min(len(dataset), args.max_samples)
+    full_dataset = make_dataset(args)
+    total_samples = len(full_dataset) if args.max_samples is None else min(len(full_dataset), args.max_samples)
     if total_samples <= 0:
         raise ValueError("Song pointseg cache needs at least one sample.")
-    shards = _make_shard_manifest(total_samples, args.shard_size)
-    manifest = {
-        "version": POINTSEG_CACHE_VERSION,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "role_names": list(ROLE_NAMES),
-        "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
-        "cache_mode": "indices",
-        "num_samples": total_samples,
-        "future_offsets": list(args.future_offsets),
-        "current_points": args.current_points,
-        "future_points": args.future_points,
-        "variable_num_points": True,
-        "point_count_policy": "cap_without_repeat",
-        "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
-        "storage_dtype": args.storage_dtype,
-        "pseudo_label_config": asdict(pseudo_cfg),
-        "args": _jsonable(vars(args)),
-        "shards": shards,
-    }
+
+    start_index, end_index = _rank_bounds(total_samples, world_size, rank)
+    local_samples = end_index - start_index
+    local_indices = range(start_index, end_index)
+    dataset = Subset(full_dataset, local_indices)
+    shards = _make_rank_shards(total_samples, args.shard_size, world_size, rank)
+
+    if is_main:
+        manifest = {
+            "version": POINTSEG_CACHE_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "role_names": list(ROLE_NAMES),
+            "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+            "cache_mode": "indices",
+            "num_samples": total_samples,
+            "future_offsets": list(args.future_offsets),
+            "current_points": args.current_points,
+            "future_points": args.future_points,
+            "variable_num_points": True,
+            "point_count_policy": "cap_without_repeat",
+            "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
+            "storage_dtype": args.storage_dtype,
+            "pseudo_label_config": asdict(pseudo_cfg),
+            "args": _jsonable(vars(args)),
+            "distributed": {
+                "world_size": world_size,
+                "launcher": "torchrun",
+                "split": "contiguous_by_dataset_index",
+            },
+            "shards": [],
+        }
+    else:
+        manifest = None
+
+    if is_main:
+        print(
+            f"[cache] total_samples={total_samples} world_size={world_size} "
+            f"batch_size_per_gpu={args.batch_size} device={device}",
+            flush=True,
+        )
+    print(
+        f"[rank {rank}/{world_size}] local_rank={local_rank} device={device} "
+        f"range=[{start_index}, {end_index}) local_samples={local_samples} shards={len(shards)}",
+        flush=True,
+    )
+
+    if local_samples == 0:
+        _write_marker(sync / f"rank_{rank:03d}.done", "empty\n")
+        if is_main and manifest is not None:
+            _wait_for_all_rank_done(args.output_dir, world_size, timeout_sec=args.rank_wait_timeout_sec)
+            manifest["shards"] = _build_all_shards_from_disk(
+                args.output_dir, total_samples, args.shard_size, world_size
+            )
+            _atomic_write_json(args.output_dir / "manifest.json", manifest)
+        return
 
     dataloader = DataLoader(
         dataset,
@@ -291,64 +444,84 @@ def cache_samples(args: argparse.Namespace) -> None:
     shard_samples: list[dict[str, np.ndarray | int]] = []
     written = 0
     previews = 0
-    progress = tqdm(total=total_samples, desc="Cache Song pointseg", unit="sample")
+    t0 = time.time()
+    progress = tqdm(
+        total=local_samples,
+        desc=f"Rank {rank} cache",
+        unit="sample",
+        position=rank,
+        disable=not is_main,
+    )
 
-    with torch.inference_mode():
-        for batch in dataloader:
-            if written >= total_samples:
-                break
-            batch_size = min(int(batch["observation.point_cloud"].shape[0]), total_samples - written)
-            batch = _slice_batch_to_size(batch, batch_size)
-            batch = move_batch_to_device(batch, device)
-            current_pc = batch["observation.point_cloud"]
-            pseudo = generate_pseudo_labels(
-                current_pc,
-                batch["observation.point_cloud_future"],
-                batch["future_ee_poses"],
-                batch["future_is_pad"],
-                current_is_pad=batch.get("observation.point_cloud_is_pad"),
-                future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
-                config=pseudo_cfg,
-            )
-            pseudo = force_small_current_clouds_foreground(
-                pseudo,
-                current_pc,
-                args.current_points,
-                batch.get("observation.point_cloud_is_pad"),
-            )
+    try:
+        with torch.inference_mode():
+            for batch in dataloader:
+                if written >= local_samples:
+                    break
 
-            if previews < args.vis_count:
-                preview_count = min(args.vis_count - previews, batch_size)
-                for batch_index in range(preview_count):
-                    current_is_pad = batch.get("observation.point_cloud_is_pad")
-                    valid = ~current_is_pad[batch_index].bool() if current_is_pad is not None else torch.ones(
-                        current_pc.shape[1], dtype=torch.bool, device=current_pc.device
-                    )
-                    _save_preview(
-                        args.output_dir,
-                        written + batch_index,
-                        current_pc[batch_index][valid],
-                        {key: value[batch_index][valid] for key, value in pseudo.items() if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == current_pc.shape[:2]},
-                    )
-                previews += preview_count
+                batch_size = min(int(batch["observation.point_cloud"].shape[0]), local_samples - written)
+                batch = _slice_batch_to_size(batch, batch_size)
+                batch = move_batch_to_device(batch, device)
+                current_pc = batch["observation.point_cloud"]
 
-            for batch_index in range(batch_size):
-                shard_samples.append(
-                    _sample_from_batch(current_pc, pseudo, batch, batch_index, written)
+                pseudo = generate_pseudo_labels(
+                    current_pc,
+                    batch["observation.point_cloud_future"],
+                    batch["future_ee_poses"],
+                    batch["future_is_pad"],
+                    current_is_pad=batch.get("observation.point_cloud_is_pad"),
+                    future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
+                    config=pseudo_cfg,
                 )
-                written += 1
-                progress.update(1)
-                if len(shard_samples) == int(shards[current_shard_index]["length"]):
-                    _save_variable_shard(
-                        args.output_dir,
-                        shards[current_shard_index],
-                        shard_samples,
-                        storage_dtype=storage_dtype,
-                    )
-                    shard_samples = []
-                    current_shard_index += 1
+                pseudo = force_small_current_clouds_foreground(
+                    pseudo,
+                    current_pc,
+                    args.current_points,
+                    batch.get("observation.point_cloud_is_pad"),
+                )
 
-    progress.close()
+                # Preview writing is intentionally limited to rank0 to avoid slow multi-process PLY I/O.
+                if is_main and previews < args.vis_count:
+                    preview_count = min(args.vis_count - previews, batch_size)
+                    for batch_index in range(preview_count):
+                        current_is_pad = batch.get("observation.point_cloud_is_pad")
+                        valid = ~current_is_pad[batch_index].bool() if current_is_pad is not None else torch.ones(
+                            current_pc.shape[1], dtype=torch.bool, device=current_pc.device
+                        )
+                        _save_preview(
+                            args.output_dir,
+                            start_index + written + batch_index,
+                            current_pc[batch_index][valid],
+                            {
+                                key: value[batch_index][valid]
+                                for key, value in pseudo.items()
+                                if torch.is_tensor(value)
+                                and value.ndim >= 2
+                                and value.shape[:2] == current_pc.shape[:2]
+                            },
+                        )
+                    previews += preview_count
+
+                for batch_index in range(batch_size):
+                    global_dataset_index = start_index + written
+                    shard_samples.append(
+                        _sample_from_batch(current_pc, pseudo, batch, batch_index, global_dataset_index)
+                    )
+                    written += 1
+                    progress.update(1)
+
+                    if len(shard_samples) == int(shards[current_shard_index]["length"]):
+                        _save_variable_shard(
+                            args.output_dir,
+                            shards[current_shard_index],
+                            shard_samples,
+                            storage_dtype=storage_dtype,
+                        )
+                        shard_samples = []
+                        current_shard_index += 1
+    finally:
+        progress.close()
+
     if shard_samples:
         _save_variable_shard(
             args.output_dir,
@@ -356,13 +529,41 @@ def cache_samples(args: argparse.Namespace) -> None:
             shard_samples,
             storage_dtype=storage_dtype,
         )
-    with open(args.output_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"Cached {written} Song pointseg samples to {args.output_dir}")
+
+    elapsed = time.time() - t0
+    speed = written / max(elapsed, 1e-6)
+    print(
+        f"[rank {rank}/{world_size}] wrote {written} samples in {elapsed:.1f}s "
+        f"({speed:.2f} samples/s)",
+        flush=True,
+    )
+
+    _write_marker(
+        sync / f"rank_{rank:03d}.done",
+        f"written={written} elapsed={elapsed:.3f} speed={speed:.3f} pid={os.getpid()}\n",
+    )
+
+    if is_main:
+        assert manifest is not None
+        _wait_for_all_rank_done(args.output_dir, world_size, timeout_sec=args.rank_wait_timeout_sec)
+        manifest["shards"] = _build_all_shards_from_disk(
+            args.output_dir, total_samples, args.shard_size, world_size
+        )
+        _atomic_write_json(args.output_dir / "manifest.json", manifest)
+        print(f"Cached {total_samples} Song pointseg samples to {args.output_dir}", flush=True)
 
 
 def main() -> None:
-    cache_samples(parse_args())
+    args = parse_args()
+    rank = int(os.environ.get("RANK", "0"))
+    try:
+        cache_samples(args)
+    except Exception as exc:
+        try:
+            _write_marker(_sync_dir(args.output_dir) / f"rank_{rank:03d}.failed", repr(exc))
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

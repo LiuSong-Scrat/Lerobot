@@ -1,4 +1,4 @@
-#  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python   benchmarks/song_real_libero/scripts/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model  --suite libero_10  --all-tasks   --episodes 10  --action-index 0   --exec-action-steps 12   --save-video --render-mode offscreen   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/10w_eval_long_temp
+# Example: MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py --config benchmarks/song_real_libero/configs/libero.json
 #!/usr/bin/env python
 """Minimal LIBERO point-cloud evaluation with absolute-pose chunk execution.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -22,32 +23,57 @@ import re
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
-from libero_collect_dataset import (
-    append_video_frames,
-    export_episode_videos,
-    resolve_suite_names,
-    resolve_task_ids_for_suite,
-)
-from libero_pointcloud_utils import (
-    add_world_gripper_cloud_to_point_cloud,
-    attach_mujoco_3d_viewer,
-    ensure_libero_config,
-    eef_pose9_gripper_from_obs,
-    fast_inverse_homogeneous,
-    get_task_init_states,
-    gripper_scalar,
-    gripper_width_percent_from_scalar,
-    make_libero_env,
-    normalize_render_camera_name,
-    observation_to_point_clouds,
-    pointcloud_camera_names_from_config,
-    pose9_to_homo_np,
-    render_camera_names_from_config,
-)
-
-
-BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+if __package__ and __package__.startswith("benchmarks."):
+    from .._paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
+    from ..smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
+    from .libero_hdf5_to_dataset import (
+        append_video_frames,
+        export_episode_videos,
+        resolve_suite_names,
+        resolve_task_ids_for_suite,
+    )
+    from .libero_pointcloud_utils import (
+        add_world_gripper_cloud_to_point_cloud,
+        attach_mujoco_3d_viewer,
+        ensure_libero_config,
+        eef_pose9_gripper_from_obs,
+        fast_inverse_homogeneous,
+        get_task_init_states,
+        gripper_scalar,
+        gripper_width_percent_from_scalar,
+        make_libero_env,
+        normalize_render_camera_name,
+        observation_to_point_clouds,
+        pointcloud_camera_names_from_config,
+        pose9_to_homo_np,
+        render_camera_names_from_config,
+    )
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
+    from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
+    from benchmarks.song_real_libero.scripts.libero_setting.libero_hdf5_to_dataset import (
+        append_video_frames,
+        export_episode_videos,
+        resolve_suite_names,
+        resolve_task_ids_for_suite,
+    )
+    from libero_setting.libero_pointcloud_utils import (
+        add_world_gripper_cloud_to_point_cloud,
+        attach_mujoco_3d_viewer,
+        ensure_libero_config,
+        eef_pose9_gripper_from_obs,
+        fast_inverse_homogeneous,
+        get_task_init_states,
+        gripper_scalar,
+        gripper_width_percent_from_scalar,
+        make_libero_env,
+        normalize_render_camera_name,
+        observation_to_point_clouds,
+        pointcloud_camera_names_from_config,
+        pose9_to_homo_np,
+        render_camera_names_from_config,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,8 +82,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--settle-steps", type=int, default=5, help="MuJoCo physics ticks after env.reset() before the first policy inference, so free objects can settle.")
     parser.add_argument("--settle-keep-robot-fixed", action=argparse.BooleanOptionalAction, default=True, help="During initial settling, restore arm/gripper qpos each sim tick so only free objects settle.")
-    parser.add_argument("--config", type=Path, default=BENCHMARK_ROOT / "configs" / "libero.json")
-    parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default="benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model")
+    parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
+    parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
@@ -65,25 +91,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
-    parser.add_argument("--output-dir", type=Path, default="benchmarks/song_real_libero/outputs/temp_eval")
+    parser.add_argument("--output-dir", type=Path, default=None)
 
     parser.add_argument("--observation-height", type=int, default=None)
     parser.add_argument("--observation-width", type=int, default=None)
-    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default="viewer3d")
+    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default=None)
     parser.add_argument("--render-camera", default=None)
     parser.add_argument("--render-every-n-steps", type=int, default=None)
     parser.add_argument("--render-gpu-device-id", type=int, default=None)
     parser.add_argument("--control-freq", type=float, default=None)
 
     parser.add_argument("--action-index", type=int, default=None)
-    parser.add_argument("--exec-action-steps", type=int, default=12)
-    parser.add_argument("--max-steps", type=int, default=800)
+    parser.add_argument("--exec-action-steps", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
 
     parser.add_argument(
         "--gripper-threshold",
         type=float,
-        default=0.075,
+        default=None,
         help="Normalized gripper-width threshold. width_pct >= threshold => open(-1), else close(+1).",
     )
     parser.add_argument("--gripper-qpos-max-width", type=float, default=None)
@@ -96,8 +122,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with open(path.expanduser(), "r", encoding="utf-8") as f:
-        return json.load(f)
+    return load_json_config(
+        path,
+        path_keys=("policy_path", "policy_repo_id", "libero_config_path", "demo_root", "output_dir", "vis_dir"),
+    )
 
 
 def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) -> Any:
@@ -398,13 +426,6 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
     to the inference wrapper.  The current world_pose9 is kept only for converting
     the predicted UMI trajectory back to world/controller targets.
     """
-    from libero_pointcloud_utils import (
-        add_world_gripper_cloud_to_point_cloud,
-        gripper_width_percent_from_scalar,
-        observation_to_point_clouds,
-        pointcloud_camera_names_from_config,
-    )
-
     pc_eff, pc_world, pose9_gripper = observation_to_point_clouds(
         env,
         raw_obs,
@@ -623,7 +644,7 @@ def get_raw_obs(env: Any, *, force_update: bool = True) -> dict[str, Any]:
     # Fallback: a zero step is avoided by default; reset obs is passed around by caller.
     raise AttributeError("Environment does not expose _get_observations().") from last_exc
 def name_to_id(model: Any, kind: str, name: str) -> int:
-    for method in (f"{kind}_name2id", f"name2id"):
+    for method in (f"{kind}_name2id", "name2id"):
         fn = getattr(model, method, None)
         if callable(fn):
             try:
@@ -652,6 +673,12 @@ def model_names(model: Any, kind: str) -> list[str]:
         except Exception:
             pass
     return out
+
+
+def _joint_type_name(model: Any, joint_id: int) -> str:
+    joint_type = int(model.jnt_type[int(joint_id)])
+    return {0: "free", 1: "ball", 2: "slide", 3: "hinge"}.get(joint_type, str(joint_type))
+
 
 def robot_arm_indices(env: Any) -> tuple[list[int], list[int]]:
     sim = get_sim(env)
@@ -839,8 +866,6 @@ def render_mujoco_viewer(env: Any, cfg: dict[str, Any], step: int, *, force: boo
 
     if mode in {"viewer3d", "mujoco"}:
         try:
-            from libero_pointcloud_utils import attach_mujoco_3d_viewer
-
             attach_mujoco_3d_viewer(env, render_camera=cfg.get("render_camera", "agentview"))
         except Exception as exc:
             print(f"[warn] attach_mujoco_3d_viewer failed: {exc!r}")
@@ -892,7 +917,7 @@ def settle_scene_after_reset(
     if bool(keep_robot_fixed):
         try:
             arm_qpos_idx, arm_qvel_idx = robot_arm_indices(env)
-        except Exception as exc:
+        except Exception:
             arm_qpos_idx, arm_qvel_idx = [], []
         try:
             gripper_records = gripper_joint_records(env)
@@ -1147,7 +1172,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["all_tasks"] = bool(args.all_tasks if args.all_tasks is not None else cfg.get("all_tasks", False))
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
 
-    output_dir = Path(cfg_get(cfg, args.output_dir, "output_dir", "outputs/clean_eval")).expanduser().resolve()
+    output_dir = Path(cfg_get(cfg, args.output_dir, "output_dir", BENCHMARK_ROOT / "outputs" / "libero_setting" / "eval")).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg["output_dir"] = str(output_dir)
     cfg["recreate_env_per_episode"] = bool(

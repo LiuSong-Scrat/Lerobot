@@ -9,6 +9,12 @@ import sys
 import time
 import numpy as np
 
+if __package__ and __package__.startswith("benchmarks."):
+    from .._paths import REAL_DATA_ROOT
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import REAL_DATA_ROOT
+
 
 DEFAULT_BESTMAN_ROOT = Path("/home/liusong/ProgramFiles/BestMan")
 cv2 = None
@@ -309,7 +315,7 @@ def _open_camera(camera_cls, camera_cfg, camera: str):
 
 def _default_output_dir(camera: str) -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return Path("outputs/rgbd_records") / f"{camera}_{timestamp}"
+    return REAL_DATA_ROOT / "raw_rgbd" / f"{camera}_{timestamp}"
 
 
 def _intrinsics_to_dict(intrinsics) -> dict:

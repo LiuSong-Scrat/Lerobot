@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import re
 import shutil
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -23,17 +24,33 @@ from lerobot.policies.smolvla.song_pointseg import (
     save_point_clouds_zarr,
 )
 
-from libero_pointcloud_utils import (
-    add_world_gripper_clouds_to_episode,
-    ensure_libero_config,
-    fast_inverse_homogeneous,
-    make_libero_env,
-    observation_to_world_point_cloud,
-    pointcloud_camera_names_from_config,
-    pose9_to_homo_np,
-    render_camera_names_from_config,
-    world_point_cloud_to_current_eff,
-)
+if __package__ and __package__.startswith("benchmarks."):
+    from .._paths import DEFAULT_LIBERO_CONFIG, LIBERO_DATA_ROOT, load_json_config
+    from .libero_pointcloud_utils import (
+        add_reference_gripper_clouds_to_episode,
+        ensure_libero_config,
+        fast_inverse_homogeneous,
+        make_libero_env,
+        observation_to_camera_point_cloud,
+        pointcloud_camera_names_from_config,
+        pose9_to_homo_np,
+        reference_point_cloud_to_current_eff,
+        render_camera_names_from_config,
+    )
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import DEFAULT_LIBERO_CONFIG, LIBERO_DATA_ROOT, load_json_config
+    from libero_setting.libero_pointcloud_utils import (
+        add_reference_gripper_clouds_to_episode,
+        ensure_libero_config,
+        fast_inverse_homogeneous,
+        make_libero_env,
+        observation_to_camera_point_cloud,
+        pointcloud_camera_names_from_config,
+        pose9_to_homo_np,
+        reference_point_cloud_to_current_eff,
+        render_camera_names_from_config,
+    )
 
 from tqdm import tqdm
 
@@ -57,15 +74,15 @@ DATASET_FEATURES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert LIBERO demonstrations into the Song point-cloud LeRobot format.")
-    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "configs" / "libero.json")
+    parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--demo-root", type=Path, default=None)
     parser.add_argument("--demo-file", type=Path, action="append", default=None)
-    parser.add_argument("--output-root", type=Path, default="/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/temp")
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--repo-id", default=None)
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-frames-per-demo", type=int, default=None)
     parser.add_argument("--num-points", type=int, default=None)
     parser.add_argument("--point-cloud-storage", choices=("zarr", "npy"), default=None)
@@ -78,15 +95,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vis-count", type=int, default=None)
     parser.add_argument("--vis-stride", type=int, default=None)
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with open(path.expanduser(), "r", encoding="utf-8") as f:
-        return json.load(f)
+    return load_json_config(
+        path,
+        path_keys=("dataset_output_root", "libero_config_path", "demo_root", "vis_dir", "output_dir"),
+    )
 
 
 def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) -> Any:
@@ -245,6 +264,8 @@ def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
         "layout": "episode_array",
         "storage_format": storage,
         "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
+        "coordinate_frame": "current_eff",
+        "source_reference_frame": "overview_camera",
     }
     if storage == "zarr":
         meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
@@ -261,6 +282,9 @@ def write_worldflow_meta(root: Path) -> None:
         "shape": [9],
         "layout": "episode_npy",
         "path_format": f"{WORLD_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy",
+        "coordinate_frame": "overview_camera",
+        "legacy_directory_name": True,
+        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -290,13 +314,13 @@ def save_episode_point_clouds(
         np.save(path, point_clouds)
 
 
-def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.ndarray) -> None:
-    world_ee_poses = np.ascontiguousarray(world_ee_poses, dtype=np.float32)
-    if world_ee_poses.ndim != 2 or world_ee_poses.shape[-1] != 9:
-        raise ValueError(f"Expected world ee poses shape (T, 9), got {world_ee_poses.shape}")
+def save_episode_worldflow(root: Path, episode_index: int, reference_ee_poses: np.ndarray) -> None:
+    reference_ee_poses = np.ascontiguousarray(reference_ee_poses, dtype=np.float32)
+    if reference_ee_poses.ndim != 2 or reference_ee_poses.shape[-1] != 9:
+        raise ValueError(f"Expected reference-frame ee poses shape (T, 9), got {reference_ee_poses.shape}")
     path = world_ee_pose_file(root, episode_index)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, world_ee_poses)
+    np.save(path, reference_ee_poses)
 
 
 def homo_to_pose9(H: np.ndarray) -> np.ndarray:
@@ -304,13 +328,13 @@ def homo_to_pose9(H: np.ndarray) -> np.ndarray:
     return np.concatenate([H[..., :3, 3], H[..., :3, 0], H[..., :3, 1]], axis=-1).astype(np.float32)
 
 
-def from_world_to_umi_tra_pose9(obs_pose9_eff_to_world: np.ndarray) -> np.ndarray:
-    T_world = pose9_to_homo_np(obs_pose9_eff_to_world)
-    T_eff0_to_world = T_world[0]
-    T_inv = fast_inverse_homogeneous(T_world)
-    T_eff0_to_eff = T_inv @ T_eff0_to_world
-    T_eff_to_eff0 = fast_inverse_homogeneous(T_eff0_to_eff)
-    return homo_to_pose9(T_eff_to_eff0)
+def from_reference_to_umi_tra_pose9(obs_pose9_eff_to_reference: np.ndarray) -> np.ndarray:
+    reference_transforms = pose9_to_homo_np(obs_pose9_eff_to_reference)
+    eff0_to_reference = reference_transforms[0]
+    reference_to_eff = fast_inverse_homogeneous(reference_transforms)
+    eff0_to_eff = reference_to_eff @ eff0_to_reference
+    eff_to_eff0 = fast_inverse_homogeneous(eff0_to_eff)
+    return homo_to_pose9(eff_to_eff0)
 
 
 def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, timestamps: np.ndarray) -> dict[str, Any]:
@@ -481,7 +505,7 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
 
     point_clouds = np.asarray(episode["point_clouds"], dtype=np.float32)
     actions = np.asarray(episode["actions"], dtype=np.float32)
-    world_ee_poses = np.asarray(episode["world_ee_poses"], dtype=np.float32)
+    reference_ee_poses = np.asarray(episode["world_ee_poses"], dtype=np.float32)
     candidate_indices = list(range(0, len(point_clouds), stride))
     if len(candidate_indices) > vis_count:
         pick = np.linspace(0, len(candidate_indices) - 1, vis_count).round().astype(int)
@@ -494,7 +518,7 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         write_ascii_ply_frame(episode_dir / f"frame_{frame_idx:04d}_umi_action_frame.ply", actions[frame_idx, :9])
 
     write_ascii_ply_lines(episode_dir / "umi_action_trajectory.ply", actions[:, :3])
-    write_ascii_ply_lines(episode_dir / "world_ee_trajectory.ply", world_ee_poses[:, :3])
+    write_ascii_ply_lines(episode_dir / "reference_ee_trajectory.ply", reference_ee_poses[:, :3])
     preview = {
         **record,
         "frame_indices": [int(idx) for idx in frame_indices],
@@ -506,7 +530,7 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         "gripper_template": str(cfg.get("gripper_template", "reap")),
         "files": {
             "umi_action_trajectory": "umi_action_trajectory.ply",
-            "world_ee_trajectory": "world_ee_trajectory.ply",
+            "reference_ee_trajectory": "reference_ee_trajectory.ply",
             "point_cloud_pattern": "frame_XXXX_point_cloud_eff.ply",
             "frame_pattern": "frame_XXXX_umi_action_frame.ply",
         },
@@ -540,7 +564,7 @@ def maybe_download_demos(cfg: dict[str, Any], demo_root: Path) -> None:
     if dataset_name is None:
         raise ValueError(f"Do not know which LIBERO demo package to download for suite {cfg['suite']!r}.")
     from libero.libero.utils.download_utils import libero_dataset_download
-    
+
 
     print(f"No local demos found. Downloading {dataset_name} demos to {demo_root} ...")
     libero_dataset_download(
@@ -673,8 +697,8 @@ def collect_demo_episode(
     observation_height = int(cfg["observation_height"])
     observation_width = int(cfg["observation_width"])
     save_video = bool(cfg.get("save_video", False))
-    point_clouds_world = np.empty((frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32)
-    world_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
+    point_clouds_reference = np.empty((frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32)
+    reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
@@ -684,18 +708,20 @@ def collect_demo_episode(
         for frame_idx in range(frame_count):
             if save_video:
                 append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
-            point_cloud_world, pose9_gripper = observation_to_world_point_cloud(
-                env,
-                raw_obs,
-                pc_camera_names,
-                observation_height,
-                observation_width,
-                num_points,
-                seed=episode_seed + frame_idx,
+            point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
+                observation_to_camera_point_cloud(
+                    env,
+                    raw_obs,
+                    pc_camera_names,
+                    observation_height,
+                    observation_width,
+                    num_points,
+                    seed=episode_seed + frame_idx,
+                )
             )
-            point_clouds_world[frame_idx] = point_cloud_world
-            world_ee_poses[frame_idx] = pose9_gripper[:9]
-            grippers[frame_idx, 0] = pose9_gripper[-1]
+            point_clouds_reference[frame_idx] = point_cloud_reference
+            reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
+            grippers[frame_idx, 0] = pose9_gripper_reference[-1]
             if frame_idx < frame_count - 1:
                 raw_obs, _, _, _ = env.step(actions[frame_idx])
     else:
@@ -703,23 +729,25 @@ def collect_demo_episode(
             raw_obs = set_env_state_and_get_obs(env, states[frame_idx])
             if save_video:
                 append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
-            point_cloud_world, pose9_gripper = observation_to_world_point_cloud(
-                env,
-                raw_obs,
-                pc_camera_names,
-                observation_height,
-                observation_width,
-                num_points,
-                seed=episode_seed + frame_idx,
+            point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
+                observation_to_camera_point_cloud(
+                    env,
+                    raw_obs,
+                    pc_camera_names,
+                    observation_height,
+                    observation_width,
+                    num_points,
+                    seed=episode_seed + frame_idx,
+                )
             )
-            point_clouds_world[frame_idx] = point_cloud_world
-            world_ee_poses[frame_idx] = pose9_gripper[:9]
-            grippers[frame_idx, 0] = pose9_gripper[-1]
+            point_clouds_reference[frame_idx] = point_cloud_reference
+            reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
+            grippers[frame_idx, 0] = pose9_gripper_reference[-1]
 
     if cfg.get("add_gripper_cloud", True):
-        point_clouds = add_world_gripper_clouds_to_episode(
-            point_clouds_world,
-            world_ee_poses,
+        point_clouds_reference = add_reference_gripper_clouds_to_episode(
+            point_clouds_reference,
+            reference_ee_poses,
             grippers.reshape(-1),
             total_points=int(cfg["num_points"]),
             gripper_points=int(cfg.get("gripper_points", 500)),
@@ -731,9 +759,8 @@ def collect_demo_episode(
             widths_are_normalized=False,
             gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         )
-    else:
-        point_clouds = world_point_cloud_to_current_eff(point_clouds_world, world_ee_poses)
-    umi_poses = from_world_to_umi_tra_pose9(world_ee_poses)
+    point_clouds = reference_point_cloud_to_current_eff(point_clouds_reference, reference_ee_poses)
+    umi_poses = from_reference_to_umi_tra_pose9(reference_ee_poses)
     episode_actions = np.concatenate([umi_poses, grippers], axis=-1).astype(np.float32)
     timestamps = np.arange(len(episode_actions), dtype=np.float32) / float(cfg["fps"])
 
@@ -741,7 +768,9 @@ def collect_demo_episode(
         "task": task_language,
         "actions": episode_actions,
         "point_clouds": point_clouds,
-        "world_ee_poses": world_ee_poses,
+        # Legacy key/path retained for the existing WorldFlow dataset wrapper.
+        # Values are expressed in the fixed Overview-camera reference frame.
+        "world_ee_poses": reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
     }
@@ -949,7 +978,7 @@ def main() -> None:
     ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
 
     output_root = Path(
-        cfg_get(cfg, args.output_root, "dataset_output_root", Path(__file__).resolve().parents[1] / "data" / "libero_lerobot_dataset")
+        cfg_get(cfg, args.output_root, "dataset_output_root", LIBERO_DATA_ROOT / "libero_lerobot_dataset")
     ).expanduser().resolve()
     repo_id = cfg_get(cfg, args.repo_id, "dataset_repo_id", "song_libero_pointcloud")
     demo_root = get_libero_dataset_root(args.demo_root, cfg)
@@ -990,6 +1019,9 @@ def main() -> None:
         "output_root": str(output_root),
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
+        "reference_frame": "overview_camera",
+        "reference_camera": pointcloud_camera_names_from_config(cfg)[0],
+        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
         "render_camera_names": render_camera_names_from_config(cfg),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),

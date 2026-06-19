@@ -10,14 +10,21 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
 
+if __package__ and __package__.startswith("benchmarks."):
+    from .._paths import LIBERO_DATA_ROOT
+else:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import LIBERO_DATA_ROOT
+
 
 def ensure_libero_config(config_path: str | Path | None = None, dataset_root: str | Path | None = None) -> Path:
     """Create LIBERO's config.yaml non-interactively before importing libero.libero."""
-    project_root = Path(__file__).resolve().parents[1]
     config_dir = Path(
         config_path
         or os.environ.get("LIBERO_CONFIG_PATH")
-        or project_root / "data" / "libero_config"
+        or LIBERO_DATA_ROOT / "libero_config"
     ).expanduser().resolve()
     os.environ["LIBERO_CONFIG_PATH"] = str(config_dir)
     config_file = config_dir / "config.yaml"
@@ -65,6 +72,13 @@ def pointcloud_camera_names_from_config(cfg: dict[str, Any]) -> list[str]:
     camera_names = [normalize_camera_name(camera_name) for camera_name in camera_names]
     if not camera_names:
         raise ValueError("At least one LIBERO point-cloud camera must be configured.")
+    reference_camera = normalize_camera_name(cfg.get("pointcloud_reference_camera", camera_names[0]))
+    if reference_camera not in camera_names:
+        raise ValueError(
+            f"pointcloud_reference_camera={reference_camera!r} must be included in "
+            f"pointcloud_camera_names={camera_names!r}."
+        )
+    camera_names = [reference_camera, *(name for name in camera_names if name != reference_camera)]
     return camera_names
 
 
@@ -295,7 +309,7 @@ def merge_cloud_with_gripper(
     original_cloud: np.ndarray,
     gripper_cloud: np.ndarray,
     rng: np.random.Generator,
-    drop_strategy: str = "tail",
+    drop_strategy: str = "random",
     shuffle_points: bool = False,
 ) -> np.ndarray:
     total_points = original_cloud.shape[0]
@@ -323,6 +337,97 @@ def merge_cloud_with_gripper(
     return merged.astype(original_cloud.dtype, copy=False)
 
 
+def add_reference_gripper_cloud_to_point_cloud(
+    point_cloud_reference: np.ndarray,
+    current_pose9_gripper_reference: np.ndarray,
+    width_percent: float,
+    *,
+    total_points: int,
+    gripper_points: int = 500,
+    gripper_len: float = 0.06,
+    gripper_template: str = "reap",
+    seed: int = 0,
+    drop_strategy: str = "random",
+    shuffle_points: bool = False,
+) -> np.ndarray:
+    """Merge a virtual gripper into a cloud without changing its fixed reference frame."""
+
+    total_points = int(total_points)
+    gripper_points = max(0, min(int(gripper_points), total_points))
+    rng = np.random.default_rng(seed)
+    point_cloud_reference = sample_or_repeat_points(point_cloud_reference, total_points, seed=seed)
+    if gripper_points == 0:
+        return point_cloud_reference
+
+    current_traj6 = pose9_to_traj6_np(np.asarray(current_pose9_gripper_reference, dtype=np.float32))[..., :6]
+    gripper_cloud_reference = create_gripper_cloud_rgb(
+        width_percent,
+        current_traj6,
+        gripper_points,
+        rng,
+        gripper_len=float(gripper_len),
+        gripper_template=str(gripper_template),
+    )
+    return merge_cloud_with_gripper(
+        point_cloud_reference,
+        gripper_cloud_reference,
+        rng,
+        drop_strategy=drop_strategy,
+        shuffle_points=shuffle_points,
+    )
+
+
+def add_reference_gripper_clouds_to_episode(
+    point_clouds_reference: np.ndarray,
+    current_pose9_grippers_reference: np.ndarray,
+    gripper_widths: np.ndarray,
+    *,
+    total_points: int,
+    gripper_points: int = 500,
+    gripper_len: float = 0.06,
+    gripper_template: str = "reap",
+    seed: int = 0,
+    drop_strategy: str = "random",
+    shuffle_points: bool = False,
+    widths_are_normalized: bool = False,
+    gripper_max_width: float | None = None,
+) -> np.ndarray:
+    """Add gripper geometry to every frame while preserving the shared reference frame."""
+
+    point_clouds_reference = np.asarray(point_clouds_reference, dtype=np.float32)
+    current_pose9_grippers_reference = np.asarray(current_pose9_grippers_reference, dtype=np.float32)
+    widths = normalize_gripper_widths(
+        gripper_widths,
+        already_normalized=widths_are_normalized,
+        max_physical_width=gripper_max_width,
+    )
+    if len(point_clouds_reference) != len(current_pose9_grippers_reference):
+        raise ValueError(
+            f"Point cloud frames {len(point_clouds_reference)} != pose frames "
+            f"{len(current_pose9_grippers_reference)}"
+        )
+    if len(point_clouds_reference) != len(widths):
+        raise ValueError(f"Point cloud frames {len(point_clouds_reference)} != gripper widths {len(widths)}")
+
+    merged = np.empty((len(point_clouds_reference), int(total_points), 6), dtype=np.float32)
+    for frame_idx, (cloud_reference, pose9, width) in enumerate(
+        zip(point_clouds_reference, current_pose9_grippers_reference, widths, strict=True)
+    ):
+        merged[frame_idx] = add_reference_gripper_cloud_to_point_cloud(
+            cloud_reference,
+            pose9,
+            float(width),
+            total_points=total_points,
+            gripper_points=gripper_points,
+            gripper_len=gripper_len,
+            gripper_template=gripper_template,
+            seed=seed + frame_idx,
+            drop_strategy=drop_strategy,
+            shuffle_points=shuffle_points,
+        )
+    return merged
+
+
 def add_local_gripper_cloud_to_point_cloud(
     point_cloud_eff: np.ndarray,
     width_percent: float,
@@ -332,7 +437,7 @@ def add_local_gripper_cloud_to_point_cloud(
     gripper_len: float = 0.06,
     gripper_template: str = "reap",
     seed: int = 0,
-    drop_strategy: str = "tail",
+    drop_strategy: str = "random",
     shuffle_points: bool = False,
 ) -> np.ndarray:
     total_points = int(total_points)
@@ -368,7 +473,7 @@ def add_local_gripper_clouds_to_episode(
     gripper_len: float = 0.06,
     gripper_template: str = "reap",
     seed: int = 0,
-    drop_strategy: str = "tail",
+    drop_strategy: str = "random",
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
     gripper_max_width: float | None = None,
@@ -459,7 +564,7 @@ def gripper_scalar(raw_obs: dict[str, Any]) -> float:
     qpos = np.abs(qpos)  ### absolute pos
     if qpos.size == 0:
         return 0.0
-    
+
     return float(np.sum(qpos))
 
 
@@ -471,15 +576,22 @@ def eef_pose9_gripper_from_obs(raw_obs: dict[str, Any]) -> np.ndarray:
     )
 
 
-def world_point_cloud_to_current_eff(point_cloud_world: np.ndarray, current_pose9_gripper: np.ndarray) -> np.ndarray:
-    pc = np.asarray(point_cloud_world, dtype=np.float32)
+def reference_point_cloud_to_current_eff(
+    point_cloud_reference: np.ndarray,
+    current_pose9_gripper_reference: np.ndarray,
+) -> np.ndarray:
+    """Transform a fixed-reference cloud into the current end-effector frame."""
+
+    pc = np.asarray(point_cloud_reference, dtype=np.float32)
     squeeze = pc.ndim == 2
     if squeeze:
         pc = pc[None]
     if pc.ndim != 3 or pc.shape[-1] != 6:
-        raise ValueError(f"Expected point_cloud shape (N, 6) or (B, N, 6), got {point_cloud_world.shape}")
+        raise ValueError(
+            f"Expected point_cloud shape (N, 6) or (B, N, 6), got {point_cloud_reference.shape}"
+        )
 
-    pose = np.asarray(current_pose9_gripper, dtype=np.float32)
+    pose = np.asarray(current_pose9_gripper_reference, dtype=np.float32)
     if pose.ndim == 1:
         pose = pose[None]
     if pose.shape[0] == 1 and pc.shape[0] > 1:
@@ -487,12 +599,18 @@ def world_point_cloud_to_current_eff(point_cloud_world: np.ndarray, current_pose
     if pose.shape[0] != pc.shape[0]:
         raise ValueError(f"Pose batch {pose.shape[0]} does not match point cloud batch {pc.shape[0]}.")
 
-    eff_to_world = pose9_to_homo_np(pose)
-    world_to_eff = fast_inverse_homogeneous(eff_to_world)
+    eff_to_reference = pose9_to_homo_np(pose)
+    reference_to_eff = fast_inverse_homogeneous(eff_to_reference)
     xyz_h = np.concatenate([pc[..., :3], np.ones((*pc.shape[:2], 1), dtype=np.float32)], axis=-1)
-    eff_xyz_h = np.einsum("bij,bnj->bni", world_to_eff, xyz_h)
+    eff_xyz_h = np.einsum("bij,bnj->bni", reference_to_eff, xyz_h)
     pc_eff = np.concatenate([eff_xyz_h[..., :3], pc[..., 3:]], axis=-1).astype(np.float32)
     return pc_eff[0] if squeeze else pc_eff
+
+
+def world_point_cloud_to_current_eff(point_cloud_world: np.ndarray, current_pose9_gripper: np.ndarray) -> np.ndarray:
+    """Backward-compatible alias for a generic fixed-reference transform."""
+
+    return reference_point_cloud_to_current_eff(point_cloud_world, current_pose9_gripper)
 
 
 def add_world_gripper_cloud_to_point_cloud(
@@ -505,33 +623,22 @@ def add_world_gripper_cloud_to_point_cloud(
     gripper_len: float = 0.06,
     gripper_template: str = "reap",
     seed: int = 0,
-    drop_strategy: str = "tail",
+    drop_strategy: str = "random",
     shuffle_points: bool = False,
 ) -> np.ndarray:
-    total_points = int(total_points)
-    gripper_points = max(0, min(int(gripper_points), total_points))
-    rng = np.random.default_rng(seed)
-    point_cloud_world = sample_or_repeat_points(point_cloud_world, total_points, seed=seed)
-    if gripper_points == 0:
-        return world_point_cloud_to_current_eff(point_cloud_world, current_pose9_gripper)
-
-    current_traj6 = pose9_to_traj6_np(np.asarray(current_pose9_gripper, dtype=np.float32))[..., :6]
-    gripper_cloud_world = create_gripper_cloud_rgb(
+    merged_world = add_reference_gripper_cloud_to_point_cloud(
+        point_cloud_world,
+        current_pose9_gripper,
         width_percent,
-        current_traj6,
-        gripper_points,
-        rng,
+        total_points=total_points,
+        gripper_points=gripper_points,
         gripper_len=float(gripper_len),
         gripper_template=str(gripper_template),
-    )
-    merged_world = merge_cloud_with_gripper(
-        point_cloud_world,
-        gripper_cloud_world,
-        rng,
+        seed=seed,
         drop_strategy=drop_strategy,
         shuffle_points=shuffle_points,
     )
-    return world_point_cloud_to_current_eff(merged_world, current_pose9_gripper)
+    return reference_point_cloud_to_current_eff(merged_world, current_pose9_gripper)
 
 
 def add_world_gripper_clouds_to_episode(
@@ -544,7 +651,7 @@ def add_world_gripper_clouds_to_episode(
     gripper_len: float = 0.06,
     gripper_template: str = "reap",
     seed: int = 0,
-    drop_strategy: str = "tail",
+    drop_strategy: str = "random",
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
     gripper_max_width: float | None = None,
@@ -583,9 +690,10 @@ def add_world_gripper_clouds_to_episode(
 
 
 def backproject_camera(env: Any, raw_obs: dict[str, Any], camera_name: str, height: int, width: int) -> np.ndarray:
+    """Back-project RGB-D pixels into that camera's own optical coordinate frame."""
+
     try:
         from robosuite.utils.camera_utils import (
-            get_camera_extrinsic_matrix,
             get_camera_intrinsic_matrix,
             get_real_depth_map,
         )
@@ -611,19 +719,83 @@ def backproject_camera(env: Any, raw_obs: dict[str, Any], camera_name: str, heig
     depth = depth.reshape(height, width)
     vv, uu = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
     intrinsic = get_camera_intrinsic_matrix(env.sim, camera_name, height, width).astype(np.float32)
-    camera_to_world = get_camera_extrinsic_matrix(env.sim, camera_name).astype(np.float32)
     z = depth
     x = (uu - intrinsic[0, 2]) * z / intrinsic[0, 0]
     # robosuite image arrays are indexed top-to-bottom, while the camera projection
-    # matrix uses the image-plane v coordinate. Flip rows before camera->world.
+    # matrix uses the opposite image-plane v convention.
     pixel_v = float(height - 1) - vv
     y = (pixel_v - intrinsic[1, 2]) * z / intrinsic[1, 1]
-    camera_points_h = np.stack([x, y, z, np.ones_like(z)], axis=-1).reshape(-1, 4)
-    world = (camera_to_world @ camera_points_h.T).T[:, :3]
+    camera_points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
 
     colors = rgb.reshape(-1, 3)
-    valid = np.isfinite(world).all(axis=1) & np.isfinite(depth.reshape(-1)) & (depth.reshape(-1) > 0)
-    return np.concatenate([world[valid], colors[valid]], axis=1).astype(np.float32, copy=False)
+    valid = np.isfinite(camera_points).all(axis=1) & np.isfinite(depth.reshape(-1)) & (depth.reshape(-1) > 0)
+    return np.concatenate([camera_points[valid], colors[valid]], axis=1).astype(np.float32, copy=False)
+
+
+def transform_point_cloud_reference(transform: np.ndarray, point_cloud: np.ndarray) -> np.ndarray:
+    point_cloud = np.asarray(point_cloud, dtype=np.float32)
+    output = point_cloud.copy()
+    transform = np.asarray(transform, dtype=np.float32)
+    output[..., :3] = point_cloud[..., :3] @ transform[:3, :3].T + transform[:3, 3]
+    return output
+
+
+def matrix_to_pose9_np(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float32)
+    return np.concatenate(
+        [matrix[..., :3, 3], matrix[..., :3, 0], matrix[..., :3, 1]],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def observation_to_camera_point_cloud(
+    env: Any,
+    raw_obs: dict[str, Any],
+    camera_names: list[str],
+    height: int,
+    width: int,
+    num_points: int,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return scene cloud and EEF pose in the first (Overview) camera frame.
+
+    The third result keeps the simulator world-frame EEF pose for controller-only
+    use during evaluation. It is not needed by dataset conversion or training.
+    """
+
+    try:
+        from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+    except Exception as exc:  # pragma: no cover - optional LIBERO dependency path
+        raise RuntimeError("robosuite camera utilities are required for LIBERO point-cloud generation.") from exc
+
+    normalized_names = [normalize_camera_name(name) for name in camera_names]
+    if not normalized_names:
+        raise ValueError("At least one fixed Overview camera is required.")
+
+    reference_camera = normalized_names[0]
+    reference_to_world = get_camera_extrinsic_matrix(env.sim, reference_camera).astype(np.float32)
+    world_to_reference = fast_inverse_homogeneous(reference_to_world)
+    clouds_reference = []
+    for camera_name in normalized_names:
+        cloud_camera = backproject_camera(env, raw_obs, camera_name, height, width)
+        if camera_name != reference_camera:
+            camera_to_world = get_camera_extrinsic_matrix(env.sim, camera_name).astype(np.float32)
+            camera_to_reference = world_to_reference @ camera_to_world
+            cloud_camera = transform_point_cloud_reference(camera_to_reference, cloud_camera)
+        clouds_reference.append(cloud_camera)
+
+    point_cloud_camera = sample_or_repeat_points(
+        np.concatenate(clouds_reference, axis=0),
+        num_points,
+        seed=seed,
+    )
+    eef_pose_world = eef_pose9_gripper_from_obs(raw_obs)
+    eef_to_world = pose9_to_homo_np(eef_pose_world[:9])
+    eef_to_camera = world_to_reference @ eef_to_world
+    eef_pose_camera = np.concatenate(
+        [matrix_to_pose9_np(eef_to_camera), np.asarray([eef_pose_world[-1]], dtype=np.float32)]
+    )
+    return point_cloud_camera, eef_pose_camera.astype(np.float32), eef_pose_world.astype(np.float32)
 
 
 def observation_to_point_clouds(
@@ -635,13 +807,27 @@ def observation_to_point_clouds(
     num_points: int,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    clouds = [backproject_camera(env, raw_obs, camera_name, height, width) for camera_name in camera_names]
-    point_cloud_world = np.concatenate(clouds, axis=0)
-    eef_pose = eef_pose9_gripper_from_obs(raw_obs)
-    point_cloud_eff = world_point_cloud_to_current_eff(point_cloud_world, eef_pose)
-    point_cloud_eff = sample_or_repeat_points(point_cloud_eff, num_points, seed=seed)
-    point_cloud_world = sample_or_repeat_points(point_cloud_world, num_points, seed=seed)
-    return point_cloud_eff, point_cloud_world, eef_pose
+    """Backward-compatible helper returning current-EEF and world-frame clouds."""
+
+    try:
+        from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+    except Exception as exc:  # pragma: no cover - optional LIBERO dependency path
+        raise RuntimeError("robosuite camera utilities are required for LIBERO point-cloud generation.") from exc
+
+    point_cloud_camera, eef_pose_camera, eef_pose_world = observation_to_camera_point_cloud(
+        env,
+        raw_obs,
+        camera_names,
+        height,
+        width,
+        num_points,
+        seed=seed,
+    )
+    reference_camera = normalize_camera_name(camera_names[0])
+    camera_to_world = get_camera_extrinsic_matrix(env.sim, reference_camera).astype(np.float32)
+    point_cloud_world = transform_point_cloud_reference(camera_to_world, point_cloud_camera)
+    point_cloud_eff = world_point_cloud_to_current_eff(point_cloud_world, eef_pose_world)
+    return point_cloud_eff, point_cloud_world, eef_pose_world
 
 
 def observation_to_world_point_cloud(
@@ -653,11 +839,18 @@ def observation_to_world_point_cloud(
     num_points: int,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    clouds = [backproject_camera(env, raw_obs, camera_name, height, width) for camera_name in camera_names]
-    point_cloud_world = np.concatenate(clouds, axis=0)
-    eef_pose = eef_pose9_gripper_from_obs(raw_obs)
-    point_cloud_world = sample_or_repeat_points(point_cloud_world, num_points, seed=seed)
-    return point_cloud_world, eef_pose
+    """Backward-compatible world-frame wrapper around the camera-frame collector."""
+
+    _point_cloud_eff, point_cloud_world, eef_pose_world = observation_to_point_clouds(
+        env,
+        raw_obs,
+        camera_names,
+        height,
+        width,
+        num_points,
+        seed=seed,
+    )
+    return point_cloud_world, eef_pose_world
 
 
 def action_pose9_to_libero(

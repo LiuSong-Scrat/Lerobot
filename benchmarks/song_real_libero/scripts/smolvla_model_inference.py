@@ -32,11 +32,18 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
-from libero_pointcloud_utils import (
-    add_local_gripper_cloud_to_point_cloud,
-    add_world_gripper_cloud_to_point_cloud,
-    gripper_width_percent_from_scalar,
-)
+if __package__:
+    from .libero_setting.libero_pointcloud_utils import (
+        add_local_gripper_cloud_to_point_cloud,
+        add_world_gripper_cloud_to_point_cloud,
+        gripper_width_percent_from_scalar,
+    )
+else:
+    from libero_setting.libero_pointcloud_utils import (
+        add_local_gripper_cloud_to_point_cloud,
+        add_world_gripper_cloud_to_point_cloud,
+        gripper_width_percent_from_scalar,
+    )
 
 
 DEFAULT_POLICY_PATH = (
@@ -112,8 +119,6 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset):
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
 
-import numpy as np
-import torch.nn.functional as F
 import open3d as o3d
 def create_frame(position, rot_matrix, scale=0.03):
     frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
@@ -155,16 +160,6 @@ def vis_umi_data(action,pointcloud):
 
     o3d.visualization.draw_geometries(geometries)
     ##########UMI
-
-def rot6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
-    a1 = d6[..., 0:3]
-    a2 = d6[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-6)
-    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1, eps=1e-6)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack([b1, b2, b3], dim=-1)
-
 
 def pose9_to_homo(pose9: torch.Tensor) -> torch.Tensor:
     t = pose9[..., 0:3]

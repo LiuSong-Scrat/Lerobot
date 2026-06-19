@@ -1,5 +1,6 @@
 import argparse
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -7,9 +8,15 @@ import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+if __package__ and __package__.startswith("benchmarks."):
+    from ._paths import REAL_DATA_ROOT
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import REAL_DATA_ROOT
 
-DEFAULT_INPUT_DIR = "/home/liusong/ProgramFiles/BestMan/Dataset/dataset/humanhand_offline"
-DEFAULT_OUTPUT_DIR = "/home/liusong/temp/temp_with_gripper"
+
+DEFAULT_INPUT_DIR = REAL_DATA_ROOT / "temp/hdf5_without_gripper"
+DEFAULT_OUTPUT_DIR = REAL_DATA_ROOT / "temp/hdf5_with_gripper"
 
 
 def natural_key(path):

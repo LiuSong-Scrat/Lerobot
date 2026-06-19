@@ -16,8 +16,13 @@ import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+if __package__ and __package__.startswith("benchmarks."):
+    from .._paths import REAL_DATA_ROOT
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import REAL_DATA_ROOT
 
-BESTMAN_ROOT = Path(__file__).resolve().parent
+
 HANDPOSE_ROOT = Path("/home/liusong/ProgramFiles/HandPoseExtraction")
 DEFAULT_POINTS_NUM = 640*480
 _VIDEO_CAPTURE_CACHE = {}
@@ -84,7 +89,7 @@ def main() -> None:
     parser.add_argument("--jsonl", default=None, help="WiLoR JSONL. Defaults to <input>/handpose_wilor.jsonl.")
     parser.add_argument(
         "--output-dir",
-        default=str(BESTMAN_ROOT / "Dataset/dataset/humanhand_offline"),
+        default=str(REAL_DATA_ROOT / "hdf5_raw"),
         help="Directory where episode_*.hdf5 files will be written.",
     )
     parser.add_argument("--task", default="humanhand_offline")
@@ -661,7 +666,14 @@ def save_segment_hdf5(
         root.attrs["segment_start_record_index"] = segment.start
         root.attrs["segment_end_record_index"] = segment.end
         root.attrs["pose_frame"] = args.pose_frame
-        root.attrs["camera_to_world"] = camera_to_world
+        if args.pose_frame == "camera":
+            root.attrs["reference_frame"] = "overhead_camera"
+            root.attrs["uses_camera_extrinsic"] = False
+        else:
+            # Legacy export mode only. The current training/conversion pipeline
+            # expects pose_frame="camera" and does not consume this extrinsic.
+            root.attrs["camera_to_world"] = camera_to_world
+            root.attrs["uses_camera_extrinsic"] = True
         root.attrs["gripper_x_offset_cm"] = float(args.gripper_x_offset_cm)
         root.attrs["gripper_z_offset_cm"] = float(args.gripper_z_offset_cm)
         root.attrs["image_color_format"] = "rgb"

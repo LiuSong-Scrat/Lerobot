@@ -128,7 +128,11 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 
 
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
-    """Inject world-frame end-effector pose chunks for worldflow supervision."""
+    """Inject fixed-reference EEF poses for WorldFlow supervision.
+
+    ``world_ee_poses`` is a compatibility path; camera-reference datasets store
+    overhead-camera-frame poses there and treat that fixed frame as model world.
+    """
 
     def __init__(
         self,
@@ -146,7 +150,9 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         self._pose_cache: dict[int, np.ndarray] = {}
 
         if not self.pose_dir.is_dir():
-            raise FileNotFoundError(f"Worldflow is enabled but world ee pose directory is missing: {self.pose_dir}")
+            raise FileNotFoundError(
+                f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
+            )
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -172,10 +178,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         if poses is None:
             path = self.pose_dir / f"episode_{episode_index:06d}.npy"
             if not path.exists():
-                raise FileNotFoundError(f"Worldflow ee pose memmap file is missing: {path}")
+                raise FileNotFoundError(f"WorldFlow reference-frame ee pose memmap file is missing: {path}")
             poses = np.load(path, mmap_mode=self.mmap_mode)
             if poses.ndim != 2 or poses.shape[-1] != 9:
-                raise ValueError(f"Expected world ee poses shape (T,9), got {poses.shape}.")
+                raise ValueError(f"Expected reference-frame ee poses shape (T,9), got {poses.shape}.")
             self._pose_cache[episode_index] = poses
         return poses
 
@@ -1527,18 +1533,18 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
-        # "--policy.type=smolvla",
+        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
+        "--policy.type=smolvla",
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
-        "--dataset.repo_id=/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
-        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg_sample_cache",
+        "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
+        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
         "--policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct",
         "--policy.load_vlm_weights=false",
         "--batch_size=8",
         "--steps=500000",
         "--log_freq=1",
-        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla_temp",
+        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla_temp",
         "--job_name=my_smolvla_pointseg_worldflow_e2e",
         "--policy.device=cuda",
         "--wandb.enable=true",

@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import shutil
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 
+if __package__ and __package__.startswith("benchmarks."):
+    from ._paths import REAL_DATA_ROOT
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _paths import REAL_DATA_ROOT
 
-DEFAULT_HDF5_DIR = "/home/liusong/temp/temp"
+
+DEFAULT_HDF5_DIR = REAL_DATA_ROOT / "humanhand_offline_demo"
 DEFAULT_POSE_KEY = "observations/pose_eular"
 
 
@@ -18,7 +26,7 @@ def parse_args():
         )
     )
     parser.add_argument(
-        "hdf5_dir",
+        "--hdf5_dir",
         nargs="?",
         default=DEFAULT_HDF5_DIR,
         help=f"HDF5 folder to scan. Default: {DEFAULT_HDF5_DIR}",
@@ -48,6 +56,14 @@ def parse_args():
         action="store_true",
         help="Only print discontinuous hdf5 filenames.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional destination for continuous files. Omit it for report-only mode.",
+    )
+    parser.add_argument("--mode", choices=("copy", "move"), default="copy")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--max-jumps",
         type=int,
@@ -91,14 +107,30 @@ def detect_jumps(positions, threshold):
     return jump_indices, step_distances, nonfinite_frames
 
 
+def transfer_continuous_file(src: Path, dst: Path, mode: str, overwrite: bool) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if not overwrite:
+            raise FileExistsError(f"Output file exists: {dst}")
+        dst.unlink()
+    if mode == "copy":
+        shutil.copy2(src, dst)
+    else:
+        shutil.move(str(src), str(dst))
+
+
 def main():
     args = parse_args()
+    source_root = Path(args.hdf5_dir).expanduser().resolve()
+    output_root = args.output_dir.expanduser().resolve() if args.output_dir is not None else None
+    good_files = []
     bad_files = []
     skipped_files = []
 
-    for hdf5_path in iter_hdf5_files(args.hdf5_dir, args.recursive):
+    for hdf5_path in iter_hdf5_files(source_root, args.recursive):
         try:
             positions = load_positions(hdf5_path, args.pose_key)
+            print(hdf5_path," len = ",positions.shape[0])
             jump_indices, step_distances, nonfinite_frames = detect_jumps(
                 positions, args.threshold
             )
@@ -116,16 +148,29 @@ def main():
                     "nonfinite_frames": nonfinite_frames,
                 }
             )
+            continue
+
+        good_files.append(hdf5_path)
+        if output_root is not None:
+            transfer_continuous_file(
+                hdf5_path,
+                output_root / hdf5_path.relative_to(source_root),
+                args.mode,
+                args.overwrite,
+            )
 
     if args.names_only:
         for item in bad_files:
             print(item["path"].name)
         return
 
-    print(f"Scanned folder: {Path(args.hdf5_dir).expanduser()}")
+    print(f"Scanned folder: {source_root}")
     print(f"Pose dataset: {args.pose_key}")
     print(f"Jump threshold: {args.threshold}")
+    print(f"Continuous hdf5 count: {len(good_files)}")
     print(f"Discontinuous hdf5 count: {len(bad_files)}")
+    if output_root is not None:
+        print(f"Continuous files written to: {output_root}")
     print()
 
     if bad_files:

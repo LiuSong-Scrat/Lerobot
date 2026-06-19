@@ -8,14 +8,14 @@
     "bestman_config": "/home/liusong/ProgramFiles/BestMan/Config/default_franka3.yaml",
     "vlm_model": "/home/liusong/SmolVLM2-500M-Video-Instruct",
     "policy_checkpoint": "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
-    "raw_rgbd_dir": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/raw_rgbd/session_default",
-    "raw_hdf5_dir": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/hdf5_raw",
-    "with_gripper_hdf5_dir": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/hdf5_with_gripper",
-    "clean_hdf5_dir": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/hdf5_clean",
-    "lerobot_dataset": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/lerobot_dataset",
-    "pointseg_cache": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/pointseg_cache",
-    "train_output": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train",
-    "infer_output": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/infer"
+    "raw_rgbd_dir": "data/real_setting/raw_rgbd/session_default",
+    "raw_hdf5_dir": "data/real_setting/hdf5_raw",
+    "with_gripper_hdf5_dir": "data/real_setting/hdf5_with_gripper",
+    "clean_hdf5_dir": "data/real_setting/hdf5_clean",
+    "lerobot_dataset": "data/real_setting/lerobot_dataset",
+    "pointseg_cache": "data/real_setting/pointseg_cache",
+    "train_output": "outputs/real_setting/train",
+    "infer_output": "outputs/real_setting/infer"
   },
   "task": "Place the Red Cube on the Blue Cube",
   "collect": {
@@ -29,8 +29,7 @@
   "hdf5": {
     "camera_names": "overhead,hand",
     "max_points": 10000,
-    "pose_frame": "world",
-    "camera_to_world_preset": "humanhand_l515",
+    "pose_frame": "camera",
     "segments": "",
     "no_interactive": false,
     "run_inference": false
@@ -56,8 +55,8 @@
     "point_cloud_storage": "zarr"
   },
   "cache": {
-    "current_points": 8192,
-    "future_points": 8192,
+    "current_points": 10000,
+    "future_points": 10000,
     "batch_size": 2,
     "num_workers": 4,
     "nn_chunk_size": 512,
