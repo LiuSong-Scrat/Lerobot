@@ -77,6 +77,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLossConfig,
     SongPointSegNet,
     generate_pseudo_labels_from_priors,
+    infer_litept_output_channels,
     invert_transform,
     matrix_to_pose9,
     pose9_to_matrix,
@@ -980,7 +981,7 @@ class LitePTTokenizer(nn.Module):
         self.grid_size = grid_size
 
         self.backbone = LitePT(in_channels=in_dim, enc_mode=enc_mode)
-        self.out_proj = nn.LazyLinear(dim)
+        self.out_proj = nn.Linear(infer_litept_output_channels(self.backbone), dim)
 
     def _is_degenerate(self, xyz, eps=1e-6):
         rng = (xyz.max(dim=0).values - xyz.min(dim=0).values).abs().sum()

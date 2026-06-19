@@ -952,6 +952,29 @@ def count_parameters(module: torch.nn.Module, only_trainable: bool = False) -> i
     return total
 
 
+def ensure_ddp_parameters_initialized(module: torch.nn.Module, accelerator: Accelerator) -> None:
+    """Fail before Accelerator/DDP wrapping and report the exact lazy parameters."""
+
+    uninitialized = []
+    for name, parameter in module.named_parameters():
+        if isinstance(parameter, torch.nn.parameter.UninitializedParameter) or getattr(
+            parameter, "is_uninitialized", False
+        ):
+            uninitialized.append(name)
+    if not uninitialized:
+        return
+
+    details = ", ".join(uninitialized)
+    message = (
+        "Policy still contains uninitialized parameters before distributed wrapping: "
+        f"{details}. Replace Lazy modules with explicit input dimensions or initialize them before "
+        "creating the optimizer and calling accelerator.prepare()."
+    )
+    if accelerator.num_processes > 1:
+        raise RuntimeError(message)
+    logging.warning(message)
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -1166,6 +1189,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Convert CLI peft config to dict for overrides
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+
+    ensure_ddp_parameters_initialized(policy, accelerator)
 
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()

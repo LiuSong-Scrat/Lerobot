@@ -144,15 +144,15 @@
     python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
       --policy.type=smolvla \
       --policy.push_to_hub=false \
-      --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/temp_dataset \
-      --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_task_cache \
+      --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset \
+      --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache \
       --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
       --policy.load_vlm_weights=false \
       --batch_size=8 \
       --steps=500000 \
       --log_freq=1 \
-      --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train_libero_fresh \
-      --job_name=song_libero_pointseg_fresh \
+      --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/ep-vla \
+      --job_name=ep-vla  \
       --policy.device=cuda \
       --wandb.enable=true \
       --wandb.disable_artifact=true \

@@ -65,6 +65,22 @@ POINTSEG_CACHE_LABEL_FIELDS = (
 _POINTOPS_KNN_FAILED = False
 
 
+def infer_litept_output_channels(backbone: nn.Module) -> int:
+    """Infer LitePT's final feature width without modifying the vendored backbone."""
+
+    encoder_only = bool(getattr(backbone, "enc_mode", False))
+    stages = getattr(backbone, "enc" if encoder_only else "dec", None)
+    if stages is None:
+        raise ValueError("LitePT backbone is missing its encoder/decoder stage container.")
+    stage_modules = list(stages.children())
+    if not stage_modules:
+        raise ValueError("LitePT backbone has no output stage.")
+    output_linears = [module for module in stage_modules[-1].modules() if isinstance(module, nn.Linear)]
+    if not output_linears:
+        raise ValueError("Could not infer LitePT output channels from its final stage.")
+    return int(output_linears[-1].out_features)
+
+
 def _env_flag(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1300,7 +1316,7 @@ class SongPointSegNet(nn.Module):
                 dec_attn=(False, False, False, False),
             )
             self.head = nn.Sequential(
-                nn.LazyLinear(hidden_dim),
+                nn.Linear(infer_litept_output_channels(self.backbone), hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, len(ROLE_NAMES)),
             )
