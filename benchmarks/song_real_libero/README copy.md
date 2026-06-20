@@ -139,6 +139,12 @@
   ## PriorCache ###########################   MultiGPU  --nproc_per_node=4
   torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache   --current-points 50000 --future-points 16384  --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=0   --overwrite
 
+    # 当前 cache 为 v3：除二分类伪标签外，还自动保存
+    # gripper/condition/target 三角色连续分数。World-Ego Dense ObjectFlow
+    # 使用 condition 分数选择被操作物体，并抑制 gripper 分数。
+    # 不需要人工分割、人工点对应或人工指定光流；旧 v2 cache 开启
+    # worldflow 前必须用上面的命令重建。
+
   ## TrainCode ###########################   MultiGPU CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu --num_processes 4 python benchmarks/song_real_libero/scripts/train_song_benchmark.py
     export SONG_POINTSEG_REQUIRE_POINTOPS=1 
     python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
@@ -168,12 +174,24 @@
       --policy.pointseg_background_ratio=0.08 \
       --policy.pointseg_min_foreground_points=500 \
       --policy.pointseg_min_background_points=0 \
+      --policy.encode_robot_state=false \
       --policy.worldflow_enable=true \
       --policy.worldflow_se3_head_enable=false \
+      --policy.worldflow_loss_weight=0.05 \
+      --policy.worldflow_geo_loss_weight=0.05 \
+      --policy.worldflow_bridge_loss_weight=0.05 \
+      --policy.worldflow_equiv_loss_weight=0.02 \
+      --policy.worldflow_max_points=2048 \
       --policy.se3_enable=false \
       --policy.se3_final_correction_enable=false
 
+    # World-Ego 结构：
+    # 1. 主分支：带虚拟末端的 current-EEF 点云 -> Ego/UMI Body action。
+    # 2. ObjectFlow：Overview 点云 + 自动运动角色 -> 稠密 3D flow。
+    # 3. 加权 Kabsch 拟合 Spatial SE(3)，再通过
+    #    B = inv(H_current) @ S @ H_current 与主分支建立 bridge。
+    # H_current 只用于解析坐标变换，不作为 state token 输入网络。
+    # 已移除 PCA canonical head 和会覆盖整条轨迹的 final correction。
+
   ## BenchmarkEval ###########################  
     MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model  --suite libero_spatial  --all-tasks   --episodes 10  --action-index 0   --exec-action-steps 12   --save-video --render-mode offscreen   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/10w_eval_spatial_temp
-
-

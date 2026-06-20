@@ -38,7 +38,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 2
+POINTSEG_CACHE_VERSION = 3
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -56,6 +56,7 @@ POINTSEG_CACHE_LABEL_FIELDS = (
     "labels",
     "weights",
     "class_scores",
+    "role_scores",
     "foreground_score",
     "episode_index",
     "frame_index",
@@ -549,7 +550,6 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
 
         future_samples = []
-        future_point_masks = []
         future_is_pad = []
         for offset in self.temporal_offsets:
             raw_index = frame_index + offset
@@ -592,9 +592,9 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             self.manifest = json.load(f)
 
         version = int(self.manifest.get("version", -1))
-        if version not in {1, POINTSEG_CACHE_VERSION}:
+        if version not in {1, 2, POINTSEG_CACHE_VERSION}:
             raise ValueError(
-                f"Unsupported Song pointseg cache version {version}; expected 1 or {POINTSEG_CACHE_VERSION}."
+                f"Unsupported Song pointseg cache version {version}; expected 1, 2, or {POINTSEG_CACHE_VERSION}."
             )
 
         fields = tuple(self.manifest.get("fields", ()))
@@ -604,7 +604,12 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
                 "embedded_point_cloud" if "point_cloud" in fields else "indices",
             )
         )
-        expected_fields = POINTSEG_CACHE_FIELDS if self.cache_mode == "embedded_point_cloud" else POINTSEG_CACHE_LABEL_FIELDS
+        if self.cache_mode == "embedded_point_cloud":
+            expected_fields = POINTSEG_CACHE_FIELDS
+        elif version >= 3:
+            expected_fields = POINTSEG_CACHE_LABEL_FIELDS
+        else:
+            expected_fields = tuple(field for field in POINTSEG_CACHE_LABEL_FIELDS if field != "role_scores")
         missing_fields = [field for field in expected_fields if field not in fields]
         if missing_fields:
             raise ValueError(f"Song pointseg cache is missing fields: {missing_fields}")
@@ -1199,13 +1204,9 @@ def force_small_current_clouds_foreground(
     )
     out["class_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["class_scores"]), out["class_scores"])
 
-    target_role_index = out["role_scores"].shape[-1] - 1
-    out["role_scores"] = torch.where(force_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
-    out["role_scores"][..., target_role_index] = torch.where(
-        force_mask,
-        torch.ones_like(out["role_scores"][..., target_role_index]),
-        out["role_scores"][..., target_role_index],
-    )
+    # Keep the automatically computed gripper/condition/target scores for valid
+    # points. Only the binary PointSeg target is forced for this legacy
+    # small-cloud policy; Dense ObjectFlow still needs the original motion roles.
     out["role_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
     out["foreground_score"] = torch.where(force_mask, torch.ones_like(out["foreground_score"]), out["foreground_score"])
     out["foreground_score"] = torch.where(pad_mask, torch.zeros_like(out["foreground_score"]), out["foreground_score"])

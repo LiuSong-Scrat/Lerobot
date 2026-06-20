@@ -103,7 +103,34 @@ data/libero_setting/libero_4suite_lerobot_dataset/
   world_ee_poses/episode_000000.npy
 ```
 
-Pointseg cache v2 is index-only: each shard stores `point_indices`, pseudo labels, weights, and scores. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
+Pointseg cache v3 is index-only: each shard stores `point_indices`, pseudo labels, weights, and scores. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
+
+Pointseg cache v3 additionally stores the automatically generated
+`gripper/condition/target` role scores. Dense ObjectFlow uses the `condition`
+score as its transported-object weight and suppresses the generated gripper
+score. No manual segmentation, correspondence annotation, or manually
+specified optical flow is used. Rebuild an older cache before enabling
+`worldflow_enable`.
+
+### World-Ego dense ObjectFlow
+
+The policy keeps robot state out of the learned prefix by default
+(`policy.encode_robot_state=false`). The main action branch consumes the
+gripper-augmented current-EEF point cloud and predicts Ego/UMI Body motion.
+The auxiliary ObjectFlow branch reconstructs the fixed Overview frame from the
+known current pose, removes gripper influence with automatic motion-role
+scores, and predicts dense per-point world-frame displacement.
+
+The dense flow is fitted to a Spatial SE(3) transform with weighted Kabsch.
+The analytic bridge
+`B = inverse(H_current) @ S @ H_current` couples it to the Ego action branch.
+`H_current` is only a coordinate carrier in the loss and is never encoded as a
+state token. Random SE(3) augmentation enforces world-frame flow equivariance.
+For variable clouds, ObjectFlow automatically keeps a balanced
+condition/target subset (`policy.worldflow_max_points`, default 2048) without
+changing the main policy point-cloud input.
+The old PCA canonical head and SE(3) final-correction/replacement path are no
+longer used.
 
 When `--policy.pointseg_enable=true` and `--pointseg_sample_cache_dir` is omitted or points to a missing cache, training now computes the same motion-prior pseudo labels online once per DataLoader batch from current/future point clouds. This fallback uses CUDA by default when available; if CUDA is used, the training script forces DataLoader `num_workers=0` to avoid CUDA initialization inside forked worker processes. Set `SONG_POINTSEG_ONLINE=0` to disable this fallback, or set `SONG_POINTSEG_ONLINE_DEVICE=cpu` to keep multi-worker CPU loading. Tune `SONG_POINTSEG_ONLINE_CURRENT_POINTS`, `SONG_POINTSEG_ONLINE_FUTURE_POINTS`, and `SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE` for debugging.
 

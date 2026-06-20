@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -75,6 +76,9 @@ class SmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
     train_state_proj: bool = True
+    # Keep proprioceptive state out of the learned prefix. The current EEF frame
+    # is already represented geometrically by the Ego point cloud.
+    encode_robot_state: bool = False
 
     # Song point-cloud foreground/background conditioning.
     pointseg_enable: bool = False
@@ -90,16 +94,24 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_use_temporal_priors_as_input: bool = False
     pointseg_use_pseudo_selection: bool = True
 
-    # World-frame trajectory auxiliary supervision.
+    # Automatic World-Ego dense rigid ObjectFlow supervision.
     worldflow_enable: bool = False
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
+    # Dense point-flow loss on automatically selected manipulated-object points.
     worldflow_loss_weight: float = 0.05
+    # Dense-flow rigidity loss around the analytic weighted-Kabsch fit.
     worldflow_geo_loss_weight: float = 0.05
+    # Consistency between ObjectFlow's spatial transform and the Ego action branch.
+    worldflow_bridge_loss_weight: float = 0.05
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
-    worldflow_se3_head_enable: bool = True
+    # Deprecated compatibility flag. ObjectFlow no longer uses a PCA canonical head.
+    worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
+    worldflow_max_points: int = 2048
+    worldflow_min_transport_points: int = 3
+    worldflow_transport_score_threshold: float = 0.05
 
     # ET-SEED-style SE(3) action generation.
     se3_enable: bool = False
@@ -108,7 +120,8 @@ class SmolVLAConfig(PreTrainedConfig):
     se3_pose_loss_weight: float = 1.0
     se3_gripper_loss_weight: float = 1.0
     se3_endpoint_loss_weight: float = 0.25
-    se3_final_correction_enable: bool = True
+    # Deprecated compatibility flag. The unstable PCA final-correction path was removed.
+    se3_final_correction_enable: bool = False
     se3_final_correction_loss_weight: float = 0.20
     se3_equivariance_loss_weight: float = 0.02
 
@@ -167,6 +180,18 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        if self.worldflow_se3_head_enable:
+            warnings.warn(
+                "worldflow_se3_head_enable is deprecated and ignored. WorldFlow now uses dense rigid "
+                "ObjectFlow with weighted Kabsch fitting and no PCA canonical frame.",
+                stacklevel=2,
+            )
+        if self.se3_final_correction_enable:
+            warnings.warn(
+                "se3_final_correction_enable is deprecated and ignored. The PCA-based final correction "
+                "path was removed; ObjectFlow is coupled to the Ego branch through an auxiliary bridge loss.",
+                stacklevel=2,
+            )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

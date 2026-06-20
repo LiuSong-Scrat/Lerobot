@@ -331,6 +331,7 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         "pointseg.labels",
         "pointseg.weights",
         "pointseg.class_scores",
+        "pointseg.role_scores",
         "pointseg.foreground_score",
     )
     transient_keys = (
@@ -462,6 +463,7 @@ class OnlinePointSegBatchCollator:
             ("labels", "pointseg.labels"),
             ("weights", "pointseg.weights"),
             ("class_scores", "pointseg.class_scores"),
+            ("role_scores", "pointseg.role_scores"),
             ("foreground_score", "pointseg.foreground_score"),
         ):
             if source_key in pseudo:
@@ -490,11 +492,21 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
             logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
             return dataset
         if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
+            if bool(getattr(policy_cfg, "worldflow_enable", False)):
+                raise ValueError(
+                    f"{reason}; Dense ObjectFlow requires cache v3 role_scores or online pseudo labels, "
+                    "but SONG_POINTSEG_ONLINE=0."
+                )
             logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
             return dataset
         root = Path(getattr(dataset, "root", dataset.meta.root))
         point_cloud_dir = root / "point_clouds"
         if not point_cloud_dir.is_dir():
+            if bool(getattr(policy_cfg, "worldflow_enable", False)):
+                raise FileNotFoundError(
+                    f"{reason}; Dense ObjectFlow cannot compute automatic role scores because "
+                    f"the point-cloud directory is missing: {point_cloud_dir}"
+                )
             logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
             return dataset
         mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
@@ -525,13 +537,19 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
     point_cloud_dir = root / "point_clouds"
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     logging.info(f"Injecting Song pointseg temporal cache from {cache_dir}")
-    return PointSegCacheInjectedDataset(
+    wrapped = PointSegCacheInjectedDataset(
         dataset,
         cache_dir=cache_dir,
         point_cloud_dir=point_cloud_dir,
         strict=strict,
         mmap_mode=mmap_mode,
     )
+    if bool(getattr(policy_cfg, "worldflow_enable", False)) and "role_scores" not in wrapped.cache.fields:
+        raise ValueError(
+            "Dense ObjectFlow requires a PointSeg cache v3 containing automatic role_scores. "
+            f"Rebuild the cache at {cache_dir} with song_cache_pointseg_samples.py --overwrite."
+        )
+    return wrapped
 
 
 def maybe_wrap_point_cloud_memmap_dataset(dataset):
@@ -1406,16 +1424,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "loss_se3_twist",
                     "loss_se3_endpoint",
                     "loss_se3_gripper",
-                    "loss_se3_final_correction",
-                    "loss_se3_equivariance",
                     "se3_action_trans_err",
                     "se3_action_rot_err_deg",
-                    "loss_worldflow_g",
-                    "loss_worldflow_geo",
+                    "loss_worldflow_flow",
+                    "loss_worldflow_rigid",
+                    "loss_worldflow_bridge",
                     "loss_worldflow_equiv",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
+                    "worldflow_transport_point_ratio",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
