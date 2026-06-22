@@ -32,10 +32,18 @@ def visualize_cloud_rgb(cloud_rgb):
     geometries.append(pcd)
     o3d.visualization.draw_geometries(geometries)
 
-
+# no_precise_episode_22.hdf5
+# precise2_episode_12.hdf5
+# precise2_episode_14.hdf5
+# precise2_episode_17.hdf5
+# precise2_episode_18.hdf5
+# precise2_episode_19.hdf5
+# precise2_episode_20.hdf5
+# precise_episode_11.hdf5
+# precise_episode_38.hdf5
 
 # 1. 打开HDF5文件
-hdf5_path = "benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo/episode_0.hdf5"
+hdf5_path = "benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo/noprecise_episode_0.hdf5"
 with h5py.File(hdf5_path, "r") as f:
     # 查看结构（可选）
     print("HDF5文件内容：")

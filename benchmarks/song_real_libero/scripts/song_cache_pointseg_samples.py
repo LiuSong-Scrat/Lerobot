@@ -215,12 +215,12 @@ def _save_preview(
     output_dir: Path,
     sample_index: int,
     current_pc: torch.Tensor,
-    pseudo: dict[str, torch.Tensor],
+    geometric_labels: torch.Tensor,
 ) -> None:
     write_role_ply(
         output_dir / "visualizations" / f"sample_{sample_index:06d}_pseudo.ply",
         current_pc.detach().cpu().numpy(),
-        pseudo["labels"].detach().cpu().numpy(),
+        geometric_labels.detach().cpu().numpy(),
     )
 
 
@@ -464,7 +464,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                 batch = move_batch_to_device(batch, device)
                 current_pc = batch["observation.point_cloud"]
 
-                pseudo = generate_pseudo_labels(
+                geometric_pseudo = generate_pseudo_labels(
                     current_pc,
                     batch["observation.point_cloud_future"],
                     batch["future_ee_poses"],
@@ -474,7 +474,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     config=pseudo_cfg,
                 )
                 pseudo = force_small_current_clouds_foreground(
-                    pseudo,
+                    geometric_pseudo,
                     current_pc,
                     args.current_points,
                     batch.get("observation.point_cloud_is_pad"),
@@ -492,13 +492,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                             args.output_dir,
                             start_index + written + batch_index,
                             current_pc[batch_index][valid],
-                            {
-                                key: value[batch_index][valid]
-                                for key, value in pseudo.items()
-                                if torch.is_tensor(value)
-                                and value.ndim >= 2
-                                and value.shape[:2] == current_pc.shape[:2]
-                            },
+                            geometric_pseudo["labels"][batch_index][valid],
                         )
                     previews += preview_count
 

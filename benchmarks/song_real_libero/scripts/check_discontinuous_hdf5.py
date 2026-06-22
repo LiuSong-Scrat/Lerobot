@@ -39,10 +39,10 @@ def parse_args():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.3,
+        default=0.05,
         help=(
             "Absolute jump threshold in the same unit as pose xyz. "
-            "Default: 0.1"
+            "Default: 0.05"
         ),
     )
     parser.add_argument(

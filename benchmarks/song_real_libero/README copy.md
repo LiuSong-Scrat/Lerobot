@@ -98,12 +98,12 @@
 
     #离线推理后切分点切片
     python benchmarks/song_real_libero/scripts/real_setting/build_humanhand_hdf5_dataset.py \
-      --input benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_precise2 \
-      --jsonl benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_precise2/handpose_wilor.jsonl \
+      --input benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_noprecise \
+      --jsonl benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_noprecise/handpose_wilor.jsonl \
       --output-dir benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo \
       --no-interactive \
       --pose-frame camera \
-      --segments "$(cat benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_precise2/segments.txt)" \
+      --segments "$(cat benchmarks/song_real_libero/data/real_setting/rgbd_records/humanhand_demo_video_noprecise/segments.txt)" \
       --max-points 50000 \
       --segment-workers 16
 
@@ -118,7 +118,7 @@
 
     python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/check_discontinuous_hdf5.py
 
-  ## LeRobotDatasetFromRealHDF5  HDF5-->Add Gripper-->Current EEF/UMI-->Zarr-->Dataset
+  ## LeRobotDatasetFromRealHDF5  HDF5-->(Add Gripper-->)Current EEF/UMI-->Zarr-->Dataset
     # 输入 HDF5 已经包含 observations/cloud_rgb/<camera>，不会下载 LIBERO 数据、
     # 重播轨迹、渲染深度图或从深度图反投影点云。
     # 如果 HDF5 已经由 add_gripper_cloud_to_hdf5.py 加过末端点云（StageGen Mixed），追加： --input-has-gripper-cloud 
@@ -132,7 +132,7 @@
       --num-points 0 \
       --input-has-gripper-cloud \
       --point-cloud-storage zarr \
-      --workers 4 \
+      --workers 6 \
       --vis-count 2 \
       --overwrite
 
