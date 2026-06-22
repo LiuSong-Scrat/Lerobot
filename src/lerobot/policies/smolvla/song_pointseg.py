@@ -38,7 +38,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 2
+POINTSEG_CACHE_VERSION = 4
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -92,8 +92,13 @@ def _env_flag(name: str, default: bool) -> bool:
 class PseudoLabelConfig:
     held_sigma: float = 0.025
     static_sigma: float = 0.025
-    held_margin: float = 0.006
-    motion_tau: float = 0.012
+    motion_gap_eps: float = 0.005
+    motion_rotation_radius: float = 0.08
+    motion_baseline_threshold: float = 0.015
+    motion_baseline_temperature: float = 0.005
+    motion_evidence_topk: int = 3
+    motion_relative_margin: float = 0.10
+    motion_relative_tau: float = 0.10
     gripper_sigma: float = 0.045
     trajectory_sigma: float = 0.12
     approach_margin: float = 0.012
@@ -592,9 +597,10 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             self.manifest = json.load(f)
 
         version = int(self.manifest.get("version", -1))
-        if version not in {1, POINTSEG_CACHE_VERSION}:
+        if version != POINTSEG_CACHE_VERSION:
             raise ValueError(
-                f"Unsupported Song pointseg cache version {version}; expected 1 or {POINTSEG_CACHE_VERSION}."
+                f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}. "
+                "Rebuild the cache because motion-prior semantics changed."
             )
 
         fields = tuple(self.manifest.get("fields", ()))
@@ -834,61 +840,79 @@ def _future_group_size(chunk_len: int, target_points: int, valid_count: int, dev
     return max(1, min(valid_count, max_elements // elements_per_future))
 
 
-def _scatter_amin_by_batch(dst: Tensor, batch_indices: Tensor, values: Tensor) -> None:
-    try:
-        index = batch_indices[:, None].expand_as(values)
-        dst.scatter_reduce_(0, index, values, reduce="amin", include_self=True)
-    except (AttributeError, RuntimeError):
-        batch_list = batch_indices.detach().cpu().tolist()
-        for local_index, bidx in enumerate(batch_list):
-            dst[bidx] = torch.minimum(dst[bidx], values[local_index])
-
-
-def _motion_residuals_single(
-    current_xyz: Tensor,
-    future_xyz: Tensor,
-    future_poses: Tensor,
-    future_is_pad: Tensor,
+def _future_motion_weights(
+    transforms: Tensor,
+    valid_future: Tensor,
     *,
-    chunk_size: int,
+    rotation_radius: float,
+    baseline_threshold: float,
+    baseline_temperature: float,
 ) -> tuple[Tensor, Tensor]:
-    transforms = pose9_to_matrix(future_poses)
-    inverse_transforms = invert_transform(transforms)
-    valid_indices = torch.nonzero(~future_is_pad[1:], as_tuple=False).flatten() + 1
+    """Return continuous confidence weights for how informative each future pose is."""
+    future_transforms = transforms[:, 1:]
+    translation = torch.linalg.norm(future_transforms[..., :3, 3], dim=-1)
+    trace = future_transforms[..., :3, :3].diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    rotation = torch.acos(((trace - 1.0) * 0.5).clamp(-1.0, 1.0))
+    baseline = translation + float(rotation_radius) * rotation
+    temperature = max(float(baseline_temperature), 1e-6)
+    weights = torch.sigmoid((baseline - float(baseline_threshold)) / temperature)
+    weights = weights.masked_fill(~valid_future, 0.0)
+    return weights, baseline
 
-    if valid_indices.numel() == 0:
-        inf = torch.full((current_xyz.shape[0],), 1.0, dtype=current_xyz.dtype, device=current_xyz.device)
-        return inf, inf
 
-    held_min = torch.full(
-        (current_xyz.shape[0],), float("inf"), dtype=current_xyz.dtype, device=current_xyz.device
-    )
-    static_min = torch.full_like(held_min, float("inf"))
-    valid_targets = future_xyz.index_select(0, valid_indices).contiguous()
-    valid_inverse = inverse_transforms.index_select(0, valid_indices)
-
-    for start in range(0, current_xyz.shape[0], chunk_size):
-        current_chunk = current_xyz[start : start + chunk_size].contiguous()
-        chunk_len = current_chunk.shape[0]
-        group_size = _future_group_size(
-            chunk_len, valid_targets.shape[1], valid_targets.shape[0], current_xyz.device
+def _aggregate_motion_hypotheses(
+    held_by_future: Tensor,
+    static_by_future: Tensor,
+    motion_weights: Tensor,
+    valid_future: Tensor,
+    *,
+    relative_gap_eps: float,
+    topk: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compare held/static hypotheses within each future frame, then aggregate robustly."""
+    if held_by_future.shape != static_by_future.shape or held_by_future.ndim != 3:
+        raise ValueError(
+            "Expected held/static residuals with matching shape (B,T,N), got "
+            f"{held_by_future.shape} and {static_by_future.shape}."
         )
-        held_chunks = []
-        static_chunks = []
-        for group_start in range(0, valid_targets.shape[0], group_size):
-            group_end = min(group_start + group_size, valid_targets.shape[0])
-            targets = valid_targets[group_start:group_end]
-            inverse = valid_inverse[group_start:group_end]
-            held_query = current_chunk.unsqueeze(0).expand(targets.shape[0], -1, -1)
-            static_query = transform_points(current_chunk.unsqueeze(0), inverse)
-            grouped_query = torch.cat([held_query, static_query], dim=1).contiguous()
-            nearest = _nearest_distances_from_grouped_queries(grouped_query, targets)
-            held_chunks.append(nearest[:, :chunk_len])
-            static_chunks.append(nearest[:, chunk_len:])
-        held_min[start : start + chunk_len] = torch.cat(held_chunks, dim=0).amin(dim=0)
-        static_min[start : start + chunk_len] = torch.cat(static_chunks, dim=0).amin(dim=0)
+    if motion_weights.shape != held_by_future.shape[:2] or valid_future.shape != held_by_future.shape[:2]:
+        raise ValueError(
+            f"Expected motion weights and valid mask shape {held_by_future.shape[:2]}, got "
+            f"{motion_weights.shape} and {valid_future.shape}."
+        )
 
-    return held_min, static_min
+    denominator = held_by_future + static_by_future + float(relative_gap_eps)
+    relative_gap = (static_by_future - held_by_future) / denominator
+    weighted_gap = relative_gap * motion_weights[..., None]
+    weighted_gap = weighted_gap.masked_fill(~valid_future[..., None], -torch.inf)
+
+    k = max(1, min(int(topk), held_by_future.shape[1]))
+    top_scores, top_indices = torch.topk(weighted_gap, k=k, dim=1)
+    selected_valid = torch.isfinite(top_scores)
+    selected_weights = torch.gather(
+        motion_weights[..., None].expand_as(held_by_future),
+        1,
+        top_indices,
+    )
+    selected_weights = selected_weights.masked_fill(~selected_valid, 0.0)
+
+    selected_held = torch.gather(held_by_future, 1, top_indices)
+    selected_static = torch.gather(static_by_future, 1, top_indices)
+    selected_held = selected_held.masked_fill(~selected_valid, 0.0)
+    selected_static = selected_static.masked_fill(~selected_valid, 0.0)
+
+    weight_sum = selected_weights.sum(dim=1)
+    held_residual = (selected_held * selected_weights).sum(dim=1) / weight_sum.clamp_min(1e-6)
+    static_residual = (selected_static * selected_weights).sum(dim=1) / weight_sum.clamp_min(1e-6)
+    residual_gap = top_scores.masked_fill(~selected_valid, 0.0).sum(dim=1)
+    residual_gap = residual_gap / selected_valid.sum(dim=1).clamp_min(1)
+
+    no_valid = ~valid_future.any(dim=1)
+    if bool(no_valid.any().item()):
+        held_residual[no_valid] = 1.0
+        static_residual[no_valid] = 1.0
+        residual_gap[no_valid] = 0.0
+    return held_residual, static_residual, residual_gap
 
 
 def _motion_residuals_batched(
@@ -899,7 +923,12 @@ def _motion_residuals_batched(
     future_point_is_pad: Tensor | None = None,
     *,
     chunk_size: int,
-) -> tuple[Tensor, Tensor]:
+    motion_gap_eps: float,
+    motion_rotation_radius: float,
+    motion_baseline_threshold: float,
+    motion_baseline_temperature: float,
+    motion_evidence_topk: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     transforms = pose9_to_matrix(future_poses)
     inverse_transforms = invert_transform(transforms)
     valid_future = ~future_is_pad[:, 1:]
@@ -908,17 +937,23 @@ def _motion_residuals_batched(
     pair_batch, pair_future_offset = torch.nonzero(valid_future, as_tuple=True)
     pair_future = pair_future_offset + 1
 
-    held_min = torch.full(
-        current_xyz.shape[:2], float("inf"), dtype=current_xyz.dtype, device=current_xyz.device
+    residual_shape = (current_xyz.shape[0], future_xyz.shape[1] - 1, current_xyz.shape[1])
+    held_by_future = torch.full(
+        residual_shape, float("inf"), dtype=current_xyz.dtype, device=current_xyz.device
     )
-    static_min = torch.full_like(held_min, float("inf"))
+    static_by_future = torch.full_like(held_by_future, float("inf"))
+    motion_weights, motion_baseline = _future_motion_weights(
+        transforms,
+        valid_future,
+        rotation_radius=motion_rotation_radius,
+        baseline_threshold=motion_baseline_threshold,
+        baseline_temperature=motion_baseline_temperature,
+    )
 
     if pair_batch.numel() == 0:
-        held_min.fill_(1.0)
-        static_min.fill_(1.0)
-        return held_min, static_min
+        empty = current_xyz.new_ones(current_xyz.shape[:2])
+        return empty, empty.clone(), current_xyz.new_zeros(current_xyz.shape[:2]), motion_weights, motion_baseline
 
-    valid_counts = valid_future.sum(dim=1)
     for start in range(0, current_xyz.shape[1], chunk_size):
         current_chunk_len = min(chunk_size, current_xyz.shape[1] - start)
         group_size = _future_group_size(
@@ -941,18 +976,19 @@ def _motion_residuals_batched(
             nearest = _nearest_distances_from_grouped_queries(grouped_query, targets, target_is_pad)
             held_group = nearest[:, :current_chunk_len]
             static_group = nearest[:, current_chunk_len:]
-            _scatter_amin_by_batch(
-                held_min[:, start : start + current_chunk_len], batch_group, held_group
-            )
-            _scatter_amin_by_batch(
-                static_min[:, start : start + current_chunk_len], batch_group, static_group
-            )
+            future_offset_group = pair_future_offset[group_start:group_end]
+            held_by_future[batch_group, future_offset_group, start : start + current_chunk_len] = held_group
+            static_by_future[batch_group, future_offset_group, start : start + current_chunk_len] = static_group
 
-    no_valid = valid_counts == 0
-    if bool(no_valid.any().item()):
-        held_min[no_valid] = 1.0
-        static_min[no_valid] = 1.0
-    return held_min, static_min
+    held_residual, static_residual, residual_gap = _aggregate_motion_hypotheses(
+        held_by_future,
+        static_by_future,
+        motion_weights,
+        valid_future,
+        relative_gap_eps=motion_gap_eps,
+        topk=motion_evidence_topk,
+    )
+    return held_residual, static_residual, residual_gap, motion_weights, motion_baseline
 
 
 def compute_motion_priors(
@@ -964,6 +1000,11 @@ def compute_motion_priors(
     current_is_pad: Tensor | None = None,
     future_point_is_pad: Tensor | None = None,
     nn_chunk_size: int = 1024,
+    motion_gap_eps: float = 0.005,
+    motion_rotation_radius: float = 0.08,
+    motion_baseline_threshold: float = 0.015,
+    motion_baseline_temperature: float = 0.005,
+    motion_evidence_topk: int = 3,
 ) -> dict[str, Tensor]:
     """Compute geometry/motion priors used by pseudo labels and the segmentation network."""
     if current_pc.ndim != 3 or future_pc.ndim != 4 or future_poses.ndim != 3:
@@ -992,13 +1033,18 @@ def compute_motion_priors(
     future_xyz = future_pc[..., :3].to(device=current_pc.device, dtype=torch.float32)
     future_poses = future_poses.to(device=current_pc.device, dtype=torch.float32)
 
-    held_residual, static_residual = _motion_residuals_batched(
+    held_residual, static_residual, residual_gap, motion_weights, motion_baseline = _motion_residuals_batched(
         current_xyz,
         future_xyz,
         future_poses,
         future_is_pad,
         future_point_is_pad,
         chunk_size=nn_chunk_size,
+        motion_gap_eps=motion_gap_eps,
+        motion_rotation_radius=motion_rotation_radius,
+        motion_baseline_threshold=motion_baseline_threshold,
+        motion_baseline_temperature=motion_baseline_temperature,
+        motion_evidence_topk=motion_evidence_topk,
     )
     held_residual = torch.where(current_is_pad, torch.ones_like(held_residual), held_residual)
     static_residual = torch.where(current_is_pad, torch.ones_like(static_residual), static_residual)
@@ -1017,7 +1063,6 @@ def compute_motion_priors(
     future_min_dist = point_to_traj[..., 1:].amin(dim=-1) if point_to_traj.shape[-1] > 1 else start_dist
     future_min_dist = torch.where(torch.isfinite(future_min_dist), future_min_dist, start_dist)
     approach_delta = start_dist - future_min_dist
-    residual_gap = static_residual - held_residual
     min_traj_dist = torch.where(current_is_pad, torch.zeros_like(min_traj_dist), min_traj_dist)
     approach_delta = torch.where(current_is_pad, torch.zeros_like(approach_delta), approach_delta)
     residual_gap = torch.where(current_is_pad, torch.zeros_like(residual_gap), residual_gap)
@@ -1045,6 +1090,8 @@ def compute_motion_priors(
         "held_residual": held_residual,
         "static_residual": static_residual,
         "residual_gap": residual_gap,
+        "motion_weights": motion_weights,
+        "motion_baseline": motion_baseline,
     }
 
 
@@ -1079,7 +1126,9 @@ def generate_pseudo_labels_from_priors(
 
     held_score = torch.exp(-held_residual / config.held_sigma)
     static_score = torch.exp(-static_residual / config.static_sigma)
-    motion_score = torch.sigmoid((residual_gap - config.held_margin) / config.motion_tau)
+    motion_score = torch.sigmoid(
+        (residual_gap - config.motion_relative_margin) / max(config.motion_relative_tau, 1e-6)
+    )
     gripper_near = torch.exp(-ee_dist / config.gripper_sigma)
     trajectory_near = torch.exp(-min_traj_dist / config.trajectory_sigma)
     approach_score = torch.sigmoid((approach_delta - config.approach_margin) / config.approach_tau)
@@ -1146,6 +1195,11 @@ def generate_pseudo_labels(
         current_is_pad=current_is_pad,
         future_point_is_pad=future_point_is_pad,
         nn_chunk_size=config.nn_chunk_size,
+        motion_gap_eps=config.motion_gap_eps,
+        motion_rotation_radius=config.motion_rotation_radius,
+        motion_baseline_threshold=config.motion_baseline_threshold,
+        motion_baseline_temperature=config.motion_baseline_temperature,
+        motion_evidence_topk=config.motion_evidence_topk,
     )
     return generate_pseudo_labels_from_priors(prior_dict, config=config)
 

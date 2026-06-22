@@ -39,7 +39,7 @@ from lerobot.utils.random_utils import set_seed
 DEFAULT_DATASET_ROOT = Path(
     os.environ.get(
         "SONG_POINTSEG_DATASET",
-        "/home/liusong/ProgramFiles/BestMan/Dataset/dataset/test3/src_hdf5_to_lerobot/lerobot_datasets/temp",
+        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
     )
 )
 DEFAULT_OUTPUT_DIR = Path(
@@ -48,6 +48,288 @@ DEFAULT_OUTPUT_DIR = Path(
         "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg",
     )
 )
+import math
+from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TypedDict
+
+import numpy as np
+import open3d as o3d
+import torch
+import torch.nn.functional as F  # noqa: N812
+from torch import Tensor, nn
+from typing_extensions import Unpack
+def create_frame(position, rot_matrix, scale=0.03):
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=scale,
+        origin=[0, 0, 0]
+    )
+    frame.rotate(rot_matrix, center=np.zeros(3))
+    frame.translate(position)
+    return frame
+def rot6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = F.normalize(a1, dim=-1, eps=1e-6)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=-1, eps=1e-6)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)  # columns
+
+
+def _skew(vec: Tensor) -> Tensor:
+    x, y, z = vec.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+    return torch.stack(
+        [
+            torch.stack([zeros, -z, y], dim=-1),
+            torch.stack([z, zeros, -x], dim=-1),
+            torch.stack([-y, x, zeros], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _eye4_like(shape: torch.Size | tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    eye = torch.eye(4, device=device, dtype=dtype)
+    return eye.expand(*shape, 4, 4).clone()
+
+
+def so3_exp(omega: Tensor, eps: float = 1e-6) -> Tensor:
+    omega = omega.to(dtype=torch.float32)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    a = torch.where(
+        small,
+        1.0 - theta2 / 6.0 + theta2 * theta2 / 120.0,
+        torch.sin(theta) / theta.clamp_min(eps),
+    )
+    b = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(eps),
+    )
+    eye = torch.eye(3, device=omega.device, dtype=omega.dtype).expand(*omega.shape[:-1], 3, 3)
+    return eye + a.unsqueeze(-1) * k + b.unsqueeze(-1) * k2
+
+
+def so3_log(rot: Tensor, eps: float = 1e-6) -> Tensor:
+    rot = rot.to(dtype=torch.float32)
+    trace = rot.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    vee = torch.stack(
+        [
+            rot[..., 2, 1] - rot[..., 1, 2],
+            rot[..., 0, 2] - rot[..., 2, 0],
+            rot[..., 1, 0] - rot[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = 0.5 * torch.linalg.norm(vee, dim=-1)
+    theta = torch.atan2(sine, cosine)
+    theta2 = theta * theta
+    factor = torch.where(
+        sine > eps,
+        theta / (2.0 * sine.clamp_min(eps)),
+        0.5 + theta2 / 12.0 + theta2 * theta2 / 720.0,
+    )
+    return factor.unsqueeze(-1) * vee
+
+
+def se3_exp(xi: Tensor, eps: float = 1e-6) -> Tensor:
+    xi = xi.to(dtype=torch.float32)
+    v = xi[..., :3]
+    omega = xi[..., 3:6]
+    rot = so3_exp(omega, eps=eps)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    a = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(eps),
+    )
+    b = torch.where(
+        small,
+        1.0 / 6.0 - theta2 / 120.0 + theta2 * theta2 / 5040.0,
+        (theta - torch.sin(theta)) / (theta2 * theta).clamp_min(eps),
+    )
+    eye3 = torch.eye(3, device=xi.device, dtype=xi.dtype).expand(*xi.shape[:-1], 3, 3)
+    v_matrix = eye3 + a.unsqueeze(-1) * k + b.unsqueeze(-1) * k2
+    trans = (v_matrix @ v.unsqueeze(-1)).squeeze(-1)
+    out = _eye4_like(xi.shape[:-1], device=xi.device, dtype=xi.dtype)
+    out[..., :3, :3] = rot
+    out[..., :3, 3] = trans
+    return out
+
+
+def se3_log(transform: Tensor, eps: float = 1e-6) -> Tensor:
+    transform = transform.to(dtype=torch.float32)
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    omega = so3_log(rot, eps=eps)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    k = _skew(omega)
+    k2 = k @ k
+    small = theta < eps
+    half_theta = 0.5 * theta
+    c = torch.where(
+        small,
+        1.0 / 12.0 + theta2 / 720.0 + theta2 * theta2 / 30240.0,
+        (1.0 / theta2.clamp_min(eps))
+        - (1.0 + torch.cos(theta)) / (2.0 * theta * torch.sin(theta).clamp_min(eps)),
+    )
+    eye3 = torch.eye(3, device=transform.device, dtype=transform.dtype).expand(*transform.shape[:-2], 3, 3)
+    v_inv = eye3 - 0.5 * k + c.unsqueeze(-1) * k2
+    v = (v_inv @ trans.unsqueeze(-1)).squeeze(-1)
+    # `half_theta` is kept to make the small-angle branch explicit and silence over-eager simplifiers.
+    _ = half_theta
+    return torch.cat([v, omega], dim=-1)
+
+
+def se3_left_apply(delta_xi: Tensor, transform: Tensor) -> Tensor:
+    return se3_exp(delta_xi) @ transform
+
+
+def se3_geodesic_loss(pred: Tensor, target: Tensor, trans_weight: float = 1.0, rot_weight: float = 1.0) -> Tensor:
+    trans = F.smooth_l1_loss(pred[..., :3, 3], target[..., :3, 3], reduction="none").sum(dim=-1)
+    rot = _rotation_geodesic(pred[..., :3, :3], target[..., :3, :3])
+    return trans_weight * trans + rot_weight * rot
+
+
+def _transform_point_cloud_xyzrgb(point_cloud: Tensor, transform: Tensor) -> Tensor:
+    xyz = point_cloud[..., :3].to(dtype=torch.float32)
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    xyz_out = torch.matmul(xyz, rot.transpose(-1, -2)) + trans.unsqueeze(-2)
+    return torch.cat([xyz_out, point_cloud[..., 3:6].to(dtype=torch.float32)], dim=-1)
+
+
+def _sample_random_se3(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    *,
+    trans_scale: float = 0.20,
+    rot_scale: float = 0.75,
+) -> Tensor:
+    xi = torch.randn(batch_size, 6, device=device, dtype=dtype)
+    xi[..., :3] = xi[..., :3] * float(trans_scale)
+    xi[..., 3:6] = xi[..., 3:6] * float(rot_scale)
+    return se3_exp(xi)
+
+
+def _to_numpy_array(value) -> np.ndarray:
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _time_gradient(num_steps: int) -> np.ndarray:
+    if num_steps <= 1:
+        return np.array([[0.1, 0.75, 0.25]], dtype=np.float64)
+    t = np.linspace(0.0, 1.0, num_steps, dtype=np.float64)[:, None]
+    start = np.array([0.05, 0.55, 1.0], dtype=np.float64)
+    middle = np.array([0.10, 0.85, 0.25], dtype=np.float64)
+    end = np.array([1.0, 0.18, 0.05], dtype=np.float64)
+    first_half = (1.0 - 2.0 * t) * start + (2.0 * t) * middle
+    second_half = (2.0 - 2.0 * t) * middle + (2.0 * t - 1.0) * end
+    return np.where(t <= 0.5, first_half, second_half).clip(0.0, 1.0)
+
+
+def _make_sphere(center: np.ndarray, radius: float, color: np.ndarray) -> o3d.geometry.TriangleMesh:
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=12)
+    sphere.translate(center)
+    sphere.paint_uniform_color(color.tolist())
+    return sphere
+
+
+def _make_trajectory_lines(positions: np.ndarray, colors: np.ndarray) -> o3d.geometry.LineSet | None:
+    if positions.shape[0] < 2:
+        return None
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(positions)
+    line_set.lines = o3d.utility.Vector2iVector([[idx, idx + 1] for idx in range(positions.shape[0] - 1)])
+    line_colors = 0.5 * (colors[:-1] + colors[1:])
+    line_set.colors = o3d.utility.Vector3dVector(line_colors)
+    return line_set
+
+
+def vis_umi_data(
+    action,
+    pointcloud,
+    *,
+    frame_stride: int | None = None,
+    max_frames: int = 12,
+    frame_scale: float = 0.035,
+    point_radius: float = 0.008,
+):
+    """Visualize a UMI pose9 trajectory with explicit temporal order.
+
+    The trajectory is colored from blue/green at the beginning to red at the end.
+    Coordinate frames are drawn sparsely so dense chunks remain readable.
+    """
+    actions = _to_numpy_array(action).astype(np.float32, copy=False)
+    while actions.ndim > 2 and actions.shape[0] == 1:
+        actions = actions[0]
+    if actions.ndim != 2 or actions.shape[-1] < 9:
+        raise ValueError(f"Expected action shape (T, >=9), got {actions.shape}.")
+
+    cloud = _to_numpy_array(pointcloud).astype(np.float32, copy=False)
+    while cloud.ndim > 2 and cloud.shape[0] == 1:
+        cloud = cloud[0]
+    if cloud.ndim != 2 or cloud.shape[-1] < 3:
+        raise ValueError(f"Expected pointcloud shape (N, >=3), got {cloud.shape}.")
+
+    positions = actions[:, :3]
+    colors = _time_gradient(positions.shape[0])
+    if frame_stride is None:
+        frame_stride = max(1, int(math.ceil(positions.shape[0] / max(1, max_frames))))
+    frame_indices = list(range(0, positions.shape[0], max(1, int(frame_stride))))
+    if positions.shape[0] - 1 not in frame_indices:
+        frame_indices.append(positions.shape[0] - 1)
+
+    geometries = [create_frame(np.array([0.0, 0.0, 0.0]), np.eye(3), scale=frame_scale * 1.2)]
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(cloud[:, :3])
+    if cloud.shape[-1] >= 6:
+        rgb = np.clip(cloud[:, 3:6] / 255.0, 0.0, 1.0)
+    else:
+        rgb = np.full((cloud.shape[0], 3), 0.55, dtype=np.float32)
+    pcd.colors = o3d.utility.Vector3dVector(rgb)
+    geometries.append(pcd)
+
+    trajectory_lines = _make_trajectory_lines(positions, colors)
+    if trajectory_lines is not None:
+        geometries.append(trajectory_lines)
+
+    # Small colored beads make the time direction visible even when frames overlap.
+    for idx, (position, color) in enumerate(zip(positions, colors, strict=True)):
+        radius = point_radius * (1.6 if idx in (0, positions.shape[0] - 1) else 1.0)
+        geometries.append(_make_sphere(position, radius, color))
+
+    for idx in frame_indices:
+        rot6d = torch.as_tensor(actions[idx, 3:9], dtype=torch.float32)
+        rotmat = rot6d_to_matrix(rot6d).cpu().numpy()
+        scale = frame_scale * (1.35 if idx in (0, positions.shape[0] - 1) else 1.0)
+        geometries.append(create_frame(positions[idx], rotmat, scale=scale))
+
+    print(
+        f"Visualizing {positions.shape[0]} poses: blue/green=start, red=end, "
+        f"frames={frame_indices}, start={positions[0].round(4)}, end={positions[-1].round(4)}"
+    )
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name="UMI trajectory: blue/green=start, red=end",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,9 +340,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-cache-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
-    parser.add_argument("--current-points", type=int, default=10000)
-    parser.add_argument("--future-points", type=int, default=10000)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--current-points", type=int, default=50000)
+    parser.add_argument("--future-points", type=int, default=16000)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -284,3 +566,32 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+# idx = 0
+# valid_mask = (batch["observation.point_cloud_is_pad"]).sum(1)==0
+# for idx,label in enumerate(valid_mask):
+#     if label==True:
+#         batch_idx = idx
+
+#         point_valid = ~batch["observation.point_cloud_is_pad"][batch_idx]
+#         step_valid = ~batch["future_is_pad"][batch_idx]
+
+#         point_cloud = batch["observation.point_cloud"][batch_idx][point_valid]
+#         rgb = point_cloud[...,3:]
+#         rgb[pseudo['labels'][batch_idx].cpu().numpy()!=1] = 0
+#         point_cloud[...,3:] = rgb
+
+
+#         trajectory = batch["future_ee_poses"][batch_idx][step_valid]
+
+#         print("episode:", batch["episode_index"][batch_idx].item())
+#         print("frame:", batch["frame_index"][batch_idx].item())
+#         print("raw action start:", batch["action"][batch_idx, 0, :9])
+#         print("relative start:", trajectory[0])
+
+#         vis_umi_data(
+#             trajectory.cpu().numpy(),
+#             point_cloud.cpu().numpy(),
+#         )

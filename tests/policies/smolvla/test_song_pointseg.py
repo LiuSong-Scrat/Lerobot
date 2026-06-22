@@ -16,6 +16,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLossConfig,
     SongPointSegNet,
     SongTemporalPointCloudDataset,
+    _aggregate_motion_hypotheses,
     generate_pseudo_labels,
     generate_pseudo_labels_from_priors,
     matrix_to_pose9,
@@ -79,6 +80,54 @@ def test_motion_residuals_separate_held_and_static_points():
     static_res = pseudo["static_residual"].squeeze(0)
     assert held_res[0] < static_res[0]
     assert static_res[1] < held_res[1]
+
+
+def test_motion_evidence_compares_hypotheses_in_the_same_future_frames():
+    held = torch.tensor([[[0.01], [0.20], [0.01]]], dtype=torch.float32)
+    static = torch.tensor([[[0.20], [0.01], [0.15]]], dtype=torch.float32)
+    motion_weights = torch.tensor([[1.0, 1.0, 0.1]], dtype=torch.float32)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+
+    held_residual, static_residual, residual_gap = _aggregate_motion_hypotheses(
+        held,
+        static,
+        motion_weights,
+        valid,
+        relative_gap_eps=0.005,
+        topk=2,
+    )
+
+    # Independent minima would produce zero evidence because both minima are 0.01,
+    # even though two same-frame comparisons favor the held hypothesis.
+    assert torch.allclose(static.amin(dim=1) - held.amin(dim=1), torch.zeros(1, 1))
+    assert residual_gap.item() > 0.4
+    assert held_residual.item() < static_residual.item()
+
+
+def test_motion_evidence_is_suppressed_when_pose_motion_is_uninformative():
+    held = torch.tensor([[[0.01], [0.01]]], dtype=torch.float32)
+    static = torch.tensor([[[0.20], [0.20]]], dtype=torch.float32)
+    valid = torch.ones(1, 2, dtype=torch.bool)
+
+    _held, _static, strong_gap = _aggregate_motion_hypotheses(
+        held,
+        static,
+        torch.ones(1, 2),
+        valid,
+        relative_gap_eps=0.005,
+        topk=2,
+    )
+    _held, _static, weak_gap = _aggregate_motion_hypotheses(
+        held,
+        static,
+        torch.full((1, 2), 0.01),
+        valid,
+        relative_gap_eps=0.005,
+        topk=2,
+    )
+
+    assert strong_gap.item() > 0.8
+    assert weak_gap.item() < 0.02
 
 
 def test_generate_pseudo_labels_from_existing_priors():
@@ -216,7 +265,13 @@ def test_song_pointseg_mlp_smoke_backward():
         future_pc,
         future_poses,
         future_is_pad,
-        config=PseudoLabelConfig(nn_chunk_size=32, min_confidence=0.0, forced_foreground_min_score=0.0),
+        config=PseudoLabelConfig(
+            nn_chunk_size=32,
+            min_confidence=0.0,
+            background_min_confidence=0.0,
+            background_foreground_max=1.0,
+            forced_foreground_min_score=0.0,
+        ),
     )
     assert pseudo["labels"].shape == (bsize, n_points)
     assert not torch.equal(pseudo["labels"], torch.full_like(pseudo["labels"], ROLE_IGNORE))

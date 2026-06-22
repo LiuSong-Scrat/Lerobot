@@ -1558,8 +1558,8 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
-        "--policy.type=smolvla",
+        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
+        # "--policy.type=smolvla",
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
