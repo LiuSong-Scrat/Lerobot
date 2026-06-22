@@ -203,16 +203,51 @@ def _sample_from_batch(
     }
 
 
-def _save_preview(
+def _episode_preview_targets(
+    dataset: SongTemporalPointCloudDataset,
+    total_samples: int,
+) -> dict[int, list[tuple[int, str, int]]]:
+    episodes = dataset.meta.episodes
+    if episodes is None:
+        raise ValueError("Episode metadata is required to save first/middle/last pseudo-label previews.")
+
+    targets: dict[int, list[tuple[int, str, int]]] = {}
+    for episode_position in range(len(episodes)):
+        episode = episodes[episode_position]
+        episode_index = int(episode.get("episode_index", episode_position))
+        start_index = int(episode["dataset_from_index"])
+        end_index = int(episode["dataset_to_index"])
+        episode_length = end_index - start_index
+        if episode_length <= 0:
+            continue
+
+        frame_targets = (
+            ("first", 0),
+            ("middle", (episode_length - 1) // 2),
+            ("last", episode_length - 1),
+        )
+        for position, frame_index in frame_targets:
+            dataset_index = start_index + frame_index
+            if 0 <= dataset_index < total_samples:
+                targets.setdefault(dataset_index, []).append((episode_index, position, frame_index))
+    return targets
+
+
+def _save_episode_preview(
     output_dir: Path,
-    sample_index: int,
+    episode_index: int,
+    position: str,
+    frame_index: int,
     current_pc: torch.Tensor,
-    pseudo: dict[str, torch.Tensor],
+    labels: torch.Tensor,
 ) -> None:
     write_role_ply(
-        output_dir / "visualizations" / f"sample_{sample_index:06d}_pseudo.ply",
+        output_dir
+        / "visualizations"
+        / f"episode_{episode_index:06d}"
+        / f"{position}_frame_{frame_index:06d}_pseudo.ply",
         current_pc.detach().cpu().numpy(),
-        pseudo["labels"].detach().cpu().numpy(),
+        labels.detach().cpu().numpy(),
     )
 
 
@@ -235,6 +270,7 @@ def cache_samples(args: argparse.Namespace) -> None:
     total_samples = len(dataset) if args.max_samples is None else min(len(dataset), args.max_samples)
     if total_samples <= 0:
         raise ValueError("Song pointseg cache needs at least one sample.")
+    preview_targets = _episode_preview_targets(dataset, total_samples)
     shards = _make_shard_manifest(total_samples, args.shard_size)
     manifest = {
         "version": POINTSEG_CACHE_VERSION,
@@ -270,7 +306,7 @@ def cache_samples(args: argparse.Namespace) -> None:
     current_shard_index = 0
     shard_samples: list[dict[str, np.ndarray | int]] = []
     written = 0
-    previews = 0
+    previews_saved = 0
     progress = tqdm(total=total_samples, desc="Cache Song pointseg", unit="sample")
 
     with torch.inference_mode():
@@ -281,7 +317,7 @@ def cache_samples(args: argparse.Namespace) -> None:
             batch = _slice_batch_to_size(batch, batch_size)
             batch = move_batch_to_device(batch, device)
             current_pc = batch["observation.point_cloud"]
-            pseudo = generate_pseudo_labels(
+            geometric_pseudo = generate_pseudo_labels(
                 current_pc,
                 batch["observation.point_cloud_future"],
                 batch["future_ee_poses"],
@@ -291,26 +327,35 @@ def cache_samples(args: argparse.Namespace) -> None:
                 config=pseudo_cfg,
             )
             pseudo = force_small_current_clouds_foreground(
-                pseudo,
+                geometric_pseudo,
                 current_pc,
                 args.current_points,
                 batch.get("observation.point_cloud_is_pad"),
             )
 
-            if previews < args.vis_count:
-                preview_count = min(args.vis_count - previews, batch_size)
-                for batch_index in range(preview_count):
-                    current_is_pad = batch.get("observation.point_cloud_is_pad")
-                    valid = ~current_is_pad[batch_index].bool() if current_is_pad is not None else torch.ones(
-                        current_pc.shape[1], dtype=torch.bool, device=current_pc.device
-                    )
-                    _save_preview(
+            current_is_pad = batch.get("observation.point_cloud_is_pad")
+            for batch_index in range(batch_size):
+                dataset_index = written + batch_index
+                targets = preview_targets.get(dataset_index, ())
+                if not targets:
+                    continue
+                valid = (
+                    ~current_is_pad[batch_index].bool()
+                    if current_is_pad is not None
+                    else torch.ones(current_pc.shape[1], dtype=torch.bool, device=current_pc.device)
+                )
+                preview_pc = current_pc[batch_index][valid]
+                preview_labels = pseudo["labels"][batch_index][valid]
+                for episode_index, position, frame_index in targets:
+                    _save_episode_preview(
                         args.output_dir,
-                        written + batch_index,
-                        current_pc[batch_index][valid],
-                        {key: value[batch_index][valid] for key, value in pseudo.items() if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == current_pc.shape[:2]},
+                        episode_index,
+                        position,
+                        frame_index,
+                        preview_pc,
+                        preview_labels,
                     )
-                previews += preview_count
+                    previews_saved += 1
 
             for batch_index in range(batch_size):
                 shard_samples.append(
@@ -338,7 +383,10 @@ def cache_samples(args: argparse.Namespace) -> None:
         )
     with open(args.output_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"Cached {written} Song pointseg samples to {args.output_dir}")
+    print(
+        f"Cached {written} Song pointseg samples to {args.output_dir}; "
+        f"episode previews saved={previews_saved}"
+    )
 
 
 def main() -> None:

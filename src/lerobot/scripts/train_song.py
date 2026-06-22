@@ -705,34 +705,51 @@ def save_joint_pointseg_visualization(
     point_cloud = payload["point_cloud"].detach().float().cpu().numpy()
     operation_prob = conditioned["operation_prob"].detach().float().cpu().numpy()
     selection_scores = conditioned["pointseg_selection_scores"].detach().float().cpu().numpy()
+    point_is_pad = payload.get("point_is_pad")
+    if torch.is_tensor(point_is_pad):
+        point_is_pad = point_is_pad.detach().bool().cpu().numpy()
     vis_dir = Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song")
     vis_dir = vis_dir / "visualizations" / "pointseg"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     saved = 0
-    for batch_idx in range(min(max_items, point_cloud.shape[0])):
-        probs = operation_prob[batch_idx]
-        scores = selection_scores[batch_idx]
+    skipped_without_split = 0
+    for batch_idx in range(point_cloud.shape[0]):
+        valid = ~point_is_pad[batch_idx] if point_is_pad is not None else np.ones(
+            point_cloud.shape[1], dtype=bool
+        )
+        if not np.any(valid):
+            skipped_without_split += 1
+            continue
+
+        current_point_cloud = point_cloud[batch_idx][valid]
+        probs = operation_prob[batch_idx][valid]
+        scores = selection_scores[batch_idx][valid]
         n_points = probs.shape[0]
+        labels_threshold = (probs >= threshold).astype(np.int64)
+        threshold_foreground_count = int(np.count_nonzero(labels_threshold == ROLE_FOREGROUND))
+        if threshold_foreground_count == 0 or threshold_foreground_count == n_points:
+            skipped_without_split += 1
+            continue
+
         foreground_count = min(
             n_points,
             conditioner._target_count(n_points, conditioner.foreground_ratio, conditioner.min_foreground_points),
         )
-
-        labels_threshold = (probs >= threshold).astype(np.int64)
-        labels_topk = np.zeros(n_points, dtype=np.int64)
         if foreground_count >= n_points:
-            topk_idx = np.arange(n_points)
-        else:
-            topk_idx = np.argpartition(-scores, foreground_count - 1)[:foreground_count]
+            skipped_without_split += 1
+            continue
+
+        labels_topk = np.zeros(n_points, dtype=np.int64)
+        topk_idx = np.argpartition(-scores, foreground_count - 1)[:foreground_count]
         labels_topk[topk_idx] = ROLE_FOREGROUND
 
         stem = f"{tag}_step{step}_b{batch_idx}"
-        write_role_ply(vis_dir / f"{stem}_thr{threshold:.2f}.ply", point_cloud[batch_idx], labels_threshold, probs)
-        write_role_ply(vis_dir / f"{stem}_topk.ply", point_cloud[batch_idx], labels_topk, probs)
+        write_role_ply(vis_dir / f"{stem}_thr{threshold:.2f}.ply", current_point_cloud, labels_threshold, probs)
+        write_role_ply(vis_dir / f"{stem}_topk.ply", current_point_cloud, labels_topk, probs)
         np.savez_compressed(
             vis_dir / f"{stem}.npz",
-            point_cloud=point_cloud[batch_idx],
+            point_cloud=current_point_cloud,
             operation_prob=probs,
             selection_scores=scores,
             labels_threshold=labels_threshold,
@@ -741,9 +758,17 @@ def save_joint_pointseg_visualization(
             threshold=np.asarray(threshold, dtype=np.float32),
         )
         saved += 1
+        if saved >= max_items:
+            break
 
     if saved:
         logging.info(f"Joint pointseg visualization saved to {vis_dir} ({tag}, step {step}, {saved} item(s))")
+    elif skipped_without_split:
+        logging.info(
+            "Skipped joint pointseg visualization (%s, step %s): no prediction contained both foreground and background.",
+            tag,
+            step,
+        )
 
 
 def ood_case_inference(
