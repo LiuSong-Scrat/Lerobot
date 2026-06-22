@@ -1459,7 +1459,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     max_items=2,
                 )
                 try:
-                    ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir)
+                    ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
                 except Exception:
                     logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
 
