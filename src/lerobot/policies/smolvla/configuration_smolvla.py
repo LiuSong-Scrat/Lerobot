@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -75,6 +76,9 @@ class SmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = False
     train_expert_only: bool = False
     train_state_proj: bool = True
+    # Keep proprioception out of the learned prefix by default. The World-Ego
+    # branch uses current EEF pose only as an analytic coordinate carrier.
+    encode_robot_state: bool = False
 
     # Song point-cloud foreground/background conditioning.
     pointseg_enable: bool = False
@@ -96,10 +100,14 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_grid_size: float = 0.01
     worldflow_loss_weight: float = 0.05
     worldflow_geo_loss_weight: float = 0.05
+    worldflow_bridge_loss_weight: float = 0.05
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
-    worldflow_se3_head_enable: bool = True
+    worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
+    worldflow_max_points: int = 2048
+    worldflow_min_transport_points: int = 3
+    worldflow_transport_score_threshold: float = 0.05
 
     # ET-SEED-style SE(3) action generation.
     se3_enable: bool = False
@@ -108,7 +116,7 @@ class SmolVLAConfig(PreTrainedConfig):
     se3_pose_loss_weight: float = 1.0
     se3_gripper_loss_weight: float = 1.0
     se3_endpoint_loss_weight: float = 0.25
-    se3_final_correction_enable: bool = True
+    se3_final_correction_enable: bool = False
     se3_final_correction_loss_weight: float = 0.20
     se3_equivariance_loss_weight: float = 0.02
 
@@ -167,6 +175,18 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        if self.worldflow_se3_head_enable:
+            warnings.warn(
+                "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
+                "World-Ego now uses dense automatic ObjectFlow + weighted Kabsch, not a PCA canonical SE(3) head.",
+                stacklevel=2,
+            )
+        if self.se3_final_correction_enable:
+            warnings.warn(
+                "se3_final_correction_enable is kept only for CLI compatibility and is ignored. "
+                "The PCA-style final correction branch has been removed from the active policy path.",
+                stacklevel=2,
+            )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

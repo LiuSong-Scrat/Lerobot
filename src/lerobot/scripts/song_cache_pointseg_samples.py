@@ -167,6 +167,7 @@ def _save_variable_shard(
     np.save(shard_dir / "labels.npy", np.concatenate([sample["labels"] for sample in samples], axis=0).astype(np.int16, copy=False))
     np.save(shard_dir / "weights.npy", np.concatenate([sample["weights"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "class_scores.npy", np.concatenate([sample["class_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+    np.save(shard_dir / "role_scores.npy", np.concatenate([sample["role_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "foreground_score.npy", np.concatenate([sample["foreground_score"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
     np.save(shard_dir / "episode_index.npy", np.asarray([sample["episode_index"] for sample in samples], dtype=np.int64))
     np.save(shard_dir / "frame_index.npy", np.asarray([sample["frame_index"] for sample in samples], dtype=np.int64))
@@ -196,6 +197,7 @@ def _sample_from_batch(
         "labels": pseudo["labels"][batch_index].detach().cpu()[valid].numpy(),
         "weights": pseudo["weights"][batch_index].detach().cpu()[valid].numpy(),
         "class_scores": pseudo["class_scores"][batch_index].detach().cpu()[valid].numpy(),
+        "role_scores": pseudo["role_scores"][batch_index].detach().cpu()[valid].numpy(),
         "foreground_score": pseudo["foreground_score"][batch_index].detach().cpu()[valid].numpy(),
         "episode_index": int(batch["episode_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
         "frame_index": int(batch["frame_index"][batch_index].detach().cpu().reshape(-1)[0].item()),
@@ -285,6 +287,7 @@ def cache_samples(args: argparse.Namespace) -> None:
         "variable_num_points": True,
         "point_count_policy": "cap_without_repeat",
         "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
+        "small_cloud_role_policy": "preserve_automatic_gripper_condition_target_scores",
         "storage_dtype": args.storage_dtype,
         "pseudo_label_config": asdict(pseudo_cfg),
         "args": _jsonable(vars(args)),

@@ -4,14 +4,14 @@ import torch
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
-    SE3CanonicalTrajectoryHead,
-    _transform_point_cloud_xyzrgb,
+    DenseRigidObjectFlowHead,
+    select_objectflow_points,
     se3_exp,
     se3_log,
     so3_exp,
     so3_log,
+    weighted_kabsch_transform,
 )
-from lerobot.policies.smolvla.song_pointseg import pose9_to_matrix
 
 
 def test_so3_and_se3_exp_log_round_trip():
@@ -33,8 +33,24 @@ def test_se3_relative_update_recovers_target():
     assert torch.allclose(recovered, a, atol=3e-4, rtol=3e-4)
 
 
-def test_se3_canonical_trajectory_head_is_equivariant_for_nondegenerate_cloud():
+def test_weighted_kabsch_recovers_spatial_transform():
     torch.manual_seed(13)
+    source = torch.randn(2, 4, 12, 3)
+    transform = se3_exp(torch.randn(2, 4, 6) * 0.15)
+    target = (
+        source @ transform[..., :3, :3].transpose(-1, -2)
+        + transform[..., :3, 3].unsqueeze(-2)
+    )
+    weights = torch.ones(2, 4, 12)
+
+    recovered = weighted_kabsch_transform(source, target, weights)
+
+    assert torch.allclose(recovered[..., :3, 3], transform[..., :3, 3], atol=2e-4, rtol=2e-4)
+    assert torch.allclose(recovered[..., :3, :3], transform[..., :3, :3], atol=2e-4, rtol=2e-4)
+
+
+def test_dense_objectflow_head_uses_automatic_roles_and_starts_from_zero_flow():
+    torch.manual_seed(17)
     cfg = SmolVLAConfig(
         chunk_size=4,
         n_action_steps=4,
@@ -42,30 +58,49 @@ def test_se3_canonical_trajectory_head_is_equivariant_for_nondegenerate_cloud():
         worldflow_feature_dim=24,
         worldflow_grid_size=0.01,
     )
-    head = SE3CanonicalTrajectoryHead(cfg, language_dim=12, feature_dim=24)
+    head = DenseRigidObjectFlowHead(cfg, language_dim=12)
     head.eval()
 
-    xyz = torch.tensor(
-        [
-            [-0.3, -0.1, 0.0],
-            [0.4, -0.2, 0.1],
-            [0.2, 0.5, -0.2],
-            [-0.1, 0.3, 0.4],
-            [0.6, 0.2, 0.3],
-            [-0.5, 0.4, -0.3],
-        ],
-        dtype=torch.float32,
-    ).unsqueeze(0)
-    rgb = torch.linspace(0, 255, xyz.shape[1] * 3, dtype=torch.float32).reshape(1, xyz.shape[1], 3)
-    point_cloud = torch.cat([xyz, rgb], dim=-1)
-    lang_emb = torch.randn(1, 5, 12)
-    lang_mask = torch.ones(1, 5, dtype=torch.bool)
-    transform = se3_exp(torch.tensor([[0.2, -0.1, 0.3, 0.15, -0.25, 0.1]], dtype=torch.float32))
-    point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud, transform)
+    point_cloud = torch.randn(2, 8, 6)
+    point_cloud[..., 3:6] = torch.rand(2, 8, 3) * 255.0
+    role_scores = torch.zeros(2, 8, 3)
+    role_scores[:, :3, 1] = 1.0
+    role_scores[:, 3:6, 2] = 1.0
+    lang_emb = torch.randn(2, 5, 12)
+    lang_mask = torch.ones(2, 5, dtype=torch.bool)
 
-    pred = pose9_to_matrix(head(point_cloud, lang_emb, lang_mask))
-    pred_aug = pose9_to_matrix(head(point_cloud_aug, lang_emb, lang_mask))
-    expected = transform.unsqueeze(1) @ pred
+    flow = head(point_cloud, role_scores, lang_emb, lang_mask)
 
-    assert torch.allclose(pred_aug[..., :3, 3], expected[..., :3, 3], atol=1e-4, rtol=1e-4)
-    assert torch.allclose(pred_aug[..., :3, :3], expected[..., :3, :3], atol=1e-4, rtol=1e-4)
+    assert flow.shape == (2, cfg.chunk_size, 8, 3)
+    assert torch.allclose(flow, torch.zeros_like(flow))
+
+
+def test_objectflow_point_cap_balances_condition_and_target_scores():
+    torch.manual_seed(19)
+    point_cloud = torch.randn(1, 10, 6)
+    role_scores = torch.zeros(1, 10, 3)
+    role_scores[0, :5, 1] = torch.linspace(1.0, 0.6, 5)
+    role_scores[0, 5:, 2] = torch.linspace(1.0, 0.6, 5)
+
+    selected_pc, selected_roles, selected_is_pad = select_objectflow_points(
+        point_cloud,
+        role_scores,
+        max_points=6,
+    )
+
+    assert selected_pc.shape == (1, 6, 6)
+    assert selected_roles.shape == (1, 6, 3)
+    assert not bool(selected_is_pad.any())
+    assert int((selected_roles[..., 1] > 0).sum().item()) >= 2
+    assert int((selected_roles[..., 2] > 0).sum().item()) >= 2
+
+
+def test_world_ego_bridge_formula_matches_body_transform():
+    torch.manual_seed(23)
+    current = se3_exp(torch.randn(3, 6) * 0.2)
+    body = se3_exp(torch.randn(3, 6) * 0.2)
+    target = current @ body
+    spatial = target @ torch.linalg.inv(current)
+    recovered_body = torch.linalg.inv(current) @ spatial @ current
+
+    assert torch.allclose(recovered_body, body, atol=3e-4, rtol=3e-4)

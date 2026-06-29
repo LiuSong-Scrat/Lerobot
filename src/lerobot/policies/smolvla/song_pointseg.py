@@ -38,7 +38,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 4
+POINTSEG_CACHE_VERSION = 5
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -56,6 +56,7 @@ POINTSEG_CACHE_LABEL_FIELDS = (
     "labels",
     "weights",
     "class_scores",
+    "role_scores",
     "foreground_score",
     "episode_index",
     "frame_index",
@@ -554,7 +555,6 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
 
         future_samples = []
-        future_point_masks = []
         future_is_pad = []
         for offset in self.temporal_offsets:
             raw_index = frame_index + offset
@@ -1253,13 +1253,9 @@ def force_small_current_clouds_foreground(
     )
     out["class_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["class_scores"]), out["class_scores"])
 
-    target_role_index = out["role_scores"].shape[-1] - 1
-    out["role_scores"] = torch.where(force_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
-    out["role_scores"][..., target_role_index] = torch.where(
-        force_mask,
-        torch.ones_like(out["role_scores"][..., target_role_index]),
-        out["role_scores"][..., target_role_index],
-    )
+    # Preserve automatic gripper/condition/target role scores. The small-cloud
+    # fallback is only a binary PointSeg label policy; ObjectFlow still needs the
+    # motion-prior role distribution rather than a hand-authored all-target mask.
     out["role_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
     out["foreground_score"] = torch.where(force_mask, torch.ones_like(out["foreground_score"]), out["foreground_score"])
     out["foreground_score"] = torch.where(pad_mask, torch.zeros_like(out["foreground_score"]), out["foreground_score"])

@@ -7,6 +7,7 @@ import torch
 
 from lerobot.policies.smolvla.song_pointseg import (
     POINTSEG_CACHE_FIELDS,
+    POINTSEG_CACHE_LABEL_FIELDS,
     POINTSEG_CACHE_VERSION,
     ROLE_FOREGROUND,
     ROLE_IGNORE,
@@ -17,6 +18,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegNet,
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
+    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     generate_pseudo_labels_from_priors,
     matrix_to_pose9,
@@ -150,6 +152,32 @@ def test_generate_pseudo_labels_from_existing_priors():
     assert pseudo["class_scores"].shape == (*priors.shape[:2], 2)
 
 
+def test_small_cloud_fallback_preserves_automatic_role_scores():
+    role_scores = torch.tensor(
+        [
+            [
+                [0.9, 0.1, 0.0],
+                [0.1, 0.8, 0.2],
+                [0.0, 0.2, 0.7],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    pseudo = {
+        "labels": torch.full((1, 3), ROLE_IGNORE, dtype=torch.long),
+        "weights": torch.zeros(1, 3),
+        "class_scores": torch.zeros(1, 3, 2),
+        "role_scores": role_scores.clone(),
+        "foreground_score": role_scores.amax(dim=-1),
+    }
+    current_pc = torch.zeros(1, 3, 6)
+
+    out = force_small_current_clouds_foreground(pseudo, current_pc, configured_current_points=8)
+
+    assert torch.equal(out["labels"], torch.full((1, 3), ROLE_FOREGROUND, dtype=torch.long))
+    assert torch.allclose(out["role_scores"], role_scores)
+
+
 class _FakeBaseDataset(torch.utils.data.Dataset):
     def __init__(self, episode_lengths):
         self.episode_lengths = episode_lengths
@@ -244,8 +272,43 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
     assert sample["observation.point_cloud"].dtype == torch.float32
     assert sample["pointseg.labels"].dtype == torch.int64
     assert sample["pointseg.labels"].tolist() == [1, 1, 0, -100]
+    assert tuple(sample["pointseg.role_scores"].shape) == (n_points, 3)
     assert sample["episode_index"].item() == 4
     assert sample["dataset_index"].item() == 1
+
+
+def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):
+    cache_dir = tmp_path / "cache"
+    shard_dir = cache_dir / "shard_000000"
+    shard_dir.mkdir(parents=True)
+    n_points = 3
+    np.save(shard_dir / "sample_offsets.npy", np.array([0, n_points], dtype=np.int64))
+    np.save(shard_dir / "point_indices.npy", np.array([1, 3, 5], dtype=np.int64))
+    np.save(shard_dir / "labels.npy", np.array([1, 0, -100], dtype=np.int16))
+    np.save(shard_dir / "weights.npy", np.ones(n_points, dtype=np.float16))
+    np.save(shard_dir / "class_scores.npy", np.ones((n_points, 2), dtype=np.float16))
+    role_scores = np.arange(n_points * 3, dtype=np.float16).reshape(n_points, 3)
+    np.save(shard_dir / "role_scores.npy", role_scores)
+    np.save(shard_dir / "foreground_score.npy", np.ones(n_points, dtype=np.float16))
+    np.save(shard_dir / "episode_index.npy", np.array([0], dtype=np.int64))
+    np.save(shard_dir / "frame_index.npy", np.array([2], dtype=np.int64))
+    np.save(shard_dir / "dataset_index.npy", np.array([7], dtype=np.int64))
+    with open(cache_dir / "manifest.json", "w") as f:
+        json.dump(
+            {
+                "version": POINTSEG_CACHE_VERSION,
+                "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+                "cache_mode": "indices",
+                "variable_num_points": True,
+                "shards": [{"path": "shard_000000", "length": 1}],
+            },
+            f,
+        )
+
+    sample = SongPointSegCachedDataset(cache_dir)[0]
+
+    assert sample["observation.point_cloud_indices"].tolist() == [1, 3, 5]
+    assert torch.allclose(sample["pointseg.role_scores"], torch.as_tensor(role_scores, dtype=torch.float32))
 
 
 def test_song_pointseg_mlp_smoke_backward():

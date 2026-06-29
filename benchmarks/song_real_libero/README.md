@@ -103,9 +103,16 @@ data/libero_setting/libero_4suite_lerobot_dataset/
   world_ee_poses/episode_000000.npy
 ```
 
-Pointseg cache v2 is index-only: each shard stores `point_indices`, pseudo labels, weights, and scores. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
+PointSeg cache v5 is index-only: each shard stores `point_indices`, pseudo labels, weights, class scores, foreground scores, and automatic `role_scores` with channels `gripper / condition-object / target`. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
 
 When `--policy.pointseg_enable=true` and `--pointseg_sample_cache_dir` is omitted or points to a missing cache, training now computes the same motion-prior pseudo labels online once per DataLoader batch from current/future point clouds. This fallback uses CUDA by default when available; if CUDA is used, the training script forces DataLoader `num_workers=0` to avoid CUDA initialization inside forked worker processes. Set `SONG_POINTSEG_ONLINE=0` to disable this fallback, or set `SONG_POINTSEG_ONLINE_DEVICE=cpu` to keep multi-worker CPU loading. Tune `SONG_POINTSEG_ONLINE_CURRENT_POINTS`, `SONG_POINTSEG_ONLINE_FUTURE_POINTS`, and `SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE` for debugging.
+
+World-Ego training uses two coupled branches when `--policy.worldflow_enable=true`:
+
+- Ego Body branch: the normal action flow-matching policy predicts executable UMI/body actions.
+- Dense ObjectFlow branch: automatic `role_scores` select non-gripper condition/target points, predict dense world-frame point displacement, fit a rigid spatial transform with weighted Kabsch, then bridge it to the body action by `B = H_i^{-1} S H_i`.
+
+This path uses no PCA/canonical frame, no manually specified segmentation, and no manually supervised point optical flow. Old PointSeg caches must be rebuilt because ObjectFlow requires cache v5 `role_scores`.
 
 ## Training
 
