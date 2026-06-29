@@ -347,8 +347,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             dataset,
             point_cloud_dir=point_cloud_dir,
             future_offsets=self._future_offsets(policy_cfg),
-            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10_000),
-            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
+            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 50000),
+            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 16384),
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
             mmap_mode=mmap_mode,
         )
@@ -844,7 +844,7 @@ def ood_case_inference(
             if task_path.exists():
                 task = task_path.read_text(encoding="utf-8").strip()
             else:
-                task = os.environ.get("SONG_OOD_TASK", "place, red_cube, eff_open, None")
+                task = os.environ.get("SONG_OOD_TASK", 'Place the Red Cube on the Blue Cube\n')
         task = str(task).strip()
         return task if task.endswith("\n") else f"{task}\n"
 
@@ -1591,16 +1591,16 @@ def _apply_song_debug_defaults() -> None:
         "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
         "--policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct",
         "--policy.load_vlm_weights=false",
-        "--batch_size=8",
+        "--batch_size=6",
         "--steps=500000",
         "--log_freq=1",
-        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla_temp",
-        "--job_name=my_smolvla_pointseg_worldflow_e2e",
+        "--output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/temp",
+        "--job_name=temp",
         "--policy.device=cuda",
         "--wandb.enable=true",
         "--wandb.disable_artifact=true",
-        "--save_freq=10000",
-        "--eval_freq=1000",
+        "--save_freq=30000",
+        "--eval_freq=30000",
         "--num_workers=8",
         "--policy.pointseg_enable=true",
         "--policy.pointseg_backbone_type=litept",
@@ -1624,7 +1624,7 @@ def _apply_song_debug_defaults() -> None:
         "--policy.worldflow_equiv_loss_weight=0.02",
         "--policy.se3_enable=false",
         "--policy.se3_noise_trans_scale=0.15",
-        "--policy.se3_noise_rot_scale=0.75",
+        "--policy.se3_noise_rot_scale=0.75",    
         "--policy.se3_pose_loss_weight=1.0",
         "--policy.se3_gripper_loss_weight=1.0",
         "--policy.se3_endpoint_loss_weight=0.25",
