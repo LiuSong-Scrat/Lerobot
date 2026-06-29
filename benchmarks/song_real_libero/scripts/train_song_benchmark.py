@@ -684,6 +684,16 @@ def _unwrap_policy_module(policy: PreTrainedPolicy) -> PreTrainedPolicy:
     return policy
 
 
+def _is_visualization_process() -> bool:
+    rank = os.environ.get("RANK") or os.environ.get("ACCELERATE_PROCESS_INDEX") or os.environ.get("LOCAL_RANK")
+    if rank is None or str(rank).strip() == "":
+        return True
+    try:
+        return int(rank) == 0
+    except ValueError:
+        return True
+
+
 @torch.no_grad()
 def save_joint_pointseg_visualization(
     policy: PreTrainedPolicy,
@@ -696,6 +706,9 @@ def save_joint_pointseg_visualization(
     max_items: int = 2,
 ) -> None:
     """Save foreground/background masks produced by the joint pointseg branch."""
+    if not _is_visualization_process():
+        return
+
     raw_policy = _unwrap_policy_module(policy)
     model = getattr(raw_policy, "model", None)
     conditioner = getattr(model, "pointseg_conditioner", None)
@@ -788,6 +801,9 @@ def ood_case_inference(
     ood_tasks: dict[int, str] | list[str] | tuple[str, ...] | None = None,
 ):
     ######OOD task may differ from the training batch, so rebuild language tokens with processor.
+    if not _is_visualization_process():
+        return []
+
     import open3d as o3d
     ood_num_points = int(os.environ.get("SONG_OOD_NUM_POINTS", str(ood_num_points)))
     if ood_num_points <= 0:
@@ -850,7 +866,7 @@ def ood_case_inference(
             if task_path.exists():
                 task = task_path.read_text(encoding="utf-8").strip()
             else:
-                task = os.environ.get("SONG_OOD_TASK", "place, red_cube, eff_open, None")
+                task = os.environ.get("SONG_OOD_TASK", 'Place the Red Cube on the Blue Cube\n')
         task = str(task).strip()
         return task if task.endswith("\n") else f"{task}\n"
 
@@ -897,57 +913,62 @@ def ood_case_inference(
     result_dir = result_dir / "visualizations" / "ood"
     result_dir.mkdir(parents=True, exist_ok=True)
 
+    raw_policy = _unwrap_policy_module(policy)
+    was_training = raw_policy.training
     results = []
-    ood_test_sno = list(range(1,7))
-    for sno in ood_test_sno:
-        ply_path = Path(f"/home/liusong/temp/ood_test_new{sno}.ply")
-        scene_point_cloud = load_ply_xyzrgb(ply_path)
-        if scene_point_cloud is None:
-            continue
+    try:
+        ood_test_sno = list(range(1,7))
+        for sno in ood_test_sno:
+            ply_path = Path(f"/home/liusong/temp/ood_test_new{sno}.ply")
+            scene_point_cloud = load_ply_xyzrgb(ply_path)
+            if scene_point_cloud is None:
+                continue
 
-        ood_batch = clone_first_batch_item(batch)
-        if torch.is_tensor(ood_batch.get("action")):
-            ood_batch["action"] = make_identity_pose_action_like(ood_batch["action"])
-        ood_batch["task"] = [load_ood_task(sno)]
+            ood_batch = clone_first_batch_item(batch)
+            if torch.is_tensor(ood_batch.get("action")):
+                ood_batch["action"] = make_identity_pose_action_like(ood_batch["action"])
+            ood_batch["task"] = [load_ood_task(sno)]
 
-        point_cloud_value = ood_batch["observation.point_cloud"]
-        rng = np.random.default_rng(1000 + int(step) * 31 + sno)
-        scene_point_cloud = random_repeat_sample_points(scene_point_cloud, int(ood_num_points), rng)
-        scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
-        set_ood_point_cloud(ood_batch, scene_tensor)
-        remove_stale_pointseg_fields(ood_batch)
-        remove_language_token_fields(ood_batch)
+            point_cloud_value = ood_batch["observation.point_cloud"]
+            rng = np.random.default_rng(1000 + int(step) * 31 + sno)
+            scene_point_cloud = random_repeat_sample_points(scene_point_cloud, int(ood_num_points), rng)
+            scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
+            set_ood_point_cloud(ood_batch, scene_tensor)
+            remove_stale_pointseg_fields(ood_batch)
+            remove_language_token_fields(ood_batch)
 
-        model_batch = preprocessor(ood_batch)
-        remove_stale_pointseg_fields(model_batch)
+            model_batch = preprocessor(ood_batch)
+            remove_stale_pointseg_fields(model_batch)
 
-        action_chunk = policy.predict_action_chunk(model_batch)
-        action_chunk = postprocessor(action_chunk)
-        visualize_res(ood_batch, action_chunk, ood_test_sno=sno, step=step, output_dir=output_dir)
-        save_joint_pointseg_visualization(
-            policy,
-            model_batch,
-            step=step,
-            output_dir=output_dir,
-            tag=f"ood{sno}",
-            max_items=1,
-        )
-        npz_path = result_dir / f"step{step}_ood{sno}.npz"
-        np.savez_compressed(
-            npz_path,
-            source_ply=np.asarray(str(ply_path)),
-            task=np.asarray(ood_batch["task"][0]),
-            point_cloud=scene_point_cloud,
-            action=action_chunk[0].detach().cpu().numpy(),
-        )
-        results.append(
-            {
-                "sno": sno,
-                "source_ply": str(ply_path),
-                "result_npz": str(npz_path),
-                "merged_ply": str(Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song") / "visualizations" / f"step{step}_{sno}.ply"),
-            }
-        )
+            action_chunk = raw_policy.predict_action_chunk(model_batch)
+            action_chunk = postprocessor(action_chunk)
+            visualize_res(ood_batch, action_chunk, ood_test_sno=sno, step=step, output_dir=output_dir)
+            save_joint_pointseg_visualization(
+                raw_policy,
+                model_batch,
+                step=step,
+                output_dir=output_dir,
+                tag=f"ood{sno}",
+                max_items=1,
+            )
+            npz_path = result_dir / f"step{step}_ood{sno}.npz"
+            np.savez_compressed(
+                npz_path,
+                source_ply=np.asarray(str(ply_path)),
+                task=np.asarray(ood_batch["task"][0]),
+                point_cloud=scene_point_cloud,
+                action=action_chunk[0].detach().cpu().numpy(),
+            )
+            results.append(
+                {
+                    "sno": sno,
+                    "source_ply": str(ply_path),
+                    "result_npz": str(npz_path),
+                    "merged_ply": str(Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song") / "visualizations" / f"step{step}_{sno}.ply"),
+                }
+            )
+    finally:
+        raw_policy.train(was_training)
     return results
 
 
