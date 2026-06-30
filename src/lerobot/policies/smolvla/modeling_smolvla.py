@@ -731,7 +731,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for key, value in self.model.last_se3_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
-        worldflow_aux = self.model.compute_worldflow_aux_loss(batch, lang_tokens, lang_masks, actions_is_pad)
+        worldflow_aux = self.model.compute_worldflow_aux_loss(
+            batch,
+            lang_tokens,
+            lang_masks,
+            actions_is_pad,
+            cached_lang_emb=self.model.last_language_emb,
+        )
         for key, value in self.model.last_worldflow_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
@@ -1572,80 +1578,43 @@ class SongPointCloudConditioner(nn.Module):
         if n_points <= 0:
             raise ValueError("Cannot select points from an empty point cloud.")
         count = max(1, int(count))
+        scores = scores.to(device=point_cloud.device)
         if candidate_mask is not None:
             candidate_mask = candidate_mask.to(device=point_cloud.device, dtype=torch.bool)
-        if point_is_pad is not None:
+
+        if point_is_pad is None:
+            valid_mask = torch.ones(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
+        else:
             point_is_pad = point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
-            selected = []
-            selected_scores = []
-            has_candidates = []
-            for bidx in range(bsize):
-                valid_idx = torch.nonzero(~point_is_pad[bidx], as_tuple=False).flatten()
-                if valid_idx.numel() == 0:
-                    valid_idx = torch.zeros(1, dtype=torch.long, device=point_cloud.device)
-                source_idx = valid_idx
-                if candidate_mask is not None:
-                    candidate_idx = valid_idx[candidate_mask[bidx, valid_idx]]
-                    if candidate_idx.numel() > 0:
-                        source_idx = candidate_idx
-                        has_candidates.append(torch.tensor(True, device=point_cloud.device))
-                    else:
-                        source_idx = valid_idx[:1]
-                        has_candidates.append(torch.tensor(False, device=point_cloud.device))
-                else:
-                    has_candidates.append(torch.tensor(True, device=point_cloud.device))
-                scores_b = scores[bidx, source_idx]
-                k = min(count, int(source_idx.numel()))
-                local_idx = torch.topk(scores_b, k=k, dim=0, largest=largest).indices
-                idx = source_idx[local_idx]
-                if count > k:
-                    repeats = math.ceil(count / k)
-                    idx = idx.repeat(repeats)[:count]
-                selected.append(point_cloud[bidx, idx])
-                selected_scores.append(scores[bidx, idx])
-            selected = torch.stack(selected, dim=0)
-            selected_scores = torch.stack(selected_scores, dim=0)
-            if return_has_candidates:
-                return selected, selected_scores, torch.stack(has_candidates, dim=0)
-            return selected, selected_scores
+            if point_is_pad.shape != point_cloud.shape[:2]:
+                raise ValueError(f"Expected point_is_pad shape {point_cloud.shape[:2]}, got {point_is_pad.shape}.")
+            valid_mask = ~point_is_pad
+
+        arange = torch.arange(n_points, device=point_cloud.device)
+        first_valid = torch.where(valid_mask, arange.unsqueeze(0), n_points).argmin(dim=1)
+        fallback_mask = torch.zeros_like(valid_mask)
+        fallback_mask.scatter_(1, first_valid[:, None], True)
 
         if candidate_mask is None:
-            topk_count = min(count, n_points)
-            indices = torch.topk(scores, k=topk_count, dim=1, largest=largest).indices
-            if count > topk_count:
-                repeats = math.ceil(count / topk_count)
-                indices = indices.repeat(1, repeats)[:, :count]
-            selected = point_cloud.gather(1, indices[..., None].expand(bsize, indices.shape[1], channels))
-            selected_scores = scores.gather(1, indices)
-            if return_has_candidates:
-                return selected, selected_scores, torch.ones(bsize, dtype=torch.bool, device=point_cloud.device)
-            return selected, selected_scores
+            source_mask = torch.where(valid_mask.any(dim=1, keepdim=True), valid_mask, fallback_mask)
+            has_candidates = torch.ones(bsize, dtype=torch.bool, device=point_cloud.device)
+        else:
+            candidate_source_mask = torch.where(valid_mask.any(dim=1, keepdim=True), valid_mask, fallback_mask)
+            candidate_mask = candidate_mask & candidate_source_mask
+            has_candidates = candidate_mask.any(dim=1)
+            source_mask = torch.where(has_candidates[:, None], candidate_mask, fallback_mask)
 
-        selected = []
-        selected_scores = []
-        has_candidates = []
-        all_idx = torch.arange(n_points, device=point_cloud.device)
-        for bidx in range(bsize):
-            candidate_idx = all_idx[candidate_mask[bidx]]
-            if candidate_idx.numel() > 0:
-                source_idx = candidate_idx
-                has_candidates.append(torch.tensor(True, device=point_cloud.device))
-            else:
-                source_idx = all_idx[:1]
-                has_candidates.append(torch.tensor(False, device=point_cloud.device))
-            scores_b = scores[bidx, source_idx]
-            k = min(count, int(source_idx.numel()))
-            local_idx = torch.topk(scores_b, k=k, dim=0, largest=largest).indices
-            idx = source_idx[local_idx]
-            if count > k:
-                repeats = math.ceil(count / k)
-                idx = idx.repeat(repeats)[:count]
-            selected.append(point_cloud[bidx, idx])
-            selected_scores.append(scores[bidx, idx])
-        selected = torch.stack(selected, dim=0)
-        selected_scores = torch.stack(selected_scores, dim=0)
+        masked_scores = scores.masked_fill(~source_mask, -torch.inf if largest else torch.inf)
+        topk_count = min(count, n_points)
+        top_indices = torch.topk(masked_scores, k=topk_count, dim=1, largest=largest).indices
+        source_count = source_mask.sum(dim=1).clamp_min(1)
+        gather_ranks = torch.arange(count, device=point_cloud.device).unsqueeze(0) % source_count.unsqueeze(1)
+        indices = top_indices.gather(1, gather_ranks)
+
+        selected = point_cloud.gather(1, indices[..., None].expand(bsize, count, channels))
+        selected_scores = scores.gather(1, indices)
         if return_has_candidates:
-            return selected, selected_scores, torch.stack(has_candidates, dim=0)
+            return selected, selected_scores, has_candidates
         return selected, selected_scores
 
     def _target_count(self, n_points: int, ratio: float, minimum: int) -> int:
@@ -1864,6 +1833,7 @@ class VLAFlowMatching(nn.Module):
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
         self.last_objectflow_payload: dict[str, Tensor] | None = None
+        self.last_language_emb: Tensor | None = None
         self.last_body_pose9_prediction: Tensor | None = None
         self.worldflow_head = (
             DenseRigidObjectFlowHead(config, self.vlm_with_expert.config.text_config.hidden_size)
@@ -1975,6 +1945,7 @@ class VLAFlowMatching(nn.Module):
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
         self.last_objectflow_payload = None
+        self.last_language_emb = None
         embs = []
         pad_masks = []
         att_masks = []
@@ -2067,6 +2038,7 @@ class VLAFlowMatching(nn.Module):
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        self.last_language_emb = lang_emb
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
         num_lang_embs = lang_emb.shape[1]
@@ -2155,6 +2127,7 @@ class VLAFlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         actions_is_pad: Tensor | None = None,
+        cached_lang_emb: Tensor | None = None,
     ) -> dict[str, Tensor] | None:
         self.last_worldflow_metrics = {}
         if self.worldflow_head is None:
@@ -2215,8 +2188,11 @@ class VLAFlowMatching(nn.Module):
         if step_is_pad.shape != target_poses.shape[:2]:
             raise ValueError(f"Expected worldflow.step_is_pad shape {target_poses.shape[:2]}, got {step_is_pad.shape}.")
 
-        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+        if torch.is_tensor(cached_lang_emb) and cached_lang_emb.shape[:2] == lang_masks.shape:
+            lang_emb = cached_lang_emb.to(device=point_cloud_world.device)
+        else:
+            lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
         current = pose9_to_matrix(current_pose)
         target = pose9_to_matrix(target_poses)
         current_inv = invert_transform(current)
