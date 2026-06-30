@@ -35,16 +35,17 @@ def test_se3_relative_update_recovers_target():
 
 def test_weighted_kabsch_recovers_spatial_transform():
     torch.manual_seed(13)
-    source = torch.randn(2, 4, 12, 3)
+    source = torch.randn(2, 12, 3)
     transform = se3_exp(torch.randn(2, 4, 6) * 0.15)
     target = (
-        source @ transform[..., :3, :3].transpose(-1, -2)
-        + transform[..., :3, 3].unsqueeze(-2)
+        torch.einsum("btij,bnj->btni", transform[..., :3, :3], source)
+        + transform[..., :3, 3].unsqueeze(2)
     )
-    weights = torch.ones(2, 4, 12)
+    weights = torch.ones(2, 12)
 
-    recovered = weighted_kabsch_transform(source, target, weights)
+    recovered, valid = weighted_kabsch_transform(source, target, weights)
 
+    assert bool(valid.all())
     assert torch.allclose(recovered[..., :3, 3], transform[..., :3, 3], atol=2e-4, rtol=2e-4)
     assert torch.allclose(recovered[..., :3, :3], transform[..., :3, :3], atol=2e-4, rtol=2e-4)
 

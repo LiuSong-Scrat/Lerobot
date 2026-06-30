@@ -1333,160 +1333,121 @@ def select_objectflow_points(
     bsize, n_points, channels = point_cloud.shape
     if n_points <= 0:
         raise ValueError("Cannot select ObjectFlow points from an empty point cloud.")
-    max_points = max(1, min(int(max_points), int(n_points)))
     if point_is_pad is None:
-        valid = torch.ones(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
+        point_is_pad = torch.zeros(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
     else:
-        valid = ~point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
-        if valid.shape != point_cloud.shape[:2]:
+        point_is_pad = point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
+        if point_is_pad.shape != point_cloud.shape[:2]:
             raise ValueError(f"Expected point_is_pad shape {point_cloud.shape[:2]}, got {point_is_pad.shape}.")
-    finite = torch.isfinite(point_cloud[..., :3]).all(dim=-1)
-    valid = valid & finite
+    point_is_pad = point_is_pad | ~torch.isfinite(point_cloud[..., :3]).all(dim=-1)
 
-    roles = role_scores.to(device=point_cloud.device, dtype=torch.float32).clamp(0.0, 1.0)
-    nongripper = (1.0 - roles[..., 0]).clamp_min(0.0)
-    condition_score = roles[..., 1] * nongripper
-    target_score = roles[..., 2] * nongripper
-    union_score = torch.maximum(condition_score, target_score)
+    roles = role_scores[..., :3].to(device=point_cloud.device, dtype=torch.float32).clamp(0.0, 1.0)
+    max_points = int(max_points)
+    if max_points <= 0 or n_points <= max_points:
+        return point_cloud.to(dtype=torch.float32), roles, point_is_pad
+    max_points = min(max_points, n_points)
 
-    out_pc = point_cloud.new_zeros((bsize, max_points, channels), dtype=torch.float32)
-    out_roles = roles.new_zeros((bsize, max_points, roles.shape[-1]))
-    out_is_pad = torch.ones(bsize, max_points, dtype=torch.bool, device=point_cloud.device)
-    all_indices = torch.arange(n_points, device=point_cloud.device)
-    condition_budget = (max_points + 1) // 2
-    target_budget = max_points // 2
+    nongripper = (1.0 - roles[..., 0]).clamp(0.0, 1.0)
+    condition_scores = (roles[..., 1] * nongripper).masked_fill(point_is_pad, -torch.inf)
+    target_scores = (roles[..., 2] * nongripper).masked_fill(point_is_pad, -torch.inf)
 
-    for bidx in range(bsize):
-        valid_idx = all_indices[valid[bidx]]
-        if valid_idx.numel() == 0:
-            continue
-        sample_budget = min(max_points, int(valid_idx.numel()))
+    condition_count = max(1, max_points // 2)
+    target_count = max_points - condition_count
+    condition_indices = torch.topk(condition_scores, k=condition_count, dim=1).indices
+    if target_count > 0:
+        target_scores = target_scores.scatter(1, condition_indices, -torch.inf)
+        target_indices = torch.topk(target_scores, k=target_count, dim=1).indices
+        indices = torch.cat([condition_indices, target_indices], dim=1)
+    else:
+        indices = condition_indices
 
-        chosen_parts = []
-        for score, budget in (
-            (condition_score[bidx], condition_budget),
-            (target_score[bidx], target_budget),
-        ):
-            if budget <= 0:
-                continue
-            source_score = score[valid_idx]
-            k = min(int(budget), int(valid_idx.numel()))
-            chosen_parts.append(valid_idx[torch.topk(source_score, k=k, largest=True).indices])
-
-        if chosen_parts:
-            chosen = torch.unique(torch.cat(chosen_parts, dim=0))
-        else:
-            chosen = valid_idx[:0]
-
-        if chosen.numel() < sample_budget:
-            fill_score = union_score[bidx, valid_idx]
-            fill_idx = valid_idx[torch.topk(fill_score, k=sample_budget, largest=True).indices]
-            chosen = torch.unique(torch.cat([chosen, fill_idx], dim=0))
-        if chosen.numel() < sample_budget:
-            chosen = valid_idx[:sample_budget]
-        else:
-            chosen = chosen[:sample_budget]
-
-        out_pc[bidx, : chosen.numel()] = point_cloud[bidx, chosen].to(dtype=torch.float32)
-        out_roles[bidx, : chosen.numel()] = roles[bidx, chosen]
-        out_is_pad[bidx, : chosen.numel()] = False
-
-    return out_pc, out_roles, out_is_pad
+    point_cloud = point_cloud.to(dtype=torch.float32).gather(
+        1, indices[..., None].expand(bsize, indices.shape[1], channels)
+    )
+    roles = roles.gather(1, indices[..., None].expand(bsize, indices.shape[1], roles.shape[-1]))
+    point_is_pad = point_is_pad.gather(1, indices)
+    return point_cloud, roles, point_is_pad
 
 
-def weighted_kabsch_transform(source_xyz: Tensor, target_xyz: Tensor, weights: Tensor, eps: float = 1e-6) -> Tensor:
-    """Fit source->target rigid transforms with row-vector point convention."""
+def weighted_kabsch_transform(
+    source_xyz: Tensor,
+    target_xyz: Tensor,
+    weights: Tensor,
+    *,
+    eps: float = 1e-6,
+) -> tuple[Tensor, Tensor]:
+    """Fit source->target rigid transforms with one batched SVD.
 
-    if source_xyz.shape != target_xyz.shape or source_xyz.shape[-1] != 3:
-        raise ValueError(f"Expected matching (...,N,3) xyz tensors, got {source_xyz.shape} and {target_xyz.shape}.")
-    if weights.shape != source_xyz.shape[:-1]:
-        raise ValueError(f"Expected weights shape {source_xyz.shape[:-1]}, got {weights.shape}.")
+    Shapes are source_xyz=(B,N,3), target_xyz=(B,T,N,3), weights=(B,N).
+    Returns transform=(B,T,4,4) and a valid mask (B,T).
+    """
 
-    source = source_xyz.to(dtype=torch.float32)
-    target = target_xyz.to(device=source.device, dtype=torch.float32)
-    weights = weights.to(device=source.device, dtype=torch.float32).clamp_min(0.0)
-    leading = source.shape[:-2]
-    n_points = source.shape[-2]
-    flat_source = source.reshape(-1, n_points, 3)
-    flat_target = target.reshape(-1, n_points, 3)
-    flat_weights = weights.reshape(-1, n_points)
+    if source_xyz.ndim != 3 or source_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected source_xyz shape (B,N,3), got {source_xyz.shape}.")
+    if target_xyz.ndim != 4 or target_xyz.shape[-2:] != source_xyz.shape[-2:]:
+        raise ValueError(
+            f"Expected target_xyz shape (B,T,N,3) matching source {source_xyz.shape}, got {target_xyz.shape}."
+        )
+    if weights.shape != source_xyz.shape[:2]:
+        raise ValueError(f"Expected weights shape {source_xyz.shape[:2]}, got {weights.shape}.")
 
-    transforms = []
-    eye4 = torch.eye(4, device=source.device, dtype=torch.float32)
-    for src, tgt, w in zip(flat_source, flat_target, flat_weights, strict=True):
-        finite = torch.isfinite(src).all(dim=-1) & torch.isfinite(tgt).all(dim=-1) & torch.isfinite(w)
-        w = torch.where(finite, w, torch.zeros_like(w))
-        denom = w.sum()
-        if float(denom.detach().cpu()) <= eps or int((w > 0).sum().item()) < 3:
-            transforms.append(eye4.clone())
-            continue
-        w_norm = w / denom.clamp_min(eps)
-        src_center = (src * w_norm[:, None]).sum(dim=0)
-        tgt_center = (tgt * w_norm[:, None]).sum(dim=0)
-        src_centered = src - src_center
-        tgt_centered = tgt - tgt_center
-        cov = src_centered.transpose(0, 1) @ (tgt_centered * w_norm[:, None])
-        if not bool(torch.isfinite(cov).all().item()):
-            transforms.append(eye4.clone())
-            continue
-        try:
-            u, _s, vh = torch.linalg.svd(cov, full_matrices=False)
-        except RuntimeError:
-            transforms.append(eye4.clone())
-            continue
-        v = vh.transpose(-1, -2)
-        det = torch.linalg.det(v @ u.transpose(-1, -2))
-        d = torch.diag(torch.stack([det.new_ones(()), det.new_ones(()), torch.where(det < 0, -det.new_ones(()), det.new_ones(()))]))
-        rot = v @ d @ u.transpose(-1, -2)
-        if not bool(torch.isfinite(rot).all().item()):
-            transforms.append(eye4.clone())
-            continue
-        trans = tgt_center - src_center @ rot.transpose(0, 1)
-        transform = eye4.clone()
-        transform[:3, :3] = rot
-        transform[:3, 3] = trans
-        transforms.append(transform)
+    source_xyz = source_xyz.to(dtype=torch.float32)
+    target_xyz = target_xyz.to(device=source_xyz.device, dtype=torch.float32)
+    weights = weights.to(device=source_xyz.device, dtype=torch.float32).clamp_min(0.0)
+    finite = torch.isfinite(source_xyz).all(dim=-1) & torch.isfinite(weights)
+    weights = torch.where(finite, weights, torch.zeros_like(weights))
+    weight_sum = weights.sum(dim=-1, keepdim=True)
+    normalized = weights / weight_sum.clamp_min(eps)
+    source_center = (source_xyz * normalized.unsqueeze(-1)).sum(dim=1)
+    target_center = (target_xyz * normalized[:, None, :, None]).sum(dim=2)
+    source_centered = source_xyz - source_center[:, None, :]
+    target_centered = target_xyz - target_center[:, :, None, :]
+    covariance = torch.einsum("bn,bni,btnj->btij", normalized, source_centered, target_centered)
 
-    return torch.stack(transforms, dim=0).reshape(*leading, 4, 4)
+    u, singular_values, vh = torch.linalg.svd(covariance, full_matrices=False)
+    rotation = vh.transpose(-1, -2) @ u.transpose(-1, -2)
+    reflection = torch.linalg.det(rotation) < 0
+    correction = torch.ones(*rotation.shape[:-2], 3, device=rotation.device, dtype=rotation.dtype)
+    correction[..., -1] = torch.where(reflection, -torch.ones_like(correction[..., -1]), correction[..., -1])
+    rotation = vh.transpose(-1, -2) @ torch.diag_embed(correction) @ u.transpose(-1, -2)
+    translation = target_center - (rotation @ source_center[:, None, :, None]).squeeze(-1)
+
+    transform = _eye4_like(rotation.shape[:-2], device=rotation.device, dtype=rotation.dtype)
+    transform[..., :3, :3] = rotation
+    transform[..., :3, 3] = translation
+    active_points = (weights > eps).sum(dim=-1)
+    finite_transform = torch.isfinite(transform).flatten(2).all(dim=-1) & torch.isfinite(singular_values).all(dim=-1)
+    valid = (weight_sum.squeeze(-1) > eps)[:, None] & (active_points >= 3)[:, None] & finite_transform
+    identity = _eye4_like(transform.shape[:-2], device=transform.device, dtype=transform.dtype)
+    transform = torch.where(valid[..., None, None], transform, identity)
+    return transform, valid
 
 
 class DenseRigidObjectFlowHead(nn.Module):
     """Dense automatic ObjectFlow head over the fixed Overview/world point cloud."""
+
+    ROLE_DIM = 3
 
     def __init__(self, config: SmolVLAConfig, language_dim: int):
         super().__init__()
         self.chunk_size = int(config.chunk_size)
         self.feature_dim = int(config.worldflow_feature_dim)
         self.point_encoder = nn.Sequential(
-            nn.Linear(9, self.feature_dim),
+            nn.Linear(6 + self.ROLE_DIM, self.feature_dim),
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
             nn.GELU(),
         )
         self.lang_proj = nn.Linear(language_dim, self.feature_dim)
-        self.global_fusion = nn.Sequential(
-            nn.Linear(self.feature_dim * 3, self.feature_dim),
+        self.context_fusion = nn.Sequential(
+            nn.Linear(self.feature_dim * 4, self.feature_dim),
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
-        )
-        self.time_embedding = nn.Embedding(self.chunk_size, self.feature_dim)
-        self.flow_head = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
             nn.GELU(),
-            nn.Linear(self.feature_dim, 3),
         )
-        final = self.flow_head[-1]
-        if isinstance(final, nn.Linear):
-            nn.init.zeros_(final.weight)
-            nn.init.zeros_(final.bias)
-
-    @staticmethod
-    def _weighted_pool(feat: Tensor, weights: Tensor, point_is_pad: Tensor | None) -> Tensor:
-        weights = weights.to(device=feat.device, dtype=feat.dtype).clamp_min(0.0)
-        if point_is_pad is not None:
-            weights = torch.where(point_is_pad.to(device=feat.device, dtype=torch.bool), torch.zeros_like(weights), weights)
-        denom = weights.sum(dim=1, keepdim=True).clamp_min(torch.finfo(feat.dtype).tiny)
-        return (feat * weights.unsqueeze(-1)).sum(dim=1) / denom
+        self.flow_head = nn.Linear(self.feature_dim, self.chunk_size * 3)
+        nn.init.zeros_(self.flow_head.weight)
+        nn.init.zeros_(self.flow_head.bias)
 
     def forward(
         self,
@@ -1498,33 +1459,37 @@ class DenseRigidObjectFlowHead(nn.Module):
     ) -> Tensor:
         if point_cloud_world.ndim != 3 or point_cloud_world.shape[-1] != 6:
             raise ValueError(f"Expected point_cloud_world shape (B,N,6), got {point_cloud_world.shape}.")
-        roles = role_scores.to(device=point_cloud_world.device, dtype=torch.float32).clamp(0.0, 1.0)
-        if roles.shape[:2] != point_cloud_world.shape[:2] or roles.shape[-1] < 3:
-            raise ValueError(f"Expected role_scores shape (B,N,>=3), got {roles.shape}.")
+        if role_scores.shape != (*point_cloud_world.shape[:2], self.ROLE_DIM):
+            raise ValueError(
+                f"Expected automatic role_scores shape {(*point_cloud_world.shape[:2], self.ROLE_DIM)}, "
+                f"got {role_scores.shape}."
+            )
+        point_cloud_world = point_cloud_world.to(dtype=torch.float32)
+        role_scores = role_scores.to(device=point_cloud_world.device, dtype=torch.float32).clamp(0.0, 1.0)
+        rgb = point_cloud_world[..., 3:6] / 255.0
+        point_inputs = torch.cat([point_cloud_world[..., :3], rgb, role_scores], dim=-1)
+        point_feat = self.point_encoder(point_inputs)
         if point_is_pad is not None:
             point_is_pad = point_is_pad.to(device=point_cloud_world.device, dtype=torch.bool)
 
-        point_input = point_cloud_world.to(dtype=torch.float32).clone()
-        point_input[..., 3:6] = point_input[..., 3:6] / 255.0
-        point_input = torch.cat([point_input[..., :6], roles[..., :3]], dim=-1)
-        point_feat = self.point_encoder(point_input)
+        nongripper = (1.0 - role_scores[..., 0]).clamp(0.0, 1.0)
         if point_is_pad is not None:
-            point_feat = point_feat * (~point_is_pad).unsqueeze(-1).to(dtype=point_feat.dtype)
-
-        nongripper = (1.0 - roles[..., 0]).clamp_min(0.0)
-        condition_feat = self._weighted_pool(point_feat, roles[..., 1] * nongripper, point_is_pad)
-        target_feat = self._weighted_pool(point_feat, roles[..., 2] * nongripper, point_is_pad)
+            nongripper = nongripper * (~point_is_pad).to(dtype=nongripper.dtype)
+        condition_weights = nongripper * role_scores[..., 1]
+        target_weights = nongripper * role_scores[..., 2]
+        condition_feat = (point_feat * condition_weights.unsqueeze(-1)).sum(dim=1) / condition_weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-6)
+        target_feat = (point_feat * target_weights.unsqueeze(-1)).sum(dim=1) / target_weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-6)
         lang_feat = self.lang_proj(_masked_language_mean(lang_emb, lang_masks).to(dtype=point_feat.dtype))
-        global_context = self.global_fusion(torch.cat([condition_feat, target_feat, lang_feat], dim=-1))
-
-        flows = []
-        for step_idx in range(self.chunk_size):
-            step_context = global_context[:, None, :] + self.time_embedding.weight[step_idx][None, None, :]
-            flow = self.flow_head(point_feat + step_context)
-            if point_is_pad is not None:
-                flow = flow * (~point_is_pad).unsqueeze(-1).to(dtype=flow.dtype)
-            flows.append(flow)
-        return torch.stack(flows, dim=1)
+        global_context = torch.cat([condition_feat, target_feat, lang_feat], dim=-1).unsqueeze(1).expand(
+            -1, point_feat.shape[1], -1
+        )
+        fused = self.context_fusion(torch.cat([point_feat, global_context], dim=-1))
+        flow = self.flow_head(fused).reshape(point_feat.shape[0], point_feat.shape[1], self.chunk_size, 3)
+        return flow.permute(0, 2, 1, 3).contiguous()
 
 
 class SongPointCloudConditioner(nn.Module):
@@ -2217,14 +2182,28 @@ class VLAFlowMatching(nn.Module):
             )
         point_cloud_ego = payload["point_cloud_ego"].to(dtype=torch.float32)
         role_scores = payload["role_scores"].to(device=point_cloud_ego.device, dtype=torch.float32)
+        if role_scores.shape[:2] != point_cloud_ego.shape[:2] or role_scores.shape[-1] < DenseRigidObjectFlowHead.ROLE_DIM:
+            raise ValueError(
+                f"Expected pointseg.role_scores shape (B,N,>={DenseRigidObjectFlowHead.ROLE_DIM}) matching "
+                f"{point_cloud_ego.shape[:2]}, got {role_scores.shape}."
+            )
+        role_scores = role_scores[..., : DenseRigidObjectFlowHead.ROLE_DIM]
         point_is_pad = payload.get("point_is_pad")
         if torch.is_tensor(point_is_pad):
             point_is_pad = point_is_pad.to(device=point_cloud_ego.device, dtype=torch.bool)
-        point_cloud_ego = point_cloud_ego.to(dtype=torch.float32)
+        else:
+            point_is_pad = torch.zeros(point_cloud_ego.shape[:2], device=point_cloud_ego.device, dtype=torch.bool)
+        point_cloud_ego, role_scores, point_is_pad = select_objectflow_points(
+            point_cloud_ego,
+            role_scores,
+            point_is_pad,
+            max_points=int(self.config.worldflow_max_points),
+        )
         current_pose = batch["worldflow.current_ee_pose"].to(device=point_cloud_ego.device, dtype=torch.float32)
+        point_cloud_world = _ego_point_cloud_to_world(point_cloud_ego, current_pose)
 
-        target_poses = batch["worldflow.ee_poses"].to(device=point_cloud_ego.device, dtype=torch.float32)
-        step_is_pad = batch["worldflow.step_is_pad"].to(device=point_cloud_ego.device, dtype=torch.bool)
+        target_poses = batch["worldflow.ee_poses"].to(device=point_cloud_world.device, dtype=torch.float32)
+        step_is_pad = batch["worldflow.step_is_pad"].to(device=point_cloud_world.device, dtype=torch.bool)
         if target_poses.ndim != 3 or target_poses.shape[-1] != 9:
             raise ValueError(f"Expected worldflow.ee_poses shape (B,T,9), got {target_poses.shape}.")
         if current_pose.ndim != 2 or current_pose.shape[-1] != 9:
@@ -2241,6 +2220,7 @@ class VLAFlowMatching(nn.Module):
         current = pose9_to_matrix(current_pose)
         target = pose9_to_matrix(target_poses)
         current_inv = invert_transform(current)
+        spatial_gt = target @ current_inv.unsqueeze(1)
 
         valid = ~step_is_pad
         if torch.is_tensor(actions_is_pad):
@@ -2248,71 +2228,90 @@ class VLAFlowMatching(nn.Module):
             if action_pad.shape[1] != valid.shape[1]:
                 raise ValueError(f"Expected actions_id_pad shape {valid.shape}, got {action_pad.shape}.")
             valid = valid & ~action_pad
+
+        pred_flow = self.worldflow_head(point_cloud_world, role_scores, lang_emb, lang_masks, point_is_pad)
+        world_xyz = point_cloud_world[..., :3].to(dtype=torch.float32)
+        gt_target_xyz = torch.einsum("btij,bnj->btni", spatial_gt[..., :3, :3], world_xyz)
+        gt_target_xyz = gt_target_xyz + spatial_gt[..., :3, 3].unsqueeze(2)
+        gt_flow = gt_target_xyz - world_xyz.unsqueeze(1)
+
+        # role_scores[..., 1] is generated from temporal held/static residuals and
+        # represents the manipulated/transported object. It explicitly suppresses
+        # role_scores[..., 0], the automatically detected virtual-gripper region.
+        transport_weights = role_scores[..., 1].clamp(0.0, 1.0)
+        transport_weights = transport_weights * (~point_is_pad).to(dtype=transport_weights.dtype)
+        active_transport = (
+            transport_weights >= float(self.config.worldflow_transport_score_threshold)
+        ).sum(dim=1)
+        has_transport = active_transport >= int(self.config.worldflow_min_transport_points)
+
+        # Kabsch supplies the analytic rigid carrier, but SVD gradients are
+        # intentionally avoided: repeated singular values are common for
+        # symmetric objects. Gradients flow through the dense flow losses below.
+        with torch.no_grad():
+            pred_spatial, rigid_valid = weighted_kabsch_transform(
+                world_xyz,
+                world_xyz.unsqueeze(1) + pred_flow.detach(),
+                transport_weights,
+            )
+        pred_body_from_object = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
+
+        valid = valid & has_transport.unsqueeze(1) & rigid_valid
         valid_count = valid.sum(dim=1).clamp_min(1)
 
-        point_cloud_world_full = _ego_point_cloud_to_world(point_cloud_ego, current_pose)
-        object_pc, object_roles, object_is_pad = select_objectflow_points(
-            point_cloud_world_full,
-            role_scores,
-            point_is_pad,
-            max_points=int(self.config.worldflow_max_points),
-        )
-        source_xyz = object_pc[..., :3].to(dtype=torch.float32)
-        valid_points = ~object_is_pad
-        nongripper = (1.0 - object_roles[..., 0]).clamp_min(0.0)
-        transport_scores = object_roles[..., 1] * nongripper
-        transport_weights = _ensure_min_transport_weights(
-            transport_scores,
-            valid_points,
-            min_points=int(self.config.worldflow_min_transport_points),
-            threshold=float(self.config.worldflow_transport_score_threshold),
-        )
+        point_flow_error = F.smooth_l1_loss(pred_flow, gt_flow, reduction="none").mean(dim=-1)
+        weight_denom = transport_weights.sum(dim=1).clamp_min(1e-6)
+        flow_step = (
+            point_flow_error * transport_weights.unsqueeze(1)
+        ).sum(dim=-1) / weight_denom.unsqueeze(1)
 
-        spatial_gt = target @ current_inv.unsqueeze(1)
-        source_time = source_xyz.unsqueeze(1).expand(-1, self.config.chunk_size, -1, -1)
-        gt_target_xyz = _transform_xyz(source_time, spatial_gt)
-        gt_flow = gt_target_xyz - source_time
-
-        pred_flow = self.worldflow_head(object_pc, object_roles, lang_emb, lang_masks, object_is_pad)
-        step_weights = transport_weights.unsqueeze(1).expand_as(gt_flow[..., 0])
-        step_weights = step_weights * valid.to(dtype=step_weights.dtype).unsqueeze(-1)
-        flow_error = F.smooth_l1_loss(pred_flow, gt_flow, reduction="none").sum(dim=-1)
-        flow_step = (flow_error * step_weights).sum(dim=-1) / step_weights.sum(dim=-1).clamp_min(1e-6)
-
-        with torch.no_grad():
-            pred_spatial = weighted_kabsch_transform(source_time, source_time + pred_flow, step_weights)
-        rigid_flow = _transform_xyz(source_time, pred_spatial) - source_time
-        rigid_error = F.smooth_l1_loss(pred_flow, rigid_flow.detach(), reduction="none").sum(dim=-1)
-        rigid_step = (rigid_error * step_weights).sum(dim=-1) / step_weights.sum(dim=-1).clamp_min(1e-6)
+        fitted_target_xyz = torch.einsum("btij,bnj->btni", pred_spatial[..., :3, :3], world_xyz)
+        fitted_target_xyz = fitted_target_xyz + pred_spatial[..., :3, 3].unsqueeze(2)
+        rigid_point_error = F.smooth_l1_loss(
+            world_xyz.unsqueeze(1) + pred_flow,
+            fitted_target_xyz.detach(),
+            reduction="none",
+        ).mean(dim=-1)
+        rigid_step = (
+            rigid_point_error * transport_weights.unsqueeze(1)
+        ).sum(dim=-1) / weight_denom.unsqueeze(1)
+        rigid_rot = _rotation_geodesic(pred_spatial[..., :3, :3], spatial_gt[..., :3, :3])
 
         body_pose9 = self.last_body_pose9_prediction
-        if torch.is_tensor(body_pose9) and body_pose9.shape[:2] == target_poses.shape[:2] and body_pose9.shape[-1] >= 9:
-            pred_body = pose9_to_matrix(body_pose9[..., :9].to(device=point_cloud_ego.device, dtype=torch.float32))
-            object_body = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
-            bridge_step = se3_geodesic_loss(
-                pred_body,
-                object_body.detach(),
-                trans_weight=float(self.config.worldflow_trans_weight),
-                rot_weight=float(self.config.worldflow_rot_weight),
-            )
-        else:
-            bridge_step = torch.zeros_like(flow_step)
+        bridge_step = torch.zeros_like(rigid_step)
+        if torch.is_tensor(body_pose9):
+            body_pose9 = body_pose9.to(device=point_cloud_world.device, dtype=torch.float32)
+            if body_pose9.shape[:2] != target_poses.shape[:2] or body_pose9.shape[-1] < 9:
+                raise ValueError(
+                    f"Expected Ego body prediction shape (B,T,>=9) matching {target_poses.shape[:2]}, "
+                    f"got {body_pose9.shape}."
+                )
+            pred_body = pose9_to_matrix(body_pose9[..., :9])
+            pred_body_spatial = current.unsqueeze(1) @ pred_body @ current_inv.unsqueeze(1)
+            body_target_xyz = torch.einsum("btij,bnj->btni", pred_body_spatial[..., :3, :3], world_xyz)
+            body_target_xyz = body_target_xyz + pred_body_spatial[..., :3, 3].unsqueeze(2)
+            body_flow = body_target_xyz - world_xyz.unsqueeze(1)
+            bridge_error = F.smooth_l1_loss(pred_flow, body_flow, reduction="none").mean(dim=-1)
+            bridge_step = (
+                bridge_error * transport_weights.unsqueeze(1)
+            ).sum(dim=-1) / weight_denom.unsqueeze(1)
 
-        equiv_step = torch.zeros_like(flow_step)
+        equiv_step = torch.zeros_like(rigid_step)
         if self.config.worldflow_equiv_loss_weight > 0:
             transform = _sample_random_se3(
-                object_pc.shape[0],
-                object_pc.device,
-                object_pc.dtype,
+                point_cloud_world.shape[0],
+                point_cloud_world.device,
+                point_cloud_world.dtype,
                 trans_scale=0.20,
                 rot_scale=0.75,
             )
-            object_pc_aug = _transform_point_cloud_xyzrgb(object_pc, transform)
-            pred_flow_aug = self.worldflow_head(object_pc_aug, object_roles, lang_emb, lang_masks, object_is_pad)
-            expected_endpoint_aug = _transform_xyz(source_time + pred_flow.detach(), transform.unsqueeze(1))
-            expected_flow_aug = expected_endpoint_aug - object_pc_aug[..., :3].unsqueeze(1)
-            equiv_error = F.smooth_l1_loss(pred_flow_aug, expected_flow_aug, reduction="none").sum(dim=-1)
-            equiv_step = (equiv_error * step_weights).sum(dim=-1) / step_weights.sum(dim=-1).clamp_min(1e-6)
+            point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud_world, transform)
+            pred_aug_flow = self.worldflow_head(point_cloud_aug, role_scores, lang_emb, lang_masks, point_is_pad)
+            expected_aug_flow = torch.einsum("bij,btnj->btni", transform[..., :3, :3], pred_flow.detach())
+            equiv_error = F.smooth_l1_loss(pred_aug_flow, expected_aug_flow, reduction="none").mean(dim=-1)
+            equiv_step = (
+                equiv_error * transport_weights.unsqueeze(1)
+            ).sum(dim=-1) / weight_denom.unsqueeze(1)
 
         per_sample_flow = _masked_step_mean(flow_step, valid)
         per_sample_rigid = _masked_step_mean(rigid_step, valid)
@@ -2334,12 +2333,11 @@ class VLAFlowMatching(nn.Module):
         trans_err = (
             torch.linalg.norm(pred_spatial[..., :3, 3] - spatial_gt[..., :3, 3], dim=-1) * valid_f
         ).sum() / valid_denom
-        rot_step = _rotation_geodesic(pred_spatial[..., :3, :3], spatial_gt[..., :3, :3])
-        rot_err = (rot_step * valid_f).sum() / valid_denom
-        valid_point_ratio = valid_points.to(dtype=pred_flow.dtype).mean()
+        rot_err = (rigid_rot * valid_f).sum() / valid_denom
         transport_point_ratio = (
-            ((transport_weights > 0) & valid_points).to(dtype=pred_flow.dtype).sum()
-            / valid_points.to(dtype=pred_flow.dtype).sum().clamp_min(1.0)
+            (transport_weights >= float(self.config.worldflow_transport_score_threshold))
+            .to(dtype=pred_flow.dtype)
+            .mean()
         )
         self.last_worldflow_metrics = {
             "loss_worldflow_flow": loss_flow.detach(),
@@ -2349,7 +2347,6 @@ class VLAFlowMatching(nn.Module):
             "worldflow_trans_err": trans_err.detach(),
             "worldflow_rot_err_deg": torch.rad2deg(rot_err.detach()),
             "worldflow_valid_ratio": valid_f.mean().detach(),
-            "worldflow_object_point_ratio": valid_point_ratio.detach(),
             "worldflow_transport_point_ratio": transport_point_ratio.detach(),
         }
         return {
@@ -2360,6 +2357,9 @@ class VLAFlowMatching(nn.Module):
             "per_sample_loss": per_sample_total,
             "valid_counts": valid_count,
             "pred_spatial": pred_spatial,
+            "pred_spatial_pose9": matrix_to_pose9(pred_spatial),
+            "pred_body_pose9": matrix_to_pose9(pred_body_from_object),
+            "pred_flow": pred_flow,
         }
 
     def forward_se3(
