@@ -52,7 +52,7 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
     from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
-    from benchmarks.song_real_libero.scripts.libero_setting.libero_hdf5_to_dataset import (
+    from libero_setting.libero_hdf5_to_dataset import (
         append_video_frames,
         export_episode_videos,
         resolve_suite_names,

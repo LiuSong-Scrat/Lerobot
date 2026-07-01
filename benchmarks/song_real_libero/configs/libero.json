@@ -1,5 +1,5 @@
 {
-  "policy_path": "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/ep_vla/checkpoints/last/pretrained_model",
+  "policy_path": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model",
   "policy_repo_id": "/home/liusong/scp_receive/smolvla",
   "vlm_model": "/home/liusong/SmolVLM2-500M-Video-Instruct",
   "output_dir": "outputs/libero_setting/eval",
@@ -121,7 +121,7 @@
   },
   "keyboard_vis": true,
   "keyboard_vis_mode": "ply",
-  "render_mode": "offscreen",
+  "render_mode": "viewer3d",
   "render_camera": "agentview",
   "render_every_n_steps": 1,
   "render_gpu_device_id": -1,

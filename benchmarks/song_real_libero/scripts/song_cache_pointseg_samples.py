@@ -231,16 +231,154 @@ def _episode_preview_targets(
         if episode_length <= 0:
             continue
 
+        max_frame_index = episode_length - 1
         frame_targets = (
-            ("first", 0),
-            ("middle", (episode_length - 1) // 2),
-            ("last", episode_length - 1),
+            ("p25", min(max_frame_index, int(episode_length * 0.25))),
+            ("p50", min(max_frame_index, int(episode_length * 0.50))),
+            ("p75", min(max_frame_index, int(episode_length * 0.75))),
         )
         for position, frame_index in frame_targets:
             dataset_index = start_index + frame_index
             if 0 <= dataset_index < total_samples:
                 targets.setdefault(dataset_index, []).append((episode_index, position, frame_index))
     return targets
+
+
+def _preview_time_gradient(num_steps: int) -> np.ndarray:
+    if num_steps <= 1:
+        return np.array([[0.1, 0.75, 0.25]], dtype=np.float64)
+    t = np.linspace(0.0, 1.0, num_steps, dtype=np.float64)[:, None]
+    start = np.array([0.05, 0.55, 1.0], dtype=np.float64)
+    middle = np.array([0.10, 0.85, 0.25], dtype=np.float64)
+    end = np.array([1.0, 0.18, 0.05], dtype=np.float64)
+    first_half = (1.0 - 2.0 * t) * start + (2.0 * t) * middle
+    second_half = (2.0 - 2.0 * t) * middle + (2.0 * t - 1.0) * end
+    return np.where(t <= 0.5, first_half, second_half).clip(0.0, 1.0)
+
+
+def _preview_rot6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    d6 = d6.to(dtype=torch.float32)
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = torch.nn.functional.normalize(a1, dim=-1, eps=1e-6)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = torch.nn.functional.normalize(b2, dim=-1, eps=1e-6)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _preview_relative_ee_positions(pose9: torch.Tensor) -> np.ndarray:
+    pose_np = pose9.detach().cpu().to(dtype=torch.float32).numpy()
+    if pose_np.ndim != 2 or pose_np.shape[-1] < 9:
+        return np.zeros((0, 3), dtype=np.float32)
+    finite = np.isfinite(pose_np[:, :9]).all(axis=1)
+    pose_np = pose_np[finite]
+    if pose_np.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    rotmats = _preview_rot6d_to_matrix(torch.from_numpy(pose_np[:, 3:9])).cpu().numpy()
+    transforms = np.tile(np.eye(4, dtype=np.float32), (pose_np.shape[0], 1, 1))
+    transforms[:, :3, :3] = rotmats
+    transforms[:, :3, 3] = pose_np[:, :3]
+    try:
+        first_inv = np.linalg.inv(transforms[0])
+    except np.linalg.LinAlgError:
+        return transforms[:, :3, 3]
+    return (first_inv[None] @ transforms)[:, :3, 3]
+
+
+def _preview_future_ee_positions(batch: dict[str, torch.Tensor], batch_index: int, horizon: int = 32) -> np.ndarray:
+    action = batch.get("action")
+    if torch.is_tensor(action) and action.ndim >= 3 and action.shape[-1] >= 9:
+        pose9 = action[batch_index, : min(int(horizon), action.shape[1]), :9]
+        positions = _preview_relative_ee_positions(pose9)
+        if positions.shape[0] > 0:
+            return positions
+
+    future_poses = batch.get("future_ee_poses")
+    if not torch.is_tensor(future_poses) or future_poses.ndim < 3 or future_poses.shape[-1] < 9:
+        return np.zeros((0, 3), dtype=np.float32)
+    pose9 = future_poses[batch_index].detach().cpu()
+    future_is_pad = batch.get("future_is_pad")
+    if torch.is_tensor(future_is_pad):
+        valid = ~future_is_pad[batch_index].detach().cpu().bool()
+        pose9 = pose9[valid] if valid.numel() == pose9.shape[0] else pose9
+    pose9 = pose9[: int(horizon), :9].to(dtype=torch.float32)
+    if pose9.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return pose9.numpy()[:, :3]
+
+
+def _write_preview_ply_with_trajectory(
+    path: Path,
+    points_xyzrgb: np.ndarray,
+    labels: np.ndarray,
+    ee_positions: np.ndarray,
+) -> None:
+    from lerobot.policies.smolvla.song_pointseg import ROLE_COLORS, ROLE_FOREGROUND
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    points_xyzrgb = np.asarray(points_xyzrgb, dtype=np.float32)
+    xyz = points_xyzrgb[:, :3]
+    labels = np.asarray(labels, dtype=np.int64)
+
+    if points_xyzrgb.shape[-1] >= 6:
+        point_colors = np.asarray(points_xyzrgb[:, 3:6], dtype=np.float32)
+        finite_colors = point_colors[np.isfinite(point_colors)]
+        if finite_colors.size > 0 and float(finite_colors.max(initial=0.0)) <= 1.0:
+            point_colors = point_colors * 255.0
+        point_colors = np.clip(np.rint(point_colors), 0, 255).astype(np.uint8)
+    else:
+        point_colors = np.full((xyz.shape[0], 3), 128, dtype=np.uint8)
+
+    point_colors[labels == ROLE_FOREGROUND] = ROLE_COLORS[ROLE_FOREGROUND]
+
+    ee_positions = np.asarray(ee_positions, dtype=np.float32)
+    if ee_positions.ndim != 2 or ee_positions.shape[-1] != 3:
+        ee_positions = np.zeros((0, 3), dtype=np.float32)
+    ee_positions = ee_positions[np.isfinite(ee_positions).all(axis=1)]
+    trajectory_colors = np.rint(_preview_time_gradient(ee_positions.shape[0]) * 255.0).astype(np.uint8)
+
+    vertices = np.concatenate([xyz, ee_positions], axis=0)
+    colors = np.concatenate([point_colors, trajectory_colors], axis=0)
+    first_trajectory_vertex = xyz.shape[0]
+    edges = [
+        (
+            first_trajectory_vertex + idx,
+            first_trajectory_vertex + idx + 1,
+            trajectory_colors[idx],
+            trajectory_colors[idx + 1],
+        )
+        for idx in range(ee_positions.shape[0] - 1)
+    ]
+
+    with open(path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {vertices.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write(f"element edge {len(edges)}\n")
+        f.write("property int vertex1\n")
+        f.write("property int vertex2\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for point, color in zip(vertices, colors, strict=False):
+            f.write(
+                f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+        for start, end, start_color, end_color in edges:
+            color = np.rint((start_color.astype(np.float32) + end_color.astype(np.float32)) * 0.5).astype(
+                np.uint8
+            )
+            f.write(f"{start} {end} {int(color[0])} {int(color[1])} {int(color[2])}\n")
 
 
 def _save_episode_preview(
@@ -250,14 +388,16 @@ def _save_episode_preview(
     frame_index: int,
     current_pc: torch.Tensor,
     labels: torch.Tensor,
+    ee_positions: np.ndarray,
 ) -> None:
-    write_role_ply(
+    _write_preview_ply_with_trajectory(
         output_dir
         / "visualizations"
         / f"episode_{episode_index:06d}"
         / f"{position}_frame_{frame_index:06d}_pseudo.ply",
         current_pc.detach().cpu().numpy(),
         labels.detach().cpu().numpy(),
+        ee_positions,
     )
 
 
@@ -532,6 +672,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     )
                     preview_pc = current_pc[batch_index][valid]
                     preview_labels = pseudo["labels"][batch_index][valid]
+                    preview_ee_positions = _preview_future_ee_positions(batch, batch_index)
                     for episode_index, position, frame_index in targets:
                         _save_episode_preview(
                             args.output_dir,
@@ -540,6 +681,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                             frame_index,
                             preview_pc,
                             preview_labels,
+                            preview_ee_positions,
                         )
                         previews_saved += 1
 

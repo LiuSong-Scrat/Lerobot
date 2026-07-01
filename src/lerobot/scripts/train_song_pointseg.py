@@ -39,13 +39,13 @@ from lerobot.utils.random_utils import set_seed
 DEFAULT_DATASET_ROOT = Path(
     os.environ.get(
         "SONG_POINTSEG_DATASET",
-        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
+        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset_5090",
     )
 )
 DEFAULT_OUTPUT_DIR = Path(
     os.environ.get(
         "SONG_POINTSEG_OUTPUT_DIR",
-        "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/song_pointseg",
+        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/song_pointseg",
     )
 )
 import math
@@ -340,8 +340,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-cache-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
-    parser.add_argument("--current-points", type=int, default=50000)
-    parser.add_argument("--future-points", type=int, default=16000)
+    parser.add_argument("--current-points", type=int, default=10000)
+    parser.add_argument("--future-points", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps", type=int, default=5000)
@@ -421,8 +421,140 @@ def save_visualization(
     operation_prob = outputs["operation_prob"][batch_index].detach().cpu().numpy()
     pseudo_labels = pseudo["labels"][batch_index].detach().cpu().numpy()
 
-    write_role_ply(vis_dir / f"step_{step:06d}_pred.ply", current_pc.numpy(), pred_labels, operation_prob)
-    write_role_ply(vis_dir / f"step_{step:06d}_pseudo.ply", current_pc.numpy(), pseudo_labels)
+    def _relative_pose_matrices(pose9: torch.Tensor) -> np.ndarray:
+        pose_np = pose9.detach().cpu().to(dtype=torch.float32).numpy()
+        finite = np.isfinite(pose_np[:, :9]).all(axis=1)
+        pose_np = pose_np[finite]
+        if pose_np.shape[0] == 0:
+            return np.zeros((0, 4, 4), dtype=np.float32)
+
+        rotmats = rot6d_to_matrix(torch.from_numpy(pose_np[:, 3:9])).cpu().numpy()
+        transforms = np.tile(np.eye(4, dtype=np.float32), (pose_np.shape[0], 1, 1))
+        transforms[:, :3, :3] = rotmats
+        transforms[:, :3, 3] = pose_np[:, :3]
+        try:
+            first_inv = np.linalg.inv(transforms[0])
+        except np.linalg.LinAlgError:
+            return transforms
+        return first_inv[None] @ transforms
+
+    def _future_ee_trajectory() -> tuple[np.ndarray, np.ndarray] | None:
+        horizon = 32
+        action = batch.get("action")
+        if torch.is_tensor(action) and action.ndim >= 3 and action.shape[-1] >= 9:
+            pose9 = action[batch_index, : min(horizon, action.shape[1]), :9]
+            transforms = _relative_pose_matrices(pose9)
+            if transforms.shape[0] > 0:
+                return transforms[:, :3, 3], transforms[:, :3, :3]
+
+        future_poses = batch.get("future_ee_poses")
+        if not torch.is_tensor(future_poses) or future_poses.ndim < 3 or future_poses.shape[-1] < 9:
+            return None
+        pose9 = future_poses[batch_index].detach().cpu()
+        future_is_pad = batch.get("future_is_pad")
+        if torch.is_tensor(future_is_pad):
+            valid = ~future_is_pad[batch_index].detach().cpu().bool()
+            pose9 = pose9[valid] if valid.numel() == pose9.shape[0] else pose9
+        pose9 = pose9[:horizon, :9]
+        if pose9.shape[0] == 0:
+            return None
+        pose9 = pose9.to(dtype=torch.float32)
+        positions = pose9.numpy()[:, :3]
+        rotmats = rot6d_to_matrix(pose9[:, 3:9]).cpu().numpy()
+        return positions, rotmats
+
+    def _write_role_ply_with_trajectory(
+        path: Path,
+        points_xyzrgb: np.ndarray,
+        labels: np.ndarray,
+        *,
+        operation_prob: np.ndarray | None = None,
+        trajectory: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        from lerobot.policies.smolvla.song_pointseg import ROLE_COLORS, ROLE_FOREGROUND
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        xyz = np.asarray(points_xyzrgb[:, :3], dtype=np.float32)
+        role_labels = np.asarray(labels, dtype=np.int64)
+        if points_xyzrgb.shape[-1] >= 6:
+            point_colors = np.asarray(points_xyzrgb[:, 3:6], dtype=np.float32)
+            finite_colors = point_colors[np.isfinite(point_colors)]
+            if finite_colors.size > 0 and float(finite_colors.max(initial=0.0)) <= 1.0:
+                point_colors = point_colors * 255.0
+            point_colors = np.clip(np.rint(point_colors), 0, 255).astype(np.uint8)
+        else:
+            point_colors = np.full((xyz.shape[0], 3), 128, dtype=np.uint8)
+
+        foreground_mask = role_labels == ROLE_FOREGROUND
+        point_colors[foreground_mask] = ROLE_COLORS[ROLE_FOREGROUND]
+        if operation_prob is not None:
+            prob = np.asarray(operation_prob, dtype=np.float32)
+            point_colors[foreground_mask] = np.clip(
+                point_colors[foreground_mask].astype(np.float32) * (0.35 + 0.65 * prob[foreground_mask, None]),
+                0,
+                255,
+            ).astype(
+                np.uint8
+            )
+
+        if trajectory is None:
+            traj_positions = np.zeros((0, 3), dtype=np.float32)
+        else:
+            traj_positions, _ = trajectory
+            traj_positions = np.asarray(traj_positions, dtype=np.float32)
+            finite = np.isfinite(traj_positions).all(axis=1)
+            traj_positions = traj_positions[finite]
+
+        traj_colors = np.rint(_time_gradient(traj_positions.shape[0]) * 255.0).astype(np.uint8)
+        vertices = np.concatenate([xyz, traj_positions], axis=0)
+        colors = np.concatenate([point_colors, traj_colors], axis=0)
+        first_traj_vertex = xyz.shape[0]
+        edges = [
+            (first_traj_vertex + idx, first_traj_vertex + idx + 1, traj_colors[idx], traj_colors[idx + 1])
+            for idx in range(traj_positions.shape[0] - 1)
+        ]
+
+        with open(path, "w") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {vertices.shape[0]}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write(f"element edge {len(edges)}\n")
+            f.write("property int vertex1\n")
+            f.write("property int vertex2\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for point, color in zip(vertices, colors, strict=False):
+                f.write(
+                    f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
+                    f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+                )
+            for start, end, start_color, end_color in edges:
+                color = np.rint((start_color.astype(np.float32) + end_color.astype(np.float32)) * 0.5).astype(np.uint8)
+                f.write(f"{start} {end} {int(color[0])} {int(color[1])} {int(color[2])}\n")
+
+    trajectory = _future_ee_trajectory()
+    current_pc_np = current_pc.numpy()
+    _write_role_ply_with_trajectory(
+        vis_dir / f"step_{step:06d}_pred.ply",
+        current_pc_np,
+        pred_labels,
+        operation_prob=operation_prob,
+        trajectory=trajectory,
+    )
+    _write_role_ply_with_trajectory(
+        vis_dir / f"step_{step:06d}_pseudo.ply",
+        current_pc_np,
+        pseudo_labels,
+        trajectory=trajectory,
+    )
     save_pointseg_npz(vis_dir / f"step_{step:06d}.npz", current_pc, {k: v[batch_index] for k, v in outputs.items() if torch.is_tensor(v)}, {k: v[batch_index] for k, v in pseudo.items() if torch.is_tensor(v)})
 
 
