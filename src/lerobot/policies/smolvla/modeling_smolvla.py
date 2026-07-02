@@ -1508,6 +1508,8 @@ class SongPointCloudConditioner(nn.Module):
         self.feature_dim = int(config.pointseg_feature_dim)
         self.foreground_ratio = float(config.pointseg_foreground_ratio)
         self.background_ratio = float(config.pointseg_background_ratio)
+        self.max_foreground_ratio = float(getattr(config, "pointseg_max_foreground_ratio", 1.0))
+        self.max_background_ratio = float(getattr(config, "pointseg_max_background_ratio", 1.0))
         self.min_foreground_points = int(config.pointseg_min_foreground_points)
         self.min_background_points = int(config.pointseg_min_background_points)
         self.aux_loss_weight = float(config.pointseg_aux_loss_weight)
@@ -1629,11 +1631,30 @@ class SongPointCloudConditioner(nn.Module):
         return torch.maximum(min_counts, ratio_counts)
 
     @staticmethod
+    def _count_bounds(
+        valid_mask: Tensor,
+        min_ratio: float,
+        min_points: int,
+        max_ratio: float,
+    ) -> tuple[Tensor, Tensor]:
+        valid_counts = valid_mask.sum(dim=1)
+        min_counts = SongPointCloudConditioner._target_counts(valid_mask, min_ratio, min_points)
+        max_ratio = max(0.0, float(max_ratio))
+        max_counts = torch.ceil(valid_counts.to(dtype=torch.float32) * max_ratio).to(dtype=torch.long)
+        max_counts = torch.minimum(max_counts, valid_counts)
+        max_counts = torch.maximum(max_counts, torch.minimum(min_counts, valid_counts))
+        min_counts = torch.minimum(min_counts, max_counts)
+        min_counts = torch.where(valid_counts > 0, min_counts, torch.zeros_like(min_counts))
+        max_counts = torch.where(valid_counts > 0, max_counts, torch.zeros_like(max_counts))
+        return min_counts, max_counts
+
+    @staticmethod
     def _select_predicted_points(
         point_cloud: Tensor,
         scores: Tensor,
         candidate_mask: Tensor,
         min_counts: Tensor,
+        max_counts: Tensor,
         *,
         largest: bool,
         point_is_pad: Tensor | None = None,
@@ -1649,8 +1670,11 @@ class SongPointCloudConditioner(nn.Module):
         scores = scores.to(device=point_cloud.device)
         candidate_mask = candidate_mask.to(device=point_cloud.device, dtype=torch.bool)
         min_counts = min_counts.to(device=point_cloud.device, dtype=torch.long)
+        max_counts = max_counts.to(device=point_cloud.device, dtype=torch.long)
         if min_counts.shape != (bsize,):
             raise ValueError(f"Expected min_counts shape ({bsize},), got {tuple(min_counts.shape)}.")
+        if max_counts.shape != (bsize,):
+            raise ValueError(f"Expected max_counts shape ({bsize},), got {tuple(max_counts.shape)}.")
 
         if point_is_pad is None:
             valid_mask = torch.ones(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
@@ -1663,6 +1687,7 @@ class SongPointCloudConditioner(nn.Module):
         candidate_mask = candidate_mask & valid_mask
         candidate_counts = candidate_mask.sum(dim=1)
         target_counts = torch.maximum(candidate_counts, min_counts.clamp_min(0))
+        target_counts = torch.minimum(target_counts, max_counts.clamp_min(0))
         target_counts = torch.where(valid_mask.any(dim=1), target_counts, torch.zeros_like(target_counts))
         output_count = int(target_counts.max().item()) if target_counts.numel() > 0 else 0
 
@@ -1782,11 +1807,17 @@ class SongPointCloudConditioner(nn.Module):
             )
         else:
             valid_point_mask = ~point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
-        min_foreground_counts = self._target_counts(
-            valid_point_mask, self.foreground_ratio, self.min_foreground_points
+        min_foreground_counts, max_foreground_counts = self._count_bounds(
+            valid_point_mask,
+            self.foreground_ratio,
+            self.min_foreground_points,
+            self.max_foreground_ratio,
         )
-        min_background_counts = self._target_counts(
-            valid_point_mask, self.background_ratio, self.min_background_points
+        min_background_counts, max_background_counts = self._count_bounds(
+            valid_point_mask,
+            self.background_ratio,
+            self.min_background_points,
+            self.max_background_ratio,
         )
         pred_labels = seg_outputs["role_probs"].argmax(dim=-1)
         foreground_candidate_mask = pred_labels == ROLE_FOREGROUND
@@ -1796,6 +1827,7 @@ class SongPointCloudConditioner(nn.Module):
             selection_scores,
             foreground_candidate_mask,
             min_foreground_counts,
+            max_foreground_counts,
             largest=True,
             point_is_pad=point_is_pad,
         )
@@ -1804,6 +1836,7 @@ class SongPointCloudConditioner(nn.Module):
             selection_scores,
             background_candidate_mask,
             min_background_counts,
+            max_background_counts,
             largest=False,
             point_is_pad=point_is_pad,
         )
@@ -1846,6 +1879,10 @@ class SongPointCloudConditioner(nn.Module):
             "pointseg_selection_scores": selection_scores,
             "pointseg_foreground_has_candidates": foreground_has_candidates,
             "pointseg_background_has_candidates": background_has_candidates,
+            "pointseg_foreground_min_counts": min_foreground_counts,
+            "pointseg_foreground_max_counts": max_foreground_counts,
+            "pointseg_background_min_counts": min_background_counts,
+            "pointseg_background_max_counts": max_background_counts,
         }
         if pseudo is not None and "role_scores" in pseudo:
             result["role_scores"] = pseudo["role_scores"].to(device=point_cloud.device, dtype=torch.float32)

@@ -88,6 +88,8 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_feature_dim: int = 64
     pointseg_foreground_ratio: float = 0.08
     pointseg_background_ratio: float = 0.25
+    pointseg_max_foreground_ratio: float = 0.25
+    pointseg_max_background_ratio: float = 0.5
     pointseg_min_foreground_points: int = 512
     pointseg_min_background_points: int = 512
     pointseg_aux_loss_weight: float = 0.20
