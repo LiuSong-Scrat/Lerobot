@@ -72,6 +72,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.song_pointseg import (
     MOTION_PRIOR_DIM,
     PseudoLabelConfig,
+    ROLE_BACKGROUND,
     ROLE_FOREGROUND,
     SongPointSegLoss,
     SongPointSegLossConfig,
@@ -1620,6 +1621,90 @@ class SongPointCloudConditioner(nn.Module):
     def _target_count(self, n_points: int, ratio: float, minimum: int) -> int:
         return max(int(minimum), math.ceil(n_points * float(ratio)))
 
+    @staticmethod
+    def _target_counts(valid_mask: Tensor, ratio: float, minimum: int) -> Tensor:
+        valid_counts = valid_mask.sum(dim=1)
+        ratio_counts = torch.ceil(valid_counts.to(dtype=torch.float32) * float(ratio)).to(dtype=torch.long)
+        min_counts = torch.full_like(valid_counts, max(0, int(minimum)))
+        return torch.maximum(min_counts, ratio_counts)
+
+    @staticmethod
+    def _select_predicted_points(
+        point_cloud: Tensor,
+        scores: Tensor,
+        candidate_mask: Tensor,
+        min_counts: Tensor,
+        *,
+        largest: bool,
+        point_is_pad: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if point_cloud.ndim != 3:
+            raise ValueError(f"Expected point_cloud shape (B,N,C), got {point_cloud.shape}.")
+        if scores.shape != point_cloud.shape[:2]:
+            raise ValueError(f"Expected scores shape {point_cloud.shape[:2]}, got {scores.shape}.")
+        if candidate_mask.shape != point_cloud.shape[:2]:
+            raise ValueError(f"Expected candidate_mask shape {point_cloud.shape[:2]}, got {candidate_mask.shape}.")
+
+        bsize, n_points, channels = point_cloud.shape
+        scores = scores.to(device=point_cloud.device)
+        candidate_mask = candidate_mask.to(device=point_cloud.device, dtype=torch.bool)
+        min_counts = min_counts.to(device=point_cloud.device, dtype=torch.long)
+        if min_counts.shape != (bsize,):
+            raise ValueError(f"Expected min_counts shape ({bsize},), got {tuple(min_counts.shape)}.")
+
+        if point_is_pad is None:
+            valid_mask = torch.ones(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
+        else:
+            point_is_pad = point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
+            if point_is_pad.shape != point_cloud.shape[:2]:
+                raise ValueError(f"Expected point_is_pad shape {point_cloud.shape[:2]}, got {point_is_pad.shape}.")
+            valid_mask = ~point_is_pad
+
+        candidate_mask = candidate_mask & valid_mask
+        candidate_counts = candidate_mask.sum(dim=1)
+        target_counts = torch.maximum(candidate_counts, min_counts.clamp_min(0))
+        target_counts = torch.where(valid_mask.any(dim=1), target_counts, torch.zeros_like(target_counts))
+        output_count = int(target_counts.max().item()) if target_counts.numel() > 0 else 0
+
+        selected = point_cloud.new_zeros((bsize, output_count, channels))
+        selected_scores = scores.new_zeros((bsize, output_count))
+        selected_is_pad = torch.ones(bsize, output_count, dtype=torch.bool, device=point_cloud.device)
+        has_predicted_candidates = candidate_counts > 0
+
+        if output_count <= 0:
+            return selected, selected_scores, selected_is_pad, has_predicted_candidates
+
+        for batch_idx in range(bsize):
+            take_count = int(target_counts[batch_idx].item())
+            if take_count <= 0:
+                continue
+
+            predicted_count = int(candidate_counts[batch_idx].item())
+            if predicted_count >= take_count:
+                source_mask = candidate_mask[batch_idx]
+            else:
+                source_mask = valid_mask[batch_idx]
+
+            source_count = int(source_mask.sum().item())
+            if source_count <= 0:
+                continue
+
+            masked_scores = scores[batch_idx].masked_fill(
+                ~source_mask,
+                -torch.inf if largest else torch.inf,
+            )
+            top_count = min(take_count, source_count)
+            indices = torch.topk(masked_scores, k=top_count, largest=largest).indices
+            if top_count < take_count:
+                repeat = torch.arange(take_count, device=point_cloud.device) % top_count
+                indices = indices[repeat]
+
+            selected[batch_idx, :take_count] = point_cloud[batch_idx, indices]
+            selected_scores[batch_idx, :take_count] = scores[batch_idx, indices]
+            selected_is_pad[batch_idx, :take_count] = False
+
+        return selected, selected_scores, selected_is_pad, has_predicted_candidates
+
     def _make_pseudo(self, payload: dict[str, Tensor], priors: Tensor | None) -> dict[str, Tensor] | None:
         labels = payload.get("pointseg.labels")
         weights = payload.get("pointseg.weights")
@@ -1691,44 +1776,60 @@ class SongPointCloudConditioner(nn.Module):
             seg_outputs = self.segmenter(point_cloud, priors=temporal_priors, point_is_pad=point_is_pad)
         operation_prob = seg_outputs["operation_prob"]
         selection_scores = self._selection_scores(operation_prob)
-        valid_points = (
-            (~point_is_pad).sum(dim=1).max().item()
-            if point_is_pad is not None
-            else point_cloud.shape[1]
+        if point_is_pad is None:
+            valid_point_mask = torch.ones(
+                point_cloud.shape[:2], dtype=torch.bool, device=point_cloud.device
+            )
+        else:
+            valid_point_mask = ~point_is_pad.to(device=point_cloud.device, dtype=torch.bool)
+        min_foreground_counts = self._target_counts(
+            valid_point_mask, self.foreground_ratio, self.min_foreground_points
         )
-        foreground_count = self._target_count(int(valid_points), self.foreground_ratio, self.min_foreground_points)
-        background_count = self._target_count(int(valid_points), self.background_ratio, self.min_background_points)
-        foreground_pc, foreground_prob = self._select_points(
-            point_cloud, selection_scores, foreground_count, largest=True, point_is_pad=point_is_pad
+        min_background_counts = self._target_counts(
+            valid_point_mask, self.background_ratio, self.min_background_points
         )
-        background_candidate_mask = self._background_candidate_mask(selection_scores, point_is_pad)
-        background_pc, background_prob, background_has_candidates = self._select_points(
+        pred_labels = seg_outputs["role_probs"].argmax(dim=-1)
+        foreground_candidate_mask = pred_labels == ROLE_FOREGROUND
+        background_candidate_mask = pred_labels == ROLE_BACKGROUND
+        foreground_pc, foreground_prob, foreground_is_pad, foreground_has_candidates = self._select_predicted_points(
             point_cloud,
             selection_scores,
-            background_count,
+            foreground_candidate_mask,
+            min_foreground_counts,
+            largest=True,
+            point_is_pad=point_is_pad,
+        )
+        background_pc, background_prob, background_is_pad, background_has_candidates = self._select_predicted_points(
+            point_cloud,
+            selection_scores,
+            background_candidate_mask,
+            min_background_counts,
             largest=False,
             point_is_pad=point_is_pad,
-            candidate_mask=background_candidate_mask,
-            return_has_candidates=True,
         )
 
         fg_weight = foreground_prob
+        fg_weight = torch.where(~foreground_is_pad, fg_weight, torch.zeros_like(fg_weight))
         fg_weight = torch.where(fg_weight >= 0.1, fg_weight, torch.zeros_like(fg_weight))
         bg_weight = 1.0 - background_prob
+        bg_weight = torch.where(~background_is_pad, bg_weight, torch.zeros_like(bg_weight))
         bg_weight = torch.where(bg_weight >= 0.1, bg_weight, torch.zeros_like(bg_weight))
 
         with _batchnorm_eval_on_single_value(self.foreground_encoder):
-            object_feat = self.foreground_encoder(foreground_pc)
+            object_feat = self.foreground_encoder(foreground_pc, foreground_is_pad)
         background_feat = self.null_background_feat.to(
             device=object_feat.device, dtype=object_feat.dtype
         ).unsqueeze(0).expand(point_cloud.shape[0], -1).clone()
-        if bool(background_has_candidates.any().item()):
-            background_pc_to_encode = background_pc[background_has_candidates]
+        background_has_points = ~background_is_pad.all(dim=1)
+        if bool(background_has_points.any().item()):
+            background_pc_to_encode = background_pc[background_has_points]
+            background_is_pad_to_encode = background_is_pad[background_has_points]
             with _batchnorm_eval_on_single_value(self.background_encoder):
                 _scene_xyz, _scene_tok, encoded_background_feat, _scene_mask = self.background_encoder(
-                    background_pc_to_encode
+                    background_pc_to_encode,
+                    background_is_pad_to_encode,
                 )
-            background_feat[background_has_candidates] = encoded_background_feat.to(dtype=background_feat.dtype)
+            background_feat[background_has_points] = encoded_background_feat.to(dtype=background_feat.dtype)
 
         result = {
             "object_feat": object_feat,
@@ -1737,10 +1838,13 @@ class SongPointCloudConditioner(nn.Module):
             "background_pc": background_pc,
             "foreground_prob": foreground_prob,
             "background_prob": background_prob,
+            "foreground_is_pad": foreground_is_pad,
+            "background_is_pad": background_is_pad,
             "operation_prob": operation_prob,
             "pointseg_outputs": seg_outputs,
             "pointseg_priors": temporal_priors,
             "pointseg_selection_scores": selection_scores,
+            "pointseg_foreground_has_candidates": foreground_has_candidates,
             "pointseg_background_has_candidates": background_has_candidates,
         }
         if pseudo is not None and "role_scores" in pseudo:
