@@ -345,6 +345,27 @@ def save_episode_worldflow(root: Path, episode_index: int, world_ee_poses: np.nd
     np.save(pose_path, world_ee_poses)
 
 
+def save_episode_images_to_paths(
+    dataset: LeRobotDataset,
+    images: np.ndarray,
+    image_feature_key: str,
+    episode_index: int,
+) -> list[str]:
+    images = np.asarray(images, dtype=np.uint8)
+    paths: list[str] = []
+    for frame_index, image in enumerate(images):
+        image_path = dataset._get_image_file_path(  # noqa: SLF001 - use LeRobot standard image layout.
+            episode_index=episode_index,
+            image_key=image_feature_key,
+            frame_index=frame_index,
+        )
+        if frame_index == 0:
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+        dataset._save_image(image, image_path, compress_level=6)  # noqa: SLF001
+        paths.append(str(image_path))
+    return paths
+
+
 def downsample_point_clouds_keep_tail(
     point_clouds: np.ndarray,
     num_points: int = DEFAULT_NUM_POINTS,
@@ -407,7 +428,12 @@ def make_episode_buffer(
     if images is not None and image_feature_key is not None:
         if len(images) != len(actions):
             raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
-        episode_buffer[image_feature_key] = np.asarray(images, dtype=np.uint8)
+        episode_buffer[image_feature_key] = save_episode_images_to_paths(
+            dataset,
+            images,
+            image_feature_key,
+            int(episode_buffer["episode_index"]),
+        )
     return episode_buffer
 
 

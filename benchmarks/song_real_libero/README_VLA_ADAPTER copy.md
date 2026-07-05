@@ -247,6 +247,10 @@ python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py 
   --overwrite
 ```
 
+
+
+
+
 如果不想保存 RGB：
 
 ```bash
@@ -311,6 +315,70 @@ python src/lerobot/scripts/song_lerobot_from_hdf5.py \
   --image-feature-key observation.images.overhead \
   --overwrite
 ```
+
+export HDF5_USE_FILE_LOCKING=FALSE
+python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py \
+  --input-dir benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo \
+  --output-root benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset \
+  --repo-id song_real_pointcloud \
+  --camera overhead \
+  --image-key observations/images/overhead \
+  --point-cloud-key observations/cloud_rgb/overhead \
+  --fps 15 \
+  --num-points 0 \
+  --input-has-gripper-cloud \
+  --point-cloud-storage zarr \
+  --workers 6 \
+  --vis-count 2 \
+  --overwrite \
+  --task  "Place the Yellow Mug on the Red Pole"
+
+torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_priorseg_cache   --current-points 50000 --future-points 16384  --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=0   --overwrite
+
+
+
+
+export SONG_POINTSEG_REQUIRE_POINTOPS=1
+python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --policy.type=smolvla \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset \
+  --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --policy.vlm_weights_path=lerobot/smolvla_base \
+  --policy.load_vlm_weights=true \
+  --policy.num_vlm_layers=16 \
+  --policy.train_expert_only=true \
+  --policy.vla_adapter_enable=true \
+  --policy.vla_adapter_freeze_vlm=true \
+  --policy.vla_adapter_point_prefix=false \
+  --batch_size=48 \
+  --steps=500000 \
+  --log_freq=1 \
+  --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/wep_v03_adapter \
+  --job_name=wep_v03_adapter \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --wandb.disable_artifact=true \
+  --save_freq=4000 \
+  --eval_freq=4000 \
+  --num_workers=12 \
+  --policy.pointseg_enable=true \
+  --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_priorseg_cache \
+  --policy.pointseg_backbone_type=litept \
+  --policy.pointseg_grid_size=0.01 \
+  --policy.pointseg_feature_dim=64 \
+  --policy.pointseg_aux_loss_weight=0.002 \
+  --policy.pointseg_foreground_ratio=0.08 \
+  --policy.pointseg_background_ratio=0.08 \
+  --policy.pointseg_min_foreground_points=4000 \
+  --policy.pointseg_min_background_points=0 \
+  --policy.pointseg_use_temporal_priors_as_input=false \
+  --policy.pointseg_use_pseudo_selection=false \
+  --policy.worldflow_enable=true \
+  --policy.worldflow_se3_head_enable=false \
+  --policy.se3_enable=false \
+  --policy.se3_final_correction_enable=false
+  
 
 ## 4. 推荐训练命令
 

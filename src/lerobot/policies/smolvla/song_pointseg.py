@@ -480,6 +480,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         seed: int = 1000,
         return_full_point_cloud: bool = False,
         mmap_mode: str = "r",
+        include_base_item: bool = True,
     ):
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
@@ -492,7 +493,9 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.seed = int(seed)
         self.return_full_point_cloud = return_full_point_cloud
         self.mmap_mode = mmap_mode
+        self.include_base_item = bool(include_base_item)
         self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._minimal_hf_dataset = None
 
     def __getattr__(self, name: str):
         return getattr(self.dataset, name)
@@ -500,6 +503,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_point_cloud_cache"] = {}
+        state["_minimal_hf_dataset"] = None
         return state
 
     def __len__(self) -> int:
@@ -541,8 +545,84 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         rel[0] = _identity_pose9(device=rel.device, dtype=rel.dtype)
         return rel
 
+    @staticmethod
+    def _as_tensor(value: Any) -> Tensor:
+        if torch.is_tensor(value):
+            return value
+        return torch.as_tensor(value)
+
+    def _minimal_lerobot_item(self, idx: int) -> dict[str, Any] | None:
+        """Read only the columns needed for temporal point labels.
+
+        The offline cache generator does not need RGB images.  Calling the
+        wrapped LeRobotDataset directly would decode every image feature before
+        point-cloud pseudo-labeling, which dominates runtime for RGB datasets.
+        This narrow path keeps the original temporal action chunk semantics but
+        avoids visual columns entirely.
+        """
+
+        dataset = self.dataset
+        if not all(hasattr(dataset, name) for name in ("_ensure_hf_dataset_loaded", "_get_query_indices")):
+            return None
+        dataset._ensure_hf_dataset_loaded()
+        if getattr(dataset, "hf_dataset", None) is None:
+            return None
+        if self._minimal_hf_dataset is None:
+            needed_columns = [
+                key
+                for key in ("action", "episode_index", "frame_index", "index")
+                if key in dataset.hf_dataset.column_names
+            ]
+            missing_columns = {"action", "episode_index", "frame_index", "index"} - set(needed_columns)
+            if missing_columns:
+                return None
+            self._minimal_hf_dataset = dataset.hf_dataset.select_columns(needed_columns)
+        hf_dataset = self._minimal_hf_dataset
+
+        try:
+            episode_index = self._as_tensor(hf_dataset["episode_index"][idx])
+            frame_index = self._as_tensor(hf_dataset["frame_index"][idx])
+            abs_index = self._as_tensor(hf_dataset["index"][idx])
+        except Exception:
+            return None
+
+        ep_idx = self._to_int(episode_index)
+        abs_idx = self._to_int(abs_index)
+        item: dict[str, Any] = {
+            "episode_index": episode_index,
+            "frame_index": frame_index,
+            "index": abs_index,
+        }
+
+        delta_indices = getattr(dataset, "delta_indices", None)
+        if delta_indices is not None and "action" in delta_indices:
+            query_indices, padding = dataset._get_query_indices(abs_idx, ep_idx)
+            action_indices = query_indices["action"]
+            absolute_to_relative = getattr(dataset, "_absolute_to_relative_idx", None)
+            relative_indices = (
+                action_indices
+                if absolute_to_relative is None
+                else [absolute_to_relative[action_idx] for action_idx in action_indices]
+            )
+            action_values = hf_dataset["action"][relative_indices]
+            item["action"] = (
+                action_values
+                if torch.is_tensor(action_values)
+                else torch.stack([self._as_tensor(value) for value in action_values])
+            )
+            item.update({key: value for key, value in padding.items() if key == "action_is_pad"})
+        else:
+            item["action"] = self._as_tensor(hf_dataset["action"][idx])
+
+        return item
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = dict(self.dataset[idx])
+        if self.include_base_item:
+            item = dict(self.dataset[idx])
+        else:
+            item = self._minimal_lerobot_item(idx)
+            if item is None:
+                item = dict(self.dataset[idx])
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         point_clouds = self._episode_point_clouds(episode_index)
