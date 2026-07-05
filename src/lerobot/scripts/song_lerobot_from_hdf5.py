@@ -220,6 +220,34 @@ dataset_features = {
     "observation.state": {"dtype": "float32", "shape": (10,), "names": ["x", "y", "z", "x1", "y1", "z1", "x2", "y2", "z2", "gripper"]},
 }
 
+
+def infer_image_shape(h5_paths: list[Path], image_key: str | None) -> tuple[int, int, int] | None:
+    if not image_key or str(image_key).lower() in {"0", "false", "none", "off"}:
+        return None
+    for path in h5_paths:
+        with h5py.File(path, "r") as f:
+            if image_key not in f:
+                continue
+            image_ds = f[image_key]
+            if image_ds.ndim != 4 or image_ds.shape[-1] != 3:
+                raise ValueError(f"{image_key} must have shape (T,H,W,3), got {image_ds.shape}")
+            return tuple(int(v) for v in image_ds.shape[1:])
+    return None
+
+
+def dataset_features_with_optional_image(
+    image_shape: tuple[int, int, int] | None,
+    image_feature_key: str,
+) -> dict:
+    features = dict(dataset_features)
+    if image_shape is not None:
+        features[image_feature_key] = {
+            "dtype": "image",
+            "shape": image_shape,
+            "names": ["height", "width", "channels"],
+        }
+    return features
+
 def recreate_empty_dir(path: str | Path) -> Path:
     path = Path(path)
     if path.is_dir():
@@ -351,7 +379,15 @@ def downsample_point_clouds_keep_tail(
     return out
 
 
-def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, point_clouds: np.ndarray, timestamps: np.ndarray) -> dict:
+def make_episode_buffer(
+    dataset: LeRobotDataset,
+    task: str,
+    actions: np.ndarray,
+    point_clouds: np.ndarray,
+    timestamps: np.ndarray,
+    images: np.ndarray | None = None,
+    image_feature_key: str | None = None,
+) -> dict:
     actions = np.ascontiguousarray(actions, dtype=np.float32)
     timestamps = np.asarray(timestamps, dtype=np.float32).reshape(-1)
 
@@ -368,6 +404,10 @@ def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray,
     episode_buffer["timestamp"] = timestamps
     episode_buffer["action"] = actions
     episode_buffer["observation.state"] = actions
+    if images is not None and image_feature_key is not None:
+        if len(images) != len(actions):
+            raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
+        episode_buffer[image_feature_key] = np.asarray(images, dtype=np.uint8)
     return episode_buffer
 
 
@@ -389,6 +429,7 @@ def convert_hdf5_file(
     task: str | None = None,
     pose_key: str = "observations/pose_eular",
     point_cloud_key: str = "observations/cloud_rgb/overhead",
+    image_key: str | None = "observations/images/overhead",
     eff_angular_key: str = "observations/eff_angular",
     num_points: int = DEFAULT_NUM_POINTS,
     gripper_points: int = DEFAULT_GRIPPER_POINTS,
@@ -397,6 +438,15 @@ def convert_hdf5_file(
         task_name = _read_task_name(f, task)
         obs_pose_eular_eff_to_world = f[pose_key][:].astype(np.float32)
         pointcloud_world = f[point_cloud_key][:].astype(np.float32)
+        images = None
+        image_enabled = image_key and str(image_key).lower() not in {"0", "false", "none", "off"}
+        if image_enabled:
+            if image_key not in f:
+                raise KeyError(f"Requested image key is missing from {h5_path}: {image_key}")
+            image_ds = f[image_key]
+            if image_ds.ndim != 4 or image_ds.shape[-1] != 3:
+                raise ValueError(f"{image_key} must have shape (T,H,W,3), got {image_ds.shape}")
+            images = np.asarray(image_ds[: len(pointcloud_world)], dtype=np.uint8)
 
         obs_pose9_eff_to_world = traj6_to_pose9(obs_pose_eular_eff_to_world)
         obs_pose9_data_eff_2_eff0 = from_world_to_umi_tra_pose9(obs_pose9_eff_to_world)
@@ -420,13 +470,16 @@ def convert_hdf5_file(
         else:
             timestamps = np.arange(len(actions), dtype=np.float32) / fps
 
-    return {
+    episode = {
         "task": task_name,
         "actions": actions,
         "point_clouds": point_clouds,
         "world_ee_poses": obs_pose9_eff_to_world,
         "timestamps": timestamps,
     }
+    if images is not None:
+        episode["images"] = images
+    return episode
 
 
 def save_converted_episode(
@@ -455,6 +508,8 @@ def save_converted_episode(
         episode["actions"],
         episode["point_clouds"],
         episode["timestamps"],
+        images=episode.get("images"),
+        image_feature_key=getattr(dataset, "_song_image_feature_key", None),
     )
     dataset.save_episode(episode_data=episode_buffer)
 
@@ -467,6 +522,7 @@ def convert_and_save_sequential(dataset: LeRobotDataset, h5_paths: list[Path], a
             task=args.task,
             pose_key=args.pose_key,
             point_cloud_key=args.point_cloud_key,
+            image_key=args.image_key,
             eff_angular_key=args.eff_angular_key,
             num_points=args.num_points,
             gripper_points=args.gripper_points,
@@ -501,6 +557,7 @@ def convert_and_save_parallel(dataset: LeRobotDataset, h5_paths: list[Path], max
                     task=args.task,
                     pose_key=args.pose_key,
                     point_cloud_key=args.point_cloud_key,
+                    image_key=args.image_key,
                     eff_angular_key=args.eff_angular_key,
                     num_points=args.num_points,
                     gripper_points=args.gripper_points,
@@ -549,6 +606,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", default=None, help="Override all episode task strings. Defaults to HDF5 task_name.")
     parser.add_argument("--pose-key", default="observations/pose_eular")
     parser.add_argument("--point-cloud-key", default="observations/cloud_rgb/overhead")
+    parser.add_argument("--image-key", default="observations/images/overhead")
+    parser.add_argument("--image-feature-key", default="observation.images.overhead")
     parser.add_argument("--eff-angular-key", default="observations/eff_angular")
     parser.add_argument("--num-points", type=int, default=DEFAULT_NUM_POINTS)
     parser.add_argument("--gripper-points", type=int, default=DEFAULT_GRIPPER_POINTS)
@@ -565,6 +624,14 @@ def main():
     root = args.output_root.expanduser().resolve()
     hdf5_folder = args.hdf5_folder.expanduser().resolve()
 
+    h5_paths = sorted(hdf5_folder.glob(args.pattern))
+    if len(h5_paths) == 0:
+        raise FileNotFoundError(f"No .hdf5 files found in {hdf5_folder}")
+    image_shape = infer_image_shape(h5_paths, args.image_key)
+    features = dataset_features_with_optional_image(image_shape, args.image_feature_key)
+    if image_shape is None:
+        args.image_key = None
+
     if root.exists():
         if not args.overwrite:
             raise FileExistsError(f"Output root already exists: {root}. Pass --overwrite to rebuild it.")
@@ -576,17 +643,14 @@ def main():
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         fps=args.fps,
-        features=dataset_features,
+        features=features,
         robot_type=args.robot_type,
         root=root,
         use_videos=False,
     )
+    dataset._song_image_feature_key = args.image_feature_key if image_shape is not None else None
     write_point_cloud_meta(dataset.root, args.point_cloud_storage)
     write_worldflow_meta(dataset.root)
-
-    h5_paths = sorted(hdf5_folder.glob(args.pattern))
-    if len(h5_paths) == 0:
-        raise FileNotFoundError(f"No .hdf5 files found in {hdf5_folder}")
 
     if args.workers <= 1 or len(h5_paths) == 1:
         convert_and_save_sequential(dataset, h5_paths, args)

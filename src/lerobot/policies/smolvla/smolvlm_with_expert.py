@@ -13,8 +13,14 @@
 # limitations under the License.
 
 import copy
+import json
+import warnings
+from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from safetensors.torch import load_file
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -23,6 +29,83 @@ from transformers import (
     AutoProcessor,
     SmolVLMForConditionalGeneration,
 )
+
+
+_CONFIG_NAME = "config.json"
+_SMOLVLA_POLICY_VLM_PREFIXES = (
+    "module.model.vlm_with_expert.vlm.",
+    "model.vlm_with_expert.vlm.",
+    "vlm_with_expert.vlm.",
+)
+
+
+def _is_disabled_source(value: str | None) -> bool:
+    return value is None or str(value).strip().lower() in {"", "0", "false", "none", "off"}
+
+
+def _read_json_file(path: Path) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def _is_smolvla_policy_config(config: dict | None) -> bool:
+    if not isinstance(config, dict):
+        return False
+    return config.get("type") == "smolvla" or "vlm_model_name" in config
+
+
+def _resolve_smolvla_policy_checkpoint(source: str | None) -> tuple[dict | None, str | None]:
+    """Return (policy_config, model_safetensors_file) when source is a SmolVLA policy checkpoint."""
+    if _is_disabled_source(source):
+        return None, None
+    source_str = str(source)
+    local_path = Path(source_str).expanduser()
+    if local_path.is_file() and local_path.suffix == ".safetensors":
+        return None, str(local_path)
+    if local_path.is_dir():
+        policy_config = _read_json_file(local_path / _CONFIG_NAME)
+        if _is_smolvla_policy_config(policy_config):
+            model_file = local_path / SAFETENSORS_SINGLE_FILE
+            if not model_file.exists():
+                raise FileNotFoundError(f"SmolVLA policy checkpoint is missing {SAFETENSORS_SINGLE_FILE}: {local_path}")
+            return policy_config, str(model_file)
+        return None, None
+    try:
+        config_file = hf_hub_download(repo_id=source_str, filename=_CONFIG_NAME)
+    except Exception:
+        return None, None
+    policy_config = _read_json_file(Path(config_file))
+    if not _is_smolvla_policy_config(policy_config):
+        return None, None
+    model_file = hf_hub_download(repo_id=source_str, filename=SAFETENSORS_SINGLE_FILE)
+    return policy_config, model_file
+
+
+def _extract_vlm_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    for prefix in _SMOLVLA_POLICY_VLM_PREFIXES:
+        vlm_state = {key[len(prefix) :]: value for key, value in state_dict.items() if key.startswith(prefix)}
+        if vlm_state:
+            return vlm_state
+    # Also accept a raw VLM safetensors file.
+    if any(key.startswith("model.") or key.startswith("lm_head.") for key in state_dict):
+        return state_dict
+    raise KeyError(
+        "Could not find VLM weights in checkpoint. Expected keys prefixed by one of "
+        f"{_SMOLVLA_POLICY_VLM_PREFIXES}, or a raw VLM state dict."
+    )
+
+
+def _load_vlm_weights_from_smolvla_policy(vlm: nn.Module, model_file: str) -> None:
+    state_dict = load_file(model_file, device="cpu")
+    vlm_state = _extract_vlm_state_dict(state_dict)
+    missing_keys, unexpected_keys = vlm.load_state_dict(vlm_state, strict=False)
+    print(
+        "Loaded VLM weights from SmolVLA policy checkpoint "
+        f"{model_file} (missing={len(missing_keys)}, unexpected={len(unexpected_keys)})."
+    )
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -62,6 +145,7 @@ class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
         model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        vlm_weights_path: str | None = None,
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
         freeze_vision_encoder: bool = False,
@@ -73,21 +157,54 @@ class SmolVLMWithExpertModel(nn.Module):
         device: str = "auto",
     ):
         super().__init__()
-        if load_vlm_weights:
-            print(f"Loading  {model_id} weights ...")
+        policy_config, policy_vlm_file = _resolve_smolvla_policy_checkpoint(model_id)
+        architecture_model_id = policy_config.get("vlm_model_name", model_id) if policy_config else model_id
+
+        if not _is_disabled_source(vlm_weights_path):
+            weights_policy_config, weights_policy_vlm_file = _resolve_smolvla_policy_checkpoint(vlm_weights_path)
+            if weights_policy_vlm_file is not None:
+                policy_vlm_file = weights_policy_vlm_file
+                if weights_policy_config and not policy_config:
+                    policy_config = weights_policy_config
+            else:
+                architecture_model_id = str(vlm_weights_path)
+
+        if policy_config is not None:
+            policy_num_vlm_layers = int(policy_config.get("num_vlm_layers", -1) or -1)
+            if policy_num_vlm_layers > 0 and num_vlm_layers != policy_num_vlm_layers:
+                warnings.warn(
+                    "Loading VLM weights from a SmolVLA policy checkpoint; aligning num_vlm_layers "
+                    f"from {num_vlm_layers} to checkpoint value {policy_num_vlm_layers}.",
+                    stacklevel=2,
+                )
+                num_vlm_layers = policy_num_vlm_layers
+
+        # If a SmolVLA policy checkpoint (or raw VLM safetensors file) is provided,
+        # build the official VLM architecture from config first and then load only
+        # the VLM sub-state-dict below. This avoids requiring a separate full
+        # SmolVLM weight file under `model_id`, and prevents double-loading large
+        # weights just to overwrite them.
+        load_architecture_weights = bool(load_vlm_weights and policy_vlm_file is None)
+
+        if load_architecture_weights:
+            print(f"Loading VLM architecture/weights from {architecture_model_id} ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
-                model_id,
+                architecture_model_id,
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
             )
             config = self.vlm.config
         else:
-            config = AutoConfig.from_pretrained(model_id)
+            if policy_vlm_file is not None:
+                print(f"Building VLM architecture from {architecture_model_id}; loading VLM weights from {policy_vlm_file} ...")
+            config = AutoConfig.from_pretrained(architecture_model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = AutoProcessor.from_pretrained(architecture_model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
+        if policy_vlm_file is not None:
+            _load_vlm_weights_from_smolvla_policy(self.vlm, policy_vlm_file)
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
         self.config = config
         # Smaller lm expert

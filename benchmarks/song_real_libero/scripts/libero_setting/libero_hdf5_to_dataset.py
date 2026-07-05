@@ -31,6 +31,7 @@ if __package__ and __package__.startswith("benchmarks."):
         ensure_libero_config,
         fast_inverse_homogeneous,
         make_libero_env,
+        normalize_camera_name,
         observation_to_camera_point_cloud,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
@@ -45,6 +46,7 @@ else:
         ensure_libero_config,
         fast_inverse_homogeneous,
         make_libero_env,
+        normalize_camera_name,
         observation_to_camera_point_cloud,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
@@ -72,6 +74,41 @@ DATASET_FEATURES = {
 }
 
 
+def image_feature_key(camera: str) -> str:
+    return f"observation.images.{str(camera).strip()}"
+
+
+def image_feature_camera(cfg: dict[str, Any]) -> str:
+    value = cfg.get("image_camera")
+    if value is not None:
+        return str(value)
+    return pointcloud_camera_names_from_config(cfg)[0]
+
+
+def ensure_image_camera_rendered(cfg: dict[str, Any]) -> None:
+    if not bool(cfg.get("save_rgb_images", True)):
+        return
+    image_camera = normalize_camera_name(image_feature_camera(cfg))
+    camera_names = [normalize_camera_name(camera_name) for camera_name in list(cfg.get("camera_names") or [])]
+    pointcloud_camera_names = pointcloud_camera_names_from_config(cfg)
+    if image_camera not in camera_names and image_camera not in pointcloud_camera_names:
+        camera_names.append(image_camera)
+        cfg["camera_names"] = camera_names
+
+
+def dataset_features_with_image(cfg: dict[str, Any]) -> dict[str, Any]:
+    features = dict(DATASET_FEATURES)
+    if bool(cfg.get("save_rgb_images", True)):
+        height = int(cfg.get("observation_height", 128))
+        width = int(cfg.get("observation_width", 128))
+        features[image_feature_key(image_feature_camera(cfg))] = {
+            "dtype": "image",
+            "shape": (height, width, 3),
+            "names": ["height", "width", "channels"],
+        }
+    return features
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert LIBERO demonstrations into the Song point-cloud LeRobot format.")
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
@@ -95,6 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vis-count", type=int, default=None)
     parser.add_argument("--vis-stride", type=int, default=None)
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-rgb-images", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--image-camera", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
@@ -165,6 +204,16 @@ def image_from_raw_obs(raw_obs: dict[str, Any], image_key: str) -> np.ndarray | 
     if image.dtype != np.uint8:
         image = np.clip(image, 0, 255).astype(np.uint8)
     return image
+
+
+def dataset_image_from_raw_obs(raw_obs: dict[str, Any], camera_name: str) -> np.ndarray | None:
+    image_key = camera_name if str(camera_name).endswith("_image") else f"{camera_name}_image"
+    image = image_from_raw_obs(raw_obs, image_key)
+    if image is None:
+        return None
+    if image_key == "agentview_image":
+        image = np.ascontiguousarray(image[:, ::-1])
+    return image.copy()
 
 
 def append_video_frames(video_frames: dict[str, list[np.ndarray]], raw_obs: dict[str, Any], camera_names: list[str]) -> None:
@@ -337,7 +386,14 @@ def from_reference_to_umi_tra_pose9(obs_pose9_eff_to_reference: np.ndarray) -> n
     return homo_to_pose9(eff_to_eff0)
 
 
-def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, timestamps: np.ndarray) -> dict[str, Any]:
+def make_episode_buffer(
+    dataset: LeRobotDataset,
+    task: str,
+    actions: np.ndarray,
+    timestamps: np.ndarray,
+    images: np.ndarray | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
     actions = np.ascontiguousarray(actions, dtype=np.float32)
     timestamps = np.asarray(timestamps, dtype=np.float32).reshape(-1)
     episode_buffer = dataset.create_episode_buffer()
@@ -347,6 +403,10 @@ def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray,
     episode_buffer["timestamp"] = timestamps
     episode_buffer["action"] = actions
     episode_buffer["observation.state"] = actions
+    if images is not None and image_key is not None:
+        if len(images) != len(actions):
+            raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
+        episode_buffer[image_key] = np.asarray(images, dtype=np.uint8)
     return episode_buffer
 
 
@@ -388,6 +448,8 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
     np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
     np.save(artifact_dir / "timestamps.npy", np.asarray(episode["timestamps"], dtype=np.float32))
+    if "images" in episode:
+        np.save(artifact_dir / "images.npy", np.ascontiguousarray(episode["images"], dtype=np.uint8))
     with open(artifact_dir / "record.json", "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False)
     if cfg.get("save_video", False):
@@ -701,6 +763,9 @@ def collect_demo_episode(
     reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
+    image_frames: list[np.ndarray] = []
+    save_rgb_images = bool(cfg.get("save_rgb_images", True))
+    image_camera = image_feature_camera(cfg) if save_rgb_images else None
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
 
     if cfg["replay_mode"] == "step" and actions is not None:
@@ -708,6 +773,11 @@ def collect_demo_episode(
         for frame_idx in range(frame_count):
             if save_video:
                 append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+            if save_rgb_images and image_camera is not None:
+                image = dataset_image_from_raw_obs(raw_obs, image_camera)
+                if image is None:
+                    raise KeyError(f"Missing RGB image for camera {image_camera!r} in LIBERO observation.")
+                image_frames.append(image)
             point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
                 observation_to_camera_point_cloud(
                     env,
@@ -729,6 +799,11 @@ def collect_demo_episode(
             raw_obs = set_env_state_and_get_obs(env, states[frame_idx])
             if save_video:
                 append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+            if save_rgb_images and image_camera is not None:
+                image = dataset_image_from_raw_obs(raw_obs, image_camera)
+                if image is None:
+                    raise KeyError(f"Missing RGB image for camera {image_camera!r} in LIBERO observation.")
+                image_frames.append(image)
             point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
                 observation_to_camera_point_cloud(
                     env,
@@ -764,7 +839,7 @@ def collect_demo_episode(
     episode_actions = np.concatenate([umi_poses, grippers], axis=-1).astype(np.float32)
     timestamps = np.arange(len(episode_actions), dtype=np.float32) / float(cfg["fps"])
 
-    return {
+    episode = {
         "task": task_language,
         "actions": episode_actions,
         "point_clouds": point_clouds,
@@ -774,6 +849,11 @@ def collect_demo_episode(
         "timestamps": timestamps,
         "video_frames": video_frames,
     }
+    if save_rgb_images:
+        if len(image_frames) != len(episode_actions):
+            raise ValueError(f"Collected {len(image_frames)} RGB frames for {len(episode_actions)} actions.")
+        episode["images"] = np.asarray(image_frames, dtype=np.uint8)
+    return episode
 
 
 def make_episode_record(
@@ -910,6 +990,8 @@ def save_collected_temp_episode(
         record = json.load(f)
     actions = np.load(artifact_dir / "actions.npy")
     timestamps = np.load(artifact_dir / "timestamps.npy")
+    images_path = artifact_dir / "images.npy"
+    images = np.load(images_path, mmap_mode="r") if images_path.exists() else None
     episode_index = int(dataset.meta.total_episodes)
 
     point_cloud_storage = str(cfg.get("point_cloud_storage", "zarr"))
@@ -939,6 +1021,8 @@ def save_collected_temp_episode(
             str(record["task_language"]),
             actions,
             timestamps,
+            images=images,
+            image_key=cfg.get("image_feature_key"),
         )
     )
     record["episode_index"] = episode_index
@@ -972,6 +1056,11 @@ def main() -> None:
     cfg["vis_count"] = int(cfg_get(cfg, args.vis_count, "vis_count", 0) or 0)
     cfg["vis_stride"] = int(cfg_get(cfg, args.vis_stride, "vis_stride", 1) or 1)
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", False))
+    cfg["save_rgb_images"] = bool(cfg_get(cfg, args.save_rgb_images, "save_rgb_images", True))
+    image_camera_value = cfg_get(cfg, args.image_camera, "image_camera")
+    if image_camera_value is not None:
+        cfg["image_camera"] = str(image_camera_value)
+    ensure_image_camera_rendered(cfg)
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
@@ -983,6 +1072,9 @@ def main() -> None:
     repo_id = cfg_get(cfg, args.repo_id, "dataset_repo_id", "song_libero_pointcloud")
     demo_root = get_libero_dataset_root(args.demo_root, cfg)
     cfg["demo_root"] = str(demo_root)
+    cfg["image_feature_key"] = (
+        image_feature_key(image_feature_camera(cfg)) if bool(cfg.get("save_rgb_images", True)) else None
+    )
     vis_dir_value = cfg_get(cfg, args.vis_dir, "vis_dir")
     vis_dir = Path(vis_dir_value).expanduser().resolve() if vis_dir_value else output_root / "visualizations"
     tmp_dir = (
@@ -1004,7 +1096,7 @@ def main() -> None:
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=int(cfg["fps"]),
-        features=DATASET_FEATURES,
+        features=dataset_features_with_image(cfg),
         robot_type="libero",
         root=output_root,
         use_videos=False,
@@ -1023,6 +1115,8 @@ def main() -> None:
         "reference_camera": pointcloud_camera_names_from_config(cfg)[0],
         "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
         "render_camera_names": render_camera_names_from_config(cfg),
+        "image_camera": image_feature_camera(cfg) if bool(cfg.get("save_rgb_images", True)) else None,
+        "image_feature_key": cfg.get("image_feature_key"),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
         "gripper_template": str(cfg.get("gripper_template", "reap")),

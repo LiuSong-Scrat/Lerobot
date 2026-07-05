@@ -80,6 +80,18 @@ class SmolVLAConfig(PreTrainedConfig):
     # branch uses current EEF pose only as an analytic coordinate carrier.
     encode_robot_state: bool = False
 
+    # VLA-Adapter / PointACT-style dual-system bridge. When enabled, the VLM is
+    # used as a frozen semantic backbone and point/action modules remain in the
+    # trainable action expert side. Point-cloud tokens are injected into action
+    # tokens through a gated bridge instead of being treated only as prefix tokens.
+    vla_adapter_enable: bool = False
+    vla_adapter_freeze_vlm: bool = True
+    vla_adapter_point_prefix: bool = False
+    vla_adapter_layers: int = 2
+    vla_adapter_num_heads: int = 8
+    vla_adapter_ffn_multiplier: float = 4.0
+    vla_adapter_dropout: float = 0.0
+
     # Song point-cloud foreground/background conditioning.
     pointseg_enable: bool = False
     pointseg_checkpoint_path: str | None = None
@@ -132,6 +144,7 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
+    vlm_weights_path: str | None = None  # Optional VLM or SmolVLA policy checkpoint used to initialize the VLM.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
@@ -187,6 +200,25 @@ class SmolVLAConfig(PreTrainedConfig):
                 "The PCA-style final correction branch has been removed from the active policy path.",
                 stacklevel=2,
             )
+        if self.vla_adapter_enable:
+            if self.vla_adapter_layers <= 0:
+                raise ValueError("vla_adapter_layers must be positive when vla_adapter_enable=True.")
+            if self.vla_adapter_num_heads <= 0:
+                raise ValueError("vla_adapter_num_heads must be positive when vla_adapter_enable=True.")
+            if self.vla_adapter_freeze_vlm and not self.load_vlm_weights:
+                warnings.warn(
+                    "vla_adapter_enable=True is intended to bridge from a pretrained frozen VLM. "
+                    "Overriding load_vlm_weights=True.",
+                    stacklevel=2,
+                )
+                self.load_vlm_weights = True
+            if self.vla_adapter_freeze_vlm and not self.train_expert_only:
+                warnings.warn(
+                    "vla_adapter_enable=True with vla_adapter_freeze_vlm=True freezes the VLM backbone. "
+                    "Overriding train_expert_only=True.",
+                    stacklevel=2,
+                )
+                self.train_expert_only = True
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

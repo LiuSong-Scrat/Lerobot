@@ -53,6 +53,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 """
 
 import math
+import warnings
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -623,12 +624,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         pc_feats, pc_masks = self.prepare_point_clouds(batch)
+        images, image_masks = self.prepare_images(batch) if self.config.vla_adapter_enable else (None, None)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            images=images,
+            image_masks=image_masks,
+            **kwargs,
         )
 
         # Unpad actions
@@ -710,6 +720,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         pc_feats, pc_masks = self.prepare_point_clouds(batch)
+        images, image_masks = self.prepare_images(batch) if self.config.vla_adapter_enable else (None, None)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -717,7 +728,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
         losses = self.model.forward(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time, actions_is_pad=actions_is_pad
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            actions_is_pad=actions_is_pad,
+            images=images,
+            image_masks=image_masks,
         )
         pointseg_aux_loss = self.model.last_pointseg_aux_loss
         pointseg_aux_weight = self.config.pointseg_aux_loss_weight if pointseg_aux_loss is not None else 0.0
@@ -845,6 +866,50 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         return [point_cloud_payload], [mask]
 
+    def prepare_images(self, batch):
+        """Prepare RGB images for the frozen SmolVLM vision encoder."""
+        images = []
+        img_masks = []
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                "vla_adapter_enable=True requires at least one RGB image feature in the batch. "
+                f"Expected one of {list(self.config.image_features)}, got batch keys {list(batch.keys())}. "
+                "Regenerate the LeRobot dataset with observation.images.* features."
+            )
+
+        for key in present_img_keys:
+            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            if img.ndim != 4:
+                raise ValueError(f"Expected image tensor {key} shape (B,C,H,W), got {img.shape}.")
+            if self.config.resize_imgs_with_padding is not None:
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+            img = img.to(dtype=torch.float32)
+            if img.max() > 2.0:
+                img = img / 255.0
+            img = img * 2.0 - 1.0
+
+            bsize = img.shape[0]
+            device = img.device
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].to(device=device, dtype=torch.bool)
+            else:
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            images.append(img)
+            img_masks.append(mask)
+
+        if missing_img_keys and present_img_keys:
+            template_img = images[0]
+            template_mask = img_masks[0]
+            for num_empty_cameras, _key in enumerate(missing_img_keys):
+                if num_empty_cameras >= self.config.empty_cameras:
+                    break
+                images.append(torch.ones_like(template_img) * -1)
+                img_masks.append(torch.zeros_like(template_mask))
+        return images, img_masks
+
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
@@ -947,6 +1012,20 @@ class SelfAttention(nn.Module):
     def forward(self, x, mask=None):
         # x: (B, N, C)
         B, N, C = x.shape
+        original_mask = None
+        if mask is not None:
+            original_mask = mask.to(device=x.device, dtype=torch.bool)
+            if original_mask.shape != x.shape[:2]:
+                raise ValueError(f"Expected attention mask shape {x.shape[:2]}, got {original_mask.shape}.")
+            # Multi-head/point attention must not see rows where every key is
+            # masked out, otherwise softmax(-inf) produces NaNs.  For such
+            # degenerate rows we expose a zero fallback key and then zero the
+            # output with the original mask below.  Normal valid rows are
+            # unchanged.
+            mask = original_mask
+            if not bool(mask.any(dim=1).all().item()):
+                mask = mask.clone()
+                mask[~mask.any(dim=1), 0] = True
 
         # 1) 投影到 Q, K, V: (B, N, C)
         Q = self.query(x)  # (B, N, C)
@@ -969,8 +1048,8 @@ class SelfAttention(nn.Module):
 
         # 5) 可选：加 LayerNorm + 残差
         x_out = self.norm(x_out + x)  # (B, N, C)
-        if mask is not None:
-            x_out = x_out * mask.unsqueeze(-1).to(dtype=x_out.dtype)
+        if original_mask is not None:
+            x_out = x_out * original_mask.unsqueeze(-1).to(dtype=x_out.dtype)
 
         return x_out
 
@@ -1592,6 +1671,7 @@ class SongPointCloudConditioner(nn.Module):
 
         arange = torch.arange(n_points, device=point_cloud.device)
         first_valid = torch.where(valid_mask, arange.unsqueeze(0), n_points).argmin(dim=1)
+        first_valid = first_valid.clamp_max(n_points - 1)
         fallback_mask = torch.zeros_like(valid_mask)
         fallback_mask.scatter_(1, first_valid[:, None], True)
 
@@ -1755,6 +1835,151 @@ class SongPointCloudConditioner(nn.Module):
         return result
 
 
+class GatedActionBridgeBlock(nn.Module):
+    """VLA-Adapter/PointACT-style bridge block on the action-expert side.
+
+    Action tokens stay in the trainable expert stream. They first refine
+    themselves, then pull frozen VLM context and trainable point-cloud context
+    through separate cross-attentions. Residual gates are zero-initialized so the
+    bridge starts as a no-op and learns how much information to inject.
+    """
+
+    def __init__(self, dim: int, num_heads: int, ffn_multiplier: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"Action bridge dim={dim} must be divisible by num_heads={num_heads}.")
+        hidden_dim = max(dim, int(round(dim * float(ffn_multiplier))))
+        self.action_norm = nn.LayerNorm(dim)
+        self.vlm_norm = nn.LayerNorm(dim)
+        self.point_norm = nn.LayerNorm(dim)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.vlm_cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.point_cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+        self.self_gate = nn.Parameter(torch.zeros(()))
+        self.vlm_gate = nn.Parameter(torch.zeros(()))
+        self.point_gate = nn.Parameter(torch.zeros(()))
+        self.ffn_gate = nn.Parameter(torch.zeros(()))
+
+    @staticmethod
+    def _safe_source(tokens: Tensor | None, valid_mask: Tensor | None) -> tuple[Tensor | None, Tensor | None]:
+        if tokens is None or tokens.shape[1] <= 0:
+            return None, None
+        if valid_mask is None:
+            valid_mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        else:
+            valid_mask = valid_mask.to(device=tokens.device, dtype=torch.bool)
+        if valid_mask.shape != tokens.shape[:2]:
+            raise ValueError(f"Expected bridge valid mask shape {tokens.shape[:2]}, got {valid_mask.shape}.")
+        has_valid = valid_mask.any(dim=1)
+        if bool(has_valid.all().item()):
+            return tokens, valid_mask
+        tokens = tokens.clone()
+        valid_mask = valid_mask.clone()
+        invalid_rows = ~has_valid
+        tokens[invalid_rows, 0] = 0
+        valid_mask[invalid_rows, 0] = True
+        return tokens, valid_mask
+
+    def _cross_attend(
+        self,
+        action_tokens: Tensor,
+        source_tokens: Tensor | None,
+        source_mask: Tensor | None,
+        attn: nn.MultiheadAttention,
+    ) -> Tensor:
+        source_tokens, source_mask = self._safe_source(source_tokens, source_mask)
+        if source_tokens is None:
+            return torch.zeros_like(action_tokens)
+        out, _ = attn(
+            action_tokens,
+            source_tokens,
+            source_tokens,
+            key_padding_mask=~source_mask,
+            need_weights=False,
+        )
+        return out
+
+    def forward(
+        self,
+        action_tokens: Tensor,
+        vlm_tokens: Tensor | None,
+        vlm_mask: Tensor | None,
+        point_tokens: Tensor | None,
+        point_mask: Tensor | None,
+    ) -> Tensor:
+        action_norm = self.action_norm(action_tokens)
+        self_out, _ = self.self_attn(action_norm, action_norm, action_norm, need_weights=False)
+        action_tokens = action_tokens + torch.tanh(self.self_gate) * self_out
+
+        query = self.vlm_norm(action_tokens)
+        vlm_out = self._cross_attend(query, vlm_tokens, vlm_mask, self.vlm_cross_attn)
+        action_tokens = action_tokens + torch.tanh(self.vlm_gate) * vlm_out
+
+        query = self.point_norm(action_tokens)
+        point_out = self._cross_attend(query, point_tokens, point_mask, self.point_cross_attn)
+        action_tokens = action_tokens + torch.tanh(self.point_gate) * point_out
+
+        action_tokens = action_tokens + torch.tanh(self.ffn_gate) * self.ffn(self.ffn_norm(action_tokens))
+        return action_tokens
+
+
+class ActionExpertBridgeAdapter(nn.Module):
+    """Fuse frozen VLM outputs and point tokens into action expert tokens."""
+
+    def __init__(
+        self,
+        *,
+        vlm_dim: int,
+        expert_dim: int,
+        num_layers: int,
+        num_heads: int,
+        ffn_multiplier: float,
+        dropout: float,
+    ):
+        super().__init__()
+        self.vlm_proj = nn.Linear(vlm_dim, expert_dim)
+        self.point_norm = nn.LayerNorm(expert_dim)
+        self.blocks = nn.ModuleList(
+            [
+                GatedActionBridgeBlock(
+                    expert_dim,
+                    num_heads=num_heads,
+                    ffn_multiplier=ffn_multiplier,
+                    dropout=dropout,
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+
+    def forward(
+        self,
+        action_tokens: Tensor,
+        *,
+        vlm_tokens: Tensor | None,
+        vlm_mask: Tensor | None,
+        point_tokens: Tensor | None,
+        point_mask: Tensor | None,
+    ) -> Tensor:
+        if vlm_tokens is not None:
+            vlm_tokens = self.vlm_proj(
+                vlm_tokens.to(device=self.vlm_proj.weight.device, dtype=self.vlm_proj.weight.dtype)
+            )
+            vlm_tokens = vlm_tokens.to(device=action_tokens.device, dtype=action_tokens.dtype)
+        if point_tokens is not None:
+            point_tokens = self.point_norm(point_tokens.to(device=action_tokens.device, dtype=action_tokens.dtype))
+        for block in self.blocks:
+            action_tokens = block(action_tokens, vlm_tokens, vlm_mask, point_tokens, point_mask)
+        return action_tokens
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -1784,9 +2009,24 @@ class VLAFlowMatching(nn.Module):
     def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
+        if self.config.vla_adapter_enable and self.config.vla_adapter_freeze_vlm:
+            if not self.config.load_vlm_weights:
+                warnings.warn(
+                    "vla_adapter_enable=True requires a pretrained VLM backbone; setting load_vlm_weights=True.",
+                    stacklevel=2,
+                )
+                self.config.load_vlm_weights = True
+            if not self.config.train_expert_only:
+                warnings.warn(
+                    "vla_adapter_enable=True freezes the VLM and trains only expert-side modules; "
+                    "setting train_expert_only=True.",
+                    stacklevel=2,
+                )
+                self.config.train_expert_only = True
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
+            vlm_weights_path=self.config.vlm_weights_path,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             load_vlm_weights=self.config.load_vlm_weights,
@@ -1815,24 +2055,57 @@ class VLAFlowMatching(nn.Module):
             raise ValueError("se3_enable=True requires max_action_dim >= 10 for pose9 + gripper actions.")
         if self.config.se3_enable and self._rtc_enabled():
             raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        use_action_bridge = bool(self.config.vla_adapter_enable)
+        use_point_prefix = (not use_action_bridge) or bool(self.config.vla_adapter_point_prefix)
         self.extractor = None if use_pointseg else LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
         self.pointcloud_proj = (
-            None if use_pointseg else nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+            nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+            if (not use_pointseg and use_point_prefix)
+            else None
+        )
+        self.pointcloud_expert_proj = (
+            nn.Linear(64, self.vlm_with_expert.expert_hidden_size)
+            if (not use_pointseg and use_action_bridge)
+            else None
         )
         self.pointseg_conditioner = SongPointCloudConditioner(config) if use_pointseg else None
         self.pointseg_object_proj = (
             nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.config.text_config.hidden_size)
-            if use_pointseg
+            if (use_pointseg and use_point_prefix)
             else None
         )
         self.pointseg_background_proj = (
             nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.config.text_config.hidden_size)
-            if use_pointseg
+            if (use_pointseg and use_point_prefix)
+            else None
+        )
+        self.pointseg_object_expert_proj = (
+            nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.expert_hidden_size)
+            if (use_pointseg and use_action_bridge)
+            else None
+        )
+        self.pointseg_background_expert_proj = (
+            nn.Linear(self.config.pointseg_feature_dim, self.vlm_with_expert.expert_hidden_size)
+            if (use_pointseg and use_action_bridge)
+            else None
+        )
+        self.action_bridge_adapter = (
+            ActionExpertBridgeAdapter(
+                vlm_dim=self.vlm_with_expert.config.text_config.hidden_size,
+                expert_dim=self.vlm_with_expert.expert_hidden_size,
+                num_layers=self.config.vla_adapter_layers,
+                num_heads=self.config.vla_adapter_num_heads,
+                ffn_multiplier=self.config.vla_adapter_ffn_multiplier,
+                dropout=self.config.vla_adapter_dropout,
+            )
+            if self.config.vla_adapter_enable
             else None
         )
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
         self.last_objectflow_payload: dict[str, Tensor] | None = None
+        self.last_action_bridge_point_tokens: Tensor | None = None
+        self.last_action_bridge_point_mask: Tensor | None = None
         self.last_language_emb: Tensor | None = None
         self.last_body_pose9_prediction: Tensor | None = None
         self.worldflow_head = (
@@ -1924,7 +2197,7 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -1933,22 +2206,80 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+        suffix_out = self._apply_action_bridge(
+            suffix_out,
+            self._make_action_bridge_cache(prefix_out, prefix_pad_masks),
+        )
         if self.se3_action_out_proj is None:
             raise RuntimeError("se3_action_out_proj is not initialized.")
         return self.se3_action_out_proj(suffix_out)
 
     def embed_prefix(
-        self, point_clouds, point_cloud_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        point_clouds,
+        point_cloud_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed point cloud features and language tokens to prepare for SmolVLM transformer processing.
-        """
+        """Embed frozen-VLM prefix tokens and cache expert-side point tokens."""
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
         self.last_objectflow_payload = None
+        self.last_action_bridge_point_tokens = None
+        self.last_action_bridge_point_mask = None
         self.last_language_emb = None
         embs = []
         pad_masks = []
         att_masks = []
+        bridge_point_embs = []
+        bridge_point_masks = []
+
+        if images is not None:
+            if image_masks is None:
+                raise ValueError("image_masks must be provided when images are provided.")
+            for img, img_mask in zip(images, image_masks, strict=False):
+                if self.add_image_special_tokens:
+                    image_start_token = (
+                        self.vlm_with_expert.embed_language_tokens(
+                            self.global_image_start_token.to(device=img.device)
+                        )
+                        .unsqueeze(0)
+                        .expand(img.shape[0], -1, -1)
+                    )
+                    image_start_mask = torch.ones_like(
+                        image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+                    )
+                    embs.append(image_start_token)
+                    pad_masks.append(image_start_mask)
+                    att_masks += [0] * image_start_mask.shape[-1]
+
+                img_emb = self.vlm_with_expert.embed_image(img)
+                img_emb_dim = img_emb.shape[-1]
+                img_emb = img_emb * math.sqrt(img_emb_dim)
+
+                bsize, num_img_embs = img_emb.shape[:2]
+                img_mask = img_mask.to(device=img_emb.device, dtype=torch.bool)[:, None].expand(
+                    bsize, num_img_embs
+                )
+                embs.append(img_emb)
+                pad_masks.append(img_mask)
+                att_masks += [0] * num_img_embs
+
+                if self.add_image_special_tokens:
+                    image_end_token = (
+                        self.vlm_with_expert.embed_language_tokens(self.image_end_token.to(device=img.device))
+                        .unsqueeze(0)
+                        .expand(img.shape[0], -1, -1)
+                    )
+                    image_end_mask = torch.ones_like(
+                        image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+                    )
+                    embs.append(image_end_token)
+                    pad_masks.append(image_end_mask)
+                    att_masks += [0] * image_end_mask.shape[-1]
 
         for _pc_idx, (
             pc,
@@ -1963,11 +2294,18 @@ class VLAFlowMatching(nn.Module):
 
             if self.pointseg_conditioner is not None:
                 conditioned = self.pointseg_conditioner(payload)
-                if self.pointseg_object_proj is None or self.pointseg_background_proj is None:
-                    raise RuntimeError("Pointseg projections are not initialized.")
-                object_emb = self.pointseg_object_proj(conditioned["object_feat"])
-                background_emb = self.pointseg_background_proj(conditioned["background_feat"])
-                pc_emb = torch.stack([object_emb, background_emb], dim=1)
+                if self.action_bridge_adapter is not None:
+                    if self.pointseg_object_expert_proj is None or self.pointseg_background_expert_proj is None:
+                        raise RuntimeError("Pointseg expert projections are not initialized.")
+                    expert_object_emb = self.pointseg_object_expert_proj(conditioned["object_feat"])
+                    expert_background_emb = self.pointseg_background_expert_proj(conditioned["background_feat"])
+                    expert_pc_emb = torch.stack([expert_object_emb, expert_background_emb], dim=1)
+                if self.action_bridge_adapter is None or self.config.vla_adapter_point_prefix:
+                    if self.pointseg_object_proj is None or self.pointseg_background_proj is None:
+                        raise RuntimeError("Pointseg prefix projections are not initialized.")
+                    object_emb = self.pointseg_object_proj(conditioned["object_feat"])
+                    background_emb = self.pointseg_background_proj(conditioned["background_feat"])
+                    pc_emb = torch.stack([object_emb, background_emb], dim=1)
                 if self.worldflow_head is not None:
                     role_scores = payload.get("pointseg.role_scores")
                     if torch.is_tensor(role_scores) and role_scores.ndim >= 3 and role_scores.shape[1] == 1:
@@ -2016,23 +2354,62 @@ class VLAFlowMatching(nn.Module):
                     if torch.is_tensor(value):
                         self.last_pointseg_metrics[key] = value.detach()
             else:
-                if self.extractor is None or self.pointcloud_proj is None:
+                if self.extractor is None:
                     raise RuntimeError("Point cloud extractor is not initialized.")
                 global_feat = self.extractor(pc, payload.get("point_is_pad"))  # (B, C)
-                pc_emb = self.pointcloud_proj(global_feat).unsqueeze(1)
-            pc_emb_dim = pc_emb.shape[-1]
-            pc_emb = pc_emb * math.sqrt(pc_emb_dim)
-            num_pc_tokens = pc_emb.shape[1]
+                if self.action_bridge_adapter is not None:
+                    if self.pointcloud_expert_proj is None:
+                        raise RuntimeError("Point cloud expert projection is not initialized.")
+                    expert_pc_emb = self.pointcloud_expert_proj(global_feat).unsqueeze(1)
+                if self.action_bridge_adapter is None or self.config.vla_adapter_point_prefix:
+                    if self.pointcloud_proj is None:
+                        raise RuntimeError("Point cloud prefix projection is not initialized.")
+                    pc_emb = self.pointcloud_proj(global_feat).unsqueeze(1)
 
-            bsize = pc_emb.shape[0]
+            bsize = pc.shape[0]
             if pc_mask.ndim == 1:
-                pc_mask = pc_mask[:, None].expand(-1, num_pc_tokens)
-            elif pc_mask.ndim == 2 and pc_mask.shape[1] == 1:
-                pc_mask = pc_mask.expand(-1, num_pc_tokens)
+                pc_mask_base = pc_mask[:, None]
+            elif pc_mask.ndim == 2:
+                pc_mask_base = pc_mask
+            else:
+                raise ValueError(f"Expected point cloud mask shape (B,) or (B,T), got {pc_mask.shape}.")
 
-            embs.append(pc_emb)
-            pad_masks.append(pc_mask)
-            att_masks += [0] * num_pc_tokens
+            if self.action_bridge_adapter is not None:
+                expert_pc_emb_dim = expert_pc_emb.shape[-1]
+                expert_pc_emb = expert_pc_emb * math.sqrt(expert_pc_emb_dim)
+                num_expert_pc_tokens = expert_pc_emb.shape[1]
+                expert_pc_mask = pc_mask
+                if pc_mask_base.shape[1] == num_expert_pc_tokens:
+                    expert_pc_mask = pc_mask_base
+                elif pc_mask_base.shape[1] == 1:
+                    expert_pc_mask = pc_mask_base.expand(-1, num_expert_pc_tokens)
+                else:
+                    raise ValueError(
+                        f"Expected point mask to have {num_expert_pc_tokens} tokens for action bridge, "
+                        f"got {pc_mask_base.shape}."
+                    )
+                bridge_point_embs.append(expert_pc_emb)
+                bridge_point_masks.append(expert_pc_mask.to(device=expert_pc_emb.device, dtype=torch.bool))
+
+            if self.action_bridge_adapter is None or self.config.vla_adapter_point_prefix:
+                pc_emb_dim = pc_emb.shape[-1]
+                pc_emb = pc_emb * math.sqrt(pc_emb_dim)
+                num_pc_tokens = pc_emb.shape[1]
+                if pc_mask_base.shape[1] == num_pc_tokens:
+                    pc_mask = pc_mask_base
+                elif pc_mask_base.shape[1] == 1:
+                    pc_mask = pc_mask_base.expand(-1, num_pc_tokens)
+                else:
+                    raise ValueError(
+                        f"Expected point mask to have {num_pc_tokens} prefix tokens, got {pc_mask_base.shape}."
+                    )
+                embs.append(pc_emb)
+                pad_masks.append(pc_mask.to(device=pc_emb.device, dtype=torch.bool))
+                att_masks += [0] * num_pc_tokens
+
+        if bridge_point_embs:
+            self.last_action_bridge_point_tokens = torch.cat(bridge_point_embs, dim=1)
+            self.last_action_bridge_point_mask = torch.cat(bridge_point_masks, dim=1)
 
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
@@ -2120,6 +2497,41 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
+
+    def _make_action_bridge_cache(
+        self,
+        prefix_out: Tensor | None,
+        prefix_pad_masks: Tensor | None,
+    ) -> dict[str, Tensor | None] | None:
+        if self.action_bridge_adapter is None:
+            return None
+        point_tokens = self.last_action_bridge_point_tokens
+        point_mask = self.last_action_bridge_point_mask
+        if torch.is_tensor(point_tokens) and not torch.is_tensor(point_mask):
+            point_mask = torch.ones(point_tokens.shape[:2], dtype=torch.bool, device=point_tokens.device)
+        return {
+            "vlm_tokens": prefix_out,
+            "vlm_mask": prefix_pad_masks,
+            "point_tokens": point_tokens,
+            "point_mask": point_mask,
+        }
+
+    def _apply_action_bridge(
+        self,
+        action_tokens: Tensor,
+        bridge_cache: dict[str, Tensor | None] | None,
+    ) -> Tensor:
+        if self.action_bridge_adapter is None:
+            return action_tokens
+        if bridge_cache is None:
+            raise RuntimeError("VLA action bridge is enabled but no bridge cache was provided.")
+        return self.action_bridge_adapter(
+            action_tokens,
+            vlm_tokens=bridge_cache.get("vlm_tokens"),
+            vlm_mask=bridge_cache.get("vlm_mask"),
+            point_tokens=bridge_cache.get("point_tokens"),
+            point_mask=bridge_cache.get("point_mask"),
+        )
 
     def compute_worldflow_aux_loss(
         self,
@@ -2349,6 +2761,8 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         actions_is_pad: Tensor | None = None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> Tensor:
         if actions.shape[-1] < 10:
             raise ValueError(f"se3_enable=True expects pose9 + gripper actions, got {actions.shape}.")
@@ -2378,7 +2792,13 @@ class VLAFlowMatching(nn.Module):
             x_t = pad_vector(x_t, actions.shape[-1])
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         pred = self._se3_predict_from_suffix(prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, time)
         twist_pred = pred[..., :6]
@@ -2419,7 +2839,18 @@ class VLAFlowMatching(nn.Module):
         return losses
 
     def forward(
-        self, pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, actions_is_pad=None
+        self,
+        pc_feats,
+        pc_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        actions_is_pad=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if self.config.se3_enable:
@@ -2433,6 +2864,8 @@ class VLAFlowMatching(nn.Module):
                 noise=noise,
                 time=time,
                 actions_is_pad=actions_is_pad,
+                images=images,
+                image_masks=image_masks,
             )
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -2444,7 +2877,13 @@ class VLAFlowMatching(nn.Module):
         x_t = (1 - time_expanded) * noise + time_expanded * actions
         u_t = actions - noise
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -2453,7 +2892,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -2464,6 +2903,10 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = self._apply_action_bridge(
+            suffix_out,
+            self._make_action_bridge_cache(prefix_out, prefix_pad_masks),
+        )
         v_t = self.action_out_proj(suffix_out)
         if x_t.shape[-1] >= 9 and v_t.shape[-1] >= 9:
             endpoint = x_t + (1.0 - time_expanded) * v_t
@@ -2481,12 +2924,22 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         if self.config.se3_enable:
             return self.sample_actions_se3(
-                pc_feats, pc_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+                pc_feats,
+                pc_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                noise=noise,
+                images=images,
+                image_masks=image_masks,
+                **kwargs,
             )
         bsize = state.shape[0]
         device = state.device
@@ -2496,12 +2949,18 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -2509,6 +2968,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        adapter_cache = self._make_action_bridge_cache(prefix_outputs[0], prefix_pad_masks)
         num_steps = self.config.num_steps
         dt = 1.0 / num_steps
 
@@ -2523,6 +2983,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    adapter_cache=adapter_cache,
                 )
 
             if self._rtc_enabled():
@@ -2556,6 +3017,8 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         if self._rtc_enabled():
@@ -2573,11 +3036,17 @@ class VLAFlowMatching(nn.Module):
                 x_t = pad_vector(x_t, self.config.max_action_dim)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -2585,6 +3054,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        adapter_cache = self._make_action_bridge_cache(prefix_outputs[0], prefix_pad_masks)
         num_steps = self.config.num_steps
         dt = 1.0 / num_steps
         for step in range(num_steps):
@@ -2595,6 +3065,7 @@ class VLAFlowMatching(nn.Module):
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 timestep=time_tensor,
+                adapter_cache=adapter_cache,
             )
             twist = pred[..., :6]
             gripper_vel = pred[..., 6:7]
@@ -2613,6 +3084,7 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        adapter_cache: dict[str, Tensor | None] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -2639,6 +3111,7 @@ class VLAFlowMatching(nn.Module):
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = self._apply_action_bridge(suffix_out, adapter_cache)
         if self.config.se3_enable:
             if self.se3_action_out_proj is None:
                 raise RuntimeError("se3_action_out_proj is not initialized.")

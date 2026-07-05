@@ -67,6 +67,53 @@ DATASET_FEATURES = {
 }
 
 
+def image_feature_key(camera: str) -> str:
+    return f"observation.images.{str(camera).strip()}"
+
+
+def resolve_image_key(h5_file: h5py.File, requested_key: str | None, camera: str) -> str | None:
+    if requested_key:
+        if str(requested_key).lower() in {"0", "false", "none", "off"}:
+            return None
+        if requested_key not in h5_file:
+            raise KeyError(f"Requested image key is missing: {requested_key}")
+        return requested_key
+    image_group_key = "observations/images"
+    if image_group_key not in h5_file:
+        return None
+    image_group = h5_file[image_group_key]
+    if camera in image_group:
+        return f"{image_group_key}/{camera}"
+    names = list(image_group.keys())
+    if len(names) == 1:
+        return f"{image_group_key}/{names[0]}"
+    return None
+
+
+def infer_image_shape(source_files: list[Path], requested_key: str | None, camera: str) -> tuple[int, int, int] | None:
+    for path in source_files:
+        with h5py.File(path, "r") as h5_file:
+            image_key = resolve_image_key(h5_file, requested_key, camera)
+            if image_key is None:
+                continue
+            image_ds = h5_file[image_key]
+            if image_ds.ndim != 4 or image_ds.shape[-1] != 3:
+                raise ValueError(f"{image_key} must have shape (T,H,W,3), got {image_ds.shape}")
+            return tuple(int(v) for v in image_ds.shape[1:])
+    return None
+
+
+def dataset_features_with_optional_image(image_shape: tuple[int, int, int] | None, camera: str) -> dict[str, Any]:
+    features = dict(DATASET_FEATURES)
+    if image_shape is not None:
+        features[image_feature_key(camera)] = {
+            "dtype": "image",
+            "shape": image_shape,
+            "names": ["height", "width", "channels"],
+        }
+    return features
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -92,6 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--num-points", type=int, default=10000)
     parser.add_argument("--point-cloud-key", default=None, help="Full HDF5 key. Defaults to observations/cloud_rgb/<camera>.")
+    parser.add_argument("--image-key", default=None, help="Full HDF5 RGB key. Defaults to observations/images/<camera> when available. Use 'none' to disable.")
     parser.add_argument("--camera", default="overhead")
     parser.add_argument("--pose-key", default="observations/pose_eular")
     parser.add_argument("--gripper-key", default="observations/eff_angular")
@@ -330,6 +378,12 @@ def prepare_point_clouds(
 def convert_hdf5_episode(source_path: Path, cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     with h5py.File(source_path, "r") as h5_file:
         cloud_key = resolve_cloud_key(h5_file, cfg.get("point_cloud_key"), str(cfg["camera"]))
+        image_key = resolve_image_key(h5_file, cfg.get("image_key"), str(cfg["camera"]))
+        if cfg.get("image_feature_key") is not None and image_key is None:
+            raise KeyError(
+                f"Dataset was created with RGB feature {cfg['image_feature_key']!r}, "
+                f"but no image dataset was found in {source_path}."
+            )
         cloud_dataset = h5_file[cloud_key]
         if cloud_dataset.ndim != 3 or cloud_dataset.shape[-1] < POINT_CLOUD_CHANNELS:
             raise ValueError(f"{cloud_key} must have shape (T,N,>=6), got {cloud_dataset.shape}")
@@ -363,6 +417,14 @@ def convert_hdf5_episode(source_path: Path, cfg: dict[str, Any]) -> tuple[dict[s
         )
         actions = reference_to_umi_actions(reference_ee_poses, grippers)
         task = source_task(h5_file, cfg.get("task"), source_path)
+        images = None
+        if image_key is not None:
+            image_dataset = h5_file[image_key]
+            if image_dataset.ndim != 4 or image_dataset.shape[-1] != 3:
+                raise ValueError(f"{image_key} must have shape (T,H,W,3), got {image_dataset.shape}")
+            if int(image_dataset.shape[0]) < frame_count:
+                raise ValueError(f"{image_key} has {image_dataset.shape[0]} frames but needs {frame_count}.")
+            images = np.asarray(image_dataset[:frame_count], dtype=np.uint8)
 
     episode = {
         "task": task,
@@ -373,11 +435,14 @@ def convert_hdf5_episode(source_path: Path, cfg: dict[str, Any]) -> tuple[dict[s
         "world_ee_poses": reference_ee_poses,
         "timestamps": timestamps,
     }
+    if images is not None:
+        episode["images"] = images
     record = {
         "source_hdf5": str(source_path),
         "task": task,
         "frames": frame_count,
         "source_point_cloud_key": cloud_key,
+        "source_image_key": image_key,
         "source_cloud_frame": cloud_frame,
         "reference_frame": "overhead_camera",
         "uses_real_camera_extrinsic": False,
@@ -402,6 +467,8 @@ def save_worker_artifact(artifact_dir: Path, episode: dict[str, Any], record: di
     np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
     np.save(artifact_dir / "timestamps.npy", np.ascontiguousarray(episode["timestamps"], dtype=np.float32))
+    if "images" in episode:
+        np.save(artifact_dir / "images.npy", np.ascontiguousarray(episode["images"], dtype=np.uint8))
     (artifact_dir / "record.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -433,7 +500,14 @@ def move_artifact(src: Path, dst: Path) -> None:
     shutil.move(str(src), str(dst))
 
 
-def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray, timestamps: np.ndarray) -> dict[str, Any]:
+def make_episode_buffer(
+    dataset: LeRobotDataset,
+    task: str,
+    actions: np.ndarray,
+    timestamps: np.ndarray,
+    images: np.ndarray | None = None,
+    image_key: str | None = None,
+) -> dict[str, Any]:
     episode_buffer = dataset.create_episode_buffer()
     frame_count = len(actions)
     episode_buffer["size"] = frame_count
@@ -442,6 +516,10 @@ def make_episode_buffer(dataset: LeRobotDataset, task: str, actions: np.ndarray,
     episode_buffer["timestamp"] = np.asarray(timestamps, dtype=np.float32)
     episode_buffer["action"] = np.asarray(actions, dtype=np.float32)
     episode_buffer["observation.state"] = np.asarray(actions, dtype=np.float32)
+    if images is not None and image_key is not None:
+        if len(images) != frame_count:
+            raise ValueError(f"Image frame count {len(images)} does not match actions {frame_count}.")
+        episode_buffer[image_key] = np.asarray(images, dtype=np.uint8)
     return episode_buffer
 
 
@@ -453,6 +531,8 @@ def save_artifact_to_dataset(
     record = json.loads((artifact_dir / "record.json").read_text(encoding="utf-8"))
     actions = np.load(artifact_dir / "actions.npy")
     timestamps = np.load(artifact_dir / "timestamps.npy")
+    images_path = artifact_dir / "images.npy"
+    images = np.load(images_path, mmap_mode="r") if images_path.exists() else None
     episode_index = int(dataset.meta.total_episodes)
     storage = str(cfg["point_cloud_storage"])
     move_artifact(
@@ -460,7 +540,16 @@ def save_artifact_to_dataset(
         point_cloud_path(dataset.root, episode_index, storage),
     )
     move_artifact(artifact_dir / "world_ee_poses.npy", world_pose_path(dataset.root, episode_index))
-    dataset.save_episode(episode_data=make_episode_buffer(dataset, str(record["task"]), actions, timestamps))
+    dataset.save_episode(
+        episode_data=make_episode_buffer(
+            dataset,
+            str(record["task"]),
+            actions,
+            timestamps,
+            images=images,
+            image_key=cfg.get("image_feature_key"),
+        )
+    )
     record["episode_index"] = episode_index
     shutil.rmtree(artifact_dir, ignore_errors=True)
     return record
@@ -578,6 +667,10 @@ def main() -> None:
         else output_root.parent / f".{output_root.name}_real_hdf5_tmp"
     )
     cfg = build_config(args)
+    image_shape = infer_image_shape(source_files, args.image_key, args.camera)
+    cfg["image_key"] = args.image_key if image_shape is not None else "none"
+    cfg["image_feature_key"] = image_feature_key(args.camera) if image_shape is not None else None
+    dataset_features = dataset_features_with_optional_image(image_shape, args.camera)
 
     if output_root.exists():
         if not args.overwrite:
@@ -592,7 +685,7 @@ def main() -> None:
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         fps=int(args.fps),
-        features=DATASET_FEATURES,
+        features=dataset_features,
         robot_type=args.robot_type,
         root=output_root,
         use_videos=False,
