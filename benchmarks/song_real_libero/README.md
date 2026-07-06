@@ -501,7 +501,7 @@ preview.json
 `camera_names` controls RGB-D rendering and MP4 previews. `pointcloud_camera_names` controls which rendered cameras are fused into `observation.point_cloud`; the default is only `["agentview"]` because directly mixing the static scene camera with the wrist camera can produce duplicate crossed scenes if the camera frames are not perfectly aligned.
 
 The LIBERO collector mirrors the real-robot point-cloud contract.
-`pointcloud_reference_camera` selects the fixed Overview reference camera and
+`pointcloud_reference_camera` selects the fixed overhead reference camera and
 is moved to the front of `pointcloud_camera_names` automatically.
 Rendered depth is back-projected directly in that camera frame, while the
 simulator extrinsic is used only to express the simulated EEF pose in the same

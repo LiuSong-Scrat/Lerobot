@@ -314,7 +314,7 @@ def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
         "storage_format": storage,
         "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
         "coordinate_frame": "current_eff",
-        "source_reference_frame": "overview_camera",
+        "source_reference_frame": "overhead_camera",
     }
     if storage == "zarr":
         meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
@@ -331,9 +331,9 @@ def write_worldflow_meta(root: Path) -> None:
         "shape": [9],
         "layout": "episode_npy",
         "path_format": f"{WORLD_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy",
-        "coordinate_frame": "overview_camera",
+        "coordinate_frame": "overhead_camera",
         "legacy_directory_name": True,
-        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
+        "sim_extrinsic_usage": "eef_world_to_overhead_camera_only",
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -870,7 +870,7 @@ def collect_demo_episode(
         "actions": episode_actions,
         "point_clouds": point_clouds,
         # Legacy key/path retained for the existing WorldFlow dataset wrapper.
-        # Values are expressed in the fixed Overview-camera reference frame.
+        # Values are expressed in the fixed overhead-camera reference frame.
         "world_ee_poses": reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
@@ -1137,9 +1137,9 @@ def main() -> None:
         "output_root": str(output_root),
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
-        "reference_frame": "overview_camera",
+        "reference_frame": "overhead_camera",
         "reference_camera": pointcloud_camera_names_from_config(cfg)[0],
-        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
+        "sim_extrinsic_usage": "eef_world_to_overhead_camera_only",
         "render_camera_names": render_camera_names_from_config(cfg),
         "image_camera": image_feature_camera(cfg) if bool(cfg.get("save_rgb_images", True)) else None,
         "image_feature_key": cfg.get("image_feature_key"),

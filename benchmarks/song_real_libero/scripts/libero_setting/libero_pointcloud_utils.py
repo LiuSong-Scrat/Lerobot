@@ -757,7 +757,7 @@ def observation_to_camera_point_cloud(
     num_points: int,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return scene cloud and EEF pose in the first (Overview) camera frame.
+    """Return scene cloud and EEF pose in the first overhead camera frame.
 
     The third result keeps the simulator world-frame EEF pose for controller-only
     use during evaluation. It is not needed by dataset conversion or training.
@@ -770,7 +770,7 @@ def observation_to_camera_point_cloud(
 
     normalized_names = [normalize_camera_name(name) for name in camera_names]
     if not normalized_names:
-        raise ValueError("At least one fixed Overview camera is required.")
+        raise ValueError("At least one fixed overhead camera is required.")
 
     reference_camera = normalized_names[0]
     reference_to_world = get_camera_extrinsic_matrix(env.sim, reference_camera).astype(np.float32)

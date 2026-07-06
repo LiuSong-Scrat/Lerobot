@@ -131,7 +131,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
     """Inject fixed-reference EEF pose chunks for WorldFlow supervision.
 
     The on-disk directory keeps its historical ``world_ee_poses`` name. New
-    datasets store poses in the fixed Overview-camera frame, which is treated as
+    datasets store poses in the fixed overhead-camera frame, which is treated as
     the model's world/reference frame and requires no real-robot extrinsic.
     """
 

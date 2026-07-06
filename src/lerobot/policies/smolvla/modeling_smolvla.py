@@ -1509,7 +1509,7 @@ def weighted_kabsch_transform(
 
 
 class DenseRigidObjectFlowHead(nn.Module):
-    """Dense automatic ObjectFlow head over the fixed Overview/world point cloud."""
+    """Dense automatic ObjectFlow head over the fixed overhead/world point cloud."""
 
     ROLE_DIM = 3
 
