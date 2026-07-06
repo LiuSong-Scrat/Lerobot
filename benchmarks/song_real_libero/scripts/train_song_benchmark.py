@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 import os
+import pickle
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -816,6 +817,8 @@ def ood_case_inference(
         return []
 
     import open3d as o3d
+    from scipy.spatial.transform import Rotation as R
+
     ood_num_points = int(os.environ.get("SONG_OOD_NUM_POINTS", str(ood_num_points)))
     if ood_num_points <= 0:
         raise ValueError(f"ood_num_points should be positive, got {ood_num_points}.")
@@ -867,6 +870,263 @@ def ood_case_inference(
         colors = np.clip(colors, 0.0, 255.0)
         return np.concatenate((points, colors), axis=1).astype(np.float32, copy=False)
 
+    def load_pkl_observation(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        with path.open("rb") as f:
+            observation = pickle.load(f)
+        if not isinstance(observation, dict):
+            raise ValueError(f"OOD pkl should contain a dict, got {type(observation).__name__}: {path}")
+        if "point_cloud" not in observation:
+            raise ValueError(f"OOD pkl is missing 'point_cloud': {path}")
+        return observation
+
+    def to_numpy(value: Any) -> np.ndarray:
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    def to_float_scalar(value: Any) -> float:
+        return float(np.asarray(to_numpy(value)).reshape(-1)[0])
+
+    def normalize_xyzrgb(value: Any, *, source: str) -> np.ndarray:
+        if hasattr(value, "points"):
+            points = np.asarray(value.points, dtype=np.float32)
+            colors = np.asarray(getattr(value, "colors", np.zeros_like(points)), dtype=np.float32)
+            if colors.shape != points.shape:
+                colors = np.zeros_like(points, dtype=np.float32)
+            xyzrgb = np.concatenate([points, colors], axis=1)
+        elif isinstance(value, dict):
+            points_value = value.get("points", value.get("xyz"))
+            if points_value is None:
+                raise ValueError(f"{source} point_cloud dict must contain 'points' or 'xyz'.")
+            points = np.asarray(to_numpy(points_value), dtype=np.float32)
+            colors_value = value.get("colors", value.get("rgb"))
+            colors = np.zeros_like(points, dtype=np.float32) if colors_value is None else np.asarray(
+                to_numpy(colors_value), dtype=np.float32
+            )
+            if colors.shape != points.shape:
+                raise ValueError(
+                    f"{source} point_cloud colors shape {colors.shape} does not match points shape {points.shape}."
+                )
+            xyzrgb = np.concatenate([points, colors], axis=1)
+        else:
+            xyzrgb = np.asarray(to_numpy(value), dtype=np.float32)
+
+        if xyzrgb.ndim != 2 or xyzrgb.shape[1] not in (3, 6):
+            raise ValueError(f"{source} point_cloud should have shape (N, 3) or (N, 6), got {xyzrgb.shape}.")
+        if xyzrgb.shape[1] == 3:
+            xyzrgb = np.concatenate([xyzrgb, np.zeros_like(xyzrgb, dtype=np.float32)], axis=1)
+
+        finite = np.isfinite(xyzrgb).all(axis=1)
+        if not np.all(finite):
+            xyzrgb = xyzrgb[finite]
+        if xyzrgb.shape[0] == 0:
+            raise ValueError(f"{source} point_cloud has no finite points.")
+
+        colors = xyzrgb[:, 3:6]
+        if colors.size and colors.max(initial=0.0) <= 1.0:
+            colors = colors * 255.0
+        xyzrgb = np.concatenate([xyzrgb[:, :3], np.clip(colors, 0.0, 255.0)], axis=1)
+        return xyzrgb.astype(np.float32, copy=False)
+
+    def traj6_to_pose9(traj6: np.ndarray) -> np.ndarray:
+        traj6 = np.asarray(traj6, dtype=np.float32).reshape(-1)
+        if traj6.shape[0] < 6:
+            raise ValueError(f"Expected pose_eular to contain at least 6 values, got shape {traj6.shape}.")
+        t = traj6[:3].astype(np.float32)
+        rot = R.from_euler("zyx", traj6[3:6], degrees=False).as_matrix().astype(np.float32)
+        return np.concatenate([t, rot[:, 0], rot[:, 1]], axis=0).astype(np.float32)
+
+    def observation_to_pose9_gripper(observation: dict[str, Any]) -> np.ndarray:
+        if "pose_eular" in observation:
+            pose9 = traj6_to_pose9(to_numpy(observation["pose_eular"]))
+            if "gripper_width" in observation:
+                gripper_width = to_float_scalar(observation["gripper_width"])
+            elif "joint_7" in observation:
+                gripper_width = to_float_scalar(observation["joint_7"])
+            else:
+                raise ValueError("OOD pkl with 'pose_eular' also needs 'gripper_width' or 'joint_7'.")
+            return np.concatenate([pose9, np.asarray([gripper_width], dtype=np.float32)], axis=0)
+
+        pose_keys = [
+            key
+            for key in observation.keys()
+            if key not in {"point_cloud", "overhead", "hand"}
+            and not str(key).startswith("observation.images.")
+        ]
+        if len(pose_keys) < 7:
+            raise ValueError("Expected 'pose_eular' or at least 7 pose/gripper entries in OOD pkl.")
+        eff_xyz_euler_gripper = [to_float_scalar(observation[key]) for key in pose_keys[:7]]
+        pose9 = traj6_to_pose9(np.asarray(eff_xyz_euler_gripper[:6], dtype=np.float32))
+        gripper_width = float(eff_xyz_euler_gripper[-1]) * 0.5
+        return np.concatenate([pose9, np.asarray([gripper_width], dtype=np.float32)], axis=0)
+
+    def rot6d_to_matrix_np(rot6d: np.ndarray) -> np.ndarray:
+        a1 = rot6d[..., 0:3]
+        a2 = rot6d[..., 3:6]
+        b1 = a1 / np.clip(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-8, None)
+        b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+        b2 = b2 / np.clip(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-8, None)
+        b3 = np.cross(b1, b2)
+        return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
+
+    def pose9_to_homo_np(pose9: np.ndarray) -> np.ndarray:
+        pose9 = np.asarray(pose9, dtype=np.float32)
+        if pose9.ndim == 1:
+            pose9 = pose9[None]
+        H = np.zeros((*pose9.shape[:-1], 4, 4), dtype=np.float32)
+        H[..., 3, 3] = 1.0
+        H[..., :3, :3] = rot6d_to_matrix_np(pose9[..., 3:9])
+        H[..., :3, 3] = pose9[..., :3]
+        return H
+
+    def fast_inverse_homogeneous_np(T: np.ndarray) -> np.ndarray:
+        T = np.asarray(T, dtype=np.float32)
+        T_inv = np.zeros_like(T)
+        rot = T[..., :3, :3]
+        trans = T[..., :3, 3:4]
+        rot_inv = np.swapaxes(rot, -1, -2)
+        T_inv[..., :3, :3] = rot_inv
+        T_inv[..., :3, 3:4] = -(rot_inv @ trans)
+        T_inv[..., 3, 3] = 1.0
+        return T_inv
+
+    def world_point_cloud_to_current_eff(point_cloud_world: np.ndarray, pose9_gripper: np.ndarray) -> np.ndarray:
+        pc = np.asarray(point_cloud_world, dtype=np.float32)
+        squeeze = pc.ndim == 2
+        if squeeze:
+            pc = pc[None]
+        pose = np.asarray(pose9_gripper, dtype=np.float32)
+        if pose.ndim == 1:
+            pose = pose[None]
+        if pose.shape[0] == 1 and pc.shape[0] > 1:
+            pose = np.repeat(pose, pc.shape[0], axis=0)
+        if pose.shape[0] != pc.shape[0]:
+            raise ValueError(f"Pose batch {pose.shape[0]} does not match point cloud batch {pc.shape[0]}.")
+        world_to_eff = fast_inverse_homogeneous_np(pose9_to_homo_np(pose[..., :9]))
+        xyz_h = np.concatenate([pc[..., :3], np.ones((*pc.shape[:2], 1), dtype=np.float32)], axis=-1)
+        eff_xyz_h = np.einsum("bij,bnj->bni", world_to_eff, xyz_h)
+        pc_eff = np.concatenate([eff_xyz_h[..., :3], pc[..., 3:]], axis=-1).astype(np.float32)
+        return pc_eff[0] if squeeze else pc_eff
+
+    def get_rgb_observation_value(observation: dict[str, Any], image_key: str) -> Any | None:
+        if image_key in observation:
+            return observation[image_key]
+        short_key = image_key
+        if image_key.startswith("observation.images."):
+            short_key = image_key[len("observation.images.") :]
+        candidates = [short_key, short_key.replace(".", "_"), short_key.replace("_rgb", "")]
+        lowered = image_key.lower()
+        if "overhead" in lowered or "overview" in lowered or "top" in lowered:
+            candidates += ["overhead", "overview", "top"]
+        if "hand" in lowered or "wrist" in lowered:
+            candidates += ["hand", "wrist"]
+        for candidate in candidates:
+            if candidate in observation:
+                return observation[candidate]
+        return None
+
+    def prepare_image_tensor(image: Any, *, batch_size: int, image_key: str) -> torch.Tensor:
+        if isinstance(image, (str, Path)):
+            from PIL import Image
+
+            image = np.asarray(Image.open(image).convert("RGB"))
+        if torch.is_tensor(image):
+            img = image.detach().to(dtype=torch.float32)
+        else:
+            img = torch.as_tensor(np.asarray(image), dtype=torch.float32)
+
+        if img.ndim == 2:
+            img = img.unsqueeze(-1)
+        if img.ndim == 3:
+            if img.shape[-1] in (1, 3, 4) and img.shape[0] not in (1, 3, 4):
+                img = img[..., :3].permute(2, 0, 1)
+            elif img.shape[0] in (1, 3, 4):
+                img = img[:3]
+            else:
+                raise ValueError(f"Expected RGB image {image_key} shape (H,W,3) or (3,H,W), got {tuple(img.shape)}.")
+            if img.shape[0] == 1:
+                img = img.expand(3, -1, -1)
+            img = img.unsqueeze(0)
+        elif img.ndim == 4:
+            if img.shape[-1] in (1, 3, 4) and img.shape[1] not in (1, 3, 4):
+                img = img[..., :3].permute(0, 3, 1, 2)
+            elif img.shape[1] in (1, 3, 4):
+                img = img[:, :3]
+            else:
+                raise ValueError(
+                    f"Expected RGB image batch {image_key} shape (B,H,W,3) or (B,3,H,W), got {tuple(img.shape)}."
+                )
+            if img.shape[1] == 1:
+                img = img.expand(-1, 3, -1, -1)
+        elif img.ndim == 5:
+            if img.shape[-1] in (1, 3, 4) and img.shape[2] not in (1, 3, 4):
+                img = img[..., :3].permute(0, 1, 4, 2, 3)
+            elif img.shape[2] in (1, 3, 4):
+                img = img[:, :, :3]
+            else:
+                raise ValueError(
+                    f"Expected temporal RGB image {image_key} shape (B,T,H,W,3) or (B,T,3,H,W), got {tuple(img.shape)}."
+                )
+            if img.shape[2] == 1:
+                img = img.expand(-1, -1, 3, -1, -1)
+        else:
+            raise ValueError(f"Expected RGB image {image_key} ndim 3/4/5, got shape {tuple(img.shape)}.")
+
+        if img.shape[0] == 1 and batch_size > 1:
+            img = img.expand(batch_size, *img.shape[1:]).clone()
+        elif img.shape[0] != batch_size:
+            raise ValueError(f"Image {image_key} batch size {img.shape[0]} does not match {batch_size}.")
+        return img.contiguous()
+
+    def set_ood_rgb_images(dst_batch: dict[str, Any], observation: dict[str, Any], policy_like: PreTrainedPolicy) -> None:
+        config = getattr(policy_like, "config", None)
+        image_feature_keys = list(getattr(config, "image_features", {}) or [])
+        if not image_feature_keys:
+            image_feature_keys = [key for key in dst_batch if str(key).startswith("observation.images.")]
+        if not image_feature_keys:
+            return
+
+        point_cloud_value = dst_batch.get("observation.point_cloud")
+        batch_size = int(point_cloud_value.shape[0]) if torch.is_tensor(point_cloud_value) and point_cloud_value.ndim >= 3 else 1
+        set_count = 0
+        missing = []
+        for image_key in image_feature_keys:
+            image_value = get_rgb_observation_value(observation, str(image_key))
+            if image_value is None:
+                missing.append(str(image_key))
+                continue
+            target = dst_batch.get(str(image_key))
+            device = target.device if torch.is_tensor(target) else (
+                point_cloud_value.device if torch.is_tensor(point_cloud_value) else torch.device("cpu")
+            )
+            dtype = target.dtype if torch.is_tensor(target) and target.is_floating_point() else torch.float32
+            image_tensor = prepare_image_tensor(image_value, batch_size=batch_size, image_key=str(image_key)).to(
+                device=device, dtype=dtype
+            )
+            if torch.is_tensor(target) and target.ndim == 5 and image_tensor.ndim == 4:
+                image_tensor = image_tensor.unsqueeze(1)
+                if target.shape[1] > 1:
+                    image_tensor = image_tensor.expand(-1, target.shape[1], -1, -1, -1).clone()
+            elif torch.is_tensor(target) and target.ndim == 4 and image_tensor.ndim == 5:
+                image_tensor = image_tensor[:, -1]
+            dst_batch[str(image_key)] = image_tensor
+            mask_key = f"{image_key}_padding_mask"
+            if mask_key in dst_batch and torch.is_tensor(dst_batch[mask_key]):
+                dst_batch[mask_key] = torch.ones(
+                    batch_size, dtype=torch.bool, device=dst_batch[mask_key].device
+                )
+            set_count += 1
+
+        if bool(getattr(config, "vla_adapter_enable", False)) and set_count == 0:
+            raise ValueError(
+                "OOD pkl did not provide any RGB image required by vla_adapter_enable=True. "
+                f"Expected one of {image_feature_keys}, got keys {sorted(observation.keys())}."
+            )
+        if missing and set_count:
+            logging.warning("OOD pkl is missing RGB keys %s; continuing with the provided camera(s).", missing)
+
     def load_ood_task(sno: int) -> str:
         if isinstance(ood_tasks, dict) and sno in ood_tasks:
             task = ood_tasks[sno]
@@ -910,14 +1170,35 @@ def ood_case_inference(
         dst_batch.pop("observation.language.tokens", None)
         dst_batch.pop("observation.language.attention_mask", None)
 
-    def make_identity_pose_action_like(action: torch.Tensor) -> torch.Tensor:
+    def set_identity_state_from_pose(dst_batch: dict[str, Any], pose9_gripper: np.ndarray | None) -> None:
+        state = dst_batch.get("observation.state")
+        if not torch.is_tensor(state) or state.shape[-1] < 9:
+            return
+        identity = torch.zeros_like(state)
+        identity[..., 3] = 1.0
+        identity[..., 7] = 1.0
+        if state.shape[-1] > 9:
+            if pose9_gripper is None:
+                identity[..., 9:] = state[..., 9:]
+            else:
+                identity[..., 9] = float(np.asarray(pose9_gripper).reshape(-1)[-1])
+                if state.shape[-1] > 10:
+                    identity[..., 10:] = state[..., 10:]
+        dst_batch["observation.state"] = identity
+
+    def make_identity_pose_action_like(action: torch.Tensor, gripper_width: float | None = None) -> torch.Tensor:
         identity = torch.zeros_like(action)
         if identity.shape[-1] < 9:
             raise ValueError(f"Expected pose9 action with last dim >= 9, got {tuple(identity.shape)}")
         identity[..., 3] = 1.0
         identity[..., 7] = 1.0
         if action.shape[-1] > 9:
-            identity[..., 9:] = action[..., 9:]
+            if gripper_width is None:
+                identity[..., 9:] = action[..., 9:]
+            else:
+                identity[..., 9] = float(gripper_width)
+                if action.shape[-1] > 10:
+                    identity[..., 10:] = action[..., 10:]
         return identity
 
     result_dir = Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song")
@@ -930,14 +1211,38 @@ def ood_case_inference(
     try:
         ood_test_sno = list(range(1,7))
         for sno in ood_test_sno:
+            pkl_path = Path(f"/home/liusong/temp/ood_test_new{sno}.pkl")
             ply_path = Path(f"/home/liusong/temp/ood_test_new{sno}.ply")
-            scene_point_cloud = load_ply_xyzrgb(ply_path)
+
+            ood_observation = None
+            point_cloud_world = None
+            pose9_gripper = None
+            source_path = ply_path
+            source_kind = "ply"
+            scene_point_cloud = None
+            if pkl_path.exists():
+                try:
+                    ood_observation = load_pkl_observation(pkl_path)
+                    point_cloud_world = normalize_xyzrgb(
+                        ood_observation["point_cloud"], source=str(pkl_path)
+                    )
+                    pose9_gripper = observation_to_pose9_gripper(ood_observation)
+                    scene_point_cloud = world_point_cloud_to_current_eff(point_cloud_world, pose9_gripper)
+                    source_path = pkl_path
+                    source_kind = "pkl"
+                except Exception:
+                    logging.exception("Failed to parse OOD pkl %s; falling back to ply if available.", pkl_path)
+
+            if scene_point_cloud is None:
+                scene_point_cloud = load_ply_xyzrgb(ply_path)
             if scene_point_cloud is None:
                 continue
 
             ood_batch = clone_first_batch_item(batch)
+            gripper_width = None if pose9_gripper is None else float(np.asarray(pose9_gripper).reshape(-1)[-1])
             if torch.is_tensor(ood_batch.get("action")):
-                ood_batch["action"] = make_identity_pose_action_like(ood_batch["action"])
+                ood_batch["action"] = make_identity_pose_action_like(ood_batch["action"], gripper_width)
+            set_identity_state_from_pose(ood_batch, pose9_gripper)
             ood_batch["task"] = [load_ood_task(sno)]
 
             point_cloud_value = ood_batch["observation.point_cloud"]
@@ -945,6 +1250,8 @@ def ood_case_inference(
             scene_point_cloud = random_repeat_sample_points(scene_point_cloud, int(ood_num_points), rng)
             scene_tensor = torch.tensor(scene_point_cloud, device=point_cloud_value.device, dtype=point_cloud_value.dtype)
             set_ood_point_cloud(ood_batch, scene_tensor)
+            if ood_observation is not None:
+                set_ood_rgb_images(ood_batch, ood_observation, raw_policy)
             remove_stale_pointseg_fields(ood_batch)
             remove_language_token_fields(ood_batch)
 
@@ -963,16 +1270,26 @@ def ood_case_inference(
                 max_items=1,
             )
             npz_path = result_dir / f"step{step}_ood{sno}.npz"
-            np.savez_compressed(
-                npz_path,
-                source_ply=np.asarray(str(ply_path)),
-                task=np.asarray(ood_batch["task"][0]),
-                point_cloud=scene_point_cloud,
-                action=action_chunk[0].detach().cpu().numpy(),
-            )
+            npz_payload = {
+                "source": np.asarray(str(source_path)),
+                "source_kind": np.asarray(source_kind),
+                "source_pkl": np.asarray(str(pkl_path) if pkl_path.exists() else ""),
+                "source_ply": np.asarray(str(ply_path)),
+                "task": np.asarray(ood_batch["task"][0]),
+                "point_cloud": scene_point_cloud,
+                "action": action_chunk[0].detach().cpu().numpy(),
+            }
+            if point_cloud_world is not None:
+                npz_payload["point_cloud_world"] = point_cloud_world
+            if pose9_gripper is not None:
+                npz_payload["pose9_gripper"] = pose9_gripper
+            np.savez_compressed(npz_path, **npz_payload)
             results.append(
                 {
                     "sno": sno,
+                    "source": str(source_path),
+                    "source_kind": source_kind,
+                    "source_pkl": str(pkl_path) if pkl_path.exists() else "",
                     "source_ply": str(ply_path),
                     "result_npz": str(npz_path),
                     "merged_ply": str(Path(output_dir or "/home/liusong/ProgramFiles/Huggingface/lerobot/outputs/train/my_smolvla_song") / "visualizations" / f"step{step}_{sno}.ply"),
