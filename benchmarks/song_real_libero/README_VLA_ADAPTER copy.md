@@ -343,15 +343,15 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.type=smolvla \
   --policy.push_to_hub=false \
   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset \
-  --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
-  --policy.vlm_weights_path=lerobot/smolvla_base \
+  --policy.vlm_model_name=/home/liusong/hf_models/SmolVLM2-500M-Video-Instruct \
+  --policy.vlm_weights_path=/home/liusong/hf_models/smolvla_base \
   --policy.load_vlm_weights=true \
   --policy.num_vlm_layers=16 \
   --policy.train_expert_only=true \
   --policy.vla_adapter_enable=true \
   --policy.vla_adapter_freeze_vlm=true \
   --policy.vla_adapter_point_prefix=false \
-  --batch_size=48 \
+  --batch_size=10 \
   --steps=500000 \
   --log_freq=1 \
   --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/wep_v03_adapter \
@@ -374,7 +374,7 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.pointseg_min_background_points=0 \
   --policy.pointseg_use_temporal_priors_as_input=false \
   --policy.pointseg_use_pseudo_selection=false \
-  --policy.worldflow_enable=true \
+  --policy.worldflow_enable=false \
   --policy.worldflow_se3_head_enable=false \
   --policy.se3_enable=false \
   --policy.se3_final_correction_enable=false

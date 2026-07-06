@@ -27,6 +27,7 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_IMAGES,
     OBS_STATE,
 )
 
@@ -389,11 +390,16 @@ class SmolVLA_ModelInference:
             one_step_agent_pos,
         )
         if len(self.predict_action_queue)==0:
+            model_observation = {
+                "point_cloud": one_step_point_cloud,
+                "state": one_step_agent_pos,
+            }
+            if "overhead" in cur_model_observation:
+                model_observation["overhead"] = cur_model_observation["overhead"]
+            if "hand" in cur_model_observation:
+                model_observation["hand"] = cur_model_observation["hand"]
             action_chunk = self.predict_action_chunk_obs(
-                {
-                    "point_cloud": one_step_point_cloud,
-                    "state": one_step_agent_pos,
-                },
+                model_observation,
                 task=task,
                 postprocess=True,
                 state_pose_mode="identity",
@@ -441,12 +447,114 @@ class SmolVLA_ModelInference:
         state_tensor = self._match_batch_size(state_tensor, batch_size, "observation.state")
         language = self._tokenize_task(task, batch_size)
 
-        return {
+        batch = {
             "observation.point_cloud": pc.to(self.device),
             OBS_STATE: state_tensor.to(self.device),
             OBS_LANGUAGE_TOKENS: language["input_ids"].to(self.device),
             OBS_LANGUAGE_ATTENTION_MASK: language["attention_mask"].to(self.device, dtype=torch.bool),
         }
+        if bool(getattr(self.policy.config, "vla_adapter_enable", False)):
+            batch.update(self._prepare_rgb_observation_batch(observation, batch_size))
+        return batch
+
+    def _prepare_rgb_observation_batch(
+        self,
+        observation: dict[str, Any],
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        image_features = dict(self.policy.config.image_features)
+        if not image_features:
+            raise ValueError(
+                "This adapter checkpoint has vla_adapter_enable=True but config.image_features is empty. "
+                f"Expected at least one key like '{OBS_IMAGES}.overhead'."
+            )
+
+        image_batch: dict[str, torch.Tensor] = {}
+        missing: list[str] = []
+        for image_key in image_features:
+            image_value = self._get_rgb_observation_value(observation, image_key)
+            if image_value is None:
+                missing.append(image_key)
+                continue
+            image = self._prepare_image_tensor(image_value, batch_size, image_key)
+            image_batch[image_key] = image.to(self.device)
+
+        if not image_batch:
+            available = sorted(str(key) for key in observation.keys())
+            raise ValueError(
+                "Adapter checkpoint requires RGB input, but no configured image feature was found in the "
+                f"observation. Expected one of {list(image_features)}, with aliases 'overhead'/'hand'. "
+                f"Available observation keys: {available}"
+            )
+        return image_batch
+
+    def _get_rgb_observation_value(self, observation: dict[str, Any], image_key: str) -> Any | None:
+        if image_key in observation:
+            return observation[image_key]
+
+        short_key = image_key
+        if image_key.startswith(f"{OBS_IMAGES}."):
+            short_key = image_key[len(f"{OBS_IMAGES}.") :]
+        candidates = [short_key, short_key.replace(".", "_"), short_key.replace("_rgb", "")]
+        lowered = image_key.lower()
+        if "overhead" in lowered or "overview" in lowered or "top" in lowered:
+            candidates += ["overhead", "overview", "top"]
+        if "hand" in lowered or "wrist" in lowered:
+            candidates += ["hand", "wrist"]
+
+        for candidate in candidates:
+            if candidate in observation:
+                return observation[candidate]
+        return None
+
+    def _prepare_image_tensor(self, image: Any, batch_size: int, image_key: str) -> torch.Tensor:
+        img = self._to_tensor(image, dtype=torch.float32)
+        if img.ndim == 3:
+            # Accept HWC uint8/float or CHW.
+            if img.shape[-1] in (1, 3, 4) and img.shape[0] not in (1, 3, 4):
+                img = img[..., :3].permute(2, 0, 1)
+            elif img.shape[0] in (1, 3, 4):
+                img = img[:3]
+            else:
+                raise ValueError(
+                    f"Expected RGB image {image_key} shape (H,W,3) or (3,H,W), got {tuple(img.shape)}."
+                )
+            if img.shape[0] == 1:
+                img = img.expand(3, -1, -1)
+            img = img.unsqueeze(0)
+        elif img.ndim == 4:
+            # Accept BHWC or BCHW.
+            if img.shape[-1] in (1, 3, 4) and img.shape[1] not in (1, 3, 4):
+                img = img[..., :3].permute(0, 3, 1, 2)
+            elif img.shape[1] in (1, 3, 4):
+                img = img[:, :3]
+            else:
+                raise ValueError(
+                    f"Expected RGB image batch {image_key} shape (B,H,W,3) or (B,3,H,W), got {tuple(img.shape)}."
+                )
+            if img.shape[1] == 1:
+                img = img.expand(-1, 3, -1, -1)
+        elif img.ndim == 5:
+            # Already temporal/batched, support B,T,H,W,C or B,T,C,H,W.
+            if img.shape[-1] in (1, 3, 4) and img.shape[2] not in (1, 3, 4):
+                img = img[..., :3].permute(0, 1, 4, 2, 3)
+            elif img.shape[2] in (1, 3, 4):
+                img = img[:, :, :3]
+            else:
+                raise ValueError(
+                    f"Expected temporal RGB image {image_key} shape (B,T,H,W,3) or (B,T,3,H,W), "
+                    f"got {tuple(img.shape)}."
+                )
+            if img.shape[2] == 1:
+                img = img.expand(-1, -1, 3, -1, -1)
+        else:
+            raise ValueError(f"Expected RGB image {image_key} ndim 3/4/5, got shape {tuple(img.shape)}.")
+
+        if img.shape[0] == 1 and batch_size > 1:
+            img = img.expand(batch_size, *img.shape[1:]).clone()
+        elif img.shape[0] != batch_size:
+            raise ValueError(f"Image {image_key} batch size {img.shape[0]} does not match {batch_size}.")
+        return img.contiguous()
 
     def _prepare_state_tensor(self, state: Any | None, *, state_pose_mode: str) -> torch.Tensor:
         state_feature = self.policy.config.robot_state_feature
@@ -520,7 +628,12 @@ class SmolVLA_ModelInference:
                 np.float32
             )
 
-        pose_keys = [key for key in observation.keys() if key != "point_cloud"]
+        pose_keys = [
+            key
+            for key in observation.keys()
+            if key not in {"point_cloud", "overhead", "hand"}
+            and not str(key).startswith(f"{OBS_IMAGES}.")
+        ]
         if len(pose_keys) < 7:
             raise ValueError(
                 "Expected at least 7 pose/gripper entries plus 'point_cloud' in cur_model_observation."
@@ -720,7 +833,7 @@ if __name__ == "__main__":
 #         return xyzrgb[idx]
 #     else:
 #         extra = np.random.choice(N, M - N, replace=True)
-#         return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)   
+#         return np.concatenate([xyzrgb, xyzrgb[extra]], axis=0)
 # batch['task'][0] = 'place, red_cube, eff_open, None\n'
 # scene_pcd = o3d.io.read_point_cloud(f"/home/liusong/temp/ood_test_new1.ply",)
 # scene_point_cloud = np.concatenate((np.asarray(scene_pcd.points[:]),np.asarray(scene_pcd.colors[:])*255), axis=1)
