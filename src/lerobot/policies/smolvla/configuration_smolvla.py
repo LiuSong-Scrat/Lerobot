@@ -93,6 +93,9 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_aux_loss_weight: float = 0.20
     pointseg_use_temporal_priors_as_input: bool = False
     pointseg_use_pseudo_selection: bool = True
+    point_action_fusion_enable: bool = True
+    point_action_fusion_heads: int = 4
+    point_action_fusion_dropout: float = 0.0
 
     # World-frame trajectory auxiliary supervision.
     worldflow_enable: bool = False

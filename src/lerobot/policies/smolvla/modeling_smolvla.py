@@ -1176,7 +1176,7 @@ class LitePTEncoder(nn.Module):
         denom = weights.sum(dim=1, keepdim=True).clamp_min(torch.finfo(weights.dtype).tiny)
         return weights / denom
 
-    def forward(self, scene_pc, point_is_pad=None):
+    def forward(self, scene_pc, point_is_pad=None, *, return_tokens: bool = False):
         scene_xyz, scene_tok, _scene_g, scene_mask = self.pc_backbone(scene_pc, point_is_pad)
         scene_tok = self.attention(scene_tok, scene_mask)
         alpha = self._masked_softmax(self.att[0](scene_tok), scene_mask)
@@ -1189,6 +1189,12 @@ class LitePTEncoder(nn.Module):
         alpha1 = self._masked_softmax(self.att1[0](scene_tok1), scene_mask1)
 
         global_feat = (scene_tok1 * alpha1).sum(dim=1)
+        if return_tokens:
+            return {
+                "global_feat": global_feat,
+                "scene_tok1": scene_tok1,
+                "scene_mask1": scene_mask1,
+            }
         return global_feat
 
 
@@ -1213,6 +1219,100 @@ class LitePTEncoder(nn.Module):
 
 
         # return global_feat
+
+
+class PointActionSelfAttention(nn.Module):
+    """PointACT-style joint self-attention over final LitePT point tokens and action tokens.
+
+    The original point-cloud prefix path stays unchanged: this module only uses
+    scene_tok1 as geometry memory and returns updated action tokens.  It does
+    not feed action-conditioned point tokens back into LitePT pooling.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        point_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if point_dim % int(num_heads) != 0:
+            raise ValueError(f"point_dim={point_dim} must be divisible by num_heads={num_heads}.")
+        self.action_dim = int(action_dim)
+        self.point_dim = int(point_dim)
+        self.num_heads = int(num_heads)
+
+        self.point_norm = nn.LayerNorm(self.point_dim)
+        self.action_norm = nn.LayerNorm(self.action_dim)
+        self.action_to_point = nn.Linear(self.action_dim, self.point_dim)
+        self.joint_norm = nn.LayerNorm(self.point_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=self.point_dim,
+            num_heads=self.num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.action_ffn_norm = nn.LayerNorm(self.point_dim)
+        self.action_ffn = nn.Sequential(
+            nn.Linear(self.point_dim, self.point_dim * 4),
+            nn.SiLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.point_dim * 4, self.point_dim),
+        )
+        self.point_to_action = nn.Linear(self.point_dim, self.action_dim)
+
+    @staticmethod
+    def _normalize_point_mask(point_tokens: Tensor, point_mask: Tensor | None) -> Tensor:
+        bsize, num_points = point_tokens.shape[:2]
+        if point_mask is None:
+            return torch.ones(bsize, num_points, dtype=torch.bool, device=point_tokens.device)
+        point_mask = point_mask.to(device=point_tokens.device, dtype=torch.bool)
+        if point_mask.shape != point_tokens.shape[:2]:
+            raise ValueError(f"Expected point_mask shape {point_tokens.shape[:2]}, got {point_mask.shape}.")
+        return point_mask
+
+    def forward(self, action_tokens: Tensor, point_tokens: Tensor, point_mask: Tensor | None = None) -> Tensor:
+        if action_tokens.ndim != 3:
+            raise ValueError(f"Expected action_tokens shape (B,T,C), got {action_tokens.shape}.")
+        if point_tokens.ndim != 3:
+            raise ValueError(f"Expected point_tokens shape (B,N,C), got {point_tokens.shape}.")
+        if action_tokens.shape[0] != point_tokens.shape[0]:
+            raise ValueError(
+                f"Batch mismatch between action_tokens {action_tokens.shape} and point_tokens {point_tokens.shape}."
+            )
+        if point_tokens.shape[-1] != self.point_dim:
+            raise ValueError(f"Expected point token dim {self.point_dim}, got {point_tokens.shape[-1]}.")
+        if action_tokens.shape[-1] != self.action_dim:
+            raise ValueError(f"Expected action token dim {self.action_dim}, got {action_tokens.shape[-1]}.")
+
+        point_mask = self._normalize_point_mask(point_tokens, point_mask)
+        point_latent = self.point_norm(point_tokens)
+        action_latent = self.action_to_point(self.action_norm(action_tokens))
+
+        joint = torch.cat([point_latent, action_latent], dim=1)
+        action_mask = torch.ones(
+            action_tokens.shape[:2],
+            dtype=torch.bool,
+            device=action_tokens.device,
+        )
+        joint_valid = torch.cat([point_mask, action_mask], dim=1)
+
+        attn_in = self.joint_norm(joint)
+        attn_out, _ = self.self_attn(
+            attn_in,
+            attn_in,
+            attn_in,
+            key_padding_mask=~joint_valid,
+            need_weights=False,
+        )
+        joint = joint + attn_out
+
+        action_joint = joint[:, point_tokens.shape[1] :]
+        action_delta = action_joint - action_latent
+        action_delta = action_delta + self.action_ffn(self.action_ffn_norm(action_delta))
+        return action_tokens + self.point_to_action(action_delta)
 
 
 class _MaskedPointMLPEncoder(nn.Module):
@@ -1718,7 +1818,14 @@ class SongPointCloudConditioner(nn.Module):
         bg_weight = torch.where(bg_weight >= 0.1, bg_weight, torch.zeros_like(bg_weight))
 
         with _batchnorm_eval_on_single_value(self.foreground_encoder):
-            object_feat = self.foreground_encoder(foreground_pc)
+            foreground_encoded = self.foreground_encoder(
+                foreground_pc,
+                return_tokens=bool(self.config.point_action_fusion_enable),
+            )
+        if isinstance(foreground_encoded, dict):
+            object_feat = foreground_encoded["global_feat"]
+        else:
+            object_feat = foreground_encoded
         background_feat = self.null_background_feat.to(
             device=object_feat.device, dtype=object_feat.dtype
         ).unsqueeze(0).expand(point_cloud.shape[0], -1).clone()
@@ -1743,6 +1850,9 @@ class SongPointCloudConditioner(nn.Module):
             "pointseg_selection_scores": selection_scores,
             "pointseg_background_has_candidates": background_has_candidates,
         }
+        if isinstance(foreground_encoded, dict):
+            result["foreground_scene_tok1"] = foreground_encoded["scene_tok1"]
+            result["foreground_scene_mask1"] = foreground_encoded["scene_mask1"]
         if pseudo is not None and "role_scores" in pseudo:
             result["role_scores"] = pseudo["role_scores"].to(device=point_cloud.device, dtype=torch.float32)
         if self.training and self.aux_loss_weight > 0:
@@ -1830,9 +1940,21 @@ class VLAFlowMatching(nn.Module):
             if use_pointseg
             else None
         )
+        self.point_action_fusion = (
+            PointActionSelfAttention(
+                action_dim=self.vlm_with_expert.expert_hidden_size,
+                point_dim=self.config.pointseg_feature_dim,
+                num_heads=self.config.point_action_fusion_heads,
+                dropout=self.config.point_action_fusion_dropout,
+            )
+            if use_pointseg and self.config.point_action_fusion_enable
+            else None
+        )
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
         self.last_objectflow_payload: dict[str, Tensor] | None = None
+        self.last_point_action_tokens: Tensor | None = None
+        self.last_point_action_mask: Tensor | None = None
         self.last_language_emb: Tensor | None = None
         self.last_body_pose9_prediction: Tensor | None = None
         self.worldflow_head = (
@@ -1911,6 +2033,17 @@ class VLAFlowMatching(nn.Module):
         valid_f = valid.to(device=values.device, dtype=values.dtype)
         return (values * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
+    def _inject_point_action_features(self, suffix_embs: Tensor) -> Tensor:
+        if self.point_action_fusion is None:
+            return suffix_embs
+        if self.last_point_action_tokens is None:
+            return suffix_embs
+        return self.point_action_fusion(
+            action_tokens=suffix_embs,
+            point_tokens=self.last_point_action_tokens,
+            point_mask=self.last_point_action_mask,
+        )
+
     def _se3_predict_from_suffix(
         self,
         prefix_embs: Tensor,
@@ -1920,6 +2053,7 @@ class VLAFlowMatching(nn.Module):
         time: Tensor,
     ) -> Tensor:
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs = self._inject_point_action_features(suffix_embs)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
@@ -1945,10 +2079,14 @@ class VLAFlowMatching(nn.Module):
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
         self.last_objectflow_payload = None
+        self.last_point_action_tokens = None
+        self.last_point_action_mask = None
         self.last_language_emb = None
         embs = []
         pad_masks = []
         att_masks = []
+        point_action_token_chunks = []
+        point_action_mask_chunks = []
 
         for _pc_idx, (
             pc,
@@ -1968,6 +2106,23 @@ class VLAFlowMatching(nn.Module):
                 object_emb = self.pointseg_object_proj(conditioned["object_feat"])
                 background_emb = self.pointseg_background_proj(conditioned["background_feat"])
                 pc_emb = torch.stack([object_emb, background_emb], dim=1)
+                if self.point_action_fusion is not None:
+                    foreground_tokens = conditioned.get("foreground_scene_tok1")
+                    foreground_mask = conditioned.get("foreground_scene_mask1")
+                    if torch.is_tensor(foreground_tokens):
+                        point_action_token_chunks.append(foreground_tokens)
+                        if torch.is_tensor(foreground_mask):
+                            point_action_mask_chunks.append(
+                                foreground_mask.to(device=foreground_tokens.device, dtype=torch.bool)
+                            )
+                        else:
+                            point_action_mask_chunks.append(
+                                torch.ones(
+                                    foreground_tokens.shape[:2],
+                                    dtype=torch.bool,
+                                    device=foreground_tokens.device,
+                                )
+                            )
                 if self.worldflow_head is not None:
                     role_scores = payload.get("pointseg.role_scores")
                     if torch.is_tensor(role_scores) and role_scores.ndim >= 3 and role_scores.shape[1] == 1:
@@ -2033,6 +2188,10 @@ class VLAFlowMatching(nn.Module):
             embs.append(pc_emb)
             pad_masks.append(pc_mask)
             att_masks += [0] * num_pc_tokens
+
+        if point_action_token_chunks:
+            self.last_point_action_tokens = torch.cat(point_action_token_chunks, dim=1)
+            self.last_point_action_mask = torch.cat(point_action_mask_chunks, dim=1)
 
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
@@ -2447,6 +2606,7 @@ class VLAFlowMatching(nn.Module):
             pc_feats, pc_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs = self._inject_point_action_features(suffix_embs)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -2616,6 +2776,7 @@ class VLAFlowMatching(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_embs = self._inject_point_action_features(suffix_embs)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
