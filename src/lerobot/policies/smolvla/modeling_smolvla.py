@@ -985,9 +985,26 @@ class LitePTTokenizer(nn.Module):
         self.dim = dim
         self.n_tokens = n_tokens
         self.grid_size = grid_size
+        self.feature_in_dim = 3 if int(in_dim) >= 6 else max(int(in_dim) - 3, 1)
 
-        self.backbone = LitePT(in_channels=in_dim, enc_mode=enc_mode)
+        self.backbone = LitePT(in_channels=self.feature_in_dim, enc_mode=enc_mode)
         self.out_proj = nn.Linear(infer_litept_output_channels(self.backbone), dim)
+
+    def _build_point_features(self, raw_feat):
+        """Use XYZ only as coordinates; feed RGB/non-coordinate channels as point features."""
+        if raw_feat.shape[-1] >= 6:
+            feat = raw_feat[:, 3:6] / 255.0
+        elif raw_feat.shape[-1] > 3:
+            feat = raw_feat[:, 3:]
+        else:
+            feat = raw_feat.new_zeros(raw_feat.shape[0], 0)
+
+        if feat.shape[-1] < self.feature_in_dim:
+            pad = feat.new_zeros(feat.shape[0], self.feature_in_dim - feat.shape[-1])
+            feat = torch.cat([feat, pad], dim=-1)
+        elif feat.shape[-1] > self.feature_in_dim:
+            feat = feat[:, : self.feature_in_dim]
+        return feat.contiguous()
 
     def _is_degenerate(self, xyz, eps=1e-6):
         rng = (xyz.max(dim=0).values - xyz.min(dim=0).values).abs().sum()
@@ -1059,10 +1076,7 @@ class LitePTTokenizer(nn.Module):
         coord = pc_v[:, :, :3].reshape(-1, 3)[flat_valid].contiguous()
 
         feat = pc_v.reshape(-1, C)[flat_valid].contiguous()
-        if C > 3:
-            feat = torch.cat([feat[:, :3], feat[:, 3:] / 255.0], dim=1)
-        else:
-            feat = feat[:, :3]
+        feat = self._build_point_features(feat)
 
         # batch index
         batch = torch.arange(Bv, device=device).repeat_interleave((~point_is_pad_v).sum(dim=1))
