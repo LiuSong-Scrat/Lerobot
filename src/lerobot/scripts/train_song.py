@@ -1602,7 +1602,7 @@ def _apply_song_debug_defaults() -> None:
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
-        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
+        # "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
         "--policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct",
         "--policy.load_vlm_weights=false",
         "--batch_size=6",
