@@ -1180,20 +1180,21 @@ class LitePTEncoder(nn.Module):
         scene_xyz, scene_tok, _scene_g, scene_mask = self.pc_backbone(scene_pc, point_is_pad)
         scene_tok = self.attention(scene_tok, scene_mask)
         alpha = self._masked_softmax(self.att[0](scene_tok), scene_mask)
-        center = (scene_xyz * alpha).sum(dim=1)
+        global_feat = (scene_tok * alpha).sum(dim=1)
+        # center = (scene_xyz * alpha).sum(dim=1)
 
-        centroid_xyz = scene_pc[..., :3] - center.unsqueeze(-2)
-        scene_pc1 = torch.cat([centroid_xyz, scene_pc[..., 3:]], dim=-1)
-        _scene_xyz1, scene_tok1, _scene_g1, scene_mask1 = self.pc_backbone1(scene_pc1, point_is_pad)
-        scene_tok1 = self.attention1(scene_tok1, scene_mask1)
-        alpha1 = self._masked_softmax(self.att1[0](scene_tok1), scene_mask1)
+        # centroid_xyz = scene_pc[..., :3] - center.unsqueeze(-2)
+        # scene_pc1 = torch.cat([centroid_xyz, scene_pc[..., 3:]], dim=-1)
+        # _scene_xyz1, scene_tok1, _scene_g1, scene_mask1 = self.pc_backbone1(scene_pc1, point_is_pad)
+        # scene_tok1 = self.attention1(scene_tok1, scene_mask1)
+        # alpha1 = self._masked_softmax(self.att1[0](scene_tok1), scene_mask1)
 
-        global_feat = (scene_tok1 * alpha1).sum(dim=1)
+        # global_feat = (scene_tok1 * alpha1).sum(dim=1)
         if return_tokens:
             return {
                 "global_feat": global_feat,
-                "scene_tok1": scene_tok1,
-                "scene_mask1": scene_mask1,
+                "scene_tok1": scene_tok,
+                "scene_mask1": scene_mask,
             }
         return global_feat
 
