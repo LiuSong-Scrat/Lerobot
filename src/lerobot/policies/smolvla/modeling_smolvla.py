@@ -714,7 +714,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad")
+        actions_is_pad = batch.get(f"{ACTION}_is_pad")
+        if torch.is_tensor(actions_is_pad):
+            actions_is_pad = actions_is_pad.to(device=actions.device, dtype=torch.bool)
         loss_dict = {}
         losses = self.model.forward(
             pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time, actions_is_pad=actions_is_pad
@@ -1235,15 +1237,34 @@ class PointActionSelfAttention(nn.Module):
         *,
         action_dim: int,
         point_dim: int,
+        max_action_steps: int,
         num_heads: int = 4,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if point_dim % int(num_heads) != 0:
             raise ValueError(f"point_dim={point_dim} must be divisible by num_heads={num_heads}.")
+        if int(max_action_steps) <= 0:
+            raise ValueError(f"max_action_steps must be positive, got {max_action_steps}.")
         self.action_dim = int(action_dim)
         self.point_dim = int(point_dim)
+        self.max_action_steps = int(max_action_steps)
         self.num_heads = int(num_heads)
+
+        # PointAction fusion runs before the Action Expert applies RoPE.  Give
+        # each action token an explicit step identity here so that equal noisy
+        # action values at different chunk positions are still distinguishable.
+        action_step_pos = torch.zeros(self.max_action_steps, self.point_dim, dtype=torch.float32)
+        positions = torch.arange(self.max_action_steps, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.point_dim, 2, dtype=torch.float32)
+            * (-math.log(10_000.0) / self.point_dim)
+        )
+        action_step_pos[:, 0::2] = torch.sin(positions * div_term)
+        action_step_pos[:, 1::2] = torch.cos(positions * div_term[: action_step_pos[:, 1::2].shape[1]])
+        # This encoding is deterministic and should not become an additional
+        # checkpoint compatibility requirement.
+        self.register_buffer("action_step_pos_embedding", action_step_pos, persistent=False)
 
         self.point_norm = nn.LayerNorm(self.point_dim)
         self.action_norm = nn.LayerNorm(self.action_dim)
@@ -1274,7 +1295,25 @@ class PointActionSelfAttention(nn.Module):
             raise ValueError(f"Expected point_mask shape {point_tokens.shape[:2]}, got {point_mask.shape}.")
         return point_mask
 
-    def forward(self, action_tokens: Tensor, point_tokens: Tensor, point_mask: Tensor | None = None) -> Tensor:
+    @staticmethod
+    def _normalize_action_pad_mask(action_tokens: Tensor, actions_is_pad: Tensor | None) -> Tensor:
+        bsize, num_actions = action_tokens.shape[:2]
+        if actions_is_pad is None:
+            return torch.zeros(bsize, num_actions, dtype=torch.bool, device=action_tokens.device)
+        actions_is_pad = actions_is_pad.to(device=action_tokens.device, dtype=torch.bool)
+        if actions_is_pad.shape != action_tokens.shape[:2]:
+            raise ValueError(
+                f"Expected actions_is_pad shape {action_tokens.shape[:2]}, got {actions_is_pad.shape}."
+            )
+        return actions_is_pad
+
+    def forward(
+        self,
+        action_tokens: Tensor,
+        point_tokens: Tensor,
+        point_mask: Tensor | None = None,
+        actions_is_pad: Tensor | None = None,
+    ) -> Tensor:
         if action_tokens.ndim != 3:
             raise ValueError(f"Expected action_tokens shape (B,T,C), got {action_tokens.shape}.")
         if point_tokens.ndim != 3:
@@ -1287,25 +1326,37 @@ class PointActionSelfAttention(nn.Module):
             raise ValueError(f"Expected point token dim {self.point_dim}, got {point_tokens.shape[-1]}.")
         if action_tokens.shape[-1] != self.action_dim:
             raise ValueError(f"Expected action token dim {self.action_dim}, got {action_tokens.shape[-1]}.")
+        if action_tokens.shape[1] > self.max_action_steps:
+            raise ValueError(
+                f"Action sequence length {action_tokens.shape[1]} exceeds max_action_steps={self.max_action_steps}."
+            )
 
         point_mask = self._normalize_point_mask(point_tokens, point_mask)
+        actions_is_pad = self._normalize_action_pad_mask(action_tokens, actions_is_pad)
+        action_mask = ~actions_is_pad
         point_latent = self.point_norm(point_tokens)
         action_latent = self.action_to_point(self.action_norm(action_tokens))
+        action_step_pos = self.action_step_pos_embedding[: action_tokens.shape[1]].to(dtype=action_latent.dtype)
+        action_latent = action_latent + action_step_pos.unsqueeze(0)
 
         joint = torch.cat([point_latent, action_latent], dim=1)
-        action_mask = torch.ones(
-            action_tokens.shape[:2],
-            dtype=torch.bool,
-            device=action_tokens.device,
-        )
         joint_valid = torch.cat([point_mask, action_mask], dim=1)
+
+        # MultiheadAttention cannot softmax a row when every key is masked.
+        # Such a sample carries no usable point/action token, so expose one
+        # harmless key for numerical safety and suppress all padded updates
+        # below.
+        safe_joint_valid = joint_valid.clone()
+        no_valid_keys = ~safe_joint_valid.any(dim=1)
+        if no_valid_keys.any():
+            safe_joint_valid[no_valid_keys, 0] = True
 
         attn_in = self.joint_norm(joint)
         attn_out, _ = self.self_attn(
             attn_in,
             attn_in,
             attn_in,
-            key_padding_mask=~joint_valid,
+            key_padding_mask=~safe_joint_valid,
             need_weights=False,
         )
         joint = joint + attn_out
@@ -1313,7 +1364,9 @@ class PointActionSelfAttention(nn.Module):
         action_joint = joint[:, point_tokens.shape[1] :]
         action_delta = action_joint - action_latent
         action_delta = action_delta + self.action_ffn(self.action_ffn_norm(action_delta))
-        return action_tokens + self.point_to_action(action_delta)
+        action_update = self.point_to_action(action_delta)
+        action_update = action_update * action_mask.unsqueeze(-1).to(dtype=action_update.dtype)
+        return action_tokens + action_update
 
 
 class _MaskedPointMLPEncoder(nn.Module):
@@ -1945,6 +1998,7 @@ class VLAFlowMatching(nn.Module):
             PointActionSelfAttention(
                 action_dim=self.vlm_with_expert.expert_hidden_size,
                 point_dim=self.config.pointseg_feature_dim,
+                max_action_steps=self.config.chunk_size,
                 num_heads=self.config.point_action_fusion_heads,
                 dropout=self.config.point_action_fusion_dropout,
             )
@@ -2034,7 +2088,11 @@ class VLAFlowMatching(nn.Module):
         valid_f = valid.to(device=values.device, dtype=values.dtype)
         return (values * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
-    def _inject_point_action_features(self, suffix_embs: Tensor) -> Tensor:
+    def _inject_point_action_features(
+        self,
+        suffix_embs: Tensor,
+        actions_is_pad: Tensor | None = None,
+    ) -> Tensor:
         if self.point_action_fusion is None:
             return suffix_embs
         if self.last_point_action_tokens is None:
@@ -2043,6 +2101,7 @@ class VLAFlowMatching(nn.Module):
             action_tokens=suffix_embs,
             point_tokens=self.last_point_action_tokens,
             point_mask=self.last_point_action_mask,
+            actions_is_pad=actions_is_pad,
         )
 
     def _se3_predict_from_suffix(
@@ -2052,9 +2111,14 @@ class VLAFlowMatching(nn.Module):
         prefix_att_masks: Tensor,
         x_t: Tensor,
         time: Tensor,
+        actions_is_pad: Tensor | None = None,
     ) -> Tensor:
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-        suffix_embs = self._inject_point_action_features(suffix_embs)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t,
+            time,
+            actions_is_pad=actions_is_pad,
+        )
+        suffix_embs = self._inject_point_action_features(suffix_embs, actions_is_pad=actions_is_pad)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
@@ -2238,7 +2302,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions, timestep, actions_is_pad: Tensor | None = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -2270,11 +2334,21 @@ class VLAFlowMatching(nn.Module):
         embs.append(action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        if actions_is_pad is None:
+            action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        else:
+            actions_is_pad = actions_is_pad.to(device=device, dtype=torch.bool)
+            if actions_is_pad.shape != (bsize, action_time_dim):
+                raise ValueError(
+                    f"Expected actions_is_pad shape {(bsize, action_time_dim)}, got {actions_is_pad.shape}."
+                )
+            action_time_mask = ~actions_is_pad
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size
+        # Start one new block for the whole action chunk. All valid action
+        # tokens attend bidirectionally within this block and to the prefix,
+        # while prefix tokens cannot attend to action tokens.
+        att_masks += [1] + ([0] * (action_time_dim - 1))
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -2362,7 +2436,7 @@ class VLAFlowMatching(nn.Module):
         if torch.is_tensor(actions_is_pad):
             action_pad = actions_is_pad.to(device=valid.device, dtype=torch.bool)
             if action_pad.shape[1] != valid.shape[1]:
-                raise ValueError(f"Expected actions_id_pad shape {valid.shape}, got {action_pad.shape}.")
+                raise ValueError(f"Expected action_is_pad shape {valid.shape}, got {action_pad.shape}.")
             valid = valid & ~action_pad
 
         pred_flow = self.worldflow_head(point_cloud_world, role_scores, lang_emb, lang_masks, point_is_pad)
@@ -2540,7 +2614,14 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             pc_feats, pc_masks, lang_tokens, lang_masks, state=state
         )
-        pred = self._se3_predict_from_suffix(prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, time)
+        pred = self._se3_predict_from_suffix(
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            x_t,
+            time,
+            actions_is_pad=actions_is_pad,
+        )
         twist_pred = pred[..., :6]
         gripper_vel_pred = pred[..., 6:7]
 
@@ -2606,8 +2687,12 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             pc_feats, pc_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-        suffix_embs = self._inject_point_action_features(suffix_embs)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t,
+            time,
+            actions_is_pad=actions_is_pad,
+        )
+        suffix_embs = self._inject_point_action_features(suffix_embs, actions_is_pad=actions_is_pad)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
