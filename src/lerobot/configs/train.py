@@ -32,6 +32,22 @@ from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
 
+# W&B creates this directory as soon as a run is initialized. In distributed
+# launches it may therefore be visible to one process while another process is
+# still validating the training configuration. It is logger-owned and does not
+# indicate that model outputs or checkpoints would be overwritten.
+_NON_TRAINING_OUTPUT_ENTRIES = frozenset({"wandb"})
+
+
+def _output_dir_has_training_artifacts(output_dir: Path) -> bool:
+    """Return whether an output directory contains anything besides logger files."""
+    try:
+        return any(entry.name not in _NON_TRAINING_OUTPUT_ENTRIES for entry in output_dir.iterdir())
+    except FileNotFoundError:
+        # The directory may be removed concurrently between is_dir() and
+        # iterdir(), especially on a shared filesystem during cluster startup.
+        return False
+
 
 @dataclass
 class TrainPipelineConfig(HubMixin):
@@ -117,10 +133,16 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+        if (
+            not self.resume
+            and isinstance(self.output_dir, Path)
+            and self.output_dir.is_dir()
+            and _output_dir_has_training_artifacts(self.output_dir)
+        ):
             raise FileExistsError(
                 f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
+                f"Please change your output directory so that {self.output_dir} is not overwritten. "
+                "An empty directory or a directory containing only W&B logs is safe and is accepted."
             )
         elif not self.output_dir:
             now = dt.datetime.now()

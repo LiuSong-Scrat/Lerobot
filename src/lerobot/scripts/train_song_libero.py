@@ -347,8 +347,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             dataset,
             point_cloud_dir=point_cloud_dir,
             future_offsets=self._future_offsets(policy_cfg),
-            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 50000),
-            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 16384),
+            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10000),
+            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10000),
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
             mmap_mode=mmap_mode,
         )
@@ -1597,12 +1597,12 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
-        "--policy.type=smolvla",
+        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model",
+        # "--policy.type=smolvla",
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
-        "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
-        "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
+        "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset",
+        #"--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
         "--policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct",
         "--policy.load_vlm_weights=false",
         "--batch_size=6",

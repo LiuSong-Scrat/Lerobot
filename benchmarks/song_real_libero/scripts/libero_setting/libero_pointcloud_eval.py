@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--observation-height", type=int, default=None)
     parser.add_argument("--observation-width", type=int, default=None)
-    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default=None)
+    parser.add_argument("--render-mode", choices=("offscreen", "onscreen", "viewer3d"), default="viewer3d")
     parser.add_argument("--render-camera", default=None)
     parser.add_argument("--render-every-n-steps", type=int, default=None)
     parser.add_argument("--render-gpu-device-id", type=int, default=None)
@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=None)
 
     parser.add_argument(
-        "--gripper-threshold",
+        "--gripper-threshold", 
         type=float,
         default=None,
         help="Normalized gripper-width threshold. width_pct >= threshold => open(-1), else close(+1).",
