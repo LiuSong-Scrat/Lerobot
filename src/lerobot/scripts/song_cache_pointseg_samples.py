@@ -26,7 +26,6 @@ from lerobot.policies.smolvla.song_pointseg import (
     ROLE_NAMES,
     PseudoLabelConfig,
     SongTemporalPointCloudDataset,
-    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     move_batch_to_device,
     parse_future_offsets,
@@ -241,15 +240,17 @@ def _save_episode_preview(
     position: str,
     frame_index: int,
     current_pc: torch.Tensor,
-    labels: torch.Tensor,
+    foreground_score: torch.Tensor,
 ) -> None:
+    score = foreground_score.detach().cpu()
     write_role_ply(
         output_dir
         / "visualizations"
         / f"episode_{episode_index:06d}"
         / f"{position}_frame_{frame_index:06d}_pseudo.ply",
         current_pc.detach().cpu().numpy(),
-        labels.detach().cpu().numpy(),
+        (score >= 0.5).to(dtype=torch.long).numpy(),
+        score.numpy(),
     )
 
 
@@ -282,12 +283,16 @@ def cache_samples(args: argparse.Namespace) -> None:
         "cache_mode": "indices",
         "num_samples": total_samples,
         "future_offsets": list(args.future_offsets),
+        "temporal_offsets": list(dataset.temporal_offsets),
+        "temporal_mode": "bidirectional" if dataset.bidirectional else "future_only",
+        "trajectory_mode": "sparse_full_episode",
+        "trajectory_samples": dataset.trajectory_samples,
         "current_points": args.current_points,
         "future_points": args.future_points,
         "variable_num_points": True,
         "point_count_policy": "cap_without_repeat",
-        "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
-        "small_cloud_role_policy": "preserve_automatic_gripper_condition_target_scores",
+        "pseudo_label_policy": "soft_binary_trajectory_v1",
+        "evidence_channels": ["tool_comotion", "trajectory_approach", "near_contact"],
         "storage_dtype": args.storage_dtype,
         "pseudo_label_config": asdict(pseudo_cfg),
         "args": _jsonable(vars(args)),
@@ -327,14 +332,10 @@ def cache_samples(args: argparse.Namespace) -> None:
                 batch["future_is_pad"],
                 current_is_pad=batch.get("observation.point_cloud_is_pad"),
                 future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
+                trajectory_poses=batch.get("pointseg_trajectory_ee_poses"),
                 config=pseudo_cfg,
             )
-            pseudo = force_small_current_clouds_foreground(
-                geometric_pseudo,
-                current_pc,
-                args.current_points,
-                batch.get("observation.point_cloud_is_pad"),
-            )
+            pseudo = geometric_pseudo
 
             current_is_pad = batch.get("observation.point_cloud_is_pad")
             for batch_index in range(batch_size):
@@ -348,7 +349,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     else torch.ones(current_pc.shape[1], dtype=torch.bool, device=current_pc.device)
                 )
                 preview_pc = current_pc[batch_index][valid]
-                preview_labels = pseudo["labels"][batch_index][valid]
+                preview_score = pseudo["foreground_score"][batch_index][valid]
                 for episode_index, position, frame_index in targets:
                     _save_episode_preview(
                         args.output_dir,
@@ -356,7 +357,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                         position,
                         frame_index,
                         preview_pc,
-                        preview_labels,
+                        preview_score,
                     )
                     previews_saved += 1
 

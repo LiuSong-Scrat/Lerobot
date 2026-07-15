@@ -28,12 +28,10 @@ from lerobot.policies.smolvla.song_pointseg import (
     ROLE_NAMES,
     PseudoLabelConfig,
     SongTemporalPointCloudDataset,
-    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     move_batch_to_device,
     parse_future_offsets,
     song_pointseg_collate,
-    write_role_ply,
 )
 from lerobot.utils.random_utils import set_seed
 
@@ -216,13 +214,22 @@ def _sample_from_batch(
 def _episode_preview_targets(
     dataset: SongTemporalPointCloudDataset,
     total_samples: int,
+    vis_count: int,
 ) -> dict[int, list[tuple[int, str, int]]]:
     episodes = dataset.meta.episodes
     if episodes is None:
         raise ValueError("Episode metadata is required to save first/middle/last pseudo-label previews.")
 
     targets: dict[int, list[tuple[int, str, int]]] = {}
-    for episode_position in range(len(episodes)):
+    if vis_count <= 0 or len(episodes) == 0:
+        return targets
+    selected_positions = np.linspace(
+        0,
+        len(episodes) - 1,
+        num=min(int(vis_count), len(episodes)),
+        dtype=np.int64,
+    )
+    for episode_position in np.unique(selected_positions).tolist():
         episode = episodes[episode_position]
         episode_index = int(episode.get("episode_index", episode_position))
         start_index = int(episode["dataset_from_index"])
@@ -232,11 +239,17 @@ def _episode_preview_targets(
             continue
 
         max_frame_index = episode_length - 1
-        frame_targets = (
+        frame_targets = [
             ("p25", min(max_frame_index, int(episode_length * 0.25))),
             ("p50", min(max_frame_index, int(episode_length * 0.50))),
             ("p75", min(max_frame_index, int(episode_length * 0.75))),
-        )
+        ]
+        # Dense terminal previews make it possible to verify that a static target
+        # (for example the rack) does not disappear when future frames run out.
+        for distance_to_end in (8, 4, 2, 1, 0):
+            terminal_frame = max(0, max_frame_index - distance_to_end)
+            frame_targets.append((f"terminal_m{distance_to_end:02d}", terminal_frame))
+        frame_targets = list(dict.fromkeys(frame_targets))
         for position, frame_index in frame_targets:
             dataset_index = start_index + frame_index
             if 0 <= dataset_index < total_samples:
@@ -288,39 +301,53 @@ def _preview_relative_ee_positions(pose9: torch.Tensor) -> np.ndarray:
 
 
 def _preview_future_ee_positions(batch: dict[str, torch.Tensor], batch_index: int, horizon: int = 32) -> np.ndarray:
+    trajectory_poses = batch.get("pointseg_trajectory_ee_poses")
+    if torch.is_tensor(trajectory_poses) and trajectory_poses.ndim >= 3 and trajectory_poses.shape[-1] >= 9:
+        pose9 = trajectory_poses[batch_index].detach().cpu()
+        offsets = batch.get("pointseg_trajectory_offsets")
+        if torch.is_tensor(offsets):
+            order = torch.argsort(offsets[batch_index].detach().cpu())
+            pose9 = pose9[order]
+        pose9 = pose9[: int(horizon), :9]
+        if pose9.shape[0] > 0:
+            return pose9.numpy()[:, :3]
+
+    future_poses = batch.get("future_ee_poses")
+    if torch.is_tensor(future_poses) and future_poses.ndim >= 3 and future_poses.shape[-1] >= 9:
+        pose9 = future_poses[batch_index].detach().cpu()
+        valid = torch.ones(pose9.shape[0], dtype=torch.bool)
+        future_is_pad = batch.get("future_is_pad")
+        if torch.is_tensor(future_is_pad):
+            candidate = ~future_is_pad[batch_index].detach().cpu().bool()
+            if candidate.numel() == pose9.shape[0]:
+                valid &= candidate
+        offsets = batch.get("future_offsets")
+        if torch.is_tensor(offsets):
+            offset_values = offsets[batch_index].detach().cpu()
+            order = torch.argsort(offset_values)
+            pose9 = pose9[order]
+            valid = valid[order]
+        pose9 = pose9[valid][: int(horizon), :9].to(dtype=torch.float32)
+        if pose9.shape[0] > 0:
+            return pose9.numpy()[:, :3]
+
     action = batch.get("action")
     if torch.is_tensor(action) and action.ndim >= 3 and action.shape[-1] >= 9:
         pose9 = action[batch_index, : min(int(horizon), action.shape[1]), :9]
-        positions = _preview_relative_ee_positions(pose9)
-        if positions.shape[0] > 0:
-            return positions
-
-    future_poses = batch.get("future_ee_poses")
-    if not torch.is_tensor(future_poses) or future_poses.ndim < 3 or future_poses.shape[-1] < 9:
-        return np.zeros((0, 3), dtype=np.float32)
-    pose9 = future_poses[batch_index].detach().cpu()
-    future_is_pad = batch.get("future_is_pad")
-    if torch.is_tensor(future_is_pad):
-        valid = ~future_is_pad[batch_index].detach().cpu().bool()
-        pose9 = pose9[valid] if valid.numel() == pose9.shape[0] else pose9
-    pose9 = pose9[: int(horizon), :9].to(dtype=torch.float32)
-    if pose9.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    return pose9.numpy()[:, :3]
+        return _preview_relative_ee_positions(pose9)
+    return np.zeros((0, 3), dtype=np.float32)
 
 
 def _write_preview_ply_with_trajectory(
     path: Path,
     points_xyzrgb: np.ndarray,
-    labels: np.ndarray,
+    foreground_score: np.ndarray,
     ee_positions: np.ndarray,
 ) -> None:
-    from lerobot.policies.smolvla.song_pointseg import ROLE_COLORS, ROLE_FOREGROUND
-
     path.parent.mkdir(parents=True, exist_ok=True)
     points_xyzrgb = np.asarray(points_xyzrgb, dtype=np.float32)
     xyz = points_xyzrgb[:, :3]
-    labels = np.asarray(labels, dtype=np.int64)
+    foreground_score = np.asarray(foreground_score, dtype=np.float32).reshape(-1).clip(0.0, 1.0)
 
     if points_xyzrgb.shape[-1] >= 6:
         point_colors = np.asarray(points_xyzrgb[:, 3:6], dtype=np.float32)
@@ -331,7 +358,17 @@ def _write_preview_ply_with_trajectory(
     else:
         point_colors = np.full((xyz.shape[0], 3), 128, dtype=np.uint8)
 
-    point_colors[labels == ROLE_FOREGROUND] = ROLE_COLORS[ROLE_FOREGROUND]
+    # Continuous blue->yellow->red heatmap.  The score is never thresholded,
+    # so small structures such as a mug handle remain inspectable.
+    heat = np.stack(
+        [
+            np.clip(2.0 * foreground_score, 0.0, 1.0),
+            np.clip(1.0 - np.abs(2.0 * foreground_score - 1.0), 0.0, 1.0),
+            np.clip(1.0 - 2.0 * foreground_score, 0.0, 1.0),
+        ],
+        axis=-1,
+    )
+    point_colors = np.rint(255.0 * heat).astype(np.uint8)
 
     ee_positions = np.asarray(ee_positions, dtype=np.float32)
     if ee_positions.ndim != 2 or ee_positions.shape[-1] != 3:
@@ -387,18 +424,41 @@ def _save_episode_preview(
     position: str,
     frame_index: int,
     current_pc: torch.Tensor,
-    labels: torch.Tensor,
+    foreground_score: torch.Tensor,
     ee_positions: np.ndarray,
 ) -> None:
+    episode_dir = output_dir / "visualizations" / f"episode_{episode_index:06d}"
     _write_preview_ply_with_trajectory(
-        output_dir
-        / "visualizations"
-        / f"episode_{episode_index:06d}"
-        / f"{position}_frame_{frame_index:06d}_pseudo.ply",
+        episode_dir / f"{position}_frame_{frame_index:06d}_soft.ply",
         current_pc.detach().cpu().numpy(),
-        labels.detach().cpu().numpy(),
+        foreground_score.detach().cpu().numpy(),
         ee_positions,
     )
+    score = foreground_score.detach().float().cpu()
+    xyz = current_pc.detach().float().cpu()[..., :3]
+    ee_distance = torch.linalg.norm(xyz, dim=-1)
+    stats: dict[str, Any] = {
+        "episode_index": int(episode_index),
+        "position": position,
+        "frame_index": int(frame_index),
+        "num_points": int(score.numel()),
+        "soft_mean": float(score.mean().item()),
+        "soft_max": float(score.max().item()),
+        "soft_quantiles": {
+            str(q): float(torch.quantile(score, q).item()) for q in (0.5, 0.75, 0.9, 0.95, 0.99)
+        },
+        "fraction_above": {
+            str(threshold): float((score >= threshold).float().mean().item())
+            for threshold in (0.25, 0.5, 0.75)
+        },
+    }
+    for radius in (0.10, 0.15, 0.25):
+        near = ee_distance <= radius
+        stats[f"near_{radius:.2f}m_count"] = int(near.sum().item())
+        stats[f"near_{radius:.2f}m_soft_mean"] = (
+            float(score[near].mean().item()) if bool(near.any()) else None
+        )
+    _atomic_write_json(episode_dir / f"{position}_frame_{frame_index:06d}_soft_stats.json", stats)
 
 
 
@@ -516,6 +576,54 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _write_terminal_continuity_summary(output_dir: Path) -> None:
+    records_by_episode: dict[int, list[dict[str, Any]]] = {}
+    for path in sorted((output_dir / "visualizations").glob("episode_*/terminal_*_soft_stats.json")):
+        with open(path) as f:
+            record = json.load(f)
+        records_by_episode.setdefault(int(record["episode_index"]), []).append(record)
+
+    episode_summaries = []
+    for episode_index, records in sorted(records_by_episode.items()):
+        records.sort(key=lambda value: int(value["frame_index"]))
+        soft_means = np.asarray([record["soft_mean"] for record in records], dtype=np.float64)
+        near_means = np.asarray(
+            [
+                np.nan if record.get("near_0.15m_soft_mean") is None else record["near_0.15m_soft_mean"]
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        episode_summaries.append(
+            {
+                "episode_index": episode_index,
+                "frames": [int(record["frame_index"]) for record in records],
+                "soft_mean_min": float(soft_means.min()),
+                "soft_mean_max": float(soft_means.max()),
+                "soft_mean_max_adjacent_change": float(np.abs(np.diff(soft_means)).max(initial=0.0)),
+                "near_0.15m_soft_mean_min": (
+                    float(np.nanmin(near_means)) if np.isfinite(near_means).any() else None
+                ),
+                "near_0.15m_soft_mean_max_adjacent_change": (
+                    float(np.nanmax(np.abs(np.diff(near_means))))
+                    if near_means.size > 1 and np.isfinite(np.diff(near_means)).any()
+                    else 0.0
+                ),
+            }
+        )
+    _atomic_write_json(
+        output_dir / "terminal_soft_continuity_summary.json",
+        {
+            "description": (
+                "Distribution-level terminal diagnostics. Inspect the matching *_soft.ply files to verify "
+                "individual mug, handle, and rack surfaces; no semantic masks are used."
+            ),
+            "num_episodes": len(episode_summaries),
+            "episodes": episode_summaries,
+        },
+    )
+
+
 def cache_samples(args: argparse.Namespace) -> None:
     if args.smoke_test:
         args.current_points = min(args.current_points, 256)
@@ -549,7 +657,7 @@ def cache_samples(args: argparse.Namespace) -> None:
     total_samples = len(full_dataset) if args.max_samples is None else min(len(full_dataset), args.max_samples)
     if total_samples <= 0:
         raise ValueError("Song pointseg cache needs at least one sample.")
-    preview_targets = _episode_preview_targets(full_dataset, total_samples)
+    preview_targets = _episode_preview_targets(full_dataset, total_samples, args.vis_count)
 
     start_index, end_index = _rank_bounds(total_samples, world_size, rank)
     local_samples = end_index - start_index
@@ -566,12 +674,16 @@ def cache_samples(args: argparse.Namespace) -> None:
             "cache_mode": "indices",
             "num_samples": total_samples,
             "future_offsets": list(args.future_offsets),
+            "temporal_offsets": list(full_dataset.temporal_offsets),
+            "temporal_mode": "bidirectional" if full_dataset.bidirectional else "future_only",
+            "trajectory_mode": "sparse_full_episode",
+            "trajectory_samples": full_dataset.trajectory_samples,
             "current_points": args.current_points,
             "future_points": args.future_points,
             "variable_num_points": True,
             "point_count_policy": "cap_without_repeat",
-            "small_cloud_label_policy": "all_valid_current_points_are_foreground_when_count_lt_current_points",
-            "small_cloud_role_policy": "preserve_automatic_gripper_condition_target_scores",
+            "pseudo_label_policy": "soft_binary_trajectory_v1",
+            "evidence_channels": ["tool_comotion", "trajectory_approach", "near_contact"],
             "storage_dtype": args.storage_dtype,
             "pseudo_label_config": asdict(pseudo_cfg),
             "args": _jsonable(vars(args)),
@@ -650,14 +762,10 @@ def cache_samples(args: argparse.Namespace) -> None:
                     batch["future_is_pad"],
                     current_is_pad=batch.get("observation.point_cloud_is_pad"),
                     future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
+                    trajectory_poses=batch.get("pointseg_trajectory_ee_poses"),
                     config=pseudo_cfg,
                 )
-                pseudo = force_small_current_clouds_foreground(
-                    geometric_pseudo,
-                    current_pc,
-                    args.current_points,
-                    batch.get("observation.point_cloud_is_pad"),
-                )
+                pseudo = geometric_pseudo
 
                 current_is_pad = batch.get("observation.point_cloud_is_pad")
                 for batch_index in range(batch_size):
@@ -671,7 +779,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                         else torch.ones(current_pc.shape[1], dtype=torch.bool, device=current_pc.device)
                     )
                     preview_pc = current_pc[batch_index][valid]
-                    preview_labels = pseudo["labels"][batch_index][valid]
+                    preview_score = pseudo["foreground_score"][batch_index][valid]
                     preview_ee_positions = _preview_future_ee_positions(batch, batch_index)
                     for episode_index, position, frame_index in targets:
                         _save_episode_preview(
@@ -680,7 +788,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                             position,
                             frame_index,
                             preview_pc,
-                            preview_labels,
+                            preview_score,
                             preview_ee_positions,
                         )
                         previews_saved += 1
@@ -733,6 +841,7 @@ def cache_samples(args: argparse.Namespace) -> None:
             args.output_dir, total_samples, args.shard_size, world_size
         )
         _atomic_write_json(args.output_dir / "manifest.json", manifest)
+        _write_terminal_continuity_summary(args.output_dir)
         print(f"Cached {total_samples} Song pointseg samples to {args.output_dir}", flush=True)
 
 

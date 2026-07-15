@@ -41,11 +41,10 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
-    PseudoLabelConfig,
     ROLE_FOREGROUND,
+    PseudoLabelConfig,
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
-    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     open_episode_point_clouds,
     song_pointseg_collate,
@@ -339,6 +338,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         "future_is_pad",
         "future_offsets",
         "future_ee_poses",
+        "pointseg_trajectory_ee_poses",
+        "pointseg_trajectory_offsets",
     )
 
     def __init__(
@@ -449,13 +450,10 @@ class OnlinePointSegBatchCollator:
                 future_is_pad,
                 current_is_pad=current_is_pad,
                 future_point_is_pad=future_point_is_pad,
+                trajectory_poses=batch["pointseg_trajectory_ee_poses"].to(
+                    device=self.device, dtype=torch.float32
+                ),
                 config=self.pseudo_config,
-            )
-            pseudo = force_small_current_clouds_foreground(
-                pseudo,
-                current_pc,
-                self.current_points,
-                current_is_pad,
             )
         t3 = time.perf_counter()
         for source_key, dest_key in (
@@ -510,8 +508,8 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
             return dataset
         mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
         logging.info(
-            f"{reason}; computing Song pointseg pseudo labels online from {point_cloud_dir}. "
-            "This matches the offline cache supervision but is much slower."
+            f"{reason}; computing bidirectional Song pointseg soft labels online from {point_cloud_dir}. "
+            "This matches the offline cache supervision but is much slower; temporal context is supervision-only."
         )
         return OnlinePointSegPseudoDataset(
             dataset,
@@ -1480,8 +1478,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
                     "pred_operation_prob",
+                    "loss_soft_bce",
+                    "loss_smoothness",
                     "pseudo_valid_ratio",
                     "pseudo_foreground_ratio",
+                    "pseudo_soft_foreground_mean",
                     "pred_foreground_ratio",
                 )
                 debug_items = []

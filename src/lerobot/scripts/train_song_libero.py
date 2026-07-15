@@ -46,7 +46,6 @@ from lerobot.policies.smolvla.song_pointseg import (
     ROLE_FOREGROUND,
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
-    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     open_episode_point_clouds,
     song_pointseg_collate,
@@ -333,6 +332,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         "future_is_pad",
         "future_offsets",
         "future_ee_poses",
+        "pointseg_trajectory_ee_poses",
+        "pointseg_trajectory_offsets",
     )
 
     def __init__(
@@ -443,13 +444,10 @@ class OnlinePointSegBatchCollator:
                 future_is_pad,
                 current_is_pad=current_is_pad,
                 future_point_is_pad=future_point_is_pad,
+                trajectory_poses=batch["pointseg_trajectory_ee_poses"].to(
+                    device=self.device, dtype=torch.float32
+                ),
                 config=self.pseudo_config,
-            )
-            pseudo = force_small_current_clouds_foreground(
-                pseudo,
-                current_pc,
-                self.current_points,
-                current_is_pad,
             )
         t3 = time.perf_counter()
         for source_key, dest_key in (

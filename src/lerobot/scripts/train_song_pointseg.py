@@ -23,9 +23,9 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLossConfig,
     SongPointSegNet,
     SongTemporalPointCloudDataset,
-    force_small_current_clouds_foreground,
     generate_pseudo_labels,
     move_batch_to_device,
+    open_episode_point_clouds,
     parse_future_offsets,
     pretty_metrics,
     refine_pseudo_labels_with_teacher,
@@ -39,13 +39,13 @@ from lerobot.utils.random_utils import set_seed
 DEFAULT_DATASET_ROOT = Path(
     os.environ.get(
         "SONG_POINTSEG_DATASET",
-        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset_5090",
+        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
     )
 )
 DEFAULT_OUTPUT_DIR = Path(
     os.environ.get(
         "SONG_POINTSEG_OUTPUT_DIR",
-        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/song_pointseg",
+        "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/pointseg/song_pointseg",
     )
 )
 import math
@@ -340,8 +340,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-cache-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
-    parser.add_argument("--current-points", type=int, default=10000)
-    parser.add_argument("--future-points", type=int, default=10000)
+    parser.add_argument("--current-points", type=int, default=50000)
+    parser.add_argument("--future-points", type=int, default=16384)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps", type=int, default=5000)
@@ -382,6 +382,12 @@ def make_dataset(args: argparse.Namespace) -> torch.utils.data.Dataset:
     if args.sample_cache_dir is not None:
         return SongPointSegCachedDataset(args.sample_cache_dir)
 
+    return make_temporal_dataset(args)
+
+
+def make_temporal_dataset(args: argparse.Namespace) -> SongTemporalPointCloudDataset:
+    """Build the uncached dataset used for temporal priors and full-resolution previews."""
+
     dataset = _make_lerobot_dataset(args)
     dataset_root = Path(getattr(dataset, "root", args.dataset_repo_id))
     point_cloud_dir = args.point_cloud_dir or dataset_root / "point_clouds"
@@ -393,6 +399,64 @@ def make_dataset(args: argparse.Namespace) -> torch.utils.data.Dataset:
         future_points=args.future_points,
         seed=args.seed,
     )
+
+
+def find_max_resolution_visualization_indices(
+    dataset: SongTemporalPointCloudDataset,
+) -> tuple[list[int], int, int]:
+    """Find frames from the dataset's highest source resolution without fixed thresholds.
+
+    The mixed real dataset currently contains already-reduced clouds and raw camera
+    clouds.  Their exact sizes are data properties, not model assumptions, so this
+    function discovers the maximum source point count from episode array metadata.
+    """
+    episodes = getattr(dataset.meta, "episodes", None)
+    if not episodes:
+        raise ValueError("Episode metadata is required for full-resolution PointSeg visualization.")
+
+    episode_records: list[tuple[int, list[int], int]] = []
+    max_source_points = 0
+    absolute_to_relative = getattr(dataset.dataset, "_absolute_to_relative_idx", None)
+    for position, episode in enumerate(episodes):
+        episode_index = int(episode.get("episode_index", position))
+        start = int(episode["dataset_from_index"])
+        end = int(episode["dataset_to_index"])
+        if absolute_to_relative is None:
+            relative_indices = list(range(start, end))
+        else:
+            relative_indices = [
+                int(absolute_to_relative[index])
+                for index in range(start, end)
+                if index in absolute_to_relative
+            ]
+        if not relative_indices:
+            continue
+        point_clouds = open_episode_point_clouds(
+            dataset.point_cloud_dir,
+            episode_index,
+            mmap_mode=dataset.mmap_mode,
+        )
+        if len(point_clouds.shape) != 3 or int(point_clouds.shape[-1]) < 3:
+            raise ValueError(
+                f"Expected episode {episode_index} point clouds with shape (T,N,C), got {point_clouds.shape}."
+            )
+        source_points = int(point_clouds.shape[1])
+        max_source_points = max(max_source_points, source_points)
+        episode_records.append((source_points, relative_indices, episode_index))
+
+    if max_source_points <= 0:
+        raise ValueError("Could not discover a positive source point count for visualization.")
+
+    candidate_indices: list[int] = []
+    candidate_episodes = 0
+    for source_points, relative_indices, _episode_index in episode_records:
+        if source_points != max_source_points:
+            continue
+        candidate_episodes += 1
+        candidate_indices.extend(relative_indices)
+    if not candidate_indices:
+        raise ValueError("No samples were found at the dataset's maximum source point-cloud resolution.")
+    return candidate_indices, max_source_points, candidate_episodes
 
 
 def pseudo_from_cached_batch(batch: dict) -> dict[str, torch.Tensor]:
@@ -413,13 +477,31 @@ def save_visualization(
     outputs: dict,
     pseudo: dict,
     batch_index: int = 0,
+    tag: str | None = None,
 ) -> None:
     vis_dir = output_dir / "visualizations"
+    stem = f"step_{step:06d}" if not tag else f"step_{step:06d}_{tag}"
     current_pc = batch["observation.point_cloud"][batch_index].detach().cpu()
-    probs = outputs["role_probs"][batch_index].detach().cpu()
+    point_is_pad = batch.get("observation.point_cloud_is_pad")
+    if torch.is_tensor(point_is_pad):
+        valid_points = ~point_is_pad[batch_index].detach().cpu().to(dtype=torch.bool)
+    else:
+        valid_points = torch.ones(current_pc.shape[0], dtype=torch.bool)
+    current_pc = current_pc[valid_points]
+    probs = outputs["role_probs"][batch_index].detach().cpu()[valid_points]
     pred_labels = probs.argmax(dim=-1).numpy()
-    operation_prob = outputs["operation_prob"][batch_index].detach().cpu().numpy()
-    pseudo_labels = pseudo["labels"][batch_index].detach().cpu().numpy()
+    operation_prob = outputs["operation_prob"][batch_index].detach().cpu()[valid_points].numpy()
+    if "foreground_score" in pseudo:
+        pseudo_foreground_score = (
+            pseudo["foreground_score"][batch_index].detach().cpu()[valid_points].numpy()
+        )
+    else:
+        pseudo_foreground_score = (
+            pseudo["class_scores"][batch_index, :, 1].detach().cpu()[valid_points].numpy()
+        )
+    # Pseudo supervision remains fully soft. This threshold is only used to
+    # render it with the same foreground/background convention as pred.ply.
+    pseudo_labels = (pseudo_foreground_score > 0.5).astype(np.int64)
 
     def _relative_pose_matrices(pose9: torch.Tensor) -> np.ndarray:
         pose_np = pose9.detach().cpu().to(dtype=torch.float32).numpy()
@@ -440,6 +522,16 @@ def save_visualization(
 
     def _future_ee_trajectory() -> tuple[np.ndarray, np.ndarray] | None:
         horizon = 32
+        trajectory_poses = batch.get("pointseg_trajectory_ee_poses")
+        if torch.is_tensor(trajectory_poses) and trajectory_poses.ndim >= 3 and trajectory_poses.shape[-1] >= 9:
+            pose9 = trajectory_poses[batch_index].detach().cpu()
+            offsets = batch.get("pointseg_trajectory_offsets")
+            if torch.is_tensor(offsets):
+                pose9 = pose9[torch.argsort(offsets[batch_index].detach().cpu())]
+            pose9 = pose9[:horizon, :9].to(dtype=torch.float32)
+            if pose9.shape[0] > 0:
+                return pose9.numpy()[:, :3], rot6d_to_matrix(pose9[:, 3:9]).cpu().numpy()
+
         action = batch.get("action")
         if torch.is_tensor(action) and action.ndim >= 3 and action.shape[-1] >= 9:
             pose9 = action[batch_index, : min(horizon, action.shape[1]), :9]
@@ -488,14 +580,22 @@ def save_visualization(
         foreground_mask = role_labels == ROLE_FOREGROUND
         point_colors[foreground_mask] = ROLE_COLORS[ROLE_FOREGROUND]
         if operation_prob is not None:
-            prob = np.asarray(operation_prob, dtype=np.float32)
+            prob = np.nan_to_num(
+                np.asarray(operation_prob, dtype=np.float32).reshape(-1),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clip(0.0, 1.0)
+            if prob.shape[0] != xyz.shape[0]:
+                raise ValueError(
+                    f"operation_prob has {prob.shape[0]} points, but point cloud has {xyz.shape[0]}"
+                )
             point_colors[foreground_mask] = np.clip(
-                point_colors[foreground_mask].astype(np.float32) * (0.35 + 0.65 * prob[foreground_mask, None]),
+                point_colors[foreground_mask].astype(np.float32)
+                * (0.35 + 0.65 * prob[foreground_mask, None]),
                 0,
                 255,
-            ).astype(
-                np.uint8
-            )
+            ).astype(np.uint8)
 
         if trajectory is None:
             traj_positions = np.zeros((0, 3), dtype=np.float32)
@@ -543,19 +643,51 @@ def save_visualization(
     trajectory = _future_ee_trajectory()
     current_pc_np = current_pc.numpy()
     _write_role_ply_with_trajectory(
-        vis_dir / f"step_{step:06d}_pred.ply",
+        vis_dir / f"{stem}_pred.ply",
         current_pc_np,
         pred_labels,
         operation_prob=operation_prob,
         trajectory=trajectory,
     )
     _write_role_ply_with_trajectory(
-        vis_dir / f"step_{step:06d}_pseudo.ply",
+        vis_dir / f"{stem}_pseudo.ply",
         current_pc_np,
         pseudo_labels,
+        operation_prob=pseudo_foreground_score,
         trajectory=trajectory,
     )
-    save_pointseg_npz(vis_dir / f"step_{step:06d}.npz", current_pc, {k: v[batch_index] for k, v in outputs.items() if torch.is_tensor(v)}, {k: v[batch_index] for k, v in pseudo.items() if torch.is_tensor(v)})
+    def _select_valid(values: dict) -> dict[str, torch.Tensor]:
+        selected = {}
+        for key, value in values.items():
+            if not torch.is_tensor(value):
+                continue
+            item = value[batch_index]
+            if item.ndim >= 1 and item.shape[0] == valid_points.shape[0]:
+                item = item[valid_points.to(device=item.device)]
+            selected[key] = item
+        return selected
+
+    def _batch_scalar(key: str, default: int = -1) -> int:
+        value = batch.get(key)
+        if not torch.is_tensor(value):
+            return int(default)
+        return int(value[batch_index].detach().cpu().reshape(-1)[0].item())
+
+    source_num_points = _batch_scalar("pointseg_source_num_points", current_pc.shape[0])
+    save_pointseg_npz(
+        vis_dir / f"{stem}.npz",
+        current_pc,
+        _select_valid(outputs),
+        _select_valid(pseudo),
+        metadata={
+            "tag": tag or "train_batch",
+            "source_num_points": source_num_points,
+            "sample_num_points": int(current_pc.shape[0]),
+            "episode_index": _batch_scalar("episode_index"),
+            "frame_index": _batch_scalar("frame_index"),
+            "dataset_index": _batch_scalar("dataset_index"),
+        },
+    )
 
 
 def save_checkpoint(
@@ -599,6 +731,24 @@ def train(args: argparse.Namespace) -> None:
     save_pointseg_config(args.output_dir / "pointseg_config.json", args, pseudo_cfg, loss_cfg)
 
     dataset = make_dataset(args)
+    visualization_dataset: SongTemporalPointCloudDataset | None = None
+    fullres_indices: list[int] = []
+    fullres_source_points = 0
+    fullres_cursor = 0
+    if args.vis_freq > 0:
+        visualization_dataset = (
+            dataset if isinstance(dataset, SongTemporalPointCloudDataset) else make_temporal_dataset(args)
+        )
+        fullres_indices, fullres_source_points, fullres_episode_count = (
+            find_max_resolution_visualization_indices(visualization_dataset)
+        )
+        fullres_rng = np.random.default_rng(args.seed + 104729)
+        fullres_rng.shuffle(fullres_indices)
+        print(
+            "PointSeg full-resolution visualization pool: "
+            f"source_points={fullres_source_points}, episodes={fullres_episode_count}, "
+            f"frames={len(fullres_indices)}"
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -641,13 +791,8 @@ def train(args: argparse.Namespace) -> None:
                     batch["future_is_pad"],
                     current_is_pad=current_is_pad,
                     future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
+                    trajectory_poses=batch.get("pointseg_trajectory_ee_poses"),
                     config=pseudo_cfg,
-                )
-                pseudo = force_small_current_clouds_foreground(
-                    pseudo,
-                    current_pc,
-                    args.current_points,
-                    current_is_pad,
                 )
             if current_is_pad is not None:
                 pseudo["point_is_pad"] = current_is_pad
@@ -684,7 +829,71 @@ def train(args: argparse.Namespace) -> None:
 
         if args.vis_freq > 0 and step % args.vis_freq == 0:
             with torch.no_grad():
-                save_visualization(args.output_dir, step, batch, outputs, pseudo)
+                # Re-run after the optimizer update in deterministic eval mode so
+                # pred.ply represents checkpoint inference rather than train-mode
+                # BatchNorm/random serialization output from before the update.
+                model.eval()
+                vis_outputs = model(current_pc, priors=pseudo["priors"], point_is_pad=current_is_pad)
+                save_visualization(args.output_dir, step, batch, vis_outputs, pseudo)
+
+                # Always save a second result from the dataset's dynamically
+                # discovered maximum source resolution.  This is independent of
+                # whichever resolutions happened to occur in the shuffled batch.
+                if visualization_dataset is None or not fullres_indices:
+                    raise RuntimeError("Full-resolution visualization pool was not initialized.")
+                fullres_index = fullres_indices[fullres_cursor % len(fullres_indices)]
+                fullres_cursor += 1
+                fullres_item = dict(visualization_dataset[fullres_index])
+                source_num_points = int(
+                    torch.as_tensor(fullres_item["pointseg_source_num_points"]).reshape(-1)[0].item()
+                )
+                if source_num_points != fullres_source_points:
+                    raise RuntimeError(
+                        "Full-resolution visualization pool became inconsistent: "
+                        f"dataset index {fullres_index} has {source_num_points} source points, "
+                        f"expected {fullres_source_points}."
+                    )
+                fullres_item["dataset_index"] = torch.tensor(fullres_index, dtype=torch.long)
+                fullres_batch = move_batch_to_device(song_pointseg_collate([fullres_item]), device)
+                fullres_pc = fullres_batch["observation.point_cloud"]
+                fullres_is_pad = fullres_batch.get("observation.point_cloud_is_pad")
+                fullres_pseudo = generate_pseudo_labels(
+                    fullres_pc,
+                    fullres_batch["observation.point_cloud_future"],
+                    fullres_batch["future_ee_poses"],
+                    fullres_batch["future_is_pad"],
+                    current_is_pad=fullres_is_pad,
+                    future_point_is_pad=fullres_batch.get("observation.point_cloud_future_is_pad"),
+                    trajectory_poses=fullres_batch.get("pointseg_trajectory_ee_poses"),
+                    config=pseudo_cfg,
+                )
+                if fullres_is_pad is not None:
+                    fullres_pseudo["point_is_pad"] = fullres_is_pad
+                if teacher is not None:
+                    fullres_teacher_outputs = teacher.model(
+                        fullres_pc,
+                        priors=fullres_pseudo["priors"],
+                        point_is_pad=fullres_is_pad,
+                    )
+                    fullres_pseudo = refine_pseudo_labels_with_teacher(
+                        fullres_pseudo,
+                        fullres_teacher_outputs["role_logits"],
+                        config=pseudo_cfg,
+                    )
+                fullres_outputs = model(
+                    fullres_pc,
+                    priors=fullres_pseudo["priors"],
+                    point_is_pad=fullres_is_pad,
+                )
+                save_visualization(
+                    args.output_dir,
+                    step,
+                    fullres_batch,
+                    fullres_outputs,
+                    fullres_pseudo,
+                    tag="fullres",
+                )
+                model.train()
 
         if args.save_freq > 0 and step % args.save_freq == 0:
             save_checkpoint(args.output_dir, step, model, optimizer, teacher, args)

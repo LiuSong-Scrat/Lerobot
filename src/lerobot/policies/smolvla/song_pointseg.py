@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import os
 import warnings
 from bisect import bisect_right
@@ -38,7 +37,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 5
+POINTSEG_CACHE_VERSION = 7
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -101,9 +100,14 @@ class PseudoLabelConfig:
     motion_relative_margin: float = 0.10
     motion_relative_tau: float = 0.10
     gripper_sigma: float = 0.045
-    trajectory_sigma: float = 0.12
-    approach_margin: float = 0.012
-    approach_tau: float = 0.035
+    trajectory_sigma: float = 0.13
+    contact_sigma: float = 0.10
+    contact_radius: float = 0.12
+    contact_temperature: float = 0.035
+    approach_margin: float = 0.005
+    approach_tau: float = 0.025
+    background_trajectory_sigma: float = 0.20
+    soft_background_weight: float = 0.20
     min_confidence: float = 0.20
     background_min_confidence: float = 0.55
     background_foreground_max: float = 0.12
@@ -111,6 +115,7 @@ class PseudoLabelConfig:
     min_foreground_fraction: float = 0.01
     forced_foreground_min_score: float = 0.05
     teacher_confidence: float = 0.86
+    teacher_blend: float = 0.25
     teacher_geometry_gate: float = 0.18
     teacher_background_min_score: float = 0.65
     teacher_background_foreground_max: float = 0.08
@@ -120,10 +125,8 @@ class PseudoLabelConfig:
 
 @dataclass(frozen=True)
 class SongPointSegLossConfig:
-    ce_weight: float = 1.0
-    foreground_bce_weight: float = 0.35
+    soft_bce_weight: float = 1.0
     smoothness_weight: float = 0.04
-    motion_consistency_weight: float = 0.20
     smooth_voxel_size: float = 0.025
     class_weights: tuple[float, float] = (0.50, 2.00)
     ignore_index: int = ROLE_IGNORE
@@ -467,7 +470,13 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
-    """Adds current/future point clouds and current-frame relative future poses to a LeRobot dataset."""
+    """Adds a temporal point-cloud window used only to build PointSeg supervision.
+
+    The current frame is always stored at temporal index 0.  With ``bidirectional=True``
+    (the default), the remaining entries contain both past and future frames.  This
+    wrapper leaves the policy action chunk untouched; temporal poses are read from the
+    episode's raw action column instead.
+    """
 
     def __init__(
         self,
@@ -475,6 +484,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         point_cloud_dir: str | Path,
         *,
         future_offsets: tuple[int, ...] | list[int] = DEFAULT_FUTURE_OFFSETS,
+        bidirectional: bool = True,
+        trajectory_samples: int = 32,
         current_points: int = 8192,
         future_points: int = 16384,
         seed: int = 1000,
@@ -486,13 +497,21 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.future_offsets = tuple(int(offset) for offset in future_offsets)
         if any(offset <= 0 for offset in self.future_offsets):
             raise ValueError("future_offsets should contain positive frame offsets; current frame is added automatically.")
-        self.temporal_offsets = (0, *self.future_offsets)
+        self.bidirectional = bool(bidirectional)
+        past_offsets = tuple(-offset for offset in reversed(self.future_offsets)) if self.bidirectional else ()
+        # Keep the current frame at index 0 because the motion-prior implementation
+        # treats every following entry as context relative to this anchor.
+        self.temporal_offsets = (0, *past_offsets, *self.future_offsets)
+        self.trajectory_samples = int(trajectory_samples)
+        if self.trajectory_samples < 0:
+            raise ValueError("trajectory_samples must be non-negative.")
         self.current_points = int(current_points)
         self.future_points = int(future_points)
         self.seed = int(seed)
         self.return_full_point_cloud = return_full_point_cloud
         self.mmap_mode = mmap_mode
         self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._episode_action_cache: dict[int, Tensor] = {}
 
     def __getattr__(self, name: str):
         return getattr(self.dataset, name)
@@ -500,6 +519,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_point_cloud_cache"] = {}
+        state["_episode_action_cache"] = {}
         return state
 
     def __len__(self) -> int:
@@ -524,22 +544,85 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             self._point_cloud_cache[episode_index] = point_clouds
         return point_clouds
 
-    def _relative_future_poses(self, action_chunk: Tensor) -> Tensor:
-        if action_chunk.ndim != 2 or action_chunk.shape[-1] < 9:
-            raise ValueError(
-                "SongTemporalPointCloudDataset expects the wrapped dataset to return an action chunk "
-                f"with shape (T, >=9), got {tuple(action_chunk.shape)}."
+    def _episode_actions(self, episode_index: int) -> Tensor:
+        cached = self._episode_action_cache.get(episode_index)
+        if cached is not None:
+            return cached
+
+        # Lightweight test/custom datasets can expose per-episode action arrays.
+        actions = getattr(self.dataset, "actions", None)
+        if actions is not None:
+            episode_actions = torch.as_tensor(actions[episode_index], dtype=torch.float32)
+            self._episode_action_cache[episode_index] = episode_actions
+            return episode_actions
+
+        ensure_loaded = getattr(self.dataset, "_ensure_hf_dataset_loaded", None)
+        if callable(ensure_loaded):
+            ensure_loaded()
+        hf_dataset = getattr(self.dataset, "hf_dataset", None)
+        meta = getattr(self.dataset, "meta", None)
+        episodes = getattr(meta, "episodes", None)
+        if hf_dataset is None or episodes is None:
+            raise RuntimeError(
+                "Bidirectional PointSeg supervision needs access to the raw per-frame action column. "
+                "Expected a LeRobotDataset or a dataset exposing per-episode `actions`."
             )
-        max_offset = max(self.temporal_offsets)
-        if action_chunk.shape[0] <= max_offset:
-            raise ValueError(
-                f"Action chunk length {action_chunk.shape[0]} is too short for max temporal offset {max_offset}. "
-                "Create the base LeRobotDataset with action delta timestamps covering every requested offset."
-            )
-        poses = action_chunk[list(self.temporal_offsets), :9].to(dtype=torch.float32)
+
+        episode_record = None
+        for position, candidate in enumerate(episodes):
+            candidate_index = int(candidate.get("episode_index", position))
+            if candidate_index == episode_index:
+                episode_record = candidate
+                break
+        if episode_record is None:
+            raise KeyError(f"Could not find episode metadata for episode_index={episode_index}.")
+
+        start = int(episode_record["dataset_from_index"])
+        end = int(episode_record["dataset_to_index"])
+        absolute_indices = list(range(start, end))
+        absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
+        if absolute_to_relative is None:
+            relative_indices = absolute_indices
+        else:
+            relative_indices = [absolute_to_relative[index] for index in absolute_indices]
+        try:
+            values = hf_dataset["action"][relative_indices]
+        except (KeyError, TypeError, IndexError):
+            values = hf_dataset[relative_indices]["action"]
+        episode_actions = torch.stack([torch.as_tensor(value) for value in values]).to(dtype=torch.float32)
+        self._episode_action_cache[episode_index] = episode_actions
+        return episode_actions
+
+    def _relative_temporal_poses(self, episode_index: int, frame_indices: list[int]) -> Tensor:
+        actions = self._episode_actions(episode_index)
+        poses = actions[frame_indices, :9].to(dtype=torch.float32)
         rel = relative_poses_to_first(poses.unsqueeze(0)).squeeze(0)
         rel[0] = _identity_pose9(device=rel.device, dtype=rel.dtype)
         return rel
+
+    def _relative_episode_trajectory(self, episode_index: int, frame_index: int) -> tuple[Tensor, Tensor]:
+        """Return a sparse full-episode EE trajectory anchored at the current frame.
+
+        Point-cloud KNN remains local.  This pose-only trajectory supplies long-range
+        approach/contact evidence without loading point clouds from the whole episode.
+        Index 0 is always the current pose so downstream code can use it as the anchor.
+        """
+        actions = self._episode_actions(episode_index)
+        episode_len = int(actions.shape[0])
+        if self.trajectory_samples == 0:
+            sample_indices = torch.tensor([frame_index], dtype=torch.long)
+        else:
+            sample_indices = torch.linspace(
+                0,
+                max(episode_len - 1, 0),
+                steps=self.trajectory_samples,
+                dtype=torch.float32,
+            ).round().to(dtype=torch.long)
+            sample_indices = torch.cat([torch.tensor([frame_index], dtype=torch.long), sample_indices])
+        poses = actions[sample_indices, :9].to(dtype=torch.float32)
+        relative = relative_poses_to_first(poses.unsqueeze(0)).squeeze(0)
+        relative[0] = _identity_pose9(device=relative.device, dtype=relative.dtype)
+        return relative, sample_indices - int(frame_index)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = dict(self.dataset[idx])
@@ -553,13 +636,19 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         current_sample, current_indices = _sample_rows_with_indices(current_full, self.current_points, rng)
         item["observation.point_cloud"] = torch.from_numpy(current_sample)
         item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
+        # Explicit source metadata lets diagnostics distinguish a raw high-resolution
+        # frame from an already-reduced cloud without inferring it from fixed sizes.
+        item["pointseg_source_num_points"] = torch.tensor(int(current_full.shape[0]), dtype=torch.long)
+        item["pointseg_sample_num_points"] = torch.tensor(int(current_sample.shape[0]), dtype=torch.long)
 
         future_samples = []
         future_is_pad = []
+        temporal_frame_indices = []
         for offset in self.temporal_offsets:
             raw_index = frame_index + offset
             clamped_index = min(max(raw_index, 0), episode_len - 1)
-            future_is_pad.append(raw_index >= episode_len)
+            future_is_pad.append(raw_index < 0 or raw_index >= episode_len)
+            temporal_frame_indices.append(clamped_index)
             future_samples.append(_sample_rows(np.asarray(point_clouds[clamped_index]), self.future_points, rng))
 
         max_future_points = max(sample.shape[0] for sample in future_samples)
@@ -575,7 +664,10 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         item["observation.point_cloud_future_is_pad"] = torch.from_numpy(future_mask)
         item["future_is_pad"] = torch.tensor(future_is_pad, dtype=torch.bool)
         item["future_offsets"] = torch.tensor(self.temporal_offsets, dtype=torch.long)
-        item["future_ee_poses"] = self._relative_future_poses(item["action"])
+        item["future_ee_poses"] = self._relative_temporal_poses(episode_index, temporal_frame_indices)
+        trajectory_poses, trajectory_offsets = self._relative_episode_trajectory(episode_index, frame_index)
+        item["pointseg_trajectory_ee_poses"] = trajectory_poses
+        item["pointseg_trajectory_offsets"] = trajectory_offsets
 
         if self.return_full_point_cloud:
             item["observation.point_cloud_full"] = torch.from_numpy(np.ascontiguousarray(current_full))
@@ -999,12 +1091,15 @@ def compute_motion_priors(
     *,
     current_is_pad: Tensor | None = None,
     future_point_is_pad: Tensor | None = None,
+    trajectory_poses: Tensor | None = None,
+    trajectory_is_pad: Tensor | None = None,
     nn_chunk_size: int = 1024,
     motion_gap_eps: float = 0.005,
     motion_rotation_radius: float = 0.08,
     motion_baseline_threshold: float = 0.015,
     motion_baseline_temperature: float = 0.005,
     motion_evidence_topk: int = 3,
+    contact_sigma: float = 0.10,
 ) -> dict[str, Tensor]:
     """Compute geometry/motion priors used by pseudo labels and the segmentation network."""
     if current_pc.ndim != 3 or future_pc.ndim != 4 or future_poses.ndim != 3:
@@ -1049,20 +1144,55 @@ def compute_motion_priors(
     held_residual = torch.where(current_is_pad, torch.ones_like(held_residual), held_residual)
     static_residual = torch.where(current_is_pad, torch.ones_like(static_residual), static_residual)
 
-    trajectory_xyz = future_poses[..., :3]
-    valid_traj = ~future_is_pad
+    if trajectory_poses is None:
+        trajectory_poses = future_poses
+        trajectory_is_pad = future_is_pad
+    else:
+        if trajectory_poses.ndim != 3 or trajectory_poses.shape[0] != bsize or trajectory_poses.shape[-1] < 3:
+            raise ValueError(
+                "Expected trajectory_poses with shape (B,L,>=3), got "
+                f"{tuple(trajectory_poses.shape)}."
+            )
+        trajectory_poses = trajectory_poses.to(device=current_pc.device, dtype=torch.float32)
+        if trajectory_is_pad is None:
+            trajectory_is_pad = torch.zeros(
+                trajectory_poses.shape[:2], dtype=torch.bool, device=current_pc.device
+            )
+        else:
+            trajectory_is_pad = trajectory_is_pad.to(device=current_pc.device, dtype=torch.bool)
+            if trajectory_is_pad.shape != trajectory_poses.shape[:2]:
+                raise ValueError(
+                    f"Expected trajectory_is_pad shape {trajectory_poses.shape[:2]}, "
+                    f"got {tuple(trajectory_is_pad.shape)}."
+                )
+
+    trajectory_xyz = trajectory_poses[..., :3]
+    valid_traj = ~trajectory_is_pad
     point_to_traj = torch.linalg.norm(current_xyz[:, :, None, :] - trajectory_xyz[:, None, :, :], dim=-1)
     point_to_traj = point_to_traj.masked_fill(~valid_traj[:, None, :], float("inf"))
     point_to_traj = point_to_traj.masked_fill(current_is_pad[:, :, None], float("inf"))
     min_traj_dist = point_to_traj.amin(dim=-1)
     min_traj_dist = torch.where(torch.isfinite(min_traj_dist), min_traj_dist, torch.zeros_like(min_traj_dist))
 
+    contact_scale = max(float(contact_sigma), 1e-6)
+    trajectory_proximity = torch.exp(-point_to_traj / contact_scale)
+    trajectory_proximity = torch.where(
+        torch.isfinite(trajectory_proximity), trajectory_proximity, torch.zeros_like(trajectory_proximity)
+    )
+    valid_traj_count = valid_traj.sum(dim=-1, keepdim=True).clamp_min(1).to(dtype=trajectory_proximity.dtype)
+    trajectory_dwell = trajectory_proximity.sum(dim=-1) / valid_traj_count
+    context_valid = (~future_is_pad)[:, 1:]
+    if context_valid.shape[1] > 0:
+        context_observability = context_valid.to(dtype=current_xyz.dtype).mean(dim=-1, keepdim=True)
+    else:
+        context_observability = current_xyz.new_zeros((bsize, 1))
+    context_observability = context_observability.expand(-1, n_points)
+
     ee_dist = torch.linalg.norm(current_xyz, dim=-1)
     ee_dist = torch.where(current_is_pad, torch.zeros_like(ee_dist), ee_dist)
-    start_dist = point_to_traj[..., 0]
-    future_min_dist = point_to_traj[..., 1:].amin(dim=-1) if point_to_traj.shape[-1] > 1 else start_dist
-    future_min_dist = torch.where(torch.isfinite(future_min_dist), future_min_dist, start_dist)
-    approach_delta = start_dist - future_min_dist
+    # The trajectory is anchored at the current EE pose, so current point-to-EE
+    # distance is the stable reference even if sparse trajectory samples repeat.
+    approach_delta = ee_dist - min_traj_dist
     min_traj_dist = torch.where(current_is_pad, torch.zeros_like(min_traj_dist), min_traj_dist)
     approach_delta = torch.where(current_is_pad, torch.zeros_like(approach_delta), approach_delta)
     residual_gap = torch.where(current_is_pad, torch.zeros_like(residual_gap), residual_gap)
@@ -1075,8 +1205,8 @@ def compute_motion_priors(
             held_residual,
             static_residual,
             residual_gap,
-            torch.exp(-held_residual / 0.05),
-            torch.exp(-static_residual / 0.05),
+            trajectory_dwell,
+            context_observability,
         ],
         dim=-1,
     )
@@ -1090,6 +1220,8 @@ def compute_motion_priors(
         "held_residual": held_residual,
         "static_residual": static_residual,
         "residual_gap": residual_gap,
+        "trajectory_dwell": trajectory_dwell,
+        "context_observability": context_observability,
         "motion_weights": motion_weights,
         "motion_baseline": motion_baseline,
     }
@@ -1113,6 +1245,8 @@ def generate_pseudo_labels_from_priors(
             "held_residual": priors[..., 3],
             "static_residual": priors[..., 4],
             "residual_gap": priors[..., 5],
+            "trajectory_dwell": priors[..., 6],
+            "context_observability": priors[..., 7],
         }
     else:
         prior_dict = dict(priors_or_dict)
@@ -1123,56 +1257,70 @@ def generate_pseudo_labels_from_priors(
     held_residual = prior_dict["held_residual"]
     static_residual = prior_dict["static_residual"]
     residual_gap = prior_dict["residual_gap"]
+    trajectory_dwell = prior_dict.get("trajectory_dwell", torch.zeros_like(ee_dist))
+    context_observability = prior_dict.get("context_observability", torch.ones_like(ee_dist))
 
     held_score = torch.exp(-held_residual / config.held_sigma)
     static_score = torch.exp(-static_residual / config.static_sigma)
     motion_score = torch.sigmoid(
         (residual_gap - config.motion_relative_margin) / max(config.motion_relative_tau, 1e-6)
     )
-    gripper_near = torch.exp(-ee_dist / config.gripper_sigma)
     trajectory_near = torch.exp(-min_traj_dist / config.trajectory_sigma)
     approach_score = torch.sigmoid((approach_delta - config.approach_margin) / config.approach_tau)
 
-    gripper_score = held_score * gripper_near
-    condition_score = held_score * motion_score * trajectory_near * (1.0 - gripper_score).clamp_min(0.0)
-    target_score = static_score * approach_score * trajectory_near * (1.0 - gripper_score).clamp_min(0.0)
-    role_scores = torch.stack([gripper_score, condition_score, target_score], dim=-1)
-    foreground_score = role_scores.amax(dim=-1)
-    background_score = (1.0 - foreground_score).clamp_min(0.0) * (0.5 + 0.5 * static_score) * (
-        1.0 - 0.7 * approach_score
-    ).clamp_min(0.0)
-
-    class_scores = torch.stack([background_score, foreground_score], dim=-1)
-    confidence, labels = class_scores.max(dim=-1)
-    labels = labels.to(dtype=torch.long)
-    foreground_valid = (labels == ROLE_FOREGROUND) & (confidence >= config.min_confidence)
-    background_valid = (
-        (labels == ROLE_BACKGROUND)
-        & (background_score >= config.background_min_confidence)
-        & (foreground_score <= config.background_foreground_max)
+    # Three pieces of trajectory evidence, not semantic roles.  Every value is a
+    # continuous probability-like score and no branch is hardened into a class.
+    tool_score = held_score * motion_score * trajectory_near
+    approached_score = approach_score * trajectory_near
+    contact_score = torch.sigmoid(
+        (float(config.contact_radius) - min_traj_dist)
+        / max(float(config.contact_temperature), 1e-6)
     )
-    valid = foreground_valid | background_valid
-    labels = torch.where(valid, labels, torch.full_like(labels, config.ignore_index))
-    weights = confidence.detach().clamp(0.05, 1.0)
-    weights = torch.where(labels == ROLE_BACKGROUND, weights * config.background_label_weight, weights)
-    weights = torch.where(labels == config.ignore_index, torch.zeros_like(weights), weights)
+    evidence_scores = torch.stack([tool_score, approached_score, contact_score], dim=-1).clamp(0.0, 1.0)
+
+    # Probabilistic OR preserves weak but complementary evidence while remaining
+    # fully soft.  In particular, target evidence no longer assumes static motion.
+    foreground_score = (1.0 - (1.0 - evidence_scores).prod(dim=-1)).clamp(0.0, 1.0)
+    class_scores = torch.stack([1.0 - foreground_score, foreground_score], dim=-1)
+
+    far_from_trajectory = 1.0 - torch.exp(
+        -min_traj_dist / max(config.background_trajectory_sigma, 1e-6)
+    )
+    background_confidence = (
+        (1.0 - foreground_score)
+        * far_from_trajectory
+        * (0.25 + 0.75 * context_observability.clamp(0.0, 1.0))
+    )
+    weights = (
+        foreground_score
+        + float(config.soft_background_weight) * background_confidence
+    ).detach().clamp(0.0, 1.0)
+    # Kept only for cache/API compatibility.  PointSeg supervision uses
+    # class_scores and weights exclusively; there are no hard pseudo labels.
+    labels = torch.full_like(foreground_score, config.ignore_index, dtype=torch.long)
     point_is_pad = prior_dict.get("point_is_pad")
     if point_is_pad is not None:
         point_is_pad = point_is_pad.to(device=labels.device, dtype=torch.bool)
         labels = torch.where(point_is_pad, torch.full_like(labels, config.ignore_index), labels)
         weights = torch.where(point_is_pad, torch.zeros_like(weights), weights)
-    labels, weights = _promote_minimum_foreground(labels, weights, class_scores.detach(), config)
+        class_scores = torch.where(point_is_pad[..., None], torch.zeros_like(class_scores), class_scores)
+        evidence_scores = torch.where(point_is_pad[..., None], torch.zeros_like(evidence_scores), evidence_scores)
+        foreground_score = torch.where(point_is_pad, torch.zeros_like(foreground_score), foreground_score)
 
     return {
         **prior_dict,
         "labels": labels,
         "weights": weights,
         "class_scores": class_scores.detach(),
-        "role_scores": role_scores.detach(),
+        # Legacy field name retained for cache compatibility.  Its channels are
+        # now [tool_comotion, trajectory_approach, near_contact].
+        "role_scores": evidence_scores.detach(),
         "foreground_score": foreground_score.detach(),
+        "background_confidence": background_confidence.detach(),
         "held_score": held_score.detach(),
         "static_score": static_score.detach(),
         "approach_score": approach_score.detach(),
+        "contact_score": contact_score.detach(),
     }
 
 
@@ -1184,6 +1332,8 @@ def generate_pseudo_labels(
     *,
     current_is_pad: Tensor | None = None,
     future_point_is_pad: Tensor | None = None,
+    trajectory_poses: Tensor | None = None,
+    trajectory_is_pad: Tensor | None = None,
     config: PseudoLabelConfig | None = None,
 ) -> dict[str, Tensor]:
     config = config or PseudoLabelConfig()
@@ -1194,12 +1344,15 @@ def generate_pseudo_labels(
         future_is_pad,
         current_is_pad=current_is_pad,
         future_point_is_pad=future_point_is_pad,
+        trajectory_poses=trajectory_poses,
+        trajectory_is_pad=trajectory_is_pad,
         nn_chunk_size=config.nn_chunk_size,
         motion_gap_eps=config.motion_gap_eps,
         motion_rotation_radius=config.motion_rotation_radius,
         motion_baseline_threshold=config.motion_baseline_threshold,
         motion_baseline_temperature=config.motion_baseline_temperature,
         motion_evidence_topk=config.motion_evidence_topk,
+        contact_sigma=config.contact_sigma,
     )
     return generate_pseudo_labels_from_priors(prior_dict, config=config)
 
@@ -1210,90 +1363,13 @@ def force_small_current_clouds_foreground(
     configured_current_points: int,
     point_is_pad: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    if configured_current_points <= 0:
-        return pseudo
-    if current_pc.ndim != 3:
-        raise ValueError(f"Expected current_pc shape (B,N,C), got {tuple(current_pc.shape)}.")
-
+    """Deprecated compatibility shim; soft labels must never depend on point count."""
+    del current_pc, configured_current_points
     if point_is_pad is None:
-        valid = torch.ones(current_pc.shape[:2], dtype=torch.bool, device=current_pc.device)
-    else:
-        point_is_pad = point_is_pad.to(device=current_pc.device, dtype=torch.bool)
-        if point_is_pad.ndim == 3 and point_is_pad.shape[1] == 1:
-            point_is_pad = point_is_pad.squeeze(1)
-        if point_is_pad.shape != current_pc.shape[:2]:
-            raise ValueError(f"Expected point_is_pad shape {current_pc.shape[:2]}, got {point_is_pad.shape}.")
-        valid = ~point_is_pad
-
-    valid_counts = valid.sum(dim=1)
-    small_cloud = valid_counts < int(configured_current_points)
-    if not bool(small_cloud.any().item()):
         return pseudo
-
     out = dict(pseudo)
-    for key in ("labels", "weights", "class_scores", "role_scores", "foreground_score"):
-        out[key] = out[key].clone()
-
-    force_mask = small_cloud[:, None] & valid
-    pad_mask = ~valid
-    out["labels"] = torch.where(force_mask, torch.full_like(out["labels"], ROLE_FOREGROUND), out["labels"])
-    out["labels"] = torch.where(pad_mask, torch.full_like(out["labels"], ROLE_IGNORE), out["labels"])
-    out["weights"] = torch.where(force_mask, torch.ones_like(out["weights"]), out["weights"])
-    out["weights"] = torch.where(pad_mask, torch.zeros_like(out["weights"]), out["weights"])
-
-    out["class_scores"][..., ROLE_BACKGROUND] = torch.where(
-        force_mask,
-        torch.zeros_like(out["class_scores"][..., ROLE_BACKGROUND]),
-        out["class_scores"][..., ROLE_BACKGROUND],
-    )
-    out["class_scores"][..., ROLE_FOREGROUND] = torch.where(
-        force_mask,
-        torch.ones_like(out["class_scores"][..., ROLE_FOREGROUND]),
-        out["class_scores"][..., ROLE_FOREGROUND],
-    )
-    out["class_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["class_scores"]), out["class_scores"])
-
-    # Preserve automatic gripper/condition/target role scores. The small-cloud
-    # fallback is only a binary PointSeg label policy; ObjectFlow still needs the
-    # motion-prior role distribution rather than a hand-authored all-target mask.
-    out["role_scores"] = torch.where(pad_mask[..., None], torch.zeros_like(out["role_scores"]), out["role_scores"])
-    out["foreground_score"] = torch.where(force_mask, torch.ones_like(out["foreground_score"]), out["foreground_score"])
-    out["foreground_score"] = torch.where(pad_mask, torch.zeros_like(out["foreground_score"]), out["foreground_score"])
-    out["small_cloud_forced_foreground"] = small_cloud
-    if point_is_pad is not None:
-        out["point_is_pad"] = point_is_pad
+    out["point_is_pad"] = point_is_pad
     return out
-
-
-def _promote_minimum_foreground(
-    labels: Tensor, weights: Tensor, class_scores: Tensor, config: PseudoLabelConfig
-) -> tuple[Tensor, Tensor]:
-    if config.min_foreground_fraction <= 0:
-        return labels, weights
-    if labels.ndim != 2:
-        return labels, weights
-
-    promoted_labels = labels.clone()
-    promoted_weights = weights.clone()
-    foreground_scores = class_scores[..., ROLE_FOREGROUND]
-    min_count = max(1, math.ceil(labels.shape[1] * config.min_foreground_fraction))
-
-    for bidx in range(labels.shape[0]):
-        eligible = (foreground_scores[bidx] >= config.forced_foreground_min_score) & (
-            labels[bidx] != config.ignore_index
-        )
-        if not bool(eligible.any()):
-            continue
-        count = min(min_count, int(eligible.sum().item()))
-        masked_scores = foreground_scores[bidx].masked_fill(~eligible, -torch.inf)
-        top_indices = torch.topk(masked_scores, k=count).indices
-        promoted_labels[bidx, top_indices] = ROLE_FOREGROUND
-        promoted_weights[bidx, top_indices] = torch.maximum(
-            promoted_weights[bidx, top_indices],
-            foreground_scores[bidx, top_indices].clamp(0.05, 1.0),
-        )
-
-    return promoted_labels, promoted_weights
 
 
 def refine_pseudo_labels_with_teacher(
@@ -1318,16 +1394,24 @@ def refine_pseudo_labels_with_teacher(
         & (teacher_conf >= config.teacher_confidence)
         & (class_scores[..., ROLE_BACKGROUND] >= config.teacher_background_min_score)
         & (pseudo["foreground_score"] <= config.teacher_background_foreground_max)
-        & (pseudo["labels"] == ROLE_BACKGROUND)
     )
     accept = foreground_accept | background_accept
 
-    labels = pseudo["labels"].clone()
-    weights = pseudo["weights"].clone()
-    labels = torch.where(accept, teacher_labels, labels)
-    weights = torch.where(accept, torch.maximum(weights, teacher_conf), weights)
-    refined["labels"] = labels
-    refined["weights"] = weights
+    geometric_foreground = pseudo["class_scores"][..., ROLE_FOREGROUND]
+    blend = (float(config.teacher_blend) * teacher_conf).clamp(0.0, 1.0)
+    blend = torch.where(accept, blend, torch.zeros_like(blend))
+    refined_foreground = (
+        (1.0 - blend) * geometric_foreground + blend * probs[..., ROLE_FOREGROUND]
+    ).clamp(0.0, 1.0)
+    refined["foreground_score"] = refined_foreground
+    refined["class_scores"] = torch.stack([1.0 - refined_foreground, refined_foreground], dim=-1)
+    refined["weights"] = torch.where(
+        accept,
+        torch.maximum(pseudo["weights"], blend),
+        pseudo["weights"],
+    )
+    # Teacher refinement remains soft; the legacy label tensor is never changed.
+    refined["labels"] = pseudo["labels"]
     refined["teacher_accept_mask"] = accept
     return refined
 
@@ -1380,6 +1464,19 @@ class SongPointSegNet(nn.Module):
             self.head = nn.Linear(hidden_dim, len(ROLE_NAMES))
         else:
             raise ValueError(f"Unknown backbone_type={backbone_type!r}. Expected 'litept' or 'mlp'.")
+
+    def train(self, mode: bool = True):
+        """Use serialization-order shuffling as training augmentation only.
+
+        LitePT defaults to randomly permuting its serialization orders on every
+        forward, including evaluation.  Keeping that behavior during training is
+        useful augmentation, while disabling it in eval makes PointSeg predictions
+        and thresholded foreground sets deterministic.
+        """
+        super().train(mode)
+        if self.backbone_type == "litept" and hasattr(self.backbone, "shuffle_orders"):
+            self.backbone.shuffle_orders = bool(mode)
+        return self
 
     def _make_features(self, current_pc: Tensor) -> Tensor:
         xyz = current_pc[..., :3].to(dtype=torch.float32)
@@ -1462,48 +1559,6 @@ class SongPointSegNet(nn.Module):
         }
 
 
-def _weighted_cross_entropy(logits: Tensor, labels: Tensor, weights: Tensor, config: SongPointSegLossConfig) -> Tensor:
-    valid = labels != config.ignore_index
-    if not bool(valid.any()):
-        return logits.sum() * 0.0
-    class_weights = torch.tensor(config.class_weights, dtype=logits.dtype, device=logits.device)
-    losses = functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        labels.reshape(-1),
-        weight=class_weights,
-        ignore_index=config.ignore_index,
-        reduction="none",
-    ).reshape_as(labels)
-    weighted = losses * weights.to(dtype=losses.dtype)
-    class_losses = []
-    for role_index in range(len(ROLE_NAMES)):
-        class_mask = valid & (labels == role_index)
-        if bool(class_mask.any()):
-            class_losses.append(weighted[class_mask].sum() / weights[class_mask].sum().clamp_min(1e-6))
-    if not class_losses:
-        return logits.sum() * 0.0
-    return torch.stack(class_losses).mean()
-
-
-def _foreground_bce(logits: Tensor, labels: Tensor, weights: Tensor, ignore_index: int) -> Tensor:
-    valid = labels != ignore_index
-    if not bool(valid.any()):
-        return logits.sum() * 0.0
-    operation_logits = logits[..., ROLE_FOREGROUND] - logits[..., ROLE_BACKGROUND]
-    target = ((labels == ROLE_FOREGROUND) & valid).to(dtype=logits.dtype)
-    losses = functional.binary_cross_entropy_with_logits(operation_logits, target, reduction="none")
-    pos = valid & (labels == ROLE_FOREGROUND)
-    neg = valid & (labels == ROLE_BACKGROUND)
-    parts = []
-    if bool(pos.any()):
-        parts.append((losses[pos] * weights[pos]).sum() / weights[pos].sum().clamp_min(1e-6))
-    if bool(neg.any()):
-        parts.append((losses[neg] * weights[neg]).sum() / weights[neg].sum().clamp_min(1e-6))
-    if not parts:
-        return logits.sum() * 0.0
-    return torch.stack(parts).mean()
-
-
 def _voxel_smoothness_loss(
     logits: Tensor, xyz: Tensor, voxel_size: float, point_is_pad: Tensor | None = None
 ) -> Tensor:
@@ -1535,17 +1590,24 @@ def _voxel_smoothness_loss(
     return total / used
 
 
-def _motion_consistency_loss(logits: Tensor, pseudo: dict[str, Tensor]) -> Tensor:
-    probs = logits.softmax(dim=-1)
+def _soft_foreground_bce(
+    logits: Tensor,
+    pseudo: dict[str, Tensor],
+    config: SongPointSegLossConfig,
+    point_is_pad: Tensor | None = None,
+) -> Tensor:
     class_scores = pseudo["class_scores"].to(device=logits.device, dtype=logits.dtype)
-    foreground_scores = class_scores[..., ROLE_FOREGROUND]
-    point_is_pad = pseudo.get("point_is_pad")
+    target = class_scores[..., ROLE_FOREGROUND].clamp(0.0, 1.0)
+    weights = pseudo["weights"].to(device=logits.device, dtype=logits.dtype).clamp_min(0.0)
     if point_is_pad is not None:
-        foreground_scores = foreground_scores.masked_fill(point_is_pad.to(device=logits.device, dtype=torch.bool), 0.0)
-    if not bool((foreground_scores > 0).any()):
-        return logits.sum() * 0.0
-    losses = (probs[..., ROLE_FOREGROUND] - foreground_scores).square()
-    return (losses * foreground_scores).sum() / foreground_scores.sum().clamp_min(1e-6)
+        weights = weights.masked_fill(point_is_pad.to(device=logits.device, dtype=torch.bool), 0.0)
+
+    operation_logits = logits[..., ROLE_FOREGROUND] - logits[..., ROLE_BACKGROUND]
+    losses = functional.binary_cross_entropy_with_logits(operation_logits, target, reduction="none")
+    background_weight, foreground_weight = config.class_weights
+    soft_class_weight = (1.0 - target) * float(background_weight) + target * float(foreground_weight)
+    effective_weight = weights * soft_class_weight
+    return (losses * effective_weight).sum() / effective_weight.sum().clamp_min(1e-6)
 
 
 class SongPointSegLoss(nn.Module):
@@ -1555,51 +1617,44 @@ class SongPointSegLoss(nn.Module):
 
     def forward(self, outputs: dict[str, Tensor], pseudo: dict[str, Tensor], current_pc: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         logits = outputs["role_logits"]
-        labels = pseudo["labels"].to(device=logits.device)
         weights = pseudo["weights"].to(device=logits.device, dtype=logits.dtype)
+        soft_target = pseudo["class_scores"][..., ROLE_FOREGROUND].to(device=logits.device, dtype=logits.dtype)
         point_is_pad = pseudo.get("point_is_pad", outputs.get("point_is_pad"))
         if point_is_pad is not None:
             point_is_pad = point_is_pad.to(device=logits.device, dtype=torch.bool)
-            labels = torch.where(point_is_pad, torch.full_like(labels, self.config.ignore_index), labels)
             weights = torch.where(point_is_pad, torch.zeros_like(weights), weights)
-        valid = labels != self.config.ignore_index
+        valid = weights > 0
         valid_f = valid.to(dtype=torch.float32)
 
-        ce = _weighted_cross_entropy(logits, labels, weights, self.config)
-        fg_bce = _foreground_bce(logits, labels, weights, self.config.ignore_index)
+        soft_bce = _soft_foreground_bce(logits, pseudo, self.config, point_is_pad)
         smoothness = _voxel_smoothness_loss(
             logits, current_pc[..., :3], self.config.smooth_voxel_size, point_is_pad
         )
-        motion = _motion_consistency_loss(logits, pseudo)
-        loss = (
-            self.config.ce_weight * ce
-            + self.config.foreground_bce_weight * fg_bce
-            + self.config.smoothness_weight * smoothness
-            + self.config.motion_consistency_weight * motion
-        )
+        loss = self.config.soft_bce_weight * soft_bce + self.config.smoothness_weight * smoothness
+        zero = logits.sum().detach() * 0.0
         metrics = {
             "loss": loss.detach(),
-            "loss_ce": ce.detach(),
-            "loss_foreground_bce": fg_bce.detach(),
+            "loss_soft_bce": soft_bce.detach(),
+            # Legacy names are kept so existing log dashboards do not fail.
+            "loss_ce": zero,
+            "loss_foreground_bce": soft_bce.detach(),
             "loss_smoothness": smoothness.detach(),
-            "loss_motion": motion.detach(),
+            "loss_motion": zero,
             "pseudo_valid_ratio": valid_f.mean().detach(),
             "pseudo_valid_foreground_ratio": (
-                (labels == ROLE_FOREGROUND)
-                .to(dtype=torch.float32)
-                .sum()
+                ((soft_target >= 0.5) & valid).to(dtype=torch.float32).sum()
                 / valid_f.sum().clamp_min(1.0)
             ).detach(),
             "pseudo_background_ratio": (
-                (labels == ROLE_BACKGROUND).to(dtype=torch.float32).sum() / valid_f.sum().clamp_min(1.0)
+                ((soft_target < 0.5) & valid).to(dtype=torch.float32).sum() / valid_f.sum().clamp_min(1.0)
             ).detach(),
-            "pseudo_foreground_ratio": (labels == ROLE_FOREGROUND)
-            .to(dtype=torch.float32)
-            .sum()
-            .div(valid_f.sum().clamp_min(1.0))
-            .detach(),
+            "pseudo_foreground_ratio": (((soft_target >= 0.5) & valid).to(dtype=torch.float32).sum()
+                                           / valid_f.sum().clamp_min(1.0)).detach(),
+            "pseudo_soft_foreground_mean": (
+                (soft_target * valid.to(dtype=soft_target.dtype)).sum() / valid_f.sum().clamp_min(1.0)
+            ).detach(),
             "pred_foreground_ratio": (
-                ((outputs["role_probs"].argmax(dim=-1) == ROLE_FOREGROUND) & valid)
+                ((outputs["operation_prob"] >= 0.5) & valid)
                 .to(dtype=torch.float32)
                 .sum()
                 / valid_f.sum().clamp_min(1.0)
@@ -1664,6 +1719,7 @@ def save_pointseg_npz(
     current_pc: Tensor,
     outputs: dict[str, Tensor],
     pseudo: dict[str, Tensor] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1735,9 @@ def save_pointseg_npz(
             data["pseudo_role_scores_gripper_condition_target"] = pseudo["role_scores"].detach().cpu().numpy()
         if "foreground_score" in pseudo:
             data["pseudo_foreground_score"] = pseudo["foreground_score"].detach().cpu().numpy()
+    if metadata is not None:
+        for key, value in metadata.items():
+            data[f"meta_{key}"] = np.asarray(value)
     np.savez_compressed(path, **data)
 
 

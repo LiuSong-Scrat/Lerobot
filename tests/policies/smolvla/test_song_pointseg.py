@@ -152,7 +152,49 @@ def test_generate_pseudo_labels_from_existing_priors():
     assert pseudo["class_scores"].shape == (*priors.shape[:2], 2)
 
 
-def test_small_cloud_fallback_preserves_automatic_role_scores():
+def test_approached_target_does_not_require_static_motion():
+    priors = torch.zeros(1, 2, 8, dtype=torch.float32)
+    priors[..., 0] = 0.20
+    priors[..., 1] = torch.tensor([[0.03, 0.40]])
+    priors[..., 2] = torch.tensor([[0.12, 0.0]])
+    priors[..., 3] = 0.20
+    # Deliberately make the approached point inconsistent with the static
+    # hypothesis.  Approach/contact evidence must still make it foreground.
+    priors[..., 4] = 1.0
+    priors[..., 5] = 0.0
+    priors[..., 6] = 0.5
+    priors[..., 7] = 1.0
+
+    pseudo = generate_pseudo_labels_from_priors(priors)
+
+    assert pseudo["foreground_score"][0, 0] > 0.7
+    assert pseudo["foreground_score"][0, 0] > pseudo["foreground_score"][0, 1]
+    assert torch.equal(pseudo["labels"], torch.full_like(pseudo["labels"], ROLE_IGNORE))
+
+
+def test_near_contact_soft_score_survives_terminal_future_padding():
+    current_xyz = torch.tensor([[[0.05, 0.0, 0.0], [0.50, 0.0, 0.0]]], dtype=torch.float32)
+    current_pc = torch.cat([current_xyz, torch.zeros(1, 2, 3)], dim=-1)
+    # The context cloud is padded, reproducing the final frame of an episode.
+    future_pc = current_pc[:, None].repeat(1, 2, 1, 1)
+    future_poses = torch.stack(
+        [_pose_from_translation([0.0, 0.0, 0.0]), _pose_from_translation([0.0, 0.0, 0.0])]
+    ).unsqueeze(0)
+    future_is_pad = torch.tensor([[False, True]])
+
+    pseudo = generate_pseudo_labels(
+        current_pc,
+        future_pc,
+        future_poses,
+        future_is_pad,
+        config=PseudoLabelConfig(nn_chunk_size=8),
+    )
+
+    assert pseudo["foreground_score"][0, 0] > 0.3
+    assert pseudo["foreground_score"][0, 0] > pseudo["foreground_score"][0, 1]
+
+
+def test_small_cloud_fallback_does_not_harden_soft_labels():
     role_scores = torch.tensor(
         [
             [
@@ -174,7 +216,9 @@ def test_small_cloud_fallback_preserves_automatic_role_scores():
 
     out = force_small_current_clouds_foreground(pseudo, current_pc, configured_current_points=8)
 
-    assert torch.equal(out["labels"], torch.full((1, 3), ROLE_FOREGROUND, dtype=torch.long))
+    assert torch.equal(out["labels"], torch.full((1, 3), ROLE_IGNORE, dtype=torch.long))
+    assert torch.equal(out["weights"], pseudo["weights"])
+    assert torch.equal(out["foreground_score"], pseudo["foreground_score"])
     assert torch.allclose(out["role_scores"], role_scores)
 
 
@@ -228,13 +272,56 @@ def test_temporal_point_cloud_dataset_shapes_and_episode_clamping(tmp_path):
 
     last_ep0 = dataset[2]
     assert tuple(last_ep0["observation.point_cloud"].shape) == (4, 6)
-    assert tuple(last_ep0["observation.point_cloud_future"].shape) == (3, 5, 6)
-    assert tuple(last_ep0["future_ee_poses"].shape) == (3, 9)
-    assert last_ep0["future_is_pad"].tolist() == [False, True, True]
+    assert last_ep0["pointseg_source_num_points"].item() == 10
+    assert last_ep0["pointseg_sample_num_points"].item() == 4
+    assert tuple(last_ep0["observation.point_cloud_future"].shape) == (5, 5, 6)
+    assert tuple(last_ep0["future_ee_poses"].shape) == (5, 9)
+    assert last_ep0["future_offsets"].tolist() == [0, -2, -1, 1, 2]
+    assert last_ep0["future_is_pad"].tolist() == [False, False, False, True, True]
     assert torch.allclose(pose9_to_matrix(last_ep0["future_ee_poses"][0]), torch.eye(4), atol=1e-5)
+    assert tuple(last_ep0["pointseg_trajectory_ee_poses"].shape) == (33, 9)
+    assert tuple(last_ep0["pointseg_trajectory_offsets"].shape) == (33,)
+    assert last_ep0["pointseg_trajectory_offsets"][0].item() == 0
+    assert last_ep0["pointseg_trajectory_offsets"].min().item() == -2
+    assert last_ep0["pointseg_trajectory_offsets"].max().item() == 0
+    assert torch.allclose(
+        pose9_to_matrix(last_ep0["pointseg_trajectory_ee_poses"][0]), torch.eye(4), atol=1e-5
+    )
 
     first_ep1 = dataset[3]
     assert float(first_ep1["observation.point_cloud"][0, 0]) >= 10.0
+
+
+def test_full_episode_pose_trajectory_extends_target_evidence_without_changing_local_motion():
+    current_xyz = torch.tensor([[[0.50, 0.0, 0.0], [0.80, 0.0, 0.0]]], dtype=torch.float32)
+    current_pc = torch.cat([current_xyz, torch.zeros(1, 2, 3)], dim=-1)
+    future_pc = current_pc[:, None].repeat(1, 2, 1, 1)
+    future_poses = torch.stack(
+        [_pose_from_translation([0.0, 0.0, 0.0]), _pose_from_translation([0.10, 0.0, 0.0])]
+    ).unsqueeze(0)
+    future_is_pad = torch.zeros(1, 2, dtype=torch.bool)
+    trajectory_poses = torch.stack(
+        [
+            _pose_from_translation([0.0, 0.0, 0.0]),
+            _pose_from_translation([0.25, 0.0, 0.0]),
+            _pose_from_translation([0.50, 0.0, 0.0]),
+        ]
+    ).unsqueeze(0)
+
+    local = generate_pseudo_labels(current_pc, future_pc, future_poses, future_is_pad)
+    full = generate_pseudo_labels(
+        current_pc,
+        future_pc,
+        future_poses,
+        future_is_pad,
+        trajectory_poses=trajectory_poses,
+    )
+
+    assert torch.allclose(local["held_residual"], full["held_residual"])
+    assert torch.allclose(local["static_residual"], full["static_residual"])
+    assert full["min_traj_dist"][0, 0] < local["min_traj_dist"][0, 0]
+    assert full["foreground_score"][0, 0] > local["foreground_score"][0, 0]
+    assert full["foreground_score"][0, 0] > full["foreground_score"][0, 1]
 
 
 def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
@@ -337,7 +424,9 @@ def test_song_pointseg_mlp_smoke_backward():
         ),
     )
     assert pseudo["labels"].shape == (bsize, n_points)
-    assert not torch.equal(pseudo["labels"], torch.full_like(pseudo["labels"], ROLE_IGNORE))
+    assert torch.equal(pseudo["labels"], torch.full_like(pseudo["labels"], ROLE_IGNORE))
+    assert torch.allclose(pseudo["class_scores"].sum(dim=-1), torch.ones(bsize, n_points), atol=1e-6)
+    assert bool(((pseudo["foreground_score"] > 0) & (pseudo["foreground_score"] < 1)).any())
 
     model = SongPointSegNet(backbone_type="mlp", hidden_dim=32)
     outputs = model(current_pc, future_pc, future_poses, future_is_pad, priors=pseudo["priors"])
@@ -350,7 +439,7 @@ def test_song_pointseg_mlp_smoke_backward():
     assert any(param.grad is not None for param in model.parameters())
 
 
-def test_teacher_background_cannot_overwrite_uncertain_foreground_geometry():
+def test_teacher_refinement_preserves_soft_labels_and_never_hardens_targets():
     pseudo = {
         "labels": torch.tensor([[ROLE_FOREGROUND, ROLE_IGNORE, 0]], dtype=torch.long),
         "weights": torch.tensor([[0.7, 0.0, 0.1]], dtype=torch.float32),
@@ -374,6 +463,6 @@ def test_teacher_background_cannot_overwrite_uncertain_foreground_geometry():
         config=PseudoLabelConfig(teacher_confidence=0.8),
     )
 
-    assert refined["labels"][0, 0].item() == ROLE_FOREGROUND
-    assert refined["labels"][0, 1].item() == ROLE_IGNORE
-    assert refined["labels"][0, 2].item() == 0
+    assert torch.equal(refined["labels"], pseudo["labels"])
+    assert torch.allclose(refined["class_scores"].sum(dim=-1), torch.ones(1, 3), atol=1e-6)
+    assert torch.all((refined["foreground_score"] >= 0) & (refined["foreground_score"] <= 1))
