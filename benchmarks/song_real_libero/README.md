@@ -103,16 +103,40 @@ data/libero_setting/libero_4suite_lerobot_dataset/
   world_ee_poses/episode_000000.npy
 ```
 
-PointSeg cache v5 is index-only: each shard stores `point_indices`, pseudo labels, weights, class scores, foreground scores, and automatic `role_scores` with channels `gripper / condition-object / target`. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
+PointSeg cache v7 is index-only: each shard stores `point_indices`, binary foreground/background soft labels, weights, class scores, foreground scores, and trajectory-evidence `role_scores`. The three evidence channels are `tool_comotion / trajectory_approach / near_contact`; they are soft motion cues rather than semantic object-role labels. The cache does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point-cloud storage. Motion priors are recomputed online only when explicitly needed.
 
 When `--policy.pointseg_enable=true` and `--pointseg_sample_cache_dir` is omitted or points to a missing cache, training now computes the same motion-prior pseudo labels online once per DataLoader batch from current/future point clouds. This fallback uses CUDA by default when available; if CUDA is used, the training script forces DataLoader `num_workers=0` to avoid CUDA initialization inside forked worker processes. Set `SONG_POINTSEG_ONLINE=0` to disable this fallback, or set `SONG_POINTSEG_ONLINE_DEVICE=cpu` to keep multi-worker CPU loading. Tune `SONG_POINTSEG_ONLINE_CURRENT_POINTS`, `SONG_POINTSEG_ONLINE_FUTURE_POINTS`, and `SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE` for debugging.
 
-World-Ego training uses two coupled branches when `--policy.worldflow_enable=true`:
+World-Ego training is disabled by default. It is constructed and evaluated only when `--policy.worldflow_enable=true`, in which case two branches are coupled during training:
 
 - Ego Body branch: the normal action flow-matching policy predicts executable UMI/body actions.
-- Dense ObjectFlow branch: automatic `role_scores` select non-gripper condition/target points, predict dense world-frame point displacement, fit a rigid spatial transform with weighted Kabsch, then bridge it to the body action by `B = H_i^{-1} S H_i`.
+- World SE(3) branch: cache-v7 evidence selects a soft tool/co-motion point set and a soft interaction point set. Two LitePT encoders and the task embedding directly predict the body trajectory `B_t = H_0^{-1} H_t`. The corresponding Overview/world spatial motion is obtained analytically by conjugation, `S_t = H_0 B_t H_0^{-1}`. The trajectory-supervised head is bridged to the Action Expert only after its metric SE(3) error becomes reliable.
 
-This path uses no PCA/canonical frame, no manually specified segmentation, and no manually supervised point optical flow. Old PointSeg caches must be rebuilt because ObjectFlow requires cache v5 `role_scores`.
+This path uses no point-flow prediction, point correspondence, Kabsch fitting, PCA/canonical frame, manually specified segmentation, or manually supervised optical flow. It requires cache v7 trajectory evidence and the dataset's fixed-reference `world_ee_poses/` trajectories. Old caches must be rebuilt.
+
+Recommended explicit World-Ego settings are:
+
+```bash
+  --policy.worldflow_enable=true \
+  --policy.worldflow_se3_head_enable=false \
+  --policy.worldflow_feature_dim=64 \
+  --policy.worldflow_grid_size=0.01 \
+  --policy.worldflow_loss_weight=0.05 \
+  --policy.worldflow_geo_loss_weight=0.05 \
+  --policy.worldflow_bridge_loss_weight=0.05 \
+  --policy.worldflow_bridge_confidence_tau=0.05 \
+  --policy.worldflow_bridge_rotation_radius=0.08 \
+  --policy.worldflow_trans_weight=1.0 \
+  --policy.worldflow_rot_weight=1.0 \
+  --policy.worldflow_equiv_loss_weight=0.02 \
+  --policy.worldflow_max_points=2048 \
+  --policy.worldflow_min_transport_points=3 \
+  --policy.worldflow_transport_score_threshold=0.05 \
+  --policy.se3_enable=false \
+  --policy.se3_final_correction_enable=false
+```
+
+`worldflow_se3_head_enable` is retained only for old command-line compatibility; the new WorldFlow implementation always uses the direct SE(3) trajectory head once `worldflow_enable=true`. `se3_enable` controls the separate main action-generation mode and does not need to be enabled for this auxiliary branch.
 
 ## Training
 

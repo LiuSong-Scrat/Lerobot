@@ -1,16 +1,19 @@
 #!/usr/bin/env python
 
+import pytest
 import torch
+from torch import nn
 
+from lerobot.configs.types import NormalizationMode
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
-    DenseRigidObjectFlowHead,
-    select_objectflow_points,
+    WorldSE3TrajectoryHead,
     se3_exp,
     se3_log,
+    select_worldflow_evidence_points,
     so3_exp,
     so3_log,
-    weighted_kabsch_transform,
+    worldflow_evidence_weights,
 )
 
 
@@ -33,70 +36,86 @@ def test_se3_relative_update_recovers_target():
     assert torch.allclose(recovered, a, atol=3e-4, rtol=3e-4)
 
 
-def test_weighted_kabsch_recovers_spatial_transform():
-    torch.manual_seed(13)
-    source = torch.randn(2, 12, 3)
-    transform = se3_exp(torch.randn(2, 4, 6) * 0.15)
-    target = (
-        torch.einsum("btij,bnj->btni", transform[..., :3, :3], source)
-        + transform[..., :3, 3].unsqueeze(2)
+def test_cache_v7_evidence_maps_to_transport_and_interaction():
+    evidence = torch.tensor(
+        [
+            [
+                [0.8, 0.0, 0.0],
+                [0.0, 0.3, 0.5],
+                [0.4, 0.2, 0.1],
+            ]
+        ]
     )
-    weights = torch.ones(2, 12)
+    point_is_pad = torch.tensor([[False, False, True]])
 
-    recovered, valid = weighted_kabsch_transform(source, target, weights)
+    transport, interaction = worldflow_evidence_weights(evidence, point_is_pad)
 
-    assert bool(valid.all())
-    assert torch.allclose(recovered[..., :3, 3], transform[..., :3, 3], atol=2e-4, rtol=2e-4)
-    assert torch.allclose(recovered[..., :3, :3], transform[..., :3, :3], atol=2e-4, rtol=2e-4)
+    assert torch.allclose(transport, torch.tensor([[0.8, 0.0, 0.0]]))
+    # Probabilistic OR: 1 - (1 - approach) * (1 - near_contact).
+    assert torch.allclose(interaction, torch.tensor([[0.0, 0.65, 0.0]]))
 
 
-def test_dense_objectflow_head_uses_automatic_roles_and_starts_from_zero_flow():
-    torch.manual_seed(17)
+def test_worldflow_point_cap_balances_transport_and_interaction_evidence():
+    point_cloud = torch.zeros(1, 10, 6)
+    point_cloud[0, :, 0] = torch.arange(10)
+    point_cloud[..., 3:6] = 127.0
+    evidence = torch.zeros(1, 10, 3)
+    evidence[0, :5, 0] = torch.linspace(1.0, 0.6, 5)
+    evidence[0, 5:, 1] = torch.linspace(1.0, 0.6, 5)
+
+    selected = select_worldflow_evidence_points(point_cloud, evidence, max_points=6)
+
+    assert selected["transport_points"].shape == (1, 3, 7)
+    assert selected["interaction_points"].shape == (1, 3, 7)
+    assert not bool(selected["transport_is_pad"].any())
+    assert not bool(selected["interaction_is_pad"].any())
+    assert bool((selected["transport_points"][0, :, 0] < 5).all())
+    assert bool((selected["interaction_points"][0, :, 0] >= 5).all())
+    assert bool((selected["transport_points"][..., 6] > 0).all())
+    assert bool((selected["interaction_points"][..., 6] > 0).all())
+
+
+class _MeanEvidenceEncoder(nn.Module):
+    def __init__(self, feature_dim: int):
+        super().__init__()
+        self.feature_dim = feature_dim
+
+    def forward(self, points: torch.Tensor, point_is_pad: torch.Tensor) -> torch.Tensor:
+        valid = (~point_is_pad).unsqueeze(-1).to(dtype=points.dtype)
+        mean = (points[..., :1] * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        return mean.expand(-1, self.feature_dim)
+
+
+def test_direct_world_se3_head_starts_from_identity_trajectory():
     cfg = SmolVLAConfig(
         chunk_size=4,
         n_action_steps=4,
-        pointseg_backbone_type="mlp",
         worldflow_feature_dim=24,
         worldflow_grid_size=0.01,
     )
-    head = DenseRigidObjectFlowHead(cfg, language_dim=12)
+    head = WorldSE3TrajectoryHead(cfg, language_dim=12)
+    # Keep this unit test independent of optional pointops kernels. LitePT is
+    # covered by its own tests and by the WorldFlow integration smoke test.
+    head.transport_encoder = _MeanEvidenceEncoder(cfg.worldflow_feature_dim)
+    head.interaction_encoder = _MeanEvidenceEncoder(cfg.worldflow_feature_dim)
     head.eval()
-
-    point_cloud = torch.randn(2, 8, 6)
-    point_cloud[..., 3:6] = torch.rand(2, 8, 3) * 255.0
-    role_scores = torch.zeros(2, 8, 3)
-    role_scores[:, :3, 1] = 1.0
-    role_scores[:, 3:6, 2] = 1.0
+    selected = {
+        "transport_points": torch.randn(2, 8, 7),
+        "transport_is_pad": torch.zeros(2, 8, dtype=torch.bool),
+        "interaction_points": torch.randn(2, 8, 7),
+        "interaction_is_pad": torch.zeros(2, 8, dtype=torch.bool),
+    }
     lang_emb = torch.randn(2, 5, 12)
     lang_mask = torch.ones(2, 5, dtype=torch.bool)
 
-    flow = head(point_cloud, role_scores, lang_emb, lang_mask)
+    body = head(selected, lang_emb, lang_mask)
+    identity = torch.eye(4).expand_as(body)
 
-    assert flow.shape == (2, cfg.chunk_size, 8, 3)
-    assert torch.allclose(flow, torch.zeros_like(flow))
-
-
-def test_objectflow_point_cap_balances_condition_and_target_scores():
-    torch.manual_seed(19)
-    point_cloud = torch.randn(1, 10, 6)
-    role_scores = torch.zeros(1, 10, 3)
-    role_scores[0, :5, 1] = torch.linspace(1.0, 0.6, 5)
-    role_scores[0, 5:, 2] = torch.linspace(1.0, 0.6, 5)
-
-    selected_pc, selected_roles, selected_is_pad = select_objectflow_points(
-        point_cloud,
-        role_scores,
-        max_points=6,
-    )
-
-    assert selected_pc.shape == (1, 6, 6)
-    assert selected_roles.shape == (1, 6, 3)
-    assert not bool(selected_is_pad.any())
-    assert int((selected_roles[..., 1] > 0).sum().item()) >= 2
-    assert int((selected_roles[..., 2] > 0).sum().item()) >= 2
+    assert body.shape == (2, cfg.chunk_size, 4, 4)
+    assert torch.allclose(body, identity)
 
 
-def test_world_ego_bridge_formula_matches_body_transform():
+def test_world_ego_conjugacy_recovers_body_transform():
     torch.manual_seed(23)
     current = se3_exp(torch.randn(3, 6) * 0.2)
     body = se3_exp(torch.randn(3, 6) * 0.2)
@@ -105,3 +124,12 @@ def test_world_ego_bridge_formula_matches_body_transform():
     recovered_body = torch.linalg.inv(current) @ spatial @ current
 
     assert torch.allclose(recovered_body, body, atol=3e-4, rtol=3e-4)
+
+
+def test_worldflow_is_disabled_by_default_and_requires_metric_actions():
+    assert SmolVLAConfig().worldflow_enable is False
+    with pytest.raises(ValueError, match="ACTION normalization"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            normalization_mapping={"ACTION": NormalizationMode.MEAN_STD},
+        )

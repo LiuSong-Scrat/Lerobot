@@ -9,6 +9,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     POINTSEG_CACHE_FIELDS,
     POINTSEG_CACHE_LABEL_FIELDS,
     POINTSEG_CACHE_VERSION,
+    POINTSEG_EVIDENCE_NAMES,
     ROLE_FOREGROUND,
     ROLE_IGNORE,
     PseudoLabelConfig,
@@ -343,9 +344,10 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
     np.save(shard_dir / "dataset_index.npy", np.array([0, 1], dtype=np.int64))
     with open(cache_dir / "manifest.json", "w") as f:
         json.dump(
-            {
-                "version": POINTSEG_CACHE_VERSION,
-                "fields": list(POINTSEG_CACHE_FIELDS),
+                {
+                    "version": POINTSEG_CACHE_VERSION,
+                    "evidence_channels": list(POINTSEG_EVIDENCE_NAMES),
+                    "fields": list(POINTSEG_CACHE_FIELDS),
                 "shards": [{"path": "shard_000000", "length": num_samples}],
             },
             f,
@@ -382,9 +384,10 @@ def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):
     np.save(shard_dir / "dataset_index.npy", np.array([7], dtype=np.int64))
     with open(cache_dir / "manifest.json", "w") as f:
         json.dump(
-            {
-                "version": POINTSEG_CACHE_VERSION,
-                "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+                {
+                    "version": POINTSEG_CACHE_VERSION,
+                    "evidence_channels": list(POINTSEG_EVIDENCE_NAMES),
+                    "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
                 "cache_mode": "indices",
                 "variable_num_points": True,
                 "shards": [{"path": "shard_000000", "length": 1}],

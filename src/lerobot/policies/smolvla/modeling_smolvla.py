@@ -71,8 +71,12 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.song_pointseg import (
     MOTION_PRIOR_DIM,
-    PseudoLabelConfig,
+    POINTSEG_EVIDENCE_NAMES,
+    POINTSEG_EVIDENCE_NEAR_CONTACT,
+    POINTSEG_EVIDENCE_TOOL_COMOTION,
+    POINTSEG_EVIDENCE_TRAJECTORY_APPROACH,
     ROLE_FOREGROUND,
+    PseudoLabelConfig,
     SongPointSegLoss,
     SongPointSegLossConfig,
     SongPointSegNet,
@@ -288,7 +292,7 @@ def _transform_point_cloud_xyzrgb(point_cloud: Tensor, transform: Tensor) -> Ten
     rot = transform[..., :3, :3]
     trans = transform[..., :3, 3]
     xyz_out = torch.matmul(xyz, rot.transpose(-1, -2)) + trans.unsqueeze(-2)
-    return torch.cat([xyz_out, point_cloud[..., 3:6].to(dtype=torch.float32)], dim=-1)
+    return torch.cat([xyz_out, point_cloud[..., 3:].to(dtype=torch.float32)], dim=-1)
 
 
 def _sample_random_se3(
@@ -891,9 +895,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|se3_action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        modules_to_save = ["worldflow_head"] if self.config.worldflow_enable else []
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            # PEFT freezes every base parameter before inserting adapters. The
+            # direct trajectory head is task-specific and must remain fully
+            # trainable/savable when WorldFlow is explicitly enabled.
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -901,7 +909,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super()._validate_peft_config(peft_config)
         if not self.config.load_vlm_weights:
             import logging
- 
+
             logging.warning(
                 "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. "
                 "Set `load_vlm_weights=True` to fine-tune the existing policy."
@@ -1369,29 +1377,6 @@ class PointActionSelfAttention(nn.Module):
         return action_tokens + action_update
 
 
-class _MaskedPointMLPEncoder(nn.Module):
-    def __init__(self, in_dim: int, dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-            nn.GELU(),
-        )
-
-    def forward(self, point_cloud: Tensor, point_is_pad: Tensor | None = None) -> Tensor:
-        feat = point_cloud.to(dtype=torch.float32).clone()
-        if feat.shape[-1] > 3:
-            feat[..., 3:] = feat[..., 3:] / 255.0
-        feat = self.net(feat)
-        if point_is_pad is None:
-            return feat.mean(dim=1)
-        valid = ~point_is_pad.to(device=feat.device, dtype=torch.bool)
-        weights = valid.unsqueeze(-1).to(dtype=feat.dtype)
-        denom = weights.sum(dim=1).clamp_min(1.0)
-        return (feat * weights).sum(dim=1) / denom
-
-
 def _rotation_geodesic(pred_rot: Tensor, target_rot: Tensor) -> Tensor:
     rel = pred_rot.transpose(-1, -2) @ target_rot
     trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
@@ -1413,25 +1398,6 @@ def _masked_step_mean(values: Tensor, valid: Tensor) -> Tensor:
     return (values * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp_min(1.0)
 
 
-def _ego_point_cloud_to_world(point_cloud_ego: Tensor, current_pose_world: Tensor) -> Tensor:
-    if point_cloud_ego.ndim != 3 or point_cloud_ego.shape[-1] != 6:
-        raise ValueError(f"Expected ego point cloud shape (B,N,6), got {point_cloud_ego.shape}.")
-    if current_pose_world.ndim != 2 or current_pose_world.shape[-1] != 9:
-        raise ValueError(f"Expected current world pose shape (B,9), got {current_pose_world.shape}.")
-    transform = pose9_to_matrix(current_pose_world.to(device=point_cloud_ego.device, dtype=torch.float32))
-    rot = transform[..., :3, :3]
-    trans = transform[..., :3, 3]
-    xyz_world = torch.matmul(point_cloud_ego[..., :3].to(dtype=torch.float32), rot.transpose(-1, -2))
-    xyz_world = xyz_world + trans.unsqueeze(1)
-    return torch.cat([xyz_world, point_cloud_ego[..., 3:6].to(dtype=torch.float32)], dim=-1)
-
-
-def _transform_xyz(points: Tensor, transform: Tensor) -> Tensor:
-    rot = transform[..., :3, :3]
-    trans = transform[..., :3, 3]
-    return torch.matmul(points, rot.transpose(-1, -2)) + trans.unsqueeze(-2)
-
-
 def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
     mask = lang_masks.to(device=lang_emb.device, dtype=torch.bool)
     weights = mask.unsqueeze(-1).to(dtype=lang_emb.dtype)
@@ -1439,60 +1405,61 @@ def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
     return (lang_emb * weights).sum(dim=1) / denom
 
 
-def _ensure_min_transport_weights(
-    scores: Tensor,
-    valid: Tensor,
-    *,
-    min_points: int,
-    threshold: float,
-) -> Tensor:
-    scores = scores.to(dtype=torch.float32).clamp_min(0.0)
-    valid = valid.to(device=scores.device, dtype=torch.bool)
-    weights = torch.where(valid & (scores >= float(threshold)), scores, torch.zeros_like(scores))
-    if min_points <= 0:
-        return weights
-    need_fallback = (weights > 0).sum(dim=1) < int(min_points)
-    if not bool(need_fallback.any().item()):
-        return weights
+def worldflow_evidence_weights(
+    evidence_scores: Tensor,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Map PointSeg cache-v7 evidence to transport and interaction weights.
 
-    out = weights.clone()
-    fallback_scores = torch.where(valid, scores, torch.full_like(scores, -torch.inf))
-    for bidx in torch.nonzero(need_fallback, as_tuple=False).flatten().tolist():
-        valid_count = int(valid[bidx].sum().item())
-        if valid_count <= 0:
-            continue
-        k = min(int(min_points), valid_count)
-        idx = torch.topk(fallback_scores[bidx], k=k, largest=True).indices
-        fallback_weight = scores[bidx, idx].clamp_min(1e-3)
-        out[bidx, idx] = torch.maximum(out[bidx, idx], fallback_weight)
-    return out
+    Cache v7 intentionally contains trajectory evidence rather than semantic
+    object roles. Tool co-motion identifies the EEF/tool side of an interaction;
+    approach and near-contact are combined with a probabilistic OR for the other
+    interaction side. Neither weight is a point-flow target.
+    """
+
+    if evidence_scores.ndim != 3 or evidence_scores.shape[-1] < len(POINTSEG_EVIDENCE_NAMES):
+        raise ValueError(
+            "Expected PointSeg trajectory evidence with shape (B,N,>=3) and channels "
+            f"{POINTSEG_EVIDENCE_NAMES}, got {evidence_scores.shape}."
+        )
+    evidence = evidence_scores[..., : len(POINTSEG_EVIDENCE_NAMES)].to(dtype=torch.float32).clamp(0.0, 1.0)
+    transport = evidence[..., POINTSEG_EVIDENCE_TOOL_COMOTION]
+    approach = evidence[..., POINTSEG_EVIDENCE_TRAJECTORY_APPROACH]
+    contact = evidence[..., POINTSEG_EVIDENCE_NEAR_CONTACT]
+    interaction = (1.0 - (1.0 - approach) * (1.0 - contact)).clamp(0.0, 1.0)
+    if point_is_pad is not None:
+        point_is_pad = point_is_pad.to(device=evidence.device, dtype=torch.bool)
+        if point_is_pad.shape != evidence.shape[:2]:
+            raise ValueError(f"Expected point_is_pad shape {evidence.shape[:2]}, got {point_is_pad.shape}.")
+        valid = (~point_is_pad).to(dtype=evidence.dtype)
+        transport = transport * valid
+        interaction = interaction * valid
+    return transport, interaction
 
 
-def select_objectflow_points(
+def select_worldflow_evidence_points(
     point_cloud: Tensor,
-    role_scores: Tensor,
+    evidence_scores: Tensor,
     point_is_pad: Tensor | None = None,
     *,
     max_points: int = 2048,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Select a balanced automatic condition/target subset for dense ObjectFlow.
-
-    role_scores is generated by motion priors and uses channels:
-    0=gripper, 1=condition/manipulated object, 2=target. Gripper points are
-    suppressed so the dense branch models object/target geometry rather than
-    memorizing the robot hand cloud.
-    """
+) -> dict[str, Tensor]:
+    """Select two soft-evidence point sets for direct SE(3) trajectory prediction."""
 
     if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
         raise ValueError(f"Expected point_cloud shape (B,N,6), got {point_cloud.shape}.")
-    if role_scores.ndim != 3 or role_scores.shape[:2] != point_cloud.shape[:2] or role_scores.shape[-1] < 3:
+    if (
+        evidence_scores.ndim != 3
+        or evidence_scores.shape[:2] != point_cloud.shape[:2]
+        or evidence_scores.shape[-1] < len(POINTSEG_EVIDENCE_NAMES)
+    ):
         raise ValueError(
-            f"Expected role_scores shape (B,N,>=3) matching point cloud, got {role_scores.shape}."
+            f"Expected trajectory evidence shape (B,N,>=3) matching point cloud, got {evidence_scores.shape}."
         )
 
     bsize, n_points, channels = point_cloud.shape
     if n_points <= 0:
-        raise ValueError("Cannot select ObjectFlow points from an empty point cloud.")
+        raise ValueError("Cannot select WorldFlow points from an empty point cloud.")
     if point_is_pad is None:
         point_is_pad = torch.zeros(bsize, n_points, dtype=torch.bool, device=point_cloud.device)
     else:
@@ -1501,155 +1468,112 @@ def select_objectflow_points(
             raise ValueError(f"Expected point_is_pad shape {point_cloud.shape[:2]}, got {point_is_pad.shape}.")
     point_is_pad = point_is_pad | ~torch.isfinite(point_cloud[..., :3]).all(dim=-1)
 
-    roles = role_scores[..., :3].to(device=point_cloud.device, dtype=torch.float32).clamp(0.0, 1.0)
-    max_points = int(max_points)
-    if max_points <= 0 or n_points <= max_points:
-        return point_cloud.to(dtype=torch.float32), roles, point_is_pad
-    max_points = min(max_points, n_points)
+    evidence = evidence_scores[..., : len(POINTSEG_EVIDENCE_NAMES)].to(
+        device=point_cloud.device, dtype=torch.float32
+    ).clamp(0.0, 1.0)
+    max_points = min(n_points, int(max_points) if int(max_points) > 0 else n_points)
+    transport_scores, interaction_scores = worldflow_evidence_weights(evidence, point_is_pad)
+    transport_scores = transport_scores.masked_fill(point_is_pad, -torch.inf)
+    interaction_scores = interaction_scores.masked_fill(point_is_pad, -torch.inf)
 
-    nongripper = (1.0 - roles[..., 0]).clamp(0.0, 1.0)
-    condition_scores = (roles[..., 1] * nongripper).masked_fill(point_is_pad, -torch.inf)
-    target_scores = (roles[..., 2] * nongripper).masked_fill(point_is_pad, -torch.inf)
+    transport_count = max(1, max_points // 2)
+    interaction_count = max_points - transport_count
+    if interaction_count <= 0:
+        interaction_count = 1
+        transport_count = max(1, max_points - 1)
+    transport_indices = torch.topk(transport_scores, k=transport_count, dim=1).indices
+    interaction_indices = torch.topk(interaction_scores, k=interaction_count, dim=1).indices
 
-    condition_count = max(1, max_points // 2)
-    target_count = max_points - condition_count
-    condition_indices = torch.topk(condition_scores, k=condition_count, dim=1).indices
-    if target_count > 0:
-        target_scores = target_scores.scatter(1, condition_indices, -torch.inf)
-        target_indices = torch.topk(target_scores, k=target_count, dim=1).indices
-        indices = torch.cat([condition_indices, target_indices], dim=1)
-    else:
-        indices = condition_indices
-
-    point_cloud = point_cloud.to(dtype=torch.float32).gather(
-        1, indices[..., None].expand(bsize, indices.shape[1], channels)
-    )
-    roles = roles.gather(1, indices[..., None].expand(bsize, indices.shape[1], roles.shape[-1]))
-    point_is_pad = point_is_pad.gather(1, indices)
-    return point_cloud, roles, point_is_pad
-
-
-def weighted_kabsch_transform(
-    source_xyz: Tensor,
-    target_xyz: Tensor,
-    weights: Tensor,
-    *,
-    eps: float = 1e-6,
-) -> tuple[Tensor, Tensor]:
-    """Fit source->target rigid transforms with one batched SVD.
-
-    Shapes are source_xyz=(B,N,3), target_xyz=(B,T,N,3), weights=(B,N).
-    Returns transform=(B,T,4,4) and a valid mask (B,T).
-    """
-
-    if source_xyz.ndim != 3 or source_xyz.shape[-1] != 3:
-        raise ValueError(f"Expected source_xyz shape (B,N,3), got {source_xyz.shape}.")
-    if target_xyz.ndim != 4 or target_xyz.shape[-2:] != source_xyz.shape[-2:]:
-        raise ValueError(
-            f"Expected target_xyz shape (B,T,N,3) matching source {source_xyz.shape}, got {target_xyz.shape}."
+    def gather(indices: Tensor, scores: Tensor) -> tuple[Tensor, Tensor]:
+        selected = point_cloud.to(dtype=torch.float32).gather(
+            1, indices[..., None].expand(bsize, indices.shape[1], channels)
         )
-    if weights.shape != source_xyz.shape[:2]:
-        raise ValueError(f"Expected weights shape {source_xyz.shape[:2]}, got {weights.shape}.")
+        selected_scores = scores.gather(1, indices).clamp_min(0.0)
+        # LitePTTokenizer scales every non-XYZ channel by 1/255. Store the soft
+        # evidence in that input convention so its encoded value remains [0,1].
+        selected = torch.cat([selected, (selected_scores * 255.0).unsqueeze(-1)], dim=-1)
+        selected_is_pad = point_is_pad.gather(1, indices)
+        return selected, selected_is_pad
 
-    source_xyz = source_xyz.to(dtype=torch.float32)
-    target_xyz = target_xyz.to(device=source_xyz.device, dtype=torch.float32)
-    weights = weights.to(device=source_xyz.device, dtype=torch.float32).clamp_min(0.0)
-    finite = torch.isfinite(source_xyz).all(dim=-1) & torch.isfinite(weights)
-    weights = torch.where(finite, weights, torch.zeros_like(weights))
-    weight_sum = weights.sum(dim=-1, keepdim=True)
-    normalized = weights / weight_sum.clamp_min(eps)
-    source_center = (source_xyz * normalized.unsqueeze(-1)).sum(dim=1)
-    target_center = (target_xyz * normalized[:, None, :, None]).sum(dim=2)
-    source_centered = source_xyz - source_center[:, None, :]
-    target_centered = target_xyz - target_center[:, :, None, :]
-    covariance = torch.einsum("bn,bni,btnj->btij", normalized, source_centered, target_centered)
-
-    u, singular_values, vh = torch.linalg.svd(covariance, full_matrices=False)
-    rotation = vh.transpose(-1, -2) @ u.transpose(-1, -2)
-    reflection = torch.linalg.det(rotation) < 0
-    correction = torch.ones(*rotation.shape[:-2], 3, device=rotation.device, dtype=rotation.dtype)
-    correction[..., -1] = torch.where(reflection, -torch.ones_like(correction[..., -1]), correction[..., -1])
-    rotation = vh.transpose(-1, -2) @ torch.diag_embed(correction) @ u.transpose(-1, -2)
-    translation = target_center - (rotation @ source_center[:, None, :, None]).squeeze(-1)
-
-    transform = _eye4_like(rotation.shape[:-2], device=rotation.device, dtype=rotation.dtype)
-    transform[..., :3, :3] = rotation
-    transform[..., :3, 3] = translation
-    active_points = (weights > eps).sum(dim=-1)
-    finite_transform = torch.isfinite(transform).flatten(2).all(dim=-1) & torch.isfinite(singular_values).all(dim=-1)
-    valid = (weight_sum.squeeze(-1) > eps)[:, None] & (active_points >= 3)[:, None] & finite_transform
-    identity = _eye4_like(transform.shape[:-2], device=transform.device, dtype=transform.dtype)
-    transform = torch.where(valid[..., None, None], transform, identity)
-    return transform, valid
+    transport_points, transport_is_pad = gather(transport_indices, transport_scores)
+    interaction_points, interaction_is_pad = gather(interaction_indices, interaction_scores)
+    return {
+        "transport_points": transport_points,
+        "transport_is_pad": transport_is_pad,
+        "interaction_points": interaction_points,
+        "interaction_is_pad": interaction_is_pad,
+        "transport_weights": transport_scores.masked_fill(point_is_pad, 0.0),
+        "interaction_weights": interaction_scores.masked_fill(point_is_pad, 0.0),
+    }
 
 
-class DenseRigidObjectFlowHead(nn.Module):
-    """Dense automatic ObjectFlow head over the fixed Overview/world point cloud."""
+class WorldSE3TrajectoryHead(nn.Module):
+    """Predict an Ego/body SE(3) trajectory and obtain World motion by conjugation."""
 
-    ROLE_DIM = 3
+    EVIDENCE_DIM = len(POINTSEG_EVIDENCE_NAMES)
 
     def __init__(self, config: SmolVLAConfig, language_dim: int):
         super().__init__()
         self.chunk_size = int(config.chunk_size)
         self.feature_dim = int(config.worldflow_feature_dim)
-        self.point_encoder = nn.Sequential(
-            nn.Linear(6 + self.ROLE_DIM, self.feature_dim),
-            nn.GELU(),
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.GELU(),
+        self.transport_encoder = LitePTEncoder(
+            in_dim=7,
+            dim=self.feature_dim,
+            n_tokens=128,
+            grid_size=float(config.worldflow_grid_size),
+        )
+        self.interaction_encoder = LitePTEncoder(
+            in_dim=7,
+            dim=self.feature_dim,
+            n_tokens=128,
+            grid_size=float(config.worldflow_grid_size),
         )
         self.lang_proj = nn.Linear(language_dim, self.feature_dim)
         self.context_fusion = nn.Sequential(
-            nn.Linear(self.feature_dim * 4, self.feature_dim),
+            nn.Linear(self.feature_dim * 3, self.feature_dim),
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
             nn.GELU(),
         )
-        self.flow_head = nn.Linear(self.feature_dim, self.chunk_size * 3)
-        nn.init.zeros_(self.flow_head.weight)
-        nn.init.zeros_(self.flow_head.bias)
+        step_pos = torch.zeros(self.chunk_size, self.feature_dim, dtype=torch.float32)
+        positions = torch.arange(self.chunk_size, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.feature_dim, 2, dtype=torch.float32)
+            * (-math.log(10_000.0) / self.feature_dim)
+        )
+        step_pos[:, 0::2] = torch.sin(positions * div_term)
+        step_pos[:, 1::2] = torch.cos(positions * div_term[: step_pos[:, 1::2].shape[1]])
+        self.register_buffer("step_pos_embedding", step_pos, persistent=False)
+        self.step_proj = nn.Linear(self.feature_dim, self.feature_dim)
+        self.trajectory_decoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, 6),
+        )
+        final = self.trajectory_decoder[-1]
+        if not isinstance(final, nn.Linear):
+            raise TypeError("WorldSE3TrajectoryHead final decoder layer must be linear.")
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
 
     def forward(
         self,
-        point_cloud_world: Tensor,
-        role_scores: Tensor,
+        selected: dict[str, Tensor],
         lang_emb: Tensor,
         lang_masks: Tensor,
-        point_is_pad: Tensor | None = None,
     ) -> Tensor:
-        if point_cloud_world.ndim != 3 or point_cloud_world.shape[-1] != 6:
-            raise ValueError(f"Expected point_cloud_world shape (B,N,6), got {point_cloud_world.shape}.")
-        if role_scores.shape != (*point_cloud_world.shape[:2], self.ROLE_DIM):
-            raise ValueError(
-                f"Expected automatic role_scores shape {(*point_cloud_world.shape[:2], self.ROLE_DIM)}, "
-                f"got {role_scores.shape}."
-            )
-        point_cloud_world = point_cloud_world.to(dtype=torch.float32)
-        role_scores = role_scores.to(device=point_cloud_world.device, dtype=torch.float32).clamp(0.0, 1.0)
-        rgb = point_cloud_world[..., 3:6] / 255.0
-        point_inputs = torch.cat([point_cloud_world[..., :3], rgb, role_scores], dim=-1)
-        point_feat = self.point_encoder(point_inputs)
-        if point_is_pad is not None:
-            point_is_pad = point_is_pad.to(device=point_cloud_world.device, dtype=torch.bool)
-
-        nongripper = (1.0 - role_scores[..., 0]).clamp(0.0, 1.0)
-        if point_is_pad is not None:
-            nongripper = nongripper * (~point_is_pad).to(dtype=nongripper.dtype)
-        condition_weights = nongripper * role_scores[..., 1]
-        target_weights = nongripper * role_scores[..., 2]
-        condition_feat = (point_feat * condition_weights.unsqueeze(-1)).sum(dim=1) / condition_weights.sum(
-            dim=1, keepdim=True
-        ).clamp_min(1e-6)
-        target_feat = (point_feat * target_weights.unsqueeze(-1)).sum(dim=1) / target_weights.sum(
-            dim=1, keepdim=True
-        ).clamp_min(1e-6)
-        lang_feat = self.lang_proj(_masked_language_mean(lang_emb, lang_masks).to(dtype=point_feat.dtype))
-        global_context = torch.cat([condition_feat, target_feat, lang_feat], dim=-1).unsqueeze(1).expand(
-            -1, point_feat.shape[1], -1
+        transport_feat = self.transport_encoder(
+            selected["transport_points"], selected["transport_is_pad"]
         )
-        fused = self.context_fusion(torch.cat([point_feat, global_context], dim=-1))
-        flow = self.flow_head(fused).reshape(point_feat.shape[0], point_feat.shape[1], self.chunk_size, 3)
-        return flow.permute(0, 2, 1, 3).contiguous()
+        interaction_feat = self.interaction_encoder(
+            selected["interaction_points"], selected["interaction_is_pad"]
+        )
+        lang_feat = self.lang_proj(_masked_language_mean(lang_emb, lang_masks).to(dtype=transport_feat.dtype))
+        context = self.context_fusion(torch.cat([transport_feat, interaction_feat, lang_feat], dim=-1))
+        step_pos = self.step_proj(self.step_pos_embedding.to(dtype=context.dtype))
+        step_context = context.unsqueeze(1) + step_pos.unsqueeze(0)
+        body_twist = self.trajectory_decoder(step_context).to(dtype=torch.float32)
+        return se3_exp(body_twist)
 
 
 class SongPointCloudConditioner(nn.Module):
@@ -1973,7 +1897,7 @@ class VLAFlowMatching(nn.Module):
         if self.config.worldflow_enable and not use_pointseg:
             raise ValueError(
                 "worldflow_enable requires pointseg_enable=True or pointseg_checkpoint_path because "
-                "worldflow uses SongPointCloudConditioner foreground/background selections as its point cloud input."
+                "World SE(3) trajectory prediction uses PointSeg cache-v7 trajectory evidence."
             )
         if self.config.se3_enable and self.config.max_action_dim < 10:
             raise ValueError("se3_enable=True requires max_action_dim >= 10 for pose9 + gripper actions.")
@@ -2007,13 +1931,13 @@ class VLAFlowMatching(nn.Module):
         )
         self.last_pointseg_aux_loss: Tensor | None = None
         self.last_pointseg_metrics: dict[str, Tensor] = {}
-        self.last_objectflow_payload: dict[str, Tensor] | None = None
+        self.last_worldflow_payload: dict[str, Tensor] | None = None
         self.last_point_action_tokens: Tensor | None = None
         self.last_point_action_mask: Tensor | None = None
         self.last_language_emb: Tensor | None = None
         self.last_body_pose9_prediction: Tensor | None = None
         self.worldflow_head = (
-            DenseRigidObjectFlowHead(config, self.vlm_with_expert.config.text_config.hidden_size)
+            WorldSE3TrajectoryHead(config, self.vlm_with_expert.config.text_config.hidden_size)
             if self.config.worldflow_enable
             else None
         )
@@ -2143,7 +2067,7 @@ class VLAFlowMatching(nn.Module):
         """
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
-        self.last_objectflow_payload = None
+        self.last_worldflow_payload = None
         self.last_point_action_tokens = None
         self.last_point_action_mask = None
         self.last_language_emb = None
@@ -2197,15 +2121,15 @@ class VLAFlowMatching(nn.Module):
                     point_is_pad = payload.get("point_is_pad")
                     if torch.is_tensor(point_is_pad) and point_is_pad.ndim == 3 and point_is_pad.shape[1] == 1:
                         point_is_pad = point_is_pad.squeeze(1)
-                    self.last_objectflow_payload = {
+                    self.last_worldflow_payload = {
                         "point_cloud_ego": pc.to(dtype=torch.float32),
                     }
                     if torch.is_tensor(role_scores):
-                        self.last_objectflow_payload["role_scores"] = role_scores.to(
+                        self.last_worldflow_payload["role_scores"] = role_scores.to(
                             device=pc.device, dtype=torch.float32
                         )
                     if torch.is_tensor(point_is_pad):
-                        self.last_objectflow_payload["point_is_pad"] = point_is_pad.to(
+                        self.last_worldflow_payload["point_is_pad"] = point_is_pad.to(
                             device=pc.device, dtype=torch.bool
                         )
                 self.last_pointseg_aux_loss = conditioned.get("pointseg_aux_loss")
@@ -2376,41 +2300,43 @@ class VLAFlowMatching(nn.Module):
         if missing:
             raise ValueError(f"Worldflow is enabled but batch is missing required keys: {missing}")
 
-        payload = self.last_objectflow_payload
+        payload = self.last_worldflow_payload
         if payload is None or not torch.is_tensor(payload.get("point_cloud_ego")):
             raise ValueError(
-                "Worldflow is enabled but the current forward pass did not cache an ObjectFlow point cloud."
+                "Worldflow is enabled but the current forward pass did not cache its Ego point cloud."
             )
         if not torch.is_tensor(payload.get("role_scores")):
             raise ValueError(
-                "Dense ObjectFlow requires automatic pointseg.role_scores "
-                "(channels: gripper, condition/manipulated object, target). "
+                "World SE(3) trajectory prediction requires cache-v7 pointseg.role_scores evidence "
+                f"with channels {POINTSEG_EVIDENCE_NAMES}. "
                 "Rebuild the PointSeg cache with the current script or enable online pseudo labels."
             )
         point_cloud_ego = payload["point_cloud_ego"].to(dtype=torch.float32)
-        role_scores = payload["role_scores"].to(device=point_cloud_ego.device, dtype=torch.float32)
-        if role_scores.shape[:2] != point_cloud_ego.shape[:2] or role_scores.shape[-1] < DenseRigidObjectFlowHead.ROLE_DIM:
+        evidence_scores = payload["role_scores"].to(device=point_cloud_ego.device, dtype=torch.float32)
+        if (
+            evidence_scores.shape[:2] != point_cloud_ego.shape[:2]
+            or evidence_scores.shape[-1] < WorldSE3TrajectoryHead.EVIDENCE_DIM
+        ):
             raise ValueError(
-                f"Expected pointseg.role_scores shape (B,N,>={DenseRigidObjectFlowHead.ROLE_DIM}) matching "
-                f"{point_cloud_ego.shape[:2]}, got {role_scores.shape}."
+                f"Expected pointseg.role_scores shape (B,N,>={WorldSE3TrajectoryHead.EVIDENCE_DIM}) matching "
+                f"{point_cloud_ego.shape[:2]}, got {evidence_scores.shape}."
             )
-        role_scores = role_scores[..., : DenseRigidObjectFlowHead.ROLE_DIM]
+        evidence_scores = evidence_scores[..., : WorldSE3TrajectoryHead.EVIDENCE_DIM]
         point_is_pad = payload.get("point_is_pad")
         if torch.is_tensor(point_is_pad):
             point_is_pad = point_is_pad.to(device=point_cloud_ego.device, dtype=torch.bool)
         else:
             point_is_pad = torch.zeros(point_cloud_ego.shape[:2], device=point_cloud_ego.device, dtype=torch.bool)
-        point_cloud_ego, role_scores, point_is_pad = select_objectflow_points(
+        selected = select_worldflow_evidence_points(
             point_cloud_ego,
-            role_scores,
+            evidence_scores,
             point_is_pad,
             max_points=int(self.config.worldflow_max_points),
         )
         current_pose = batch["worldflow.current_ee_pose"].to(device=point_cloud_ego.device, dtype=torch.float32)
-        point_cloud_world = _ego_point_cloud_to_world(point_cloud_ego, current_pose)
 
-        target_poses = batch["worldflow.ee_poses"].to(device=point_cloud_world.device, dtype=torch.float32)
-        step_is_pad = batch["worldflow.step_is_pad"].to(device=point_cloud_world.device, dtype=torch.bool)
+        target_poses = batch["worldflow.ee_poses"].to(device=point_cloud_ego.device, dtype=torch.float32)
+        step_is_pad = batch["worldflow.step_is_pad"].to(device=point_cloud_ego.device, dtype=torch.bool)
         if target_poses.ndim != 3 or target_poses.shape[-1] != 9:
             raise ValueError(f"Expected worldflow.ee_poses shape (B,T,9), got {target_poses.shape}.")
         if current_pose.ndim != 2 or current_pose.shape[-1] != 9:
@@ -2423,10 +2349,10 @@ class VLAFlowMatching(nn.Module):
             raise ValueError(f"Expected worldflow.step_is_pad shape {target_poses.shape[:2]}, got {step_is_pad.shape}.")
 
         if torch.is_tensor(cached_lang_emb) and cached_lang_emb.shape[:2] == lang_masks.shape:
-            lang_emb = cached_lang_emb.to(device=point_cloud_world.device)
+            lang_emb = cached_lang_emb.to(device=point_cloud_ego.device).detach()
         else:
             lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+            lang_emb = (lang_emb * math.sqrt(lang_emb.shape[-1])).detach()
         current = pose9_to_matrix(current_pose)
         target = pose9_to_matrix(target_poses)
         current_inv = invert_transform(current)
@@ -2439,137 +2365,148 @@ class VLAFlowMatching(nn.Module):
                 raise ValueError(f"Expected action_is_pad shape {valid.shape}, got {action_pad.shape}.")
             valid = valid & ~action_pad
 
-        pred_flow = self.worldflow_head(point_cloud_world, role_scores, lang_emb, lang_masks, point_is_pad)
-        world_xyz = point_cloud_world[..., :3].to(dtype=torch.float32)
-        gt_target_xyz = torch.einsum("btij,bnj->btni", spatial_gt[..., :3, :3], world_xyz)
-        gt_target_xyz = gt_target_xyz + spatial_gt[..., :3, 3].unsqueeze(2)
-        gt_flow = gt_target_xyz - world_xyz.unsqueeze(1)
-
-        # role_scores[..., 1] is generated from temporal held/static residuals and
-        # represents the manipulated/transported object. It explicitly suppresses
-        # role_scores[..., 0], the automatically detected virtual-gripper region.
-        transport_weights = role_scores[..., 1].clamp(0.0, 1.0)
-        transport_weights = transport_weights * (~point_is_pad).to(dtype=transport_weights.dtype)
+        transport_weights, interaction_weights = worldflow_evidence_weights(evidence_scores, point_is_pad)
         active_transport = (
             transport_weights >= float(self.config.worldflow_transport_score_threshold)
         ).sum(dim=1)
         has_transport = active_transport >= int(self.config.worldflow_min_transport_points)
-
-        # Kabsch supplies the analytic rigid carrier, but SVD gradients are
-        # intentionally avoided: repeated singular values are common for
-        # symmetric objects. Gradients flow through the dense flow losses below.
-        with torch.no_grad():
-            pred_spatial, rigid_valid = weighted_kabsch_transform(
-                world_xyz,
-                world_xyz.unsqueeze(1) + pred_flow.detach(),
-                transport_weights,
-            )
-        pred_body_from_object = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
-
-        valid = valid & has_transport.unsqueeze(1) & rigid_valid
+        valid = valid & has_transport.unsqueeze(1)
         valid_count = valid.sum(dim=1).clamp_min(1)
 
-        point_flow_error = F.smooth_l1_loss(pred_flow, gt_flow, reduction="none").mean(dim=-1)
-        weight_denom = transport_weights.sum(dim=1).clamp_min(1e-6)
-        flow_step = (
-            point_flow_error * transport_weights.unsqueeze(1)
-        ).sum(dim=-1) / weight_denom.unsqueeze(1)
-
-        fitted_target_xyz = torch.einsum("btij,bnj->btni", pred_spatial[..., :3, :3], world_xyz)
-        fitted_target_xyz = fitted_target_xyz + pred_spatial[..., :3, 3].unsqueeze(2)
-        rigid_point_error = F.smooth_l1_loss(
-            world_xyz.unsqueeze(1) + pred_flow,
-            fitted_target_xyz.detach(),
-            reduction="none",
-        ).mean(dim=-1)
-        rigid_step = (
-            rigid_point_error * transport_weights.unsqueeze(1)
-        ).sum(dim=-1) / weight_denom.unsqueeze(1)
-        rigid_rot = _rotation_geodesic(pred_spatial[..., :3, :3], spatial_gt[..., :3, :3])
+        body_gt = current_inv.unsqueeze(1) @ target
+        pred_body = self.worldflow_head(selected, lang_emb, lang_masks)
+        # World spatial motion is not estimated from point correspondences. It
+        # is obtained exactly from the predicted Ego/body trajectory by SE(3)
+        # conjugation, S = H0 B H0^{-1}.
+        pred_spatial = current.unsqueeze(1) @ pred_body @ current_inv.unsqueeze(1)
+        body_step = se3_geodesic_loss(
+            pred_body,
+            body_gt,
+            trans_weight=float(self.config.worldflow_trans_weight),
+            rot_weight=float(self.config.worldflow_rot_weight),
+        )
+        world_step = se3_geodesic_loss(
+            pred_spatial,
+            spatial_gt,
+            trans_weight=float(self.config.worldflow_trans_weight),
+            rot_weight=float(self.config.worldflow_rot_weight),
+        )
+        body_trans_err = torch.linalg.norm(pred_body[..., :3, 3] - body_gt[..., :3, 3], dim=-1)
+        world_trans_err = torch.linalg.norm(
+            pred_spatial[..., :3, 3] - spatial_gt[..., :3, 3], dim=-1
+        )
+        body_rot_err = _rotation_geodesic(pred_body[..., :3, :3], body_gt[..., :3, :3])
+        bridge_metric_error = body_trans_err + float(self.config.worldflow_bridge_rotation_radius) * body_rot_err
+        bridge_confidence = torch.exp(
+            -bridge_metric_error / float(self.config.worldflow_bridge_confidence_tau)
+        ).detach()
 
         body_pose9 = self.last_body_pose9_prediction
-        bridge_step = torch.zeros_like(rigid_step)
+        bridge_step = torch.zeros_like(body_step)
         if torch.is_tensor(body_pose9):
-            body_pose9 = body_pose9.to(device=point_cloud_world.device, dtype=torch.float32)
+            body_pose9 = body_pose9.to(device=point_cloud_ego.device, dtype=torch.float32)
             if body_pose9.shape[:2] != target_poses.shape[:2] or body_pose9.shape[-1] < 9:
                 raise ValueError(
                     f"Expected Ego body prediction shape (B,T,>=9) matching {target_poses.shape[:2]}, "
                     f"got {body_pose9.shape}."
                 )
-            pred_body = pose9_to_matrix(body_pose9[..., :9])
-            pred_body_spatial = current.unsqueeze(1) @ pred_body @ current_inv.unsqueeze(1)
-            body_target_xyz = torch.einsum("btij,bnj->btni", pred_body_spatial[..., :3, :3], world_xyz)
-            body_target_xyz = body_target_xyz + pred_body_spatial[..., :3, 3].unsqueeze(2)
-            body_flow = body_target_xyz - world_xyz.unsqueeze(1)
-            bridge_error = F.smooth_l1_loss(pred_flow, body_flow, reduction="none").mean(dim=-1)
-            bridge_step = (
-                bridge_error * transport_weights.unsqueeze(1)
-            ).sum(dim=-1) / weight_denom.unsqueeze(1)
+            action_body = pose9_to_matrix(body_pose9[..., :9])
+            # The trajectory-supervised World head is a detached teacher for
+            # the Action Expert. Confidence gating prevents early random
+            # predictions from perturbing the primary action objective.
+            bridge_step = se3_geodesic_loss(
+                action_body,
+                pred_body.detach(),
+                trans_weight=float(self.config.worldflow_trans_weight),
+                rot_weight=float(self.config.worldflow_rot_weight),
+            ) * bridge_confidence
 
-        equiv_step = torch.zeros_like(rigid_step)
+        equiv_step = torch.zeros_like(body_step)
         if self.config.worldflow_equiv_loss_weight > 0:
             transform = _sample_random_se3(
-                point_cloud_world.shape[0],
-                point_cloud_world.device,
-                point_cloud_world.dtype,
+                point_cloud_ego.shape[0],
+                point_cloud_ego.device,
+                point_cloud_ego.dtype,
                 trans_scale=0.20,
                 rot_scale=0.75,
             )
-            point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud_world, transform)
-            pred_aug_flow = self.worldflow_head(point_cloud_aug, role_scores, lang_emb, lang_masks, point_is_pad)
-            expected_aug_flow = torch.einsum("bij,btnj->btni", transform[..., :3, :3], pred_flow.detach())
-            equiv_error = F.smooth_l1_loss(pred_aug_flow, expected_aug_flow, reduction="none").mean(dim=-1)
-            equiv_step = (
-                equiv_error * transport_weights.unsqueeze(1)
-            ).sum(dim=-1) / weight_denom.unsqueeze(1)
+            selected_aug = dict(selected)
+            selected_aug["transport_points"] = _transform_point_cloud_xyzrgb(
+                selected["transport_points"], transform
+            )
+            selected_aug["interaction_points"] = _transform_point_cloud_xyzrgb(
+                selected["interaction_points"], transform
+            )
+            pred_body_aug = self.worldflow_head(selected_aug, lang_emb, lang_masks)
+            transform_inv = invert_transform(transform)
+            expected_body_aug = (
+                transform.unsqueeze(1) @ pred_body.detach() @ transform_inv.unsqueeze(1)
+            )
+            equiv_step = se3_geodesic_loss(
+                pred_body_aug,
+                expected_body_aug,
+                trans_weight=float(self.config.worldflow_trans_weight),
+                rot_weight=float(self.config.worldflow_rot_weight),
+            )
 
-        per_sample_flow = _masked_step_mean(flow_step, valid)
-        per_sample_rigid = _masked_step_mean(rigid_step, valid)
+        per_sample_body = _masked_step_mean(body_step, valid)
+        per_sample_world = _masked_step_mean(world_step, valid)
         per_sample_bridge = _masked_step_mean(bridge_step, valid)
         per_sample_equiv = _masked_step_mean(equiv_step, valid)
-        loss_flow = per_sample_flow.mean()
-        loss_rigid = per_sample_rigid.mean()
+        loss_body = per_sample_body.mean()
+        loss_world = per_sample_world.mean()
         loss_bridge = per_sample_bridge.mean()
         loss_equiv = per_sample_equiv.mean()
         per_sample_total = (
-            self.config.worldflow_loss_weight * per_sample_flow
-            + self.config.worldflow_geo_loss_weight * per_sample_rigid
+            self.config.worldflow_loss_weight * per_sample_body
+            + self.config.worldflow_geo_loss_weight * per_sample_world
             + self.config.worldflow_bridge_loss_weight * per_sample_bridge
             + self.config.worldflow_equiv_loss_weight * per_sample_equiv
         )
 
-        valid_f = valid.to(dtype=pred_flow.dtype)
+        valid_f = valid.to(dtype=pred_body.dtype)
         valid_denom = valid_f.sum().clamp_min(1.0)
-        trans_err = (
-            torch.linalg.norm(pred_spatial[..., :3, 3] - spatial_gt[..., :3, 3], dim=-1) * valid_f
-        ).sum() / valid_denom
-        rot_err = (rigid_rot * valid_f).sum() / valid_denom
+        body_trans_err_mean = (body_trans_err * valid_f).sum() / valid_denom
+        world_trans_err_mean = (world_trans_err * valid_f).sum() / valid_denom
+        rot_err_mean = (body_rot_err * valid_f).sum() / valid_denom
+        bridge_confidence_mean = (bridge_confidence * valid_f).sum() / valid_denom
+        valid_points = (~point_is_pad).to(dtype=pred_body.dtype)
+        valid_point_denom = valid_points.sum().clamp_min(1.0)
         transport_point_ratio = (
             (transport_weights >= float(self.config.worldflow_transport_score_threshold))
-            .to(dtype=pred_flow.dtype)
-            .mean()
-        )
+            .to(dtype=pred_body.dtype)
+            * valid_points
+        ).sum() / valid_point_denom
+        interaction_point_ratio = (
+            (interaction_weights >= float(self.config.worldflow_transport_score_threshold))
+            .to(dtype=pred_body.dtype)
+            * valid_points
+        ).sum() / valid_point_denom
         self.last_worldflow_metrics = {
-            "loss_worldflow_flow": loss_flow.detach(),
-            "loss_worldflow_rigid": loss_rigid.detach(),
+            "loss_worldflow_body": loss_body.detach(),
+            "loss_worldflow_world": loss_world.detach(),
             "loss_worldflow_bridge": loss_bridge.detach(),
             "loss_worldflow_equiv": loss_equiv.detach(),
-            "worldflow_trans_err": trans_err.detach(),
-            "worldflow_rot_err_deg": torch.rad2deg(rot_err.detach()),
+            "worldflow_body_trans_err_m": body_trans_err_mean.detach(),
+            "worldflow_world_trans_err_m": world_trans_err_mean.detach(),
+            "worldflow_trans_err": world_trans_err_mean.detach(),
+            "worldflow_rot_err_deg": torch.rad2deg(rot_err_mean.detach()),
+            "worldflow_bridge_confidence": bridge_confidence_mean.detach(),
             "worldflow_valid_ratio": valid_f.mean().detach(),
             "worldflow_transport_point_ratio": transport_point_ratio.detach(),
+            "worldflow_interaction_point_ratio": interaction_point_ratio.detach(),
         }
         return {
-            "loss_flow": loss_flow,
-            "loss_rigid": loss_rigid,
+            "loss_body": loss_body,
+            "loss_world": loss_world,
             "loss_bridge": loss_bridge,
             "loss_equiv": loss_equiv,
             "per_sample_loss": per_sample_total,
             "valid_counts": valid_count,
             "pred_spatial": pred_spatial,
             "pred_spatial_pose9": matrix_to_pose9(pred_spatial),
-            "pred_body_pose9": matrix_to_pose9(pred_body_from_object),
-            "pred_flow": pred_flow,
+            "pred_body": pred_body,
+            "pred_body_pose9": matrix_to_pose9(pred_body),
         }
 
     def forward_se3(

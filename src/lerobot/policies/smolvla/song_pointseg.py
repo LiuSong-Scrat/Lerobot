@@ -27,6 +27,14 @@ ROLE_BACKGROUND = 0
 ROLE_FOREGROUND = 1
 ROLE_IGNORE = -100
 ROLE_NAMES = ("background", "foreground")
+POINTSEG_EVIDENCE_TOOL_COMOTION = 0
+POINTSEG_EVIDENCE_TRAJECTORY_APPROACH = 1
+POINTSEG_EVIDENCE_NEAR_CONTACT = 2
+POINTSEG_EVIDENCE_NAMES = (
+    "tool_comotion",
+    "trajectory_approach",
+    "near_contact",
+)
 ROLE_COLORS = np.array(
     [
         [128, 128, 128],
@@ -693,6 +701,12 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}. "
                 "Rebuild the cache because motion-prior semantics changed."
+            )
+        evidence_channels = tuple(self.manifest.get("evidence_channels", ()))
+        if evidence_channels != POINTSEG_EVIDENCE_NAMES:
+            raise ValueError(
+                "Song pointseg cache trajectory-evidence channels do not match the current cache-v7 "
+                f"semantics: expected {POINTSEG_EVIDENCE_NAMES}, got {evidence_channels}. Rebuild the cache."
             )
 
         fields = tuple(self.manifest.get("fields", ()))
@@ -1732,7 +1746,7 @@ def save_pointseg_npz(
         data["pseudo_labels"] = pseudo["labels"].detach().cpu().numpy()
         data["pseudo_weights"] = pseudo["weights"].detach().cpu().numpy()
         if "role_scores" in pseudo:
-            data["pseudo_role_scores_gripper_condition_target"] = pseudo["role_scores"].detach().cpu().numpy()
+            data["pseudo_trajectory_evidence_scores"] = pseudo["role_scores"].detach().cpu().numpy()
         if "foreground_score" in pseudo:
             data["pseudo_foreground_score"] = pseudo["foreground_score"].detach().cpu().numpy()
     if metadata is not None:
@@ -1758,6 +1772,7 @@ def save_pointseg_config(path: str | Path, args: Any, pseudo_cfg: PseudoLabelCon
         "pseudo_label_config": asdict(pseudo_cfg),
         "loss_config": asdict(loss_cfg),
         "role_names": ROLE_NAMES,
+        "evidence_names": POINTSEG_EVIDENCE_NAMES,
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)

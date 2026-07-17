@@ -485,7 +485,7 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
             if bool(getattr(policy_cfg, "worldflow_enable", False)):
                 raise ValueError(
-                    f"{reason}; Dense ObjectFlow requires pointseg.role_scores. "
+                    f"{reason}; the World SE(3) head requires cache-v7 pointseg.role_scores evidence. "
                     "Provide a current PointSeg cache or enable SONG_POINTSEG_ONLINE=1."
                 )
             logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
@@ -495,7 +495,7 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         if not point_cloud_dir.is_dir():
             if bool(getattr(policy_cfg, "worldflow_enable", False)):
                 raise FileNotFoundError(
-                    f"{reason}; Dense ObjectFlow requires point clouds for online role_scores, "
+                    f"{reason}; the World SE(3) head requires point clouds for online trajectory evidence, "
                     f"but point cloud dir is missing: {point_cloud_dir}"
                 )
             logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
@@ -1438,15 +1438,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "loss_se3_equivariance",
                     "se3_action_trans_err",
                     "se3_action_rot_err_deg",
-                    "loss_worldflow_flow",
-                    "loss_worldflow_rigid",
+                    "loss_worldflow_body",
+                    "loss_worldflow_world",
                     "loss_worldflow_bridge",
                     "loss_worldflow_equiv",
+                    "worldflow_body_trans_err_m",
+                    "worldflow_world_trans_err_m",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
+                    "worldflow_bridge_confidence",
                     "worldflow_valid_ratio",
-                    "worldflow_object_point_ratio",
                     "worldflow_transport_point_ratio",
+                    "worldflow_interaction_point_ratio",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
@@ -1595,8 +1598,8 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
-        "--policy.type=smolvla",
+        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
+        # "--policy.type=smolvla",
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
