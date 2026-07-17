@@ -15,7 +15,7 @@
       --save-video \
       --vis-count 2 
   ## PriorCache ###########################   MultiGPU  --nproc_per_node=4
-  torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_cache   --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=0   --overwrite
+  torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_cache   --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=4   --overwrite
 
   ## TrainCode ###########################   MultiGPU CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu --num_processes 4 python benchmarks/song_real_libero/scripts/train_song_benchmark.py
     export SONG_POINTSEG_REQUIRE_POINTOPS=1 

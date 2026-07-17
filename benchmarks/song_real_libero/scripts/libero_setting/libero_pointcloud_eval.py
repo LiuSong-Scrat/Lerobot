@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
-import re
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -28,6 +29,7 @@ if __package__ and __package__.startswith("benchmarks."):
     from ..smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
     from .libero_hdf5_to_dataset import (
         append_video_frames,
+        dataset_image_from_raw_obs,
         export_episode_videos,
         resolve_suite_names,
         resolve_task_ids_for_suite,
@@ -35,8 +37,8 @@ if __package__ and __package__.startswith("benchmarks."):
     from .libero_pointcloud_utils import (
         add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
-        ensure_libero_config,
         eef_pose9_gripper_from_obs,
+        ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
         gripper_scalar,
@@ -51,9 +53,9 @@ if __package__ and __package__.startswith("benchmarks."):
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
-    from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
     from libero_setting.libero_hdf5_to_dataset import (
         append_video_frames,
+        dataset_image_from_raw_obs,
         export_episode_videos,
         resolve_suite_names,
         resolve_task_ids_for_suite,
@@ -61,8 +63,8 @@ else:
     from libero_setting.libero_pointcloud_utils import (
         add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
-        ensure_libero_config,
         eef_pose9_gripper_from_obs,
+        ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
         gripper_scalar,
@@ -74,6 +76,7 @@ else:
         pose9_to_homo_np,
         render_camera_names_from_config,
     )
+    from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
 
 
 def parse_args() -> argparse.Namespace:
@@ -452,6 +455,20 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
             shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
         )
     return np.ascontiguousarray(pc_eff, dtype=np.float32), world_pose9, gripper
+
+
+def build_policy_rgb_observation(infer: SmolVLA_ModelInference, raw_obs: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Read the same static LIBERO camera frame declared by the adapter checkpoint."""
+    images = {}
+    for image_key in infer.policy.config.image_features:
+        camera_name = image_key.removeprefix("observation.images.")
+        image = dataset_image_from_raw_obs(raw_obs, camera_name)
+        if image is None:
+            raise KeyError(
+                f"Adapter checkpoint requires {image_key!r}, but {camera_name!r} is absent from raw_obs."
+            )
+        images[image_key] = image
+    return images
 
 
 def _axis_points(origin: np.ndarray, rot: np.ndarray, *, scale: float = 0.04, samples: int = 12) -> tuple[np.ndarray, np.ndarray]:
@@ -1047,8 +1064,14 @@ def run_episode(
                 shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
             )
 
+        model_observation = {
+            "point_cloud": point_cloud,
+            "state": identity_pose9_gripper(float(eef_pose[-1])),
+        }
+        if infer.policy.config.vla_adapter_enable:
+            model_observation.update(build_policy_rgb_observation(infer, raw_obs))
         chunk = infer.predict_action_chunk_obs(
-            {"point_cloud": point_cloud, "state": identity_pose9_gripper(float(eef_pose[-1]))},
+            model_observation,
             task=task_language,
             postprocess=True,
             state_pose_mode="identity",

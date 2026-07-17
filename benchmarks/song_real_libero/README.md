@@ -1,5 +1,7 @@
 # Song Real + LIBERO Benchmark
 
+冻结预训练 SmolVLM、加入静态 RGB image token，同时保留 cache-v7 点云/动作通路的完整说明见 [README_VLM_ADAPTER.md](README_VLM_ADAPTER.md)。
+
 This project bundles the benchmark workflow for the local point-cloud SmolVLA policy:
 
 1. record BestMan RGB-D sequences

@@ -71,8 +71,8 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.song_pointseg import (
     MOTION_PRIOR_DIM,
-    PseudoLabelConfig,
     ROLE_FOREGROUND,
+    PseudoLabelConfig,
     SongPointSegLoss,
     SongPointSegLossConfig,
     SongPointSegNet,
@@ -85,7 +85,13 @@ from lerobot.policies.smolvla.song_pointseg import (
 from lerobot.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_IMAGES,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from lerobot.utils.utils import get_safe_dtype
 
 from .litept.model import LitePT
@@ -607,7 +613,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
-    def get_optim_params(self) -> dict:
+    def get_optim_params(self):
+        if self.config.vla_adapter_enable:
+            return [parameter for parameter in self.parameters() if parameter.requires_grad]
         return self.parameters()
 
     def _get_action_chunk(
@@ -623,12 +631,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         pc_feats, pc_masks = self.prepare_point_clouds(batch)
+        images, image_masks = self.prepare_images(batch) if self.config.vla_adapter_enable else (None, None)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            images=images,
+            image_masks=image_masks,
+            **kwargs,
         )
 
         # Unpad actions
@@ -710,6 +727,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         pc_feats, pc_masks = self.prepare_point_clouds(batch)
+        images, image_masks = self.prepare_images(batch) if self.config.vla_adapter_enable else (None, None)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -719,7 +737,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions_is_pad = actions_is_pad.to(device=actions.device, dtype=torch.bool)
         loss_dict = {}
         losses = self.model.forward(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise, time, actions_is_pad=actions_is_pad
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            actions_is_pad=actions_is_pad,
+            images=images,
+            image_masks=image_masks,
         )
         pointseg_aux_loss = self.model.last_pointseg_aux_loss
         pointseg_aux_weight = self.config.pointseg_aux_loss_weight if pointseg_aux_loss is not None else 0.0
@@ -846,6 +874,64 @@ class SmolVLAPolicy(PreTrainedPolicy):
         #     mask = torch.ones(bsize, dtype=torch.bool, device=device)
 
         return [point_cloud_payload], [mask]
+
+    def prepare_images(self, batch):
+        """Prepare one static RGB frame per configured camera for the frozen vision encoder."""
+        images = []
+        image_masks = []
+        present_keys = [key for key in self.config.image_features if key in batch]
+        missing_keys = [key for key in self.config.image_features if key not in batch]
+        optional_empty_keys = {
+            f"{OBS_IMAGES}.empty_camera_{index}" for index in range(self.config.empty_cameras)
+        }
+        required_missing_keys = [key for key in missing_keys if key not in optional_empty_keys]
+
+        if not present_keys:
+            raise ValueError(
+                "vla_adapter_enable=True requires an RGB image feature in every batch. "
+                f"Expected one of {list(self.config.image_features)}, got keys {list(batch)}. "
+                f"Use a dataset containing a feature such as '{OBS_IMAGES}.overhead'."
+            )
+        if required_missing_keys:
+            raise ValueError(
+                "Frozen-VLM adapter batch is missing configured RGB camera(s): "
+                f"{required_missing_keys}. Available keys: {list(batch)}."
+            )
+
+        for key in present_keys:
+            image = batch[key][:, -1] if batch[key].ndim == 5 else batch[key]
+            if image.ndim != 4:
+                raise ValueError(f"Expected image {key} shape (B,C,H,W), got {tuple(image.shape)}.")
+            if image.shape[1] not in (1, 3, 4):
+                raise ValueError(f"Expected channel-first image {key}, got {tuple(image.shape)}.")
+            image = image[:, :3]
+            if image.shape[1] == 1:
+                image = image.expand(-1, 3, -1, -1)
+            image = image.to(dtype=torch.float32)
+            if self.config.resize_imgs_with_padding is not None:
+                image = resize_with_pad(image, *self.config.resize_imgs_with_padding, pad_value=0)
+            # LeRobot visual features and the inference wrappers provide [0, 1].
+            # Keep the official SmolVLA conversion and avoid a GPU min/max sync.
+            image = image * 2.0 - 1.0
+
+            batch_size = image.shape[0]
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].to(device=image.device, dtype=torch.bool)
+                if mask.ndim > 1:
+                    mask = mask[:, -1]
+            else:
+                mask = torch.ones(batch_size, dtype=torch.bool, device=image.device)
+            images.append(image)
+            image_masks.append(mask)
+
+        # Preserve the official empty-camera behavior without silently treating
+        # an actually required RGB camera as optional.
+        for _key in missing_keys:
+            if _key not in optional_empty_keys:
+                continue
+            images.append(torch.full_like(images[0], -1.0))
+            image_masks.append(torch.zeros_like(image_masks[0]))
+        return images, image_masks
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -1951,6 +2037,7 @@ class VLAFlowMatching(nn.Module):
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
+            vlm_weights_path=self.config.vlm_weights_path,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             load_vlm_weights=self.config.load_vlm_weights,
@@ -2137,10 +2224,16 @@ class VLAFlowMatching(nn.Module):
         return self.se3_action_out_proj(suffix_out)
 
     def embed_prefix(
-        self, point_clouds, point_cloud_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        point_clouds,
+        point_cloud_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed point cloud features and language tokens to prepare for SmolVLM transformer processing.
-        """
+        """Build the official image/language prefix with additional trainable point tokens."""
         self.last_pointseg_aux_loss = None
         self.last_pointseg_metrics = {}
         self.last_objectflow_payload = None
@@ -2153,12 +2246,53 @@ class VLAFlowMatching(nn.Module):
         point_action_token_chunks = []
         point_action_mask_chunks = []
 
+        if self.config.vla_adapter_enable and images is None:
+            raise ValueError("Frozen-VLM adapter mode requires static RGB images for the prefix.")
+        if images is not None:
+            if image_masks is None or len(images) != len(image_masks):
+                raise ValueError("images and image_masks must be provided with matching lengths.")
+            for image, image_mask in zip(images, image_masks, strict=True):
+                if self.add_image_special_tokens:
+                    image_start = self.vlm_with_expert.embed_language_tokens(
+                        self.global_image_start_token.to(device=image.device)
+                    ).unsqueeze(0).expand(image.shape[0], -1, -1)
+                    image_start_mask = torch.ones(
+                        image_start.shape[:2], dtype=torch.bool, device=image_start.device
+                    )
+                    embs.append(image_start)
+                    pad_masks.append(image_start_mask)
+                    att_masks += [0] * image_start.shape[1]
+
+                image_emb = self.vlm_with_expert.embed_image(image)
+                image_emb = image_emb * math.sqrt(image_emb.shape[-1])
+                batch_size, num_image_tokens = image_emb.shape[:2]
+                image_mask = image_mask.to(device=image_emb.device, dtype=torch.bool)
+                if image_mask.ndim != 1 or image_mask.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Expected one image-valid flag per sample, got {tuple(image_mask.shape)}."
+                    )
+                image_mask = image_mask[:, None].expand(batch_size, num_image_tokens)
+                embs.append(image_emb)
+                pad_masks.append(image_mask)
+                att_masks += [0] * num_image_tokens
+
+                if self.add_image_special_tokens:
+                    image_end = self.vlm_with_expert.embed_language_tokens(
+                        self.image_end_token.to(device=image.device)
+                    ).unsqueeze(0).expand(image.shape[0], -1, -1)
+                    image_end_mask = torch.ones(
+                        image_end.shape[:2], dtype=torch.bool, device=image_end.device
+                    )
+                    embs.append(image_end)
+                    pad_masks.append(image_end_mask)
+                    att_masks += [0] * image_end.shape[1]
+
         for _pc_idx, (
             pc,
             pc_mask,
         ) in enumerate(zip(point_clouds, point_cloud_masks, strict=False)):
-            # Point cloud features replace the original image features.
-            # The original SmolVLA image processing is intentionally disabled.
+            # Point tokens are additional prefix tokens; they do not replace
+            # image tokens in frozen-VLM adapter mode.
             payload = pc if isinstance(pc, dict) else {"point_cloud": pc}
             pc = payload["point_cloud"]
             if pc.ndim != 3:
@@ -2583,6 +2717,8 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         actions_is_pad: Tensor | None = None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> Tensor:
         if actions.shape[-1] < 10:
             raise ValueError(f"se3_enable=True expects pose9 + gripper actions, got {actions.shape}.")
@@ -2612,7 +2748,13 @@ class VLAFlowMatching(nn.Module):
             x_t = pad_vector(x_t, actions.shape[-1])
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         pred = self._se3_predict_from_suffix(
             prefix_embs,
@@ -2660,7 +2802,18 @@ class VLAFlowMatching(nn.Module):
         return losses
 
     def forward(
-        self, pc_feats, pc_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, actions_is_pad=None
+        self,
+        pc_feats,
+        pc_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        actions_is_pad=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if self.config.se3_enable:
@@ -2674,6 +2827,8 @@ class VLAFlowMatching(nn.Module):
                 noise=noise,
                 time=time,
                 actions_is_pad=actions_is_pad,
+                images=images,
+                image_masks=image_masks,
             )
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -2685,7 +2840,13 @@ class VLAFlowMatching(nn.Module):
         x_t = (1 - time_expanded) * noise + time_expanded * actions
         u_t = actions - noise
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             x_t,
@@ -2727,12 +2888,22 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         if self.config.se3_enable:
             return self.sample_actions_se3(
-                pc_feats, pc_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+                pc_feats,
+                pc_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                noise=noise,
+                images=images,
+                image_masks=image_masks,
+                **kwargs,
             )
         bsize = state.shape[0]
         device = state.device
@@ -2742,7 +2913,13 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -2802,6 +2979,8 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         if self._rtc_enabled():
@@ -2819,7 +2998,13 @@ class VLAFlowMatching(nn.Module):
                 x_t = pad_vector(x_t, self.config.max_action_dim)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pc_feats, pc_masks, lang_tokens, lang_masks, state=state
+            pc_feats,
+            pc_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            images=images,
+            image_masks=image_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

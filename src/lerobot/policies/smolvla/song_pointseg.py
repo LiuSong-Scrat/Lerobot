@@ -490,6 +490,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         future_points: int = 16384,
         seed: int = 1000,
         return_full_point_cloud: bool = False,
+        include_base_item: bool = True,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
@@ -509,9 +510,11 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.future_points = int(future_points)
         self.seed = int(seed)
         self.return_full_point_cloud = return_full_point_cloud
+        self.include_base_item = bool(include_base_item)
         self.mmap_mode = mmap_mode
         self._point_cloud_cache: dict[int, np.ndarray] = {}
         self._episode_action_cache: dict[int, Tensor] = {}
+        self._index_dataset = None
 
     def __getattr__(self, name: str):
         return getattr(self.dataset, name)
@@ -520,6 +523,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         state = self.__dict__.copy()
         state["_point_cloud_cache"] = {}
         state["_episode_action_cache"] = {}
+        state["_index_dataset"] = None
         return state
 
     def __len__(self) -> int:
@@ -624,8 +628,21 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         relative[0] = _identity_pose9(device=relative.device, dtype=relative.dtype)
         return relative, sample_indices - int(frame_index)
 
+    def _index_only_item(self, idx: int) -> dict[str, Any]:
+        """Read frame identity without decoding image/video columns for offline cache generation."""
+        ensure_loaded = getattr(self.dataset, "_ensure_hf_dataset_loaded", None)
+        if callable(ensure_loaded):
+            ensure_loaded()
+        hf_dataset = getattr(self.dataset, "hf_dataset", None)
+        if hf_dataset is None:
+            full_item = self.dataset[idx]
+            return {key: full_item[key] for key in ("episode_index", "frame_index")}
+        if self._index_dataset is None:
+            self._index_dataset = hf_dataset.select_columns(["episode_index", "frame_index"])
+        return dict(self._index_dataset[idx])
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = dict(self.dataset[idx])
+        item = dict(self.dataset[idx]) if self.include_base_item else self._index_only_item(idx)
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         point_clouds = self._episode_point_clouds(episode_index)

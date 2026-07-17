@@ -108,6 +108,7 @@ def make_dataset(args: argparse.Namespace) -> SongTemporalPointCloudDataset:
         current_points=args.current_points,
         future_points=args.future_points,
         seed=args.seed,
+        include_base_item=False,
     )
 
 
