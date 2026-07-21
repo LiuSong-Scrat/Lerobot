@@ -955,7 +955,7 @@ def make_libero_env(
         robot.controller.use_delta = bool(control_delta)
     return env, task
 
-def attach_mujoco_3d_viewer(env, render_camera="free"):
+def attach_mujoco_3d_viewer(env, render_camera="free", key_callback=None):
     inner_env = env
 
     while hasattr(inner_env, "env"):
@@ -975,7 +975,11 @@ def attach_mujoco_3d_viewer(env, render_camera="free"):
 
     existing_viewer = getattr(inner_env, "viewer", None)
     old_key = getattr(inner_env, "_viewer3d_key", None)
-    new_key = (sim_id, model_id, data_id)
+    # A passive-viewer key callback cannot be replaced after the viewer has
+    # been launched. Include its identity so a new episode can install its own
+    # callback even when reset() reuses the same MuJoCo model and data objects.
+    callback_id = id(key_callback) if key_callback is not None else None
+    new_key = (sim_id, model_id, data_id, callback_id)
 
     if existing_viewer is not None and hasattr(existing_viewer, "render") and old_key == new_key:
         return existing_viewer
@@ -1004,12 +1008,22 @@ def attach_mujoco_3d_viewer(env, render_camera="free"):
         print("[DEBUG] mj_data:", type(mj_data), type(mj_data).__module__)
         print("[DEBUG] Using mujoco.viewer.launch_passive")
 
-        viewer = mujoco.viewer.launch_passive(
-            mj_model,
-            mj_data,
-            show_left_ui=True,
-            show_right_ui=True,
-        )
+        launch_kwargs = {
+            "show_left_ui": True,
+            "show_right_ui": True,
+        }
+        if key_callback is not None:
+            launch_kwargs["key_callback"] = key_callback
+        try:
+            viewer = mujoco.viewer.launch_passive(mj_model, mj_data, **launch_kwargs)
+        except TypeError as exc:
+            # Keep compatibility with older MuJoCo releases. The evaluator
+            # still has an immediate terminal-key fallback in this case.
+            if "key_callback" not in launch_kwargs:
+                raise
+            print(f"[WARN] passive viewer does not support key_callback: {exc!r}")
+            launch_kwargs.pop("key_callback")
+            viewer = mujoco.viewer.launch_passive(mj_model, mj_data, **launch_kwargs)
 
         try:
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE

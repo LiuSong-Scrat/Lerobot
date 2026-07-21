@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import select
 import sys
+import termios
+import threading
 import time
+import tty
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +235,66 @@ def sync_viewer(viewer: Any) -> bool:
         wrapped.sync()
         return True
     return False
+
+
+class EpisodeKeyboardControl:
+    """Collect an immediate `n` request from the viewer or the terminal."""
+
+    def __init__(self) -> None:
+        self._manual_failure = threading.Event()
+        self._stdin_fd: int | None = None
+        self._stdin_attrs: list[Any] | None = None
+
+    def _request_manual_failure(self, source: str) -> None:
+        if self._manual_failure.is_set():
+            return
+        self._manual_failure.set()
+        print(
+            f"[eval] received 'n' from {source}: mark current episode as failed and continue",
+            flush=True,
+        )
+
+    def viewer_key_callback(self, keycode: int) -> None:
+        """MuJoCo passive-viewer callback (GLFW letter codes are ASCII-compatible)."""
+        if int(keycode) in (ord("n"), ord("N")):
+            self._request_manual_failure("viewer")
+
+    def start_terminal(self) -> bool:
+        """Enable single-key terminal input without requiring Enter."""
+        if not sys.stdin.isatty():
+            return False
+        try:
+            self._stdin_fd = sys.stdin.fileno()
+            self._stdin_attrs = termios.tcgetattr(self._stdin_fd)
+            tty.setcbreak(self._stdin_fd)
+            return True
+        except (OSError, termios.error):
+            self._stdin_fd = None
+            self._stdin_attrs = None
+            return False
+
+    def poll(self) -> bool:
+        """Poll terminal input and return whether this episode must stop."""
+        if self._stdin_fd is not None:
+            try:
+                while select.select([self._stdin_fd], [], [], 0.0)[0]:
+                    key = os.read(self._stdin_fd, 1)
+                    if not key:
+                        break
+                    if key.lower() == b"n":
+                        self._request_manual_failure("terminal")
+            except OSError:
+                pass
+        return self._manual_failure.is_set()
+
+    def close(self) -> None:
+        if self._stdin_fd is not None and self._stdin_attrs is not None:
+            try:
+                termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_attrs)
+            except (OSError, termios.error):
+                pass
+        self._stdin_fd = None
+        self._stdin_attrs = None
 
 
 def render_viewer3d(env: Any, cfg: dict[str, Any], step: int, *, force: bool = False) -> None:
@@ -457,15 +522,120 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
     return np.ascontiguousarray(pc_eff, dtype=np.float32), world_pose9, gripper
 
 
-def build_policy_rgb_observation(infer: SmolVLA_ModelInference, raw_obs: dict[str, Any]) -> dict[str, np.ndarray]:
-    """Read the same static LIBERO camera frame declared by the adapter checkpoint."""
-    images = {}
-    for image_key in infer.policy.config.image_features:
-        camera_name = image_key.removeprefix("observation.images.")
+def _normalized_camera_name(camera_name: Any) -> str:
+    camera_name = str(camera_name).strip()
+    return camera_name[: -len("_image")] if camera_name.endswith("_image") else camera_name
+
+
+def _append_camera_candidate(candidates: list[str], camera_name: Any) -> None:
+    if camera_name is None:
+        return
+    camera_name = _normalized_camera_name(camera_name)
+    if camera_name and camera_name not in candidates:
+        candidates.append(camera_name)
+
+
+def _policy_image_camera_candidates(
+    image_key: str,
+    cfg: dict[str, Any],
+    *,
+    single_image_feature: bool,
+) -> list[str]:
+    """Map a dataset image feature name to possible LIBERO render cameras."""
+    feature_camera = image_key.removeprefix("observation.images.")
+    normalized_feature = feature_camera.lower().replace("-", "_")
+    candidates: list[str] = []
+
+    camera_map = cfg.get("policy_image_camera_map") or {}
+    if not isinstance(camera_map, dict):
+        raise TypeError("policy_image_camera_map must be a JSON object mapping policy image keys to LIBERO cameras.")
+    _append_camera_candidate(candidates, camera_map.get(image_key, camera_map.get(feature_camera)))
+
+    # image_camera is the source camera used by the LIBERO dataset converter.
+    # It is therefore the strongest implicit mapping for a single-image checkpoint.
+    if single_image_feature:
+        _append_camera_candidate(candidates, cfg.get("image_camera"))
+    _append_camera_candidate(candidates, feature_camera)
+
+    overview_aliases = {
+        "agentview",
+        "external",
+        "external_camera",
+        "overhead",
+        "overhead_camera",
+        "overview",
+        "overview_camera",
+    }
+    hand_aliases = {
+        "eye_in_hand",
+        "hand",
+        "hand_camera",
+        "robot0_eye_in_hand",
+        "wrist",
+        "wrist_camera",
+    }
+    configured_cameras = list(cfg.get("camera_names") or [])
+
+    if normalized_feature in overview_aliases:
+        _append_camera_candidate(candidates, cfg.get("pointcloud_reference_camera"))
+        for camera_name in cfg.get("pointcloud_camera_names") or []:
+            _append_camera_candidate(candidates, camera_name)
+        for camera_name in configured_cameras:
+            normalized = _normalized_camera_name(camera_name).lower()
+            if "agentview" in normalized or "overhead" in normalized or "overview" in normalized:
+                _append_camera_candidate(candidates, camera_name)
+        _append_camera_candidate(candidates, "agentview")
+    elif normalized_feature in hand_aliases:
+        for camera_name in configured_cameras:
+            normalized = _normalized_camera_name(camera_name).lower()
+            if "eye_in_hand" in normalized or "wrist" in normalized or "hand" in normalized:
+                _append_camera_candidate(candidates, camera_name)
+        _append_camera_candidate(candidates, "robot0_eye_in_hand")
+
+    return candidates
+
+
+def resolve_policy_rgb_cameras(
+    infer: SmolVLA_ModelInference,
+    raw_obs: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, str]:
+    """Resolve canonical adapter image features to concrete LIBERO raw-observation cameras."""
+    image_keys = list(infer.policy.config.image_features)
+    resolved: dict[str, str] = {}
+    for image_key in image_keys:
+        candidates = _policy_image_camera_candidates(
+            image_key,
+            cfg,
+            single_image_feature=len(image_keys) == 1,
+        )
+        for camera_name in candidates:
+            if dataset_image_from_raw_obs(raw_obs, camera_name) is not None:
+                resolved[image_key] = camera_name
+                break
+        else:
+            available = sorted(
+                key for key, value in raw_obs.items() if key.endswith("_image") and np.asarray(value).ndim == 3
+            )
+            raise KeyError(
+                f"Adapter checkpoint requires {image_key!r}, but no matching LIBERO image was found. "
+                f"Tried cameras={candidates!r}; available image keys={available!r}. "
+                "Set policy_image_camera_map in the eval config when using a custom camera alias."
+            )
+    return resolved
+
+
+def build_policy_rgb_observation(
+    camera_map: dict[str, str],
+    raw_obs: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    """Read adapter RGB inputs under the exact feature keys declared by the checkpoint."""
+    images: dict[str, np.ndarray] = {}
+    for image_key, camera_name in camera_map.items():
         image = dataset_image_from_raw_obs(raw_obs, camera_name)
         if image is None:
             raise KeyError(
-                f"Adapter checkpoint requires {image_key!r}, but {camera_name!r} is absent from raw_obs."
+                f"Adapter image mapping {image_key!r} <- {camera_name!r} became unavailable in raw_obs."
             )
         images[image_key] = image
     return images
@@ -1019,6 +1189,11 @@ def run_episode(
     infer.policy.reset()
     infer.policy_reset()
 
+    policy_rgb_camera_map: dict[str, str] = {}
+    if infer.policy.config.vla_adapter_enable:
+        policy_rgb_camera_map = resolve_policy_rgb_cameras(infer, raw_obs, cfg)
+        print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
+
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
     save_video = bool(cfg.get("save_video", True))
     video_frames: dict[str, list[np.ndarray]] = {}
@@ -1040,99 +1215,142 @@ def run_episode(
     steps = 0
     start_s = time.perf_counter()
 
-    while steps < max_steps and not done and not success_ever:
-        point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
-            env,
-            raw_obs,
-            pc_camera_names,
-            int(cfg["observation_height"]),
-            int(cfg["observation_width"]),
-            int(cfg["num_points"]),
-            seed=steps,
-        )
-        if bool(cfg.get("add_gripper_cloud", True)):
-            point_cloud = add_world_gripper_cloud_to_point_cloud(
-                point_cloud_world,
-                eef_pose,
-                gripper_width_percent_from_scalar(float(eef_pose[-1]), max_physical_width=gripper_max_width),
-                total_points=int(cfg["num_points"]),
-                gripper_points=int(cfg.get("gripper_points", 500)),
-                gripper_len=float(cfg.get("gripper_len", 0.06)),
-                gripper_template=str(cfg.get("gripper_template", "reap")),
-                seed=steps,
-                drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-                shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-            )
+    manual_failure = False
+    keyboard = EpisodeKeyboardControl()
+    terminal_keys_enabled = keyboard.start_terminal()
+    if str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
+        render_camera = normalize_render_camera_name(str(cfg.get("render_camera", "agentview")))
+        attach_mujoco_3d_viewer(env, render_camera=render_camera, key_callback=keyboard.viewer_key_callback)
+        render_viewer3d(env, cfg, steps, force=True)
+    if terminal_keys_enabled or str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
+        print("[eval] press 'n' to mark the current episode as failed and continue", flush=True)
 
-        model_observation = {
-            "point_cloud": point_cloud,
-            "state": identity_pose9_gripper(float(eef_pose[-1])),
-        }
-        if infer.policy.config.vla_adapter_enable:
-            model_observation.update(build_policy_rgb_observation(infer, raw_obs))
-        chunk = infer.predict_action_chunk_obs(
-            model_observation,
-            task=task_language,
-            postprocess=True,
-            state_pose_mode="identity",
-        )[0].detach().cpu().numpy()
-        model_call_count += 1
-
-        start_idx = min(action_index, max(0, len(chunk) - 1))
-        end_idx = len(chunk) if exec_action_steps <= 0 else min(len(chunk), start_idx + exec_action_steps)
-        selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
-
-        actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
-            env=env,
-            current_eef_pose9_gripper=eef_pose,
-            action_chunk=selected_chunk,
-            gripper_threshold=gripper_threshold,
-            gripper_max_width=gripper_max_width,
-        )
-
-        for row, action, model_world, controller_pose in zip(
-            selected_chunk,
-            actions,
-            model_worlds,
-            controller_pose9,
-            strict=True,
-        ):
-            if steps >= max_steps or done or success_ever:
+    try:
+        while steps < max_steps and not done and not success_ever:
+            if keyboard.poll():
+                manual_failure = True
                 break
-            try:
-                raw_obs, reward, done, _ = env.step(action)
-            except ValueError as exc:
-                if "terminated episode" in str(exc):
-                    done = True
-                    break
-                raise
 
-            steps += 1
-            render_viewer3d(env, cfg, steps)
-            reward = float(reward)
-            rewards.append(reward)
-            libero_actions.append(np.asarray(action, dtype=np.float32))
-            model_action_rows.append(np.asarray(row, dtype=np.float32))
-            target_model_worlds.append(np.asarray(model_world, dtype=np.float32))
-            target_controller_pose9.append(np.asarray(controller_pose, dtype=np.float32))
-            gripper_commands.append(float(action[-1]))
-            gripper_raw_widths.append(float(row[-1]))
-            gripper_width_pcts.append(
-                gripper_width_percent_from_scalar(float(row[-1]), max_physical_width=gripper_max_width)
+            point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
+                env,
+                raw_obs,
+                pc_camera_names,
+                int(cfg["observation_height"]),
+                int(cfg["observation_width"]),
+                int(cfg["num_points"]),
+                seed=steps,
+            )
+            if bool(cfg.get("add_gripper_cloud", True)):
+                point_cloud = add_world_gripper_cloud_to_point_cloud(
+                    point_cloud_world,
+                    eef_pose,
+                    gripper_width_percent_from_scalar(float(eef_pose[-1]), max_physical_width=gripper_max_width),
+                    total_points=int(cfg["num_points"]),
+                    gripper_points=int(cfg.get("gripper_points", 500)),
+                    gripper_len=float(cfg.get("gripper_len", 0.06)),
+                    gripper_template=str(cfg.get("gripper_template", "reap")),
+                    seed=steps,
+                    drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
+                    shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
+                )
+
+            model_observation = {
+                "point_cloud": point_cloud,
+                "state": identity_pose9_gripper(float(eef_pose[-1])),
+            }
+            if infer.policy.config.vla_adapter_enable:
+                model_observation.update(build_policy_rgb_observation(policy_rgb_camera_map, raw_obs))
+            chunk = infer.predict_action_chunk_obs(
+                model_observation,
+                task=task_language,
+                postprocess=True,
+                state_pose_mode="identity",
+            )[0].detach().cpu().numpy()
+            model_call_count += 1
+
+            if keyboard.poll():
+                manual_failure = True
+                break
+
+            start_idx = min(action_index, max(0, len(chunk) - 1))
+            end_idx = len(chunk) if exec_action_steps <= 0 else min(len(chunk), start_idx + exec_action_steps)
+            selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
+
+            actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
+                env=env,
+                current_eef_pose9_gripper=eef_pose,
+                action_chunk=selected_chunk,
+                gripper_threshold=gripper_threshold,
+                gripper_max_width=gripper_max_width,
             )
 
-            if save_video:
-                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+            for row, action, model_world, controller_pose in zip(
+                selected_chunk,
+                actions,
+                model_worlds,
+                controller_pose9,
+                strict=True,
+            ):
+                if steps >= max_steps or done or success_ever or keyboard.poll():
+                    manual_failure = keyboard.poll()
+                    break
+                try:
+                    raw_obs, reward, done, _ = env.step(action)
+                except ValueError as exc:
+                    if "terminated episode" in str(exc):
+                        done = True
+                        break
+                    raise
 
-            try:
-                success_ever = success_ever or bool(env.check_success())
-            except Exception:
-                success_ever = success_ever or bool(reward > 0.0)
+                steps += 1
+                render_viewer3d(env, cfg, steps)
+                reward = float(reward)
+                rewards.append(reward)
+                libero_actions.append(np.asarray(action, dtype=np.float32))
+                model_action_rows.append(np.asarray(row, dtype=np.float32))
+                target_model_worlds.append(np.asarray(model_world, dtype=np.float32))
+                target_controller_pose9.append(np.asarray(controller_pose, dtype=np.float32))
+                gripper_commands.append(float(action[-1]))
+                gripper_raw_widths.append(float(row[-1]))
+                gripper_width_pcts.append(
+                    gripper_width_percent_from_scalar(float(row[-1]), max_physical_width=gripper_max_width)
+                )
+
+                if save_video:
+                    append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+
+                if keyboard.poll():
+                    manual_failure = True
+                    break
+
+                try:
+                    success_ever = success_ever or bool(env.check_success())
+                except Exception:
+                    success_ever = success_ever or bool(reward > 0.0)
+
+            if manual_failure:
+                break
+        manual_failure = manual_failure or keyboard.poll()
+    finally:
+        keyboard.close()
+
+    if manual_failure:
+        success_ever = False
 
     final_eef_pose = eef_pose9_gripper_from_obs(raw_obs)
     return {
         "success": bool(success_ever),
         "done": bool(done),
+        "manual_failure": bool(manual_failure),
+        "termination_reason": (
+            "manual_failure_n"
+            if manual_failure
+            else "success"
+            if success_ever
+            else "env_done"
+            if done
+            else "max_steps"
+        ),
         "steps": int(steps),
         "action_rows_executed": int(len(libero_actions)),
         "model_call_count": int(model_call_count),
