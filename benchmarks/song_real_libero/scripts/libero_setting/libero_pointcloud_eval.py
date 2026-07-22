@@ -354,7 +354,16 @@ def parse_args() -> argparse.Namespace:
         "--task-workers",
         type=int,
         default=None,
-        help="Number of task environments evaluated concurrently by this GPU model service.",
+        help="Maximum number of distinct tasks evaluated concurrently by this GPU model service.",
+    )
+    parser.add_argument(
+        "--episode-workers-per-task",
+        type=int,
+        default=None,
+        help=(
+            "Independent environment processes used to split the episodes of each active task. "
+            "For example, 2 assigns even and odd episode indices to separate environments."
+        ),
     )
     parser.add_argument(
         "--task-worker-backend",
@@ -1381,6 +1390,8 @@ def _process_task_worker_entry(
     worker_id: int,
     suite_name: str,
     task_id: int,
+    shard_index: int,
+    episode_indices: list[int],
     cfg: dict[str, Any],
     output_dir: Path,
     request_queue: Any,
@@ -1416,15 +1427,17 @@ def _process_task_worker_entry(
             task_id=int(task_id),
             cfg=cfg,
             output_dir=output_dir,
+            episode_indices=episode_indices,
             on_environment_ready=_announce_ready_and_wait,
         )
-        result_queue.put(("ok", int(worker_id), int(task_id), summary))
+        result_queue.put(("ok", int(worker_id), int(task_id), int(shard_index), summary))
     except BaseException as exc:
         result_queue.put(
             (
                 "error",
                 int(worker_id),
                 int(task_id),
+                int(shard_index),
                 repr(exc),
                 traceback.format_exc(),
             )
@@ -2439,10 +2452,27 @@ def evaluate_task(
     task_id: int,
     cfg: dict[str, Any],
     output_dir: Path,
+    episode_indices: list[int] | None = None,
     on_environment_ready: Any | None = None,
 ) -> dict[str, Any]:
-    """Evaluate all configured episodes for one task in its owning worker."""
+    """Evaluate all or one deterministic episode shard for a task."""
     init_states = get_task_init_states(suite, int(task_id))
+    if episode_indices is None:
+        resolved_episode_indices = list(range(int(cfg["episodes"])))
+    else:
+        resolved_episode_indices = [int(episode_index) for episode_index in episode_indices]
+        if len(set(resolved_episode_indices)) != len(resolved_episode_indices):
+            raise ValueError(f"Duplicate episode indices for task {task_id}: {resolved_episode_indices}")
+        invalid_episode_indices = [
+            episode_index
+            for episode_index in resolved_episode_indices
+            if episode_index < 0 or episode_index >= int(cfg["episodes"])
+        ]
+        if invalid_episode_indices:
+            raise ValueError(
+                f"Invalid episode indices for task {task_id}: {invalid_episode_indices}; "
+                f"configured episode count is {int(cfg['episodes'])}."
+            )
     task_results: list[dict[str, Any]] = []
     task_name = f"task_{int(task_id):03d}"
     task_language = f"{suite_name}:{int(task_id)}"
@@ -2478,7 +2508,7 @@ def evaluate_task(
             # construct their per-episode environments concurrently.
             on_environment_ready()
 
-        for episode_idx in range(int(cfg["episodes"])):
+        for episode_idx in resolved_episode_indices:
             episode_dir = (
                 output_dir
                 / suite_name
@@ -2600,7 +2630,13 @@ def failed_task_summary(
     task_id: int,
     episode_count: int,
     exc: BaseException,
+    episode_indices: list[int] | None = None,
 ) -> dict[str, Any]:
+    resolved_episode_indices = (
+        list(range(int(episode_count)))
+        if episode_indices is None
+        else [int(episode_index) for episode_index in episode_indices]
+    )
     episodes = [
         {
             "episode_index": episode_idx,
@@ -2611,7 +2647,7 @@ def failed_task_summary(
             "max_reward": 0.0,
             "error": repr(exc),
         }
-        for episode_idx in range(int(episode_count))
+        for episode_idx in resolved_episode_indices
     ]
     return make_task_summary(
         suite_name=suite_name,
@@ -2620,6 +2656,88 @@ def failed_task_summary(
         task_language=f"{suite_name}:{int(task_id)}",
         episodes=episodes,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeWorkerJob:
+    worker_id: int
+    task_id: int
+    shard_index: int
+    episode_indices: tuple[int, ...]
+
+
+def _build_episode_worker_jobs(
+    task_ids: list[int],
+    *,
+    episode_count: int,
+    episode_workers_per_task: int,
+) -> list[_EpisodeWorkerJob]:
+    shard_count = min(max(1, int(episode_workers_per_task)), max(1, int(episode_count)))
+    jobs: list[_EpisodeWorkerJob] = []
+    for task_id in task_ids:
+        for shard_index in range(shard_count):
+            episode_indices = tuple(range(shard_index, int(episode_count), shard_count))
+            if not episode_indices:
+                continue
+            jobs.append(
+                _EpisodeWorkerJob(
+                    worker_id=len(jobs),
+                    task_id=int(task_id),
+                    shard_index=shard_index,
+                    episode_indices=episode_indices,
+                )
+            )
+    return jobs
+
+
+def merge_task_episode_shards(
+    *,
+    suite_name: str,
+    task_ids: list[int],
+    episode_count: int,
+    partial_summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    partials_by_task: dict[int, list[dict[str, Any]]] = {int(task_id): [] for task_id in task_ids}
+    for summary in partial_summaries:
+        task_id = int(summary["task_id"])
+        if task_id not in partials_by_task:
+            raise RuntimeError(f"Received an unexpected task summary for task {task_id}.")
+        partials_by_task[task_id].append(summary)
+
+    merged: list[dict[str, Any]] = []
+    expected_episode_indices = set(range(int(episode_count)))
+    for task_id in task_ids:
+        partials = partials_by_task[int(task_id)]
+        if not partials:
+            raise RuntimeError(f"No episode worker returned a summary for task {task_id}.")
+        episodes_by_index: dict[int, dict[str, Any]] = {}
+        for partial in partials:
+            for episode in partial.get("episodes", []):
+                episode_index = int(episode["episode_index"])
+                if episode_index in episodes_by_index:
+                    raise RuntimeError(
+                        f"Duplicate result for suite={suite_name} task={task_id} episode={episode_index}."
+                    )
+                episodes_by_index[episode_index] = episode
+        actual_episode_indices = set(episodes_by_index)
+        if actual_episode_indices != expected_episode_indices:
+            missing = sorted(expected_episode_indices - actual_episode_indices)
+            unexpected = sorted(actual_episode_indices - expected_episode_indices)
+            raise RuntimeError(
+                f"Incomplete episode shards for suite={suite_name} task={task_id}: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+        first = partials[0]
+        merged.append(
+            make_task_summary(
+                suite_name=suite_name,
+                task_id=int(task_id),
+                task_name=str(first.get("task_name", f"task_{int(task_id):03d}")),
+                task_language=str(first.get("task_language", f"{suite_name}:{int(task_id)}")),
+                episodes=[episodes_by_index[index] for index in sorted(episodes_by_index)],
+            )
+        )
+    return merged
 
 
 def evaluate_suite_process_parallel(
@@ -2633,59 +2751,72 @@ def evaluate_suite_process_parallel(
 ) -> list[dict[str, Any]]:
     """Run MuJoCo tasks in child processes and serve all policy calls in this process.
 
-    Each child owns one persistent task environment.  The parent owns the only
-    policy copy on the GPU and dynamically batches requests arriving over IPC.
-    Tasks are processed in waves when task_ids exceeds worker_count.
+    Each child owns one persistent environment for one task/episode shard.  The
+    parent owns the only policy copy on the GPU and dynamically batches requests
+    arriving over IPC.  Tasks are processed in waves when task_ids exceeds
+    worker_count, while episode shards of every active task run together.
     """
     context = mp.get_context("spawn")
     adapter_enabled = bool(infer.policy.config.vla_adapter_enable)
     image_feature_keys = [str(key) for key in infer.policy.config.image_features]
     max_batch_size = max(1, int(cfg["inference_batch_size"]))
     batch_wait_s = max(0.0, float(cfg["inference_batch_wait_ms"])) / 1000.0
-    summaries: list[dict[str, Any]] = []
+    partial_summaries: list[dict[str, Any]] = []
     request_count = 0
     batch_count = 0
     max_observed_batch = 0
     infrastructure_failures: list[str] = []
+    episode_workers_per_task = min(
+        max(1, int(cfg.get("episode_workers_per_task", 1))),
+        max(1, int(cfg["episodes"])),
+    )
 
     for wave_start in range(0, len(task_ids), max(1, int(worker_count))):
         wave_task_ids = [int(task_id) for task_id in task_ids[wave_start : wave_start + worker_count]]
-        request_queue = context.Queue(maxsize=max(2, len(wave_task_ids) * 2))
+        jobs = _build_episode_worker_jobs(
+            wave_task_ids,
+            episode_count=int(cfg["episodes"]),
+            episode_workers_per_task=episode_workers_per_task,
+        )
+        request_queue = context.Queue(maxsize=max(2, len(jobs) * 2))
         ready_queue = context.Queue()
         result_queue = context.Queue()
         start_event = context.Event()
         response_queues = {
-            worker_id: context.Queue(maxsize=1) for worker_id in range(len(wave_task_ids))
+            job.worker_id: context.Queue(maxsize=1) for job in jobs
         }
         processes: dict[int, Any] = {}
-        task_by_worker = {
-            worker_id: int(task_id) for worker_id, task_id in enumerate(wave_task_ids)
-        }
+        job_by_worker = {job.worker_id: job for job in jobs}
 
         previous_bootstrap = os.environ.get("SONG_LIBERO_ENV_WORKER")
         os.environ["SONG_LIBERO_ENV_WORKER"] = "1"
         try:
-            for worker_id, task_id in task_by_worker.items():
+            for job in jobs:
                 process = context.Process(
                     target=_process_task_worker_entry,
                     kwargs={
-                        "worker_id": worker_id,
+                        "worker_id": job.worker_id,
                         "suite_name": suite_name,
-                        "task_id": task_id,
+                        "task_id": job.task_id,
+                        "shard_index": job.shard_index,
+                        "episode_indices": list(job.episode_indices),
                         "cfg": cfg,
                         "output_dir": output_dir,
                         "request_queue": request_queue,
-                        "response_queue": response_queues[worker_id],
+                        "response_queue": response_queues[job.worker_id],
                         "ready_queue": ready_queue,
                         "result_queue": result_queue,
                         "start_event": start_event,
                         "vla_adapter_enable": adapter_enabled,
                         "image_feature_keys": image_feature_keys,
                     },
-                    name=f"libero-{suite_name}-task-{task_id}",
+                    name=(
+                        f"libero-{suite_name}-task-{job.task_id}-"
+                        f"episode-shard-{job.shard_index}"
+                    ),
                 )
                 process.start()
-                processes[worker_id] = process
+                processes[job.worker_id] = process
         finally:
             if previous_bootstrap is None:
                 os.environ.pop("SONG_LIBERO_ENV_WORKER", None)
@@ -2700,18 +2831,27 @@ def evaluate_suite_process_parallel(
             status = str(message[0])
             worker_id = int(message[1])
             task_id = int(message[2])
+            shard_index = int(message[3])
             if worker_id in finished_workers:
                 return
+            job = job_by_worker[worker_id]
+            if task_id != job.task_id or shard_index != job.shard_index:
+                raise RuntimeError(
+                    f"Worker {worker_id} returned task/shard ({task_id}, {shard_index}), "
+                    f"expected ({job.task_id}, {job.shard_index})."
+                )
             if status == "ok":
-                summary = message[3]
+                summary = message[4]
             else:
-                error_repr = str(message[3])
-                error_traceback = str(message[4])
+                error_repr = str(message[4])
+                error_traceback = str(message[5])
                 infrastructure_failures.append(
-                    f"suite={suite_name} task={task_id}: {error_repr}"
+                    f"suite={suite_name} task={task_id} shard={shard_index} "
+                    f"episodes={list(job.episode_indices)}: {error_repr}"
                 )
                 print(
-                    f"[warn] process worker failed suite={suite_name} task={task_id}: "
+                    f"[warn] process worker failed suite={suite_name} task={task_id} "
+                    f"shard={shard_index} episodes={list(job.episode_indices)}: "
                     f"{error_repr}\n{error_traceback}",
                     flush=True,
                 )
@@ -2720,6 +2860,7 @@ def evaluate_suite_process_parallel(
                     task_id=task_id,
                     episode_count=int(cfg["episodes"]),
                     exc=RuntimeError(error_repr),
+                    episode_indices=list(job.episode_indices),
                 )
             worker_summaries[worker_id] = summary
             finished_workers.add(worker_id)
@@ -2735,15 +2876,18 @@ def evaluate_suite_process_parallel(
             for worker_id, process in processes.items():
                 if worker_id in finished_workers or process.is_alive() or process.exitcode is None:
                     continue
-                task_id = task_by_worker[worker_id]
+                job = job_by_worker[worker_id]
+                task_id = job.task_id
                 exc = RuntimeError(
                     f"Environment worker exited without a result (exitcode={process.exitcode})."
                 )
                 infrastructure_failures.append(
-                    f"suite={suite_name} task={task_id}: {exc}"
+                    f"suite={suite_name} task={task_id} shard={job.shard_index} "
+                    f"episodes={list(job.episode_indices)}: {exc}"
                 )
                 print(
-                    f"[warn] process worker died suite={suite_name} task={task_id}: {exc}",
+                    f"[warn] process worker died suite={suite_name} task={task_id} "
+                    f"shard={job.shard_index} episodes={list(job.episode_indices)}: {exc}",
                     flush=True,
                 )
                 worker_summaries[worker_id] = failed_task_summary(
@@ -2751,6 +2895,7 @@ def evaluate_suite_process_parallel(
                     task_id=task_id,
                     episode_count=int(cfg["episodes"]),
                     exc=exc,
+                    episode_indices=list(job.episode_indices),
                 )
                 finished_workers.add(worker_id)
 
@@ -2759,7 +2904,7 @@ def evaluate_suite_process_parallel(
             # environment in this wave is ready.  This removes the old startup
             # artifact where task 0 could run several episodes while other
             # tasks were still serially constructing EGL contexts.
-            while len(ready_workers | finished_workers) < len(wave_task_ids):
+            while len(ready_workers | finished_workers) < len(jobs):
                 try:
                     ready_workers.add(int(ready_queue.get(timeout=0.1)))
                 except queue.Empty:
@@ -2768,15 +2913,16 @@ def evaluate_suite_process_parallel(
                 _record_dead_workers()
             print(
                 f"[parallel] suite={suite_name}: environments ready "
-                f"{len(ready_workers)}/{len(wave_task_ids)}; starting rollout wave",
+                f"{len(ready_workers)}/{len(jobs)} for {len(wave_task_ids)} tasks; "
+                "starting rollout wave",
                 flush=True,
             )
             start_event.set()
 
-            while len(finished_workers) < len(wave_task_ids):
+            while len(finished_workers) < len(jobs):
                 _drain_results()
                 _record_dead_workers()
-                if len(finished_workers) >= len(wave_task_ids):
+                if len(finished_workers) >= len(jobs):
                     break
                 try:
                     first_request = request_queue.get(timeout=0.1)
@@ -2818,7 +2964,7 @@ def evaluate_suite_process_parallel(
                 except Exception:
                     pass
 
-        summaries.extend(worker_summaries[index] for index in sorted(worker_summaries))
+        partial_summaries.extend(worker_summaries[index] for index in sorted(worker_summaries))
 
     mean_batch = request_count / batch_count if batch_count else 0.0
     print(
@@ -2840,7 +2986,12 @@ def evaluate_suite_process_parallel(
             error=error_message,
         )
         raise RuntimeError(error_message)
-    return summaries
+    return merge_task_episode_shards(
+        suite_name=suite_name,
+        task_ids=task_ids,
+        episode_count=int(cfg["episodes"]),
+        partial_summaries=partial_summaries,
+    )
 
 
 def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str], Path]:
@@ -2893,12 +3044,27 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg["output_dir"] = str(output_dir)
     cfg["task_workers"] = max(1, int(cfg_get(cfg, args.task_workers, "task_workers", 1)))
+    cfg["episode_workers_per_task"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg,
+                args.episode_workers_per_task,
+                "episode_workers_per_task",
+                1,
+            )
+        ),
+    )
+    configured_environment_workers = (
+        cfg["task_workers"]
+        * min(cfg["episode_workers_per_task"], max(1, cfg["episodes"]))
+    )
     cfg["task_worker_backend"] = str(
         cfg_get(
             cfg,
             args.task_worker_backend,
             "task_worker_backend",
-            "process" if cfg["task_workers"] > 1 else "thread",
+            "process" if configured_environment_workers > 1 else "thread",
         )
     ).lower()
     cfg["recreate_env_per_episode"] = bool(
@@ -2939,7 +3105,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
                 cfg,
                 args.inference_batch_size,
                 "inference_batch_size",
-                cfg["task_workers"],
+                configured_environment_workers,
             )
         ),
     )
@@ -2947,17 +3113,19 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         0.0,
         float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
     )
-    cfg["keyboard_control_enabled"] = cfg["task_workers"] == 1
-    if cfg["task_workers"] > 1:
+    cfg["keyboard_control_enabled"] = configured_environment_workers == 1
+    if configured_environment_workers > 1:
         if cfg["task_worker_backend"] not in {"process", "thread"}:
             raise ValueError(
                 "task_worker_backend must be either 'process' or 'thread', got "
                 f"{cfg['task_worker_backend']!r}."
             )
         if str(cfg.get("render_mode", "offscreen")).lower() != "offscreen":
-            raise ValueError("--task-workers > 1 requires --render-mode offscreen.")
+            raise ValueError("Parallel environment workers require --render-mode offscreen.")
         if bool(cfg.get("visualize_foreground", False)):
-            raise ValueError("--task-workers > 1 requires --no-visualize-foreground.")
+            raise ValueError("Parallel environment workers require --no-visualize-foreground.")
+    if cfg["episode_workers_per_task"] > 1 and cfg["task_worker_backend"] != "process":
+        raise ValueError("--episode-workers-per-task > 1 requires --task-worker-backend process.")
 
     return cfg, suite_names, output_dir
 
@@ -3104,6 +3272,7 @@ def main() -> None:
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={cfg['episodes']}, "
         f"task_workers={cfg['task_workers']}, "
+        f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
         f"task_worker_backend={cfg['task_worker_backend']}, "
         f"inference_batch_size={cfg['inference_batch_size']}, "
         f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
@@ -3143,8 +3312,13 @@ def main() -> None:
                 episodes_per_task=int(cfg["episodes"]),
             )
             worker_count = min(int(cfg["task_workers"]), max(1, len(task_ids)))
+            episode_worker_count = min(
+                int(cfg["episode_workers_per_task"]),
+                max(1, int(cfg["episodes"])),
+            )
+            environment_worker_count = worker_count * episode_worker_count
 
-            if worker_count == 1:
+            if environment_worker_count == 1:
                 for task_id in task_ids:
                     summary = evaluate_task(
                         infer=eval_infer,
@@ -3160,7 +3334,8 @@ def main() -> None:
 
             if str(cfg["task_worker_backend"]) == "process":
                 print(
-                    f"[parallel] suite={suite_name}: starting {worker_count} MuJoCo processes "
+                    f"[parallel] suite={suite_name}: starting up to {environment_worker_count} "
+                    f"MuJoCo processes ({worker_count} tasks x {episode_worker_count} episode shards) "
                     f"for task_ids={list(map(int, task_ids))}; policy remains in the parent process",
                     flush=True,
                 )
