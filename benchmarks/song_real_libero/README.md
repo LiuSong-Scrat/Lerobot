@@ -704,3 +704,47 @@ For local 3D debugging on a desktop session, use the MuJoCo viewer mode instead 
 
 `--headed` is equivalent to `--render-mode viewer3d`. Use `--render-mode onscreen` only if you want robosuite's OpenCV camera window instead of the interactive MuJoCo 3D viewer.
 Do not set `PYOPENGL_PLATFORM=glfw`; robosuite may still initialize an EGL context for offscreen RGB-D, and that combination causes an import error.
+
+### SmolVLA action-token diagnostics and online PointSeg view
+
+Use fixed-noise token-group ablation to measure how language, RGB, point-cloud,
+and action-to-action token communication change the final action chunk:
+
+```bash
+python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
+  --policy.path /path/to/checkpoints/last/pretrained_model \
+  --dataset.repo_id /path/to/lerobot_dataset \
+  --index 0 \
+  --analyze-modalities \
+  --analysis-seed 0 \
+  --analysis-output-dir /tmp/smolvla_modality_analysis
+```
+
+For a real-robot observation pickle, replace the dataset arguments with
+`--obs.path /path/to/observation.pkl --task "..."`. The analysis reuses exactly
+the same initial flow-matching noise for the baseline and every ablation. It
+saves:
+
+- `modality_influence.json`: complete actions and scalar/per-step metrics;
+- `modality_influence_bars.png`: translation, rotation, and gripper influence;
+- `modality_trajectory_comparison.png`: baseline and ablated 3D trajectories;
+- `modality_per_step_deviation.png`: where each modality changes the chunk.
+
+Dataset analysis also compares every result against the ground-truth action.
+Positive `action_mse_delta_vs_baseline` means removing that token group made the
+action worse. Without ground truth or rollout reward, the report measures only
+causal sensitivity and must not be interpreted as action quality.
+
+Show PointSeg's raw per-point foreground probability continuously during LIBERO
+evaluation by adding:
+
+```bash
+--visualize-foreground --foreground-vis-max-points 50000
+```
+
+The color map is blue (`0`) through cyan/yellow to red (`1`). The window runs in
+a separate process so its OpenGL context cannot conflict with MuJoCo EGL/GLX.
+For `single_inference`, pass `visualize_foreground=True` to the constructor or
+method, or set `SONG_VISUALIZE_FOREGROUND=1` before starting an existing deploy
+script. The window updates on each actual policy forward; while queued actions
+are being consumed it retains the most recent model-call scores.

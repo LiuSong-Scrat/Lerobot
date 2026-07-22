@@ -406,7 +406,7 @@ def _apply_song_eval_debug_defaults() -> None:
         return
     sys.argv = [
         "eval_song.py",
-        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
+        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/020000/pretrained_model",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset",
         "--pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/ep_vla_v03_adapter_cache_v7_data/ep_vla_v03_adapter_cache_v7",

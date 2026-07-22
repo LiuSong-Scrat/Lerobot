@@ -7,7 +7,7 @@
   "dataset_repo_id": "song_libero_pointcloud",
   "libero_config_path": "data/libero_setting/libero_config",
   "demo_root": "data/libero_setting/libero_demos",
-  "suite": "libero_object",
+  "suite": "libero_spatial",
   "task_ids": null,
   "episodes": 10,
   "fps": 30,

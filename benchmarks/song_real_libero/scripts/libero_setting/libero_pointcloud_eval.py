@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import select
 import sys
@@ -23,11 +24,15 @@ import termios
 import threading
 import time
 import tty
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+_ENV_CREATION_LOCK = threading.Lock()
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
@@ -88,8 +93,66 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Clean LIBERO eval: point-cloud observation -> action chunk -> absolute pose execution."
     )
-    parser.add_argument("--settle-steps", type=int, default=5, help="MuJoCo physics ticks after env.reset() before the first policy inference, so free objects can settle.")
-    parser.add_argument("--settle-keep-robot-fixed", action=argparse.BooleanOptionalAction, default=True, help="During initial settling, restore arm/gripper qpos each sim tick so only free objects settle.")
+    parser.add_argument(
+        "--settle-steps",
+        type=int,
+        default=None,
+        help="Minimum MuJoCo physics ticks after reset before accepting a stable scene (legacy override).",
+    )
+    parser.add_argument(
+        "--settle-min-seconds",
+        type=float,
+        default=None,
+        help="Minimum simulated time before scene stability can be accepted.",
+    )
+    parser.add_argument(
+        "--settle-stable-seconds",
+        type=float,
+        default=None,
+        help="Required continuous low-velocity duration before the first policy inference.",
+    )
+    parser.add_argument(
+        "--settle-max-seconds",
+        type=float,
+        default=None,
+        help="Time before warning that settling is slow; strict mode keeps waiting instead of skipping the episode.",
+    )
+    parser.add_argument(
+        "--settle-linear-velocity-threshold",
+        type=float,
+        default=None,
+        help="Maximum free-object linear speed in m/s for a stable physics tick.",
+    )
+    parser.add_argument(
+        "--settle-angular-velocity-threshold",
+        type=float,
+        default=None,
+        help="Maximum free-object angular speed in rad/s for a stable physics tick.",
+    )
+    parser.add_argument(
+        "--settle-other-dof-velocity-threshold",
+        type=float,
+        default=None,
+        help="Fallback scalar joint-speed threshold when a scene has no free joints.",
+    )
+    parser.add_argument(
+        "--settle-require-stable",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep waiting after the settling warning until the scene is stable (default: true).",
+    )
+    parser.add_argument(
+        "--settle-keep-robot-fixed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="During initial settling, restore arm/gripper qpos each sim tick so only scene objects settle.",
+    )
+    parser.add_argument(
+        "--initial-gripper-open",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Start every evaluation episode with the gripper at its fully open joint limits.",
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
@@ -125,6 +188,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-points", type=int, default=None)
 
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--visualize-foreground",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Continuously show PointSeg foreground probability in a non-blocking Open3D window.",
+    )
+    parser.add_argument("--foreground-vis-max-points", type=int, default=None)
+    parser.add_argument(
+        "--task-workers",
+        type=int,
+        default=None,
+        help="Number of task environments evaluated concurrently in this GPU process.",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent task requests combined into one policy forward.",
+    )
+    parser.add_argument(
+        "--inference-batch-wait-ms",
+        type=float,
+        default=None,
+        help="Short collection window used by the shared-GPU dynamic batcher.",
+    )
     parser.add_argument("--recreate-env-per-episode", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -366,6 +454,7 @@ def action_chunk_to_absolute_libero_actions(
         target_controller_world = target_model_world @ model_to_controller
         arm_action = world_pose_to_libero_absolute_action(target_controller_world)
         delta_pre_width = chunk[idx+1,-1]-chunk[idx,-1] if idx< chunk.shape[0]-1 else 0
+        # print("delta_pre_width = ", delta_pre_width)
         gripper_action = -1.0 if delta_pre_width > 0.004 else (1.0 if delta_pre_width < -0.004 else 0.0)
         libero_actions.append(np.concatenate([arm_action, np.asarray([gripper_action], dtype=np.float32)]))
         target_controller_pose9.append(matrix_to_pose9(target_controller_world))
@@ -639,6 +728,175 @@ def build_policy_rgb_observation(
             )
         images[image_key] = image
     return images
+
+
+@dataclass(slots=True)
+class _InferenceRequest:
+    observation: dict[str, Any]
+    task: str
+    postprocess: bool
+    state_pose_mode: str
+    future: Future[Any]
+
+
+def _stack_model_observations(observations: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Stack homogeneous per-environment observations into one model batch."""
+    if not observations:
+        raise ValueError("Cannot stack an empty observation list.")
+    expected_keys = set(observations[0])
+    for index, observation in enumerate(observations[1:], start=1):
+        if set(observation) != expected_keys:
+            raise KeyError(
+                f"Parallel inference observation {index} has keys {sorted(observation)}, "
+                f"expected {sorted(expected_keys)}."
+            )
+
+    batch: dict[str, np.ndarray] = {}
+    for key in sorted(expected_keys):
+        values = [np.asarray(observation[key]) for observation in observations]
+        try:
+            batch[key] = np.stack(values, axis=0)
+        except ValueError as exc:
+            shapes = [tuple(value.shape) for value in values]
+            raise ValueError(f"Cannot batch observation key {key!r} with shapes {shapes}.") from exc
+    return batch
+
+
+class BatchedInferenceScheduler:
+    """One-policy dynamic batcher shared by concurrent task environment threads.
+
+    MuJoCo work remains in the task threads.  Only this scheduler thread touches
+    the policy, so a GPU process loads one checkpoint and never performs
+    concurrent forwards on the same module.
+    """
+
+    shared_parallel_inference = True
+
+    def __init__(
+        self,
+        infer: SmolVLA_ModelInference,
+        *,
+        max_batch_size: int,
+        batch_wait_ms: float,
+    ) -> None:
+        self.infer = infer
+        self.policy = infer.policy
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.batch_wait_s = max(0.0, float(batch_wait_ms)) / 1000.0
+        self._queue: queue.Queue[_InferenceRequest | object] = queue.Queue()
+        self._stop_token = object()
+        self._closed = False
+        self._batch_count = 0
+        self._request_count = 0
+        self._max_observed_batch = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="libero-gpu-inference-batcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def policy_reset(self) -> None:
+        # predict_action_chunk() does not consume the policy action queue.  A
+        # shared reset from one environment would otherwise race other tasks.
+        return None
+
+    def predict_action_chunk_obs(
+        self,
+        observation: dict[str, Any],
+        *,
+        task: str | list[str] = "",
+        postprocess: bool = True,
+        state_pose_mode: str = "identity",
+    ) -> Any:
+        if self._closed:
+            raise RuntimeError("Parallel inference scheduler is already closed.")
+        if not isinstance(task, str):
+            if len(task) != 1:
+                raise ValueError("A task worker must submit exactly one language instruction.")
+            task = str(task[0])
+        future: Future[Any] = Future()
+        self._queue.put(
+            _InferenceRequest(
+                observation=observation,
+                task=str(task),
+                postprocess=bool(postprocess),
+                state_pose_mode=str(state_pose_mode),
+                future=future,
+            )
+        )
+        return future.result()
+
+    def _collect_batch(self, first: _InferenceRequest) -> tuple[list[_InferenceRequest], bool]:
+        requests = [first]
+        closing = False
+        deadline = time.monotonic() + self.batch_wait_s
+        while len(requests) < self.max_batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                item = self._queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if item is self._stop_token:
+                closing = True
+                break
+            requests.append(item)
+        return requests, closing
+
+    def _execute_batch(self, requests: list[_InferenceRequest]) -> None:
+        try:
+            postprocess_values = {request.postprocess for request in requests}
+            state_modes = {request.state_pose_mode for request in requests}
+            if len(postprocess_values) != 1 or len(state_modes) != 1:
+                raise ValueError("All requests in one dynamic batch must use the same inference options.")
+            observation_batch = _stack_model_observations(
+                [request.observation for request in requests]
+            )
+            action_chunks = self.infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in requests],
+                postprocess=requests[0].postprocess,
+                state_pose_mode=requests[0].state_pose_mode,
+            )
+            if int(action_chunks.shape[0]) != len(requests):
+                raise RuntimeError(
+                    f"Policy returned batch {int(action_chunks.shape[0])}, expected {len(requests)}."
+                )
+            for index, request in enumerate(requests):
+                request.future.set_result(action_chunks[index : index + 1])
+            self._batch_count += 1
+            self._request_count += len(requests)
+            self._max_observed_batch = max(self._max_observed_batch, len(requests))
+        except BaseException as exc:
+            for request in requests:
+                if not request.future.done():
+                    request.future.set_exception(exc)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._stop_token:
+                break
+            requests, closing = self._collect_batch(item)
+            self._execute_batch(requests)
+            if closing:
+                break
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(self._stop_token)
+        self._thread.join()
+        mean_batch = self._request_count / self._batch_count if self._batch_count else 0.0
+        print(
+            "[parallel] inference batches: "
+            f"requests={self._request_count}, batches={self._batch_count}, "
+            f"mean_batch={mean_batch:.2f}, max_batch={self._max_observed_batch}",
+            flush=True,
+        )
 
 
 def _axis_points(origin: np.ndarray, rot: np.ndarray, *, scale: float = 0.04, samples: int = 12) -> tuple[np.ndarray, np.ndarray]:
@@ -1079,24 +1337,47 @@ def render_mujoco_viewer(env: Any, cfg: dict[str, Any], step: int, *, force: boo
 def settle_scene_after_reset(
     env: Any,
     *,
-    steps: int,
+    steps: int = 0,
+    min_seconds: float = 0.25,
+    stable_seconds: float = 0.25,
+    max_seconds: float = 8.0,
+    linear_velocity_threshold: float = 0.01,
+    angular_velocity_threshold: float = 0.05,
+    other_dof_velocity_threshold: float = 0.02,
+    require_stable: bool = True,
     keep_robot_fixed: bool = True,
+    open_gripper: bool = True,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Let objects settle before the first policy inference without env.step().
+    """Advance physics until scene objects have remained stable for a time window.
 
     The fast runner moves the robot by direct IK/qpos writes instead of robosuite
     env.step().  After env.reset(), some LIBERO objects may still be slightly
     above the table or have transient velocity.  If the policy starts immediately,
     the first point cloud can represent a scene that has not settled yet.  This
-    helper advances only MuJoCo physics for a few ticks, while optionally restoring
-    the robot arm and gripper qpos so the robot itself does not drift before
-    policy execution starts.
+    helper advances only MuJoCo physics and monitors free-object linear/angular
+    velocities.  Stability must hold continuously, which avoids accepting the
+    near-zero velocity at the apex of a falling object's trajectory.  The robot
+    arm and gripper can be restored every tick so their motion does not affect the
+    stability decision or the initial policy observation.
     """
     sim = get_sim(env)
-    steps = max(0, int(steps))
-    if steps <= 0:
-        return get_raw_obs(env, force_update=True)
+    model = sim.model
+
+    timestep = 0.002
+    for candidate in (model, getattr(model, "_model", None)):
+        opt = getattr(candidate, "opt", None)
+        candidate_timestep = getattr(opt, "timestep", None)
+        if candidate_timestep is not None and float(candidate_timestep) > 0.0:
+            timestep = float(candidate_timestep)
+            break
+
+    minimum_steps = max(max(0, int(steps)), int(np.ceil(max(0.0, float(min_seconds)) / timestep)))
+    stable_steps = max(1, int(np.ceil(max(0.0, float(stable_seconds)) / timestep)))
+    warning_steps = max(
+        minimum_steps + stable_steps,
+        int(np.ceil(max(0.0, float(max_seconds)) / timestep)),
+    )
 
     arm_qpos_idx: list[int] = []
     arm_qvel_idx: list[int] = []
@@ -1106,13 +1387,79 @@ def settle_scene_after_reset(
             arm_qpos_idx, arm_qvel_idx = robot_arm_indices(env)
         except Exception:
             arm_qpos_idx, arm_qvel_idx = [], []
+    if bool(keep_robot_fixed) or bool(open_gripper):
         try:
             gripper_records = gripper_joint_records(env)
         except Exception:
             gripper_records = []
 
+    if bool(open_gripper):
+        if not gripper_records:
+            raise RuntimeError("Could not identify gripper joints required to set the initial fully-open state.")
+        for rec in gripper_records:
+            joint_id = int(rec["joint_id"])
+            qpos_adr = int(rec["qpos_adr"])
+            joint_range = np.asarray(model.jnt_range[joint_id], dtype=np.float64).reshape(-1)
+            if joint_range.size < 2:
+                raise RuntimeError(f"Gripper joint {rec['name']!r} does not have a valid joint range.")
+            # Panda finger joints have opposite signs: [0, +0.04] and
+            # [-0.04, 0].  The endpoint with the larger absolute displacement
+            # is the open limit for each finger.
+            low, high = float(joint_range[0]), float(joint_range[1])
+            sim.data.qpos[qpos_adr] = low if abs(low) > abs(high) else high
+            qvel_adr = int(rec.get("qvel_adr", -1))
+            if 0 <= qvel_adr < len(sim.data.qvel):
+                sim.data.qvel[qvel_adr] = 0.0
+        sim.forward()
+
     fixed_arm_qpos = np.asarray(sim.data.qpos[arm_qpos_idx], dtype=np.float64).copy() if arm_qpos_idx else None
     fixed_gripper_qpos = {int(rec["qpos_adr"]): float(sim.data.qpos[int(rec["qpos_adr"])]) for rec in gripper_records}
+
+    robot_qvel_idx = {int(index) for index in arm_qvel_idx}
+    for rec in gripper_records:
+        qvel_adr = int(rec.get("qvel_adr", -1))
+        if qvel_adr >= 0:
+            robot_qvel_idx.add(qvel_adr)
+    robot = getattr(env, "robots", [None])[0]
+    if robot is not None:
+        for attr in (
+            "_ref_joint_vel_indexes",
+            "ref_joint_vel_indexes",
+            "_ref_gripper_joint_vel_indexes",
+            "ref_gripper_joint_vel_indexes",
+            "gripper_joint_vel_indexes",
+        ):
+            value = getattr(robot, attr, None)
+            if value is not None:
+                robot_qvel_idx.update(int(index) for index in np.asarray(value).reshape(-1).tolist())
+
+    # MuJoCo joint types: free=0, ball=1, slide=2, hinge=3.  LIBERO tabletop
+    # objects use free joints, so these six-DoF velocity blocks are the most
+    # direct, scene-independent signal that falling / bouncing has stopped.
+    free_object_dof_addresses: list[int] = []
+    all_non_robot_dofs: list[int] = []
+    joint_type_to_dofs = {0: 6, 1: 3, 2: 1, 3: 1}
+    try:
+        joint_types = np.asarray(model.jnt_type).reshape(-1)
+        joint_dof_addresses = np.asarray(model.jnt_dofadr).reshape(-1)
+        for joint_id, raw_joint_type in enumerate(joint_types):
+            joint_type = int(raw_joint_type)
+            dof_address = int(joint_dof_addresses[joint_id])
+            dof_count = int(joint_type_to_dofs.get(joint_type, 0))
+            dofs = [dof_address + offset for offset in range(dof_count)]
+            scene_dofs = [index for index in dofs if index not in robot_qvel_idx]
+            all_non_robot_dofs.extend(scene_dofs)
+            if joint_type == 0 and len(scene_dofs) == 6:
+                free_object_dof_addresses.append(dof_address)
+    except Exception:
+        free_object_dof_addresses = []
+        all_non_robot_dofs = [
+            index for index in range(len(sim.data.qvel)) if index not in robot_qvel_idx
+        ]
+
+    # Prefer free objects whenever they exist.  This avoids passive robot finger
+    # joints or tiny fixture-joint jitter blocking an otherwise settled scene.
+    use_free_object_velocity = bool(free_object_dof_addresses)
 
     def _restore_robot() -> None:
         if fixed_arm_qpos is not None and arm_qpos_idx:
@@ -1128,31 +1475,141 @@ def settle_scene_after_reset(
                 if 0 <= qvel_adr < len(sim.data.qvel):
                     sim.data.qvel[qvel_adr] = 0.0
 
+    def _scene_velocity_metrics() -> tuple[float, float, float]:
+        qvel = np.asarray(sim.data.qvel, dtype=np.float64)
+        max_linear = 0.0
+        max_angular = 0.0
+        if use_free_object_velocity:
+            for dof_address in free_object_dof_addresses:
+                max_linear = max(max_linear, float(np.linalg.norm(qvel[dof_address : dof_address + 3])))
+                max_angular = max(max_angular, float(np.linalg.norm(qvel[dof_address + 3 : dof_address + 6])))
+            return max_linear, max_angular, 0.0
+        max_other = (
+            float(np.max(np.abs(qvel[np.asarray(all_non_robot_dofs, dtype=np.int64)])))
+            if all_non_robot_dofs
+            else 0.0
+        )
+        return 0.0, 0.0, max_other
+
     sim.forward()
-    if bool(keep_robot_fixed):
+    if bool(keep_robot_fixed) or bool(open_gripper):
         _restore_robot()
-    for settle_step in range(steps):
+        sim.forward()
+
+    consecutive_stable_steps = 0
+    scene_is_stable = False
+    executed_steps = 0
+    max_linear_speed = 0.0
+    max_angular_speed = 0.0
+    max_other_speed = 0.0
+    warned_slow_settling = False
+    settle_step = 0
+    while True:
         if hasattr(sim.data, "ctrl"):
             try:
                 sim.data.ctrl[:] = 0.0
             except Exception:
                 pass
-        if bool(keep_robot_fixed):
+        if bool(keep_robot_fixed) or bool(open_gripper):
             _restore_robot()
         try:
             sim.step()
-        except Exception:
-            break
-        if bool(keep_robot_fixed):
+        except Exception as exc:
+            raise RuntimeError(f"MuJoCo failed while settling the scene at physics tick {settle_step}.") from exc
+        if bool(keep_robot_fixed) or bool(open_gripper):
             _restore_robot()
+            sim.forward()
+
+        executed_steps = settle_step + 1
+        max_linear_speed, max_angular_speed, max_other_speed = _scene_velocity_metrics()
+        velocity_is_stable = (
+            max_linear_speed <= float(linear_velocity_threshold)
+            and max_angular_speed <= float(angular_velocity_threshold)
+            and max_other_speed <= float(other_dof_velocity_threshold)
+        )
+        if executed_steps >= minimum_steps and velocity_is_stable:
+            consecutive_stable_steps += 1
+        else:
+            consecutive_stable_steps = 0
+        if consecutive_stable_steps >= stable_steps:
+            scene_is_stable = True
+            break
+        if executed_steps >= warning_steps and not warned_slow_settling:
+            monitored = (
+                f"{len(free_object_dof_addresses)} free objects"
+                if use_free_object_velocity
+                else f"{len(all_non_robot_dofs)} scene DoFs"
+            )
+            message = (
+                "Scene settling is slower than expected: "
+                f"ticks={executed_steps}, sim_time={executed_steps * timestep:.3f}s, "
+                f"monitored={monitored}, linear={max_linear_speed:.6f}m/s, "
+                f"angular={max_angular_speed:.6f}rad/s, other={max_other_speed:.6f}."
+            )
+            if bool(require_stable):
+                print(f"[warn] {message} Keeping this episode and waiting until it is stable.", flush=True)
+            else:
+                print(
+                    f"[warn] {message} Continuing because --no-settle-require-stable was selected.",
+                    flush=True,
+                )
+                break
+            warned_slow_settling = True
+        settle_step += 1
+
+    if bool(keep_robot_fixed) or bool(open_gripper):
+        # Restore once more so the arm exactly matches the episode init_state and
+        # the gripper exactly matches its selected initial state (fully open by
+        # default) in both simulator state and the first model observation.
+        _restore_robot()
     sim.forward()
+
+    robot_qpos_error = 0.0
+    if bool(keep_robot_fixed) or bool(open_gripper):
+        if fixed_arm_qpos is not None and arm_qpos_idx:
+            robot_qpos_error = max(
+                robot_qpos_error,
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(sim.data.qpos[arm_qpos_idx], dtype=np.float64)
+                            - fixed_arm_qpos
+                        )
+                    )
+                ),
+            )
+        for qpos_adr, expected_value in fixed_gripper_qpos.items():
+            robot_qpos_error = max(
+                robot_qpos_error,
+                abs(float(sim.data.qpos[int(qpos_adr)]) - float(expected_value)),
+            )
+        if robot_qpos_error > 1e-10:
+            raise RuntimeError(
+                "Robot initial qpos changed during scene settling "
+                f"(maximum absolute error={robot_qpos_error:.3e})."
+            )
+
+    monitored = (
+        f"{len(free_object_dof_addresses)} free objects"
+        if use_free_object_velocity
+        else f"{len(all_non_robot_dofs)} scene DoFs"
+    )
+    settle_summary = (
+        f"ticks={executed_steps}, sim_time={executed_steps * timestep:.3f}s, monitored={monitored}, "
+        f"linear={max_linear_speed:.6f}m/s, angular={max_angular_speed:.6f}rad/s, "
+        f"other={max_other_speed:.6f}, robot_qpos_error={robot_qpos_error:.3e}, "
+        f"gripper_width={sum(abs(value) for value in fixed_gripper_qpos.values()):.6f}m"
+    )
+    # if scene_is_stable:
+    #     print(f"[settle] scene stable: {settle_summary}", flush=True)
+
     raw_obs = get_raw_obs(env, force_update=True)
     return raw_obs
 
 
 def run_episode(
     *,
-    infer: SmolVLA_ModelInference,
+    infer: Any,
     env: Any,
     task_language: str,
     init_state: np.ndarray,
@@ -1172,8 +1629,16 @@ def run_episode(
 
     raw_obs = settle_scene_after_reset(
         env,
-        steps=int(cfg['settle_steps']),
-        keep_robot_fixed=bool(cfg['settle_keep_robot_fixed']),
+        steps=int(cfg["settle_steps"]),
+        min_seconds=float(cfg["settle_min_seconds"]),
+        stable_seconds=float(cfg["settle_stable_seconds"]),
+        max_seconds=float(cfg["settle_max_seconds"]),
+        linear_velocity_threshold=float(cfg["settle_linear_velocity_threshold"]),
+        angular_velocity_threshold=float(cfg["settle_angular_velocity_threshold"]),
+        other_dof_velocity_threshold=float(cfg["settle_other_dof_velocity_threshold"]),
+        require_stable=bool(cfg["settle_require_stable"]),
+        keep_robot_fixed=bool(cfg["settle_keep_robot_fixed"]),
+        open_gripper=bool(cfg["initial_gripper_open"]),
         cfg=cfg,
     )
 
@@ -1186,13 +1651,14 @@ def run_episode(
     for _ in range(warmup_steps):
         raw_obs, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
 
-    infer.policy.reset()
-    infer.policy_reset()
+    if not bool(getattr(infer, "shared_parallel_inference", False)):
+        infer.policy.reset()
+        infer.policy_reset()
 
     policy_rgb_camera_map: dict[str, str] = {}
     if infer.policy.config.vla_adapter_enable:
         policy_rgb_camera_map = resolve_policy_rgb_cameras(infer, raw_obs, cfg)
-        print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
+        # print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
 
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
     save_video = bool(cfg.get("save_video", True))
@@ -1217,13 +1683,14 @@ def run_episode(
 
     manual_failure = False
     keyboard = EpisodeKeyboardControl()
-    terminal_keys_enabled = keyboard.start_terminal()
+    if bool(cfg.get("keyboard_control_enabled", True)):
+        keyboard.start_terminal()
     if str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
         render_camera = normalize_render_camera_name(str(cfg.get("render_camera", "agentview")))
         attach_mujoco_3d_viewer(env, render_camera=render_camera, key_callback=keyboard.viewer_key_callback)
         render_viewer3d(env, cfg, steps, force=True)
-    if terminal_keys_enabled or str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
-        print("[eval] press 'n' to mark the current episode as failed and continue", flush=True)
+    # if terminal_keys_enabled or str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
+        # print("[eval] press 'n' to mark the current episode as failed and continue", flush=True)
 
     try:
         while steps < max_steps and not done and not success_ever:
@@ -1373,6 +1840,169 @@ def run_episode(
     }
 
 
+def evaluate_task(
+    *,
+    infer: Any,
+    suite: Any,
+    suite_name: str,
+    task_id: int,
+    cfg: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Evaluate all configured episodes for one task in its owning worker thread."""
+    init_states = get_task_init_states(suite, int(task_id))
+    task_results: list[dict[str, Any]] = []
+    task_name = f"task_{int(task_id):03d}"
+    task_language = f"{suite_name}:{int(task_id)}"
+
+    def _make_task_env() -> tuple[Any, Any]:
+        # LIBERO / robosuite model construction and EGL context setup enter
+        # process-global native registries.  Concurrent construction can
+        # segfault even though already-created environments are independent.
+        with _ENV_CREATION_LOCK:
+            return make_libero_env(
+                suite,
+                int(task_id),
+                int(cfg["observation_height"]),
+                int(cfg["observation_width"]),
+                render_camera_names_from_config(cfg),
+                render_mode=str(cfg.get("render_mode", "offscreen")),
+                render_camera=str(cfg.get("render_camera", "agentview")),
+                render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
+                control_delta=False,
+                control_freq=float(cfg["control"].get("control_freq", 20.0)),
+            )
+
+    shared_env = None
+    try:
+        if not bool(cfg.get("recreate_env_per_episode", False)):
+            shared_env, shared_task = _make_task_env()
+            task_name = str(getattr(shared_task, "name", task_name))
+            task_language = str(getattr(shared_task, "language", task_language))
+
+        for episode_idx in range(int(cfg["episodes"])):
+            episode_dir = (
+                output_dir
+                / suite_name
+                / f"task_{int(task_id):03d}"
+                / f"episode_{episode_idx:03d}"
+            )
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                f"[eval] start suite={suite_name} task={task_id} episode={episode_idx}",
+                flush=True,
+            )
+
+            env = shared_env
+            try:
+                if bool(cfg.get("recreate_env_per_episode", False)):
+                    env, task = _make_task_env()
+                    task_name = str(getattr(task, "name", task_name))
+                    task_language = str(getattr(task, "language", task_language))
+
+                assert env is not None
+                result = run_episode(
+                    infer=infer,
+                    env=env,
+                    task_language=task_language,
+                    init_state=init_states[episode_idx % len(init_states)],
+                    cfg=cfg,
+                )
+
+                action_npz = save_episode_actions(result, episode_dir)
+                episode_record = compact_episode_record(result, episode_idx, action_npz)
+
+                if bool(cfg.get("save_video", True)):
+                    video_record = {
+                        "episode_index": int(episode_idx),
+                        "demo_name": "rollout",
+                        "video_dir_name": episode_dir.name,
+                    }
+                    video_paths = export_episode_videos(
+                        result,
+                        episode_dir.parent,
+                        video_record,
+                        cfg,
+                    )
+                    if video_paths:
+                        episode_record["videos"] = video_paths
+
+                write_json_atomic(episode_dir / "result.json", episode_record)
+                task_results.append(episode_record)
+                print(
+                    f"[eval] done suite={suite_name} task={task_id} episode={episode_idx} "
+                    f"success={episode_record['success']} steps={episode_record['steps']} "
+                    f"model_calls={episode_record['model_call_count']} "
+                    f"sum_reward={episode_record['sum_reward']:.3f}",
+                    flush=True,
+                )
+            except Exception as exc:
+                failure = {
+                    "episode_index": int(episode_idx),
+                    "success": False,
+                    "steps": 0,
+                    "model_call_count": 0,
+                    "sum_reward": 0.0,
+                    "max_reward": 0.0,
+                    "error": repr(exc),
+                }
+                write_json_atomic(episode_dir / "result.json", failure)
+                write_json_atomic(episode_dir / "error.json", failure)
+                task_results.append(failure)
+                print(
+                    f"[warn] failed suite={suite_name} task={task_id} episode={episode_idx}: {exc!r}",
+                    flush=True,
+                )
+            finally:
+                if bool(cfg.get("recreate_env_per_episode", False)) and env is not None:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+    finally:
+        if shared_env is not None:
+            try:
+                shared_env.close()
+            except Exception:
+                pass
+
+    return make_task_summary(
+        suite_name=suite_name,
+        task_id=int(task_id),
+        task_name=task_name,
+        task_language=task_language,
+        episodes=task_results,
+    )
+
+
+def failed_task_summary(
+    *,
+    suite_name: str,
+    task_id: int,
+    episode_count: int,
+    exc: BaseException,
+) -> dict[str, Any]:
+    episodes = [
+        {
+            "episode_index": episode_idx,
+            "success": False,
+            "steps": 0,
+            "model_call_count": 0,
+            "sum_reward": 0.0,
+            "max_reward": 0.0,
+            "error": repr(exc),
+        }
+        for episode_idx in range(int(episode_count))
+    ]
+    return make_task_summary(
+        suite_name=suite_name,
+        task_id=int(task_id),
+        task_name=f"task_{int(task_id):03d}",
+        task_language=f"{suite_name}:{int(task_id)}",
+        episodes=episodes,
+    )
+
+
 def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str], Path]:
     cfg = load_config(args.config)
     cfg.setdefault("control", {})
@@ -1389,6 +2019,12 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["render_every_n_steps"] = int(cfg_get(cfg, args.render_every_n_steps, "render_every_n_steps", 1))
     cfg["render_gpu_device_id"] = int(cfg_get(cfg, args.render_gpu_device_id, "render_gpu_device_id", -1))
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", True))
+    cfg["visualize_foreground"] = bool(
+        cfg_get(cfg, args.visualize_foreground, "visualize_foreground", False)
+    )
+    cfg["foreground_vis_max_points"] = int(
+        cfg_get(cfg, args.foreground_vis_max_points, "foreground_vis_max_points", 50000)
+    )
     cfg["add_gripper_cloud"] = bool(cfg_get(cfg, args.add_gripper_cloud, "add_gripper_cloud", True))
     if args.gripper_points is not None:
         cfg["gripper_points"] = int(args.gripper_points)
@@ -1419,8 +2055,56 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["recreate_env_per_episode"] = bool(
         cfg_get(cfg, args.recreate_env_per_episode, "recreate_env_per_episode", False)
     )
-    cfg["settle_steps"] = args.settle_steps
-    cfg["settle_keep_robot_fixed"] = args.settle_keep_robot_fixed
+    cfg["settle_steps"] = int(cfg_get(cfg, args.settle_steps, "settle_steps", 0))
+    cfg["settle_min_seconds"] = float(
+        cfg_get(cfg, args.settle_min_seconds, "settle_min_seconds", 0.25)
+    )
+    cfg["settle_stable_seconds"] = float(
+        cfg_get(cfg, args.settle_stable_seconds, "settle_stable_seconds", 0.25)
+    )
+    cfg["settle_max_seconds"] = float(
+        cfg_get(cfg, args.settle_max_seconds, "settle_max_seconds", 8.0)
+    )
+    cfg["settle_linear_velocity_threshold"] = float(
+        cfg_get(cfg, args.settle_linear_velocity_threshold, "settle_linear_velocity_threshold", 0.01)
+    )
+    cfg["settle_angular_velocity_threshold"] = float(
+        cfg_get(cfg, args.settle_angular_velocity_threshold, "settle_angular_velocity_threshold", 0.05)
+    )
+    cfg["settle_other_dof_velocity_threshold"] = float(
+        cfg_get(cfg, args.settle_other_dof_velocity_threshold, "settle_other_dof_velocity_threshold", 0.02)
+    )
+    cfg["settle_require_stable"] = bool(
+        cfg_get(cfg, args.settle_require_stable, "settle_require_stable", True)
+    )
+    cfg["settle_keep_robot_fixed"] = bool(
+        cfg_get(cfg, args.settle_keep_robot_fixed, "settle_keep_robot_fixed", True)
+    )
+    cfg["initial_gripper_open"] = bool(
+        cfg_get(cfg, args.initial_gripper_open, "initial_gripper_open", True)
+    )
+    cfg["task_workers"] = max(1, int(cfg_get(cfg, args.task_workers, "task_workers", 1)))
+    cfg["inference_batch_size"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg,
+                args.inference_batch_size,
+                "inference_batch_size",
+                cfg["task_workers"],
+            )
+        ),
+    )
+    cfg["inference_batch_wait_ms"] = max(
+        0.0,
+        float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
+    )
+    cfg["keyboard_control_enabled"] = cfg["task_workers"] == 1
+    if cfg["task_workers"] > 1:
+        if str(cfg.get("render_mode", "offscreen")).lower() != "offscreen":
+            raise ValueError("--task-workers > 1 requires --render-mode offscreen.")
+        if bool(cfg.get("visualize_foreground", False)):
+            raise ValueError("--task-workers > 1 requires --no-visualize-foreground.")
 
     return cfg, suite_names, output_dir
 
@@ -1436,160 +2120,108 @@ def main() -> None:
         policy_path=cfg["policy_path"],
         policy_repo_id=cfg.get("policy_repo_id"),
         device=cfg["device"],
+        visualize_foreground=cfg["visualize_foreground"],
+        foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
     )
 
     print(
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={cfg['episodes']}, "
+        f"task_workers={cfg['task_workers']}, "
+        f"inference_batch_size={cfg['inference_batch_size']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
         f"gripper_threshold={cfg['control']['gripper_threshold']}, "
         f"save_video={cfg['save_video']}, "
         f"render_mode={cfg.get('render_mode')}, "
-        f"render_every_n_steps={cfg.get('render_every_n_steps')}"
+        f"render_every_n_steps={cfg.get('render_every_n_steps')}, "
+        f"visualize_foreground={cfg.get('visualize_foreground')}"
     )
 
     all_task_summaries: list[dict[str, Any]] = []
     benchmark_dict = benchmark.get_benchmark_dict()
-
-    for suite_name in suite_names:
-        suite = benchmark_dict[suite_name]()
-        task_ids = resolve_task_ids_for_suite(
-            suite_name=suite_name,
-            task_count=len(suite.tasks),
-            cli_task_ids=args.task_id,
-            cfg=cfg,
+    scheduler: BatchedInferenceScheduler | None = None
+    eval_infer: Any = infer
+    if int(cfg["task_workers"]) > 1:
+        scheduler = BatchedInferenceScheduler(
+            infer,
+            max_batch_size=int(cfg["inference_batch_size"]),
+            batch_wait_ms=float(cfg["inference_batch_wait_ms"]),
         )
+        eval_infer = scheduler
 
-        for task_id in task_ids:
-            init_states = get_task_init_states(suite, int(task_id))
-            task_results: list[dict[str, Any]] = []
-            task_name = f"task_{int(task_id):03d}"
-            task_language = f"{suite_name}:{int(task_id)}"
+    try:
+        for suite_name in suite_names:
+            suite = benchmark_dict[suite_name]()
+            task_ids = resolve_task_ids_for_suite(
+                suite_name=suite_name,
+                task_count=len(suite.tasks),
+                cli_task_ids=args.task_id,
+                cfg=cfg,
+            )
+            worker_count = min(int(cfg["task_workers"]), max(1, len(task_ids)))
 
-            shared_env = None
-            shared_task = None
-            try:
-                if not bool(cfg.get("recreate_env_per_episode", False)):
-                    shared_env, shared_task = make_libero_env(
-                        suite,
-                        int(task_id),
-                        int(cfg["observation_height"]),
-                        int(cfg["observation_width"]),
-                        render_camera_names_from_config(cfg),
-                        render_mode=str(cfg.get("render_mode", "offscreen")),
-                        render_camera=str(cfg.get("render_camera", "agentview")),
-                        render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
-                        control_delta=False,
-                        control_freq=float(cfg["control"].get("control_freq", 20.0)),
-                    )
-                    task_name = str(getattr(shared_task, "name", task_name))
-                    task_language = str(getattr(shared_task, "language", task_language))
-
-                for episode_idx in range(int(cfg["episodes"])):
-                    episode_dir = output_dir / suite_name / f"task_{int(task_id):03d}" / f"episode_{episode_idx:03d}"
-                    episode_dir.mkdir(parents=True, exist_ok=True)
-                    print(f"[eval] start suite={suite_name} task={task_id} episode={episode_idx}", flush=True)
-
-                    env = shared_env
-                    task = shared_task
-                    if bool(cfg.get("recreate_env_per_episode", False)):
-                        env, task = make_libero_env(
-                            suite,
-                            int(task_id),
-                            int(cfg["observation_height"]),
-                            int(cfg["observation_width"]),
-                            render_camera_names_from_config(cfg),
-                            render_mode=str(cfg.get("render_mode", "offscreen")),
-                            render_camera=str(cfg.get("render_camera", "agentview")),
-                            render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
-                            control_delta=False,
-                            control_freq=float(cfg["control"].get("control_freq", 20.0)),
-                        )
-                        task_name = str(getattr(task, "name", task_name))
-                        task_language = str(getattr(task, "language", task_language))
-
-                    try:
-                        assert env is not None
-                        result = run_episode(
-                            infer=infer,
-                            env=env,
-                            task_language=task_language,
-                            init_state=init_states[episode_idx % len(init_states)],
-                            cfg=cfg,
-                        )
-
-
-                        action_npz = save_episode_actions(result, episode_dir)
-                        episode_record = compact_episode_record(result, episode_idx, action_npz)
-
-                        if bool(cfg.get("save_video", True)):
-                            video_record = {
-                                "episode_index": int(episode_idx),
-                                "demo_name": "rollout",
-                                "video_dir_name": episode_dir.name,
-                            }
-                            video_paths = export_episode_videos(result, episode_dir.parent, video_record, cfg)
-                            if video_paths:
-                                episode_record["videos"] = video_paths
-
-                        write_json_atomic(episode_dir / "result.json", episode_record)
-                        task_results.append(episode_record)
-                        print(
-                            f"[eval] done suite={suite_name} task={task_id} episode={episode_idx} "
-                            f"success={episode_record['success']} steps={episode_record['steps']} "
-                            f"model_calls={episode_record['model_call_count']} "
-                            f"sum_reward={episode_record['sum_reward']:.3f}",
-                            flush=True,
-                        )
-                    except Exception as exc:
-                        failure = {
-                            "episode_index": int(episode_idx),
-                            "success": False,
-                            "steps": 0,
-                            "model_call_count": 0,
-                            "sum_reward": 0.0,
-                            "max_reward": 0.0,
-                            "error": repr(exc),
-                        }
-                        write_json_atomic(episode_dir / "result.json", failure)
-                        write_json_atomic(episode_dir / "error.json", failure)
-                        task_results.append(failure)
-                        print(
-                            f"[warn] failed suite={suite_name} task={task_id} episode={episode_idx}: {exc!r}",
-                            flush=True,
-                        )
-                    finally:
-                        if bool(cfg.get("recreate_env_per_episode", False)) and env is not None:
-                            try:
-                                env.close()
-                            except Exception:
-                                pass
-
-                    current_task_summary = make_task_summary(
+            if worker_count == 1:
+                for task_id in task_ids:
+                    summary = evaluate_task(
+                        infer=eval_infer,
+                        suite=suite,
                         suite_name=suite_name,
                         task_id=int(task_id),
-                        task_name=task_name,
-                        task_language=task_language,
-                        episodes=task_results,
+                        cfg=cfg,
+                        output_dir=output_dir,
                     )
-                    write_eval_reports(output_dir, cfg, suite_names, [*all_task_summaries, current_task_summary])
+                    all_task_summaries.append(summary)
+                    write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
+                continue
 
-            finally:
-                if shared_env is not None:
-                    try:
-                        shared_env.close()
-                    except Exception:
-                        pass
-
-            all_task_summaries.append(
-                make_task_summary(
-                    suite_name=suite_name,
-                    task_id=int(task_id),
-                    task_name=task_name,
-                    task_language=task_language,
-                    episodes=task_results,
-                )
+            print(
+                f"[parallel] suite={suite_name}: starting {worker_count} task workers "
+                f"for task_ids={list(map(int, task_ids))}",
+                flush=True,
             )
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix=f"{suite_name}-task",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        evaluate_task,
+                        infer=eval_infer,
+                        suite=suite,
+                        suite_name=suite_name,
+                        task_id=int(task_id),
+                        cfg=cfg,
+                        output_dir=output_dir,
+                    ): int(task_id)
+                    for task_id in task_ids
+                }
+                for future in as_completed(futures):
+                    task_id = futures[future]
+                    try:
+                        summary = future.result()
+                    except BaseException as exc:
+                        print(
+                            f"[warn] task worker failed suite={suite_name} task={task_id}: {exc!r}",
+                            flush=True,
+                        )
+                        summary = failed_task_summary(
+                            suite_name=suite_name,
+                            task_id=task_id,
+                            episode_count=int(cfg["episodes"]),
+                            exc=exc,
+                        )
+                    all_task_summaries.append(summary)
+                    all_task_summaries.sort(
+                        key=lambda item: (
+                            suite_names.index(str(item["suite"])),
+                            int(item["task_id"]),
+                        )
+                    )
+                    write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
+    finally:
+        if scheduler is not None:
+            scheduler.close()
+        infer.close()
 
     write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
     print(json.dumps(aggregate_task_results(all_task_summaries), indent=2, ensure_ascii=False))

@@ -23,6 +23,11 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.policies.smolvla.song_pointseg import open_episode_point_clouds
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.inference_diagnostics import (
+    ForegroundScoreVisualizer,
+    SmolVLAModalityAnalyzer,
+    save_modality_influence_report,
+)
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import (
     ACTION,
@@ -230,6 +235,8 @@ class SmolVLA_ModelInference:
         device: str = "cuda",
         processor_path: str | Path | None = None,
         local_files_only: bool = True,
+        visualize_foreground: bool | None = None,
+        foreground_visualizer_max_points: int = 50000,
     ) -> None:
         self.policy_path = str(policy_path)
         self.policy_repo_id = str(policy_repo_id) if policy_repo_id is not None else None
@@ -262,8 +269,92 @@ class SmolVLA_ModelInference:
         self.dataset: torch.utils.data.Dataset | None = None
         self.predict_action_queue = deque()
         self.last_model_point_cloud: np.ndarray | None = None
+        self.last_model_observation: dict[str, Any] | None = None
+        if visualize_foreground is None:
+            visualize_foreground = os.environ.get("SONG_VISUALIZE_FOREGROUND", "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.foreground_visualizer = ForegroundScoreVisualizer(
+            enabled=bool(visualize_foreground),
+            max_points=int(foreground_visualizer_max_points),
+        )
+        self.policy.model.capture_pointseg_visualization = bool(visualize_foreground)
+        self.modality_analyzer = SmolVLAModalityAnalyzer(self.policy, self.postprocessor)
         self.policy.n_action_steps = 16
         self.policy.horizon = 32
+
+    def enable_foreground_visualization(self, enabled: bool = True) -> None:
+        self.foreground_visualizer.enabled = bool(enabled)
+        self.policy.model.capture_pointseg_visualization = bool(enabled)
+        if enabled:
+            self.foreground_visualizer.enable()
+        else:
+            self.foreground_visualizer.close()
+
+    def _update_foreground_visualization(self) -> None:
+        if self.foreground_visualizer.enabled:
+            self.foreground_visualizer.update_from_model(self.policy.model)
+
+    @torch.inference_mode()
+    def analyze_modality_influence(
+        self,
+        observation: dict[str, Any],
+        *,
+        task: str | list[str] = "",
+        state_pose_mode: str = "identity",
+        seed: int = 0,
+        reference_action_chunk: torch.Tensor | np.ndarray | None = None,
+        output_dir: str | Path | None = None,
+    ) -> dict[str, Any]:
+        model_batch = self.build_model_batch(observation, task=task, state_pose_mode=state_pose_mode)
+        report = self.modality_analyzer.analyze(
+            model_batch,
+            seed=seed,
+            reference_action_chunk=reference_action_chunk,
+        )
+        if output_dir is not None:
+            report["artifacts"] = save_modality_influence_report(report, output_dir)
+        self._update_foreground_visualization()
+        return report
+
+    @torch.inference_mode()
+    def analyze_dataset_index(
+        self,
+        index: int,
+        *,
+        dataset_repo_id: str | Path | None = None,
+        dataset_root: str | Path | None = None,
+        task: str | None = None,
+        seed: int = 0,
+        output_dir: str | Path | None = None,
+    ) -> dict[str, Any]:
+        if self.dataset is None:
+            if dataset_repo_id is None:
+                raise ValueError("dataset_repo_id is required before the dataset has been loaded.")
+            self.load_dataset(dataset_repo_id, root=dataset_root)
+        assert self.dataset is not None
+        batch = default_collate([dict(self.dataset[index])])
+        if task is not None:
+            batch["task"] = [task]
+        model_batch = self.preprocessor(batch)
+        reference = model_batch.get(ACTION)
+        report = self.modality_analyzer.analyze(
+            model_batch,
+            seed=seed,
+            reference_action_chunk=reference,
+        )
+        report["dataset_index"] = int(index)
+        if output_dir is not None:
+            report["artifacts"] = save_modality_influence_report(report, output_dir)
+        self._update_foreground_visualization()
+        return report
+
+    def close(self) -> None:
+        self.foreground_visualizer.close()
+
     def _resolve_processor_path(self, processor_path: str | Path | None) -> str | None:
         candidates = [processor_path, self.policy_path, self.policy_repo_id]
         for candidate in candidates:
@@ -331,6 +422,7 @@ class SmolVLA_ModelInference:
 
         model_batch = self.preprocessor(batch)
         action_chunk = self.policy.predict_action_chunk(model_batch)
+        self._update_foreground_visualization()
         first_action = action_chunk[:, 0]
 
         if postprocess:
@@ -362,6 +454,7 @@ class SmolVLA_ModelInference:
             state_pose_mode=state_pose_mode,
         )
         action_chunk = self.policy.predict_action_chunk(model_batch)
+        self._update_foreground_visualization()
         if postprocess:
             action_chunk = self.postprocessor(action_chunk)
         return action_chunk.detach().cpu()
@@ -381,6 +474,7 @@ class SmolVLA_ModelInference:
             state_pose_mode=state_pose_mode,
         )
         action = self.policy.select_action(model_batch)
+        self._update_foreground_visualization()
         if postprocess:
             action = self.postprocessor(action)
         return action.detach().cpu()
@@ -400,6 +494,7 @@ class SmolVLA_ModelInference:
         gripper_drop_strategy: str = "tail",
         gripper_shuffle_points: bool = False,
         gripper_qpos_max_width: float = 0.08,
+        visualize_foreground: bool | None = None,
     ) -> np.ndarray:
         """Run one real-robot style inference step.
 
@@ -443,6 +538,8 @@ class SmolVLA_ModelInference:
                 gripper_shuffle_points=gripper_shuffle_points,
             )
         self.last_model_point_cloud = one_step_point_cloud
+        if visualize_foreground is True:
+            self.enable_foreground_visualization(True)
         if len(self.predict_action_queue)==0:
             model_observation = {
                 "point_cloud": one_step_point_cloud,
@@ -451,6 +548,7 @@ class SmolVLA_ModelInference:
             for image_alias in ("overhead", "hand"):
                 if image_alias in cur_model_observation:
                     model_observation[image_alias] = cur_model_observation[image_alias]
+            self.last_model_observation = model_observation
             action_chunk = self.predict_action_chunk_obs(
                 model_observation,
                 task=task,
@@ -468,6 +566,8 @@ class SmolVLA_ModelInference:
             self.predict_action_queue.extend(pred_world_pose9_gripper)
             if visualize:
                 vis_umi_data(pred_world_pose9_gripper, one_step_point_cloud)
+        elif self.foreground_visualizer.enabled:
+            self.foreground_visualizer.refresh()
 
         pred_action = self.predict_action_queue.popleft()
         pred_pose9_gripper_np = pred_action
@@ -496,7 +596,11 @@ class SmolVLA_ModelInference:
             raise ValueError(f"Expected point cloud shape (N, 6) or (B, N, 6), got {tuple(pc.shape)}")
         batch_size = pc.shape[0]
 
-        state_tensor = self._prepare_state_tensor(state, state_pose_mode=state_pose_mode)
+        state_tensor = self._prepare_state_tensor(
+            state,
+            state_pose_mode=state_pose_mode,
+            batch_size=batch_size,
+        )
         state_tensor = self._match_batch_size(state_tensor, batch_size, "observation.state")
         language = self._tokenize_task(task, batch_size)
 
@@ -594,7 +698,13 @@ class SmolVLA_ModelInference:
             )
         return tensor.contiguous()
 
-    def _prepare_state_tensor(self, state: Any | None, *, state_pose_mode: str) -> torch.Tensor:
+    def _prepare_state_tensor(
+        self,
+        state: Any | None,
+        *,
+        state_pose_mode: str,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
         state_feature = self.policy.config.robot_state_feature
         state_dim = state_feature.shape[0] if state_feature is not None else self.policy.config.max_state_dim
         if state is None:
@@ -603,7 +713,14 @@ class SmolVLA_ModelInference:
             state_tensor = self._to_tensor(state, dtype=torch.float32)
             if state_tensor.ndim == 1:
                 state_tensor = state_tensor.unsqueeze(0)
-            elif state_tensor.ndim == 2 and state_tensor.shape[-1] == state_dim and state_tensor.shape[0] != 1:
+            elif (
+                state_tensor.ndim == 2
+                and state_tensor.shape[-1] == state_dim
+                and state_tensor.shape[0] != batch_size
+            ):
+                # A single-observation temporal state arrives as (T, D).  A
+                # dynamic inference batch arrives as (B, D) and must not be
+                # collapsed to the last worker's state.
                 state_tensor = state_tensor.unsqueeze(0)
             if state_tensor.ndim > 2:
                 state_tensor = state_tensor[:, -1]
@@ -792,6 +909,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-qpos-max-width", type=float, default=0.08)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--visualize-foreground", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--foreground-vis-max-points", type=int, default=50000)
+    parser.add_argument("--analyze-modalities", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--analysis-output-dir", type=Path, default=None)
+    parser.add_argument("--analysis-seed", type=int, default=0)
     parser.add_argument("--save-trajectory-ply", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-postprocess", action="store_true")
     return parser.parse_args()
@@ -924,6 +1046,8 @@ def main() -> None:
         policy_repo_id=args.policy_repo_id,
         device=args.device,
         processor_path=args.processor_path,
+        visualize_foreground=args.visualize_foreground,
+        foreground_visualizer_max_points=args.foreground_vis_max_points,
     )
 
     if args.obs_path is not None:
@@ -941,6 +1065,7 @@ def main() -> None:
             gripper_drop_strategy=args.gripper_drop_strategy,
             gripper_shuffle_points=args.gripper_shuffle_points,
             gripper_qpos_max_width=args.gripper_qpos_max_width,
+            visualize_foreground=args.visualize_foreground,
         )
         print(f"Predicted single action shape: {tuple(action.shape)}")
         print(action)
@@ -961,6 +1086,19 @@ def main() -> None:
                 }
             },
         )
+        if args.analyze_modalities:
+            if infer.last_model_observation is None:
+                raise RuntimeError("single_inference did not retain a model observation for diagnostics.")
+            analysis_dir = args.analysis_output_dir or (
+                (args.output_dir / "modality_analysis") if args.output_dir is not None else Path("modality_analysis")
+            )
+            report = infer.analyze_modality_influence(
+                infer.last_model_observation,
+                task=args.task,
+                seed=args.analysis_seed,
+                output_dir=analysis_dir,
+            )
+            print("Modality influence:", report["normalized_action_l2_influence"])
         return
 
     if args.ply_path is not None:
@@ -1023,6 +1161,17 @@ def main() -> None:
     print(f"Predicted action chunk shape: {tuple(result['action_chunk'].shape)}")
     if result["gt_action_chunk"] is not None:
         print(f"Ground-truth action chunk shape: {tuple(result['gt_action_chunk'].shape)}")
+    if args.analyze_modalities:
+        analysis_dir = args.analysis_output_dir or (
+            (args.output_dir / "modality_analysis") if args.output_dir is not None else Path("modality_analysis")
+        )
+        report = infer.analyze_dataset_index(
+            args.index,
+            task=args.task or None,
+            seed=args.analysis_seed,
+            output_dir=analysis_dir,
+        )
+        print("Modality influence:", report["normalized_action_l2_influence"])
     save_inference_outputs(
         args.output_dir,
         action=result["action_chunk"].detach().cpu().numpy(),

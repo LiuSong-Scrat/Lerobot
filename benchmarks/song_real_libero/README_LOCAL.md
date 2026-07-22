@@ -7,7 +7,7 @@
       --suite libero_spatial \
       --suite libero_object \
       --all-tasks \
-      --episodes 10 \
+      --episodes 2 \
       --num-workers 10 \
       --point-cloud-storage zarr \
       --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \

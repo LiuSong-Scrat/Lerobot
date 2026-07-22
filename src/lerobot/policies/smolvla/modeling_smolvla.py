@@ -2099,6 +2099,11 @@ class VLAFlowMatching(nn.Module):
         self.last_point_action_mask: Tensor | None = None
         self.last_language_emb: Tensor | None = None
         self.last_body_pose9_prediction: Tensor | None = None
+        # Runtime-only diagnostics. These are plain Python attributes so they
+        # never alter checkpoints or normal training / inference behavior.
+        self.inference_ablation_modalities: frozenset[str] = frozenset()
+        self.capture_pointseg_visualization = False
+        self.last_pointseg_visualization: dict[str, Tensor] | None = None
         self.worldflow_head = (
             DenseRigidObjectFlowHead(config, self.vlm_with_expert.config.text_config.hidden_size)
             if self.config.worldflow_enable
@@ -2240,6 +2245,11 @@ class VLAFlowMatching(nn.Module):
         self.last_point_action_tokens = None
         self.last_point_action_mask = None
         self.last_language_emb = None
+        self.last_pointseg_visualization = None
+        diagnostic_ablations = self.inference_ablation_modalities
+        ablate_rgb = "rgb" in diagnostic_ablations
+        ablate_point = "point" in diagnostic_ablations
+        ablate_language = "language" in diagnostic_ablations
         embs = []
         pad_masks = []
         att_masks = []
@@ -2259,6 +2269,8 @@ class VLAFlowMatching(nn.Module):
                     image_start_mask = torch.ones(
                         image_start.shape[:2], dtype=torch.bool, device=image_start.device
                     )
+                    if ablate_rgb:
+                        image_start_mask.zero_()
                     embs.append(image_start)
                     pad_masks.append(image_start_mask)
                     att_masks += [0] * image_start.shape[1]
@@ -2272,6 +2284,8 @@ class VLAFlowMatching(nn.Module):
                         f"Expected one image-valid flag per sample, got {tuple(image_mask.shape)}."
                     )
                 image_mask = image_mask[:, None].expand(batch_size, num_image_tokens)
+                if ablate_rgb:
+                    image_mask = torch.zeros_like(image_mask)
                 embs.append(image_emb)
                 pad_masks.append(image_mask)
                 att_masks += [0] * num_image_tokens
@@ -2283,6 +2297,8 @@ class VLAFlowMatching(nn.Module):
                     image_end_mask = torch.ones(
                         image_end.shape[:2], dtype=torch.bool, device=image_end.device
                     )
+                    if ablate_rgb:
+                        image_end_mask.zero_()
                     embs.append(image_end)
                     pad_masks.append(image_end_mask)
                     att_masks += [0] * image_end.shape[1]
@@ -2305,7 +2321,7 @@ class VLAFlowMatching(nn.Module):
                 object_emb = self.pointseg_object_proj(conditioned["object_feat"])
                 background_emb = self.pointseg_background_proj(conditioned["background_feat"])
                 pc_emb = torch.stack([object_emb, background_emb], dim=1)
-                if self.point_action_fusion is not None:
+                if self.point_action_fusion is not None and not ablate_point:
                     foreground_tokens = conditioned.get("foreground_scene_tok1")
                     foreground_mask = conditioned.get("foreground_scene_mask1")
                     if torch.is_tensor(foreground_tokens):
@@ -2346,6 +2362,20 @@ class VLAFlowMatching(nn.Module):
                 operation_prob = conditioned["operation_prob"].detach()
                 selection_scores = conditioned["pointseg_selection_scores"].detach()
                 point_is_pad = payload.get("point_is_pad")
+                if self.capture_pointseg_visualization:
+                    snapshot_point_is_pad = (
+                        point_is_pad.detach()
+                        if torch.is_tensor(point_is_pad)
+                        else torch.zeros_like(operation_prob, dtype=torch.bool)
+                    )
+                    if snapshot_point_is_pad.ndim == 3 and snapshot_point_is_pad.shape[1] == 1:
+                        snapshot_point_is_pad = snapshot_point_is_pad.squeeze(1)
+                    self.last_pointseg_visualization = {
+                        "point_cloud": pc.detach(),
+                        "point_is_pad": snapshot_point_is_pad.to(device=pc.device, dtype=torch.bool),
+                        "operation_prob": operation_prob,
+                        "selection_scores": selection_scores,
+                    }
                 if torch.is_tensor(point_is_pad):
                     valid_points = (~point_is_pad.to(device=operation_prob.device, dtype=torch.bool)).to(
                         dtype=operation_prob.dtype
@@ -2383,6 +2413,8 @@ class VLAFlowMatching(nn.Module):
                 pc_mask = pc_mask[:, None].expand(-1, num_pc_tokens)
             elif pc_mask.ndim == 2 and pc_mask.shape[1] == 1:
                 pc_mask = pc_mask.expand(-1, num_pc_tokens)
+            if ablate_point:
+                pc_mask = torch.zeros_like(pc_mask, dtype=torch.bool)
 
             embs.append(pc_emb)
             pad_masks.append(pc_mask)
@@ -2398,7 +2430,10 @@ class VLAFlowMatching(nn.Module):
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
         self.last_language_emb = lang_emb
         embs.append(lang_emb)
-        pad_masks.append(lang_masks)
+        effective_lang_masks = lang_masks
+        if ablate_language:
+            effective_lang_masks = torch.zeros_like(lang_masks, dtype=torch.bool)
+        pad_masks.append(effective_lang_masks)
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
@@ -3055,6 +3090,15 @@ class VLAFlowMatching(nn.Module):
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        if "action_context" in self.inference_ablation_modalities:
+            # Preserve each action token and prefix cross-attention while
+            # removing communication between different action steps.
+            action_identity = torch.eye(
+                suffix_len,
+                dtype=torch.bool,
+                device=suffix_att_2d_masks.device,
+            ).unsqueeze(0)
+            suffix_att_2d_masks = suffix_att_2d_masks & action_identity
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]

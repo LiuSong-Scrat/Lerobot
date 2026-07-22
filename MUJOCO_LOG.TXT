@@ -13,3 +13,6 @@ ERROR: mjv_cameraInModel: mjvScene frustum_near too small
 Mon Jun 15 19:02:47 2026
 ERROR: mjv_cameraInModel: mjvScene frustum_near too small
 
+Tue Jul 21 17:35:09 2026
+ERROR: mjv_cameraInModel: mjvScene frustum_near too small
+
