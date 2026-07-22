@@ -28,6 +28,7 @@ import time
 import traceback
 import tty
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -416,6 +417,235 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(json_safe(payload), f, indent=2, ensure_ascii=False)
     tmp_path.replace(path)
+
+
+@contextmanager
+def interprocess_file_lock(path: Path):
+    """Serialize report updates from independent MuJoCo worker processes."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_json_or_default(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.is_file():
+        return default
+    try:
+        with open(path, encoding="utf-8") as json_file:
+            value = json.load(json_file)
+        return value if isinstance(value, dict) else default
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _suite_progress_summary(progress: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "suite": str(progress["suite"]),
+        "status": str(progress.get("status", "running")),
+        "expected_task_count": int(progress.get("expected_task_count", 0)),
+        "expected_episode_count": int(progress.get("expected_episode_count", 0)),
+        "completed_episode_count": int(progress.get("completed_episode_count", 0)),
+        "success_count": int(progress.get("success_count", 0)),
+        "failure_count": int(progress.get("failure_count", 0)),
+        "completion_rate": float(progress.get("completion_rate", 0.0)),
+        "success_rate": float(progress.get("success_rate", 0.0)),
+        "progress_path": str(progress.get("progress_path", "")),
+        "error": progress.get("error"),
+    }
+
+
+def _update_root_progress(output_dir: Path, suite_progress: dict[str, Any]) -> None:
+    progress_path = output_dir / "progress.json"
+    with interprocess_file_lock(output_dir / ".progress.lock"):
+        progress = _read_json_or_default(
+            progress_path,
+            {
+                "created_unix_s": time.time(),
+                "status": "running",
+                "suites": {},
+            },
+        )
+        suites = progress.setdefault("suites", {})
+        suites[str(suite_progress["suite"])] = _suite_progress_summary(suite_progress)
+        suite_values = list(suites.values())
+        expected = int(sum(int(item.get("expected_episode_count", 0)) for item in suite_values))
+        completed = int(sum(int(item.get("completed_episode_count", 0)) for item in suite_values))
+        success = int(sum(int(item.get("success_count", 0)) for item in suite_values))
+        failure = int(sum(int(item.get("failure_count", 0)) for item in suite_values))
+        statuses = [str(item.get("status", "running")) for item in suite_values]
+        progress.update(
+            {
+                "updated_unix_s": time.time(),
+                "status": (
+                    "failed"
+                    if "failed" in statuses
+                    else "completed"
+                    if statuses and all(status == "completed" for status in statuses)
+                    else "running"
+                ),
+                "expected_episode_count": expected,
+                "completed_episode_count": completed,
+                "success_count": success,
+                "failure_count": failure,
+                "completion_rate": float(completed / expected) if expected else 0.0,
+                "success_rate": float(success / completed) if completed else 0.0,
+            }
+        )
+        write_json_atomic(progress_path, progress)
+
+
+def initialize_realtime_suite_progress(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    task_ids: list[int],
+    episodes_per_task: int,
+) -> None:
+    suite_dir = output_dir / suite_name
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = suite_dir / "progress.json"
+    expected_episode_count = len(task_ids) * int(episodes_per_task)
+    progress = {
+        "created_unix_s": time.time(),
+        "updated_unix_s": time.time(),
+        "suite": suite_name,
+        "status": "running",
+        "expected_task_ids": [int(task_id) for task_id in task_ids],
+        "expected_task_count": len(task_ids),
+        "episodes_per_task": int(episodes_per_task),
+        "expected_episode_count": expected_episode_count,
+        "completed_episode_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "completion_rate": 0.0,
+        "success_rate": 0.0,
+        "progress_path": str(progress_path),
+        "tasks": {
+            str(int(task_id)): {
+                "completed_episode_count": 0,
+                "success_count": 0,
+                "episodes": {},
+            }
+            for task_id in task_ids
+        },
+    }
+    with interprocess_file_lock(suite_dir / ".progress.lock"):
+        write_json_atomic(progress_path, progress)
+        # This file is scoped to one suite and therefore can be reset safely
+        # before its environment workers are started.
+        with open(suite_dir / "evaluation_events.jsonl", "w", encoding="utf-8"):
+            pass
+    _update_root_progress(output_dir, progress)
+
+
+def append_realtime_episode_event(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+    event: str,
+    episode_record: dict[str, Any] | None = None,
+) -> None:
+    suite_dir = output_dir / suite_name
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    event_record = {
+        "unix_s": time.time(),
+        "event": str(event),
+        "suite": suite_name,
+        "task_id": int(task_id),
+        "episode_index": int(episode_index),
+    }
+    if episode_record is not None:
+        event_record["result"] = json_safe(episode_record)
+
+    with interprocess_file_lock(suite_dir / ".events.lock"):
+        with open(suite_dir / "evaluation_events.jsonl", "a", encoding="utf-8") as events_file:
+            events_file.write(json.dumps(event_record, ensure_ascii=False) + "\n")
+            events_file.flush()
+            os.fsync(events_file.fileno())
+
+
+def update_realtime_episode_progress(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+    episode_record: dict[str, Any],
+) -> None:
+    suite_dir = output_dir / suite_name
+    progress_path = suite_dir / "progress.json"
+    with interprocess_file_lock(suite_dir / ".progress.lock"):
+        progress = _read_json_or_default(
+            progress_path,
+            {
+                "suite": suite_name,
+                "status": "running",
+                "expected_task_count": 0,
+                "expected_episode_count": 0,
+                "tasks": {},
+            },
+        )
+        tasks = progress.setdefault("tasks", {})
+        task_progress = tasks.setdefault(
+            str(int(task_id)),
+            {"completed_episode_count": 0, "success_count": 0, "episodes": {}},
+        )
+        task_progress.setdefault("episodes", {})[str(int(episode_index))] = json_safe(episode_record)
+
+        completed = 0
+        success = 0
+        for value in tasks.values():
+            episodes = list(value.get("episodes", {}).values())
+            value["completed_episode_count"] = len(episodes)
+            value["success_count"] = sum(bool(item.get("success", False)) for item in episodes)
+            completed += int(value["completed_episode_count"])
+            success += int(value["success_count"])
+        expected = int(progress.get("expected_episode_count", 0))
+        progress.update(
+            {
+                "updated_unix_s": time.time(),
+                "status": "completed" if expected > 0 and completed >= expected else "running",
+                "completed_episode_count": completed,
+                "success_count": success,
+                "failure_count": completed - success,
+                "completion_rate": float(completed / expected) if expected else 0.0,
+                "success_rate": float(success / completed) if completed else 0.0,
+                "progress_path": str(progress_path),
+            }
+        )
+        write_json_atomic(progress_path, progress)
+    append_realtime_episode_event(
+        output_dir=output_dir,
+        suite_name=suite_name,
+        task_id=task_id,
+        episode_index=episode_index,
+        event="episode_finished",
+        episode_record=episode_record,
+    )
+    _update_root_progress(output_dir, progress)
+
+
+def mark_realtime_suite_failed(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    error: str,
+) -> None:
+    suite_dir = output_dir / suite_name
+    progress_path = suite_dir / "progress.json"
+    with interprocess_file_lock(suite_dir / ".progress.lock"):
+        progress = _read_json_or_default(progress_path, {"suite": suite_name, "tasks": {}})
+        progress.update({"updated_unix_s": time.time(), "status": "failed", "error": str(error)})
+        write_json_atomic(progress_path, progress)
+    _update_root_progress(output_dir, progress)
 
 
 def matrix_to_pose9(matrix: np.ndarray) -> np.ndarray:
@@ -2256,6 +2486,13 @@ def evaluate_task(
                 / f"episode_{episode_idx:03d}"
             )
             episode_dir.mkdir(parents=True, exist_ok=True)
+            append_realtime_episode_event(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                task_id=int(task_id),
+                episode_index=int(episode_idx),
+                event="episode_started",
+            )
             print(
                 f"[eval] start suite={suite_name} task={task_id} episode={episode_idx}",
                 flush=True,
@@ -2296,6 +2533,13 @@ def evaluate_task(
                         episode_record["videos"] = video_paths
 
                 write_json_atomic(episode_dir / "result.json", episode_record)
+                update_realtime_episode_progress(
+                    output_dir=output_dir,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    episode_index=int(episode_idx),
+                    episode_record=episode_record,
+                )
                 task_results.append(episode_record)
                 print(
                     f"[eval] done suite={suite_name} task={task_id} episode={episode_idx} "
@@ -2316,6 +2560,13 @@ def evaluate_task(
                 }
                 write_json_atomic(episode_dir / "result.json", failure)
                 write_json_atomic(episode_dir / "error.json", failure)
+                update_realtime_episode_progress(
+                    output_dir=output_dir,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    episode_index=int(episode_idx),
+                    episode_record=failure,
+                )
                 task_results.append(failure)
                 print(
                     f"[warn] failed suite={suite_name} task={task_id} episode={episode_idx}: {exc!r}",
@@ -2395,6 +2646,7 @@ def evaluate_suite_process_parallel(
     request_count = 0
     batch_count = 0
     max_observed_batch = 0
+    infrastructure_failures: list[str] = []
 
     for wave_start in range(0, len(task_ids), max(1, int(worker_count))):
         wave_task_ids = [int(task_id) for task_id in task_ids[wave_start : wave_start + worker_count]]
@@ -2455,6 +2707,9 @@ def evaluate_suite_process_parallel(
             else:
                 error_repr = str(message[3])
                 error_traceback = str(message[4])
+                infrastructure_failures.append(
+                    f"suite={suite_name} task={task_id}: {error_repr}"
+                )
                 print(
                     f"[warn] process worker failed suite={suite_name} task={task_id}: "
                     f"{error_repr}\n{error_traceback}",
@@ -2483,6 +2738,9 @@ def evaluate_suite_process_parallel(
                 task_id = task_by_worker[worker_id]
                 exc = RuntimeError(
                     f"Environment worker exited without a result (exitcode={process.exitcode})."
+                )
+                infrastructure_failures.append(
+                    f"suite={suite_name} task={task_id}: {exc}"
                 )
                 print(
                     f"[warn] process worker died suite={suite_name} task={task_id}: {exc}",
@@ -2569,6 +2827,19 @@ def evaluate_suite_process_parallel(
         f"mean_batch={mean_batch:.2f}, max_batch={max_observed_batch}",
         flush=True,
     )
+    if infrastructure_failures:
+        preview = "\n".join(infrastructure_failures[:10])
+        if len(infrastructure_failures) > 10:
+            preview += f"\n... and {len(infrastructure_failures) - 10} more worker failures"
+        error_message = (
+            "Parallel LIBERO environment workers failed before completing evaluation:\n" + preview
+        )
+        mark_realtime_suite_failed(
+            output_dir=output_dir,
+            suite_name=suite_name,
+            error=error_message,
+        )
+        raise RuntimeError(error_message)
     return summaries
 
 
@@ -2754,11 +3025,15 @@ def run_multi_gpu_suite_launcher(
                 "--device",
                 "cuda",
                 "--render-gpu-device-id",
-                "0",
+                str(gpu_id),
             ]
             child_env = os.environ.copy()
             child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            child_env["MUJOCO_EGL_DEVICE_ID"] = "0"
+            # This robosuite / MuJoCo stack interprets both variables as
+            # physical EGL device ids and explicitly requires the EGL id to be
+            # present in CUDA_VISIBLE_DEVICES.  Torch still sees this one
+            # physical card as logical cuda:0 inside the child process.
+            child_env["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
             child_env["SONG_LIBERO_SUITE_WORKER"] = "1"
             process = subprocess.Popen(command, env=child_env, cwd=str(Path.cwd()))
             processes.append((suite_name, gpu_id, process))
@@ -2860,6 +3135,12 @@ def main() -> None:
                 task_count=len(suite.tasks),
                 cli_task_ids=args.task_id,
                 cfg=cfg,
+            )
+            initialize_realtime_suite_progress(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                task_ids=[int(task_id) for task_id in task_ids],
+                episodes_per_task=int(cfg["episodes"]),
             )
             worker_count = min(int(cfg["task_workers"]), max(1, len(task_ids)))
 
