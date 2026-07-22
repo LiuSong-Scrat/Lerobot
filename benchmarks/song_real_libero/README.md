@@ -2,6 +2,8 @@
 
 冻结预训练 SmolVLM、加入静态 RGB image token，同时保留 cache-v7 点云/动作通路的完整说明见 [README_VLM_ADAPTER.md](README_VLM_ADAPTER.md)。
 
+LIBERO 标准时限、历史 v0.4 结果、checkpoint 哈希、动作 chunk 对照以及串行/多卡/独立模型评测说明见 [LIBERO_EVALUATION_AUDIT.md](LIBERO_EVALUATION_AUDIT.md)。
+
 This project bundles the benchmark workflow for the local point-cloud SmolVLA policy:
 
 1. record BestMan RGB-D sequences
@@ -451,24 +453,39 @@ conda run -n reap python benchmarks/song_real_libero/scripts/train_song_benchmar
 Run online evaluation on the four suites with each task's own LIBERO language prompt:
 
 ```bash
-MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_4suite_fresh/checkpoints/000100/pretrained_model \
+  --policy.path /absolute/path/to/checkpoints/020000_after32k_after32k/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
   --suite libero_10 \
+  --suite-gpu-ids 0,1,2,3 \
   --all-tasks \
   --episodes 10 \
-  --action-index 0 \
+  --isolated-policy-workers 1 \
+  --task-workers 1 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 1 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --action-index 1 \
   --exec-action-steps 16 \
-  --no-replan-every-step \
-  --gripper-wait-until-reached \
-  --gripper-wait-tolerance 0.004 \
-  --gripper-wait-max-steps 12 \
-  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --use-suite-max-steps \
+  --no-recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --no-save-video \
+  --output-dir /absolute/path/to/eval_libero_4suite
 ```
+
+For a faster stochastic-policy run on 24 GB GPUs, use
+`--isolated-policy-workers 2`; keep task workers, episode workers, and actual
+inference batch size at 1. Do not compare this throughput run directly with a
+single-model serial score.
 
 
 Each worker creates its own LIBERO/robosuite environment and writes lightweight temporary episode artifacts. The main process moves the final point-cloud arrays into the LeRobot dataset sequentially, so dataset writes remain deterministic without duplicating large point clouds through pickle files.
@@ -544,7 +561,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
   --episodes 1
 ```
 
-This online runner resets a LIBERO/robosuite environment, reads RGB-D observations each step, builds the same `50000 = 49500 scene + 500 gripper` point cloud, predicts `pose9 + gripper`, converts it to LIBERO's 7D relative action, steps the simulator, and reports success/reward.
+This online runner resets a LIBERO/robosuite environment, waits for the scene to stabilize with the robot fixed and gripper open, reads RGB-D observations, builds the same UMI-frame point-cloud input, predicts `pose9 + gripper`, converts pose rows to LIBERO absolute OSC targets plus a directional gripper command, and reports success/reward. Standard evaluation uses the per-suite horizons documented in `LIBERO_EVALUATION_AUDIT.md`.
 
 ## Notes
 
@@ -677,27 +694,33 @@ python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/train_libero_fresh_post/checkpoints/last/pretrained_model \
+  --policy.path /absolute/path/to/checkpoints/020000_after32k_after32k/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
   --suite libero_10  \
+  --suite-gpu-ids 0,1,2,3 \
   --all-tasks \
   --episodes 10 \
-  --action-index 0 \
+  --isolated-policy-workers 1 \
+  --task-workers 1 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 1 \
+  --action-index 1 \
   --exec-action-steps 16 \
-  --no-replan-every-step \
-  --gripper-wait-until-reached \
-  --gripper-wait-tolerance 0.004 \
-  --gripper-wait-max-steps 12 \
-  --save-video \
-  --render-mode viewer3d \
-  --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/eval_libero_4suite_temp
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --use-suite-max-steps \
+  --no-recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --no-save-video \
+  --output-dir /absolute/path/to/eval_libero_4suite
 ```
 
 
 `libero_pointcloud_eval.py` saves rollout videos by default. Add `--no-save-video` to disable video output for faster evaluation.
-By default evaluation predicts one SmolVLA action chunk and executes the first 16 actions before replanning. Gripper execution follows the predicted continuous gripper width from the same action row as the arm target, with no smoothing, thresholding, deadband, or artificial open/close labels. When the gripper target width changes, the runner repeats that same action row until the measured gripper width reaches `gripper_wait_tolerance` or `gripper_wait_max_steps` is exhausted, so the arm does not advance to the next chunk row before the close/open command has been applied. Each episode saves `model_pose_actions.npy`, `gripper_targets.npy`, `gripper_actuals.npy`, `gripper_width_errors.npy`, `gripper_wait_flags.npy`, and `gripper_progress_indices.npy` for debugging this alignment.
+The recommended policy skips the near-identity row 0 and executes rows 1 through 16 before replanning. LIBERO's Panda gripper accepts directional commands, so `delta_width` maps the predicted next-minus-current width change to open, close, or hold using `gripper_delta_threshold`; it does not repeatedly chase a physical target width. Each episode saves `actions.npz` with model rows, controller commands and targets, achieved poses, tracking errors, chunk-boundary errors, and gripper diagnostics.
 During interactive evaluation, press `v` in the terminal to save the latest predicted UMI action chunk visualization under `<output-dir>/keyboard_vis/`. The default mode writes PLY/NPZ files and is safe for `MUJOCO_GL=egl`; use `--keyboard-vis-mode window` only on a local desktop session with working Open3D/GLX.
 
 For local 3D debugging on a desktop session, use the MuJoCo viewer mode instead of EGL:

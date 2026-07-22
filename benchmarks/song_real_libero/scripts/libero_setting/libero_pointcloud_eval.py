@@ -14,6 +14,8 @@ Removed from the original evaluator:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import multiprocessing as mp
 import os
@@ -39,9 +41,23 @@ from scipy.spatial.transform import Rotation as R
 
 _ENV_CREATION_LOCK = threading.Lock()
 _ENV_WORKER_BOOTSTRAP = os.environ.get("SONG_LIBERO_ENV_WORKER", "0") == "1"
+_ISOLATED_POLICY_WORKER_BOOTSTRAP = (
+    os.environ.get("SONG_LIBERO_ISOLATED_POLICY_WORKER", "0") == "1"
+)
 _SUITE_LAUNCHER_BOOTSTRAP = any(
     arg == "--suite-gpu-ids" or arg.startswith("--suite-gpu-ids=") for arg in sys.argv[1:]
 )
+# This must be set before the policy import performs the first CUDA operation.
+# PyTorch uses it when deterministic cuBLAS execution is requested below.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+LIBERO_STANDARD_MAX_STEPS = {
+    "libero_spatial": 220,
+    "libero_object": 280,
+    "libero_goal": 300,
+    "libero_10": 520,
+    "libero_90": 400,
+}
 
 
 def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
@@ -53,7 +69,11 @@ def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
-    if not _ENV_WORKER_BOOTSTRAP and not _SUITE_LAUNCHER_BOOTSTRAP:
+    if (
+        not _ENV_WORKER_BOOTSTRAP
+        and not _ISOLATED_POLICY_WORKER_BOOTSTRAP
+        and not _SUITE_LAUNCHER_BOOTSTRAP
+    ):
         from ..smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
     else:
         SmolVLA_ModelInference = Any
@@ -93,7 +113,11 @@ else:
         pose9_to_homo_np,
         render_camera_names_from_config,
     )
-    if not _ENV_WORKER_BOOTSTRAP and not _SUITE_LAUNCHER_BOOTSTRAP:
+    if (
+        not _ENV_WORKER_BOOTSTRAP
+        and not _ISOLATED_POLICY_WORKER_BOOTSTRAP
+        and not _SUITE_LAUNCHER_BOOTSTRAP
+    ):
         from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
     else:
         SmolVLA_ModelInference = Any
@@ -108,6 +132,95 @@ def resolve_suite_names(cli_suites: list[str] | None, cfg: dict[str, Any]) -> li
     if not suites:
         raise ValueError("At least one LIBERO suite must be configured.")
     return suites
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any]:
+    """Capture enough immutable identity to compare local and server runs."""
+    script_path = Path(__file__).resolve()
+    repo_root = script_path.parents[4]
+    policy = Path(policy_path).expanduser() if policy_path is not None else None
+    resolved_policy = policy.resolve() if policy is not None and policy.exists() else policy
+    model_path = resolved_policy / "model.safetensors" if resolved_policy is not None else None
+    config_path = resolved_policy / "config.json" if resolved_policy is not None else None
+
+    identity: dict[str, Any] = {
+        "hostname": os.uname().nodename,
+        "python": sys.executable,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "mujoco_gl": os.environ.get("MUJOCO_GL"),
+        "pyopengl_platform": os.environ.get("PYOPENGL_PLATFORM"),
+        "policy_path_requested": None if policy is None else str(policy),
+        "policy_path_resolved": None if resolved_policy is None else str(resolved_policy),
+        "eval_script_sha256": _sha256_file(script_path),
+        "inference_wrapper_sha256": _sha256_file(script_path.parent.parent / "smolvla_model_inference.py"),
+        "pointcloud_utils_sha256": _sha256_file(script_path.with_name("libero_pointcloud_utils.py")),
+        "modeling_smolvla_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "modeling_smolvla.py"
+        ),
+        "song_pointseg_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "song_pointseg.py"
+        ),
+        "smolvlm_with_expert_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "smolvlm_with_expert.py"
+        ),
+        "policy_config_sha256": _sha256_file(config_path) if config_path is not None else None,
+    }
+    package_versions: dict[str, str] = {}
+    for distribution in ("torch", "spconv-cu118", "spconv-cu120", "mujoco", "robosuite", "libero"):
+        try:
+            package_versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    identity["package_versions"] = package_versions
+    try:
+        identity["gpu_inventory"] = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,driver_version",
+                "--format=csv,noheader",
+            ],
+            text=True,
+        ).strip().splitlines()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    if model_path is not None and model_path.is_file():
+        stat = model_path.stat()
+        identity.update(
+            {
+                "model_size_bytes": int(stat.st_size),
+                "model_mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+        # Suite children do not write a global summary; avoid hashing the same
+        # 1.4 GB checkpoint once per GPU child.  The launcher or single process
+        # records the full digest exactly once.
+        if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") != "1":
+            identity["model_sha256"] = _sha256_file(model_path)
+    try:
+        identity["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+        ).strip()
+        identity["git_dirty"] = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=repo_root,
+                text=True,
+            ).strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        identity["git_commit"] = None
+        identity["git_dirty"] = None
+    return identity
 
 
 def resolve_task_ids_for_suite(
@@ -315,6 +428,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -330,13 +444,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-index", type=int, default=None)
     parser.add_argument("--exec-action-steps", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--use-suite-max-steps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the standard LIBERO per-suite horizons (220/280/300/520/400).",
+    )
     parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument(
+        "--policy-noise-seed",
+        type=int,
+        default=None,
+        help=(
+            "Base seed for per-suite/task/episode/model-call flow-matching noise. "
+            "The default is 0 for scheduling-invariant evaluation; use a negative value to restore stochastic noise."
+        ),
+    )
+    parser.add_argument(
+        "--deterministic-torch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use deterministic PyTorch/cuDNN/cuBLAS inference settings (default: true). "
+            "Disable only for throughput experiments whose scores will not be compared to official runs."
+        ),
+    )
 
     parser.add_argument(
-        "--gripper-threshold", 
+        "--gripper-threshold",
         type=float,
         default=None,
-        help="Normalized gripper-width threshold. width_pct >= threshold => open(-1), else close(+1).",
+        help="Physical gripper-width threshold in metres used by absolute_width control.",
+    )
+    parser.add_argument(
+        "--gripper-control-mode",
+        choices=("delta_width", "absolute_width", "target_width"),
+        default=None,
+        help=(
+            "Convert predicted widths either from their temporal derivative (legacy evaluator behavior) "
+            "by thresholding the absolute physical width, or by tracking the predicted physical width "
+            "against the measured gripper width."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-delta-threshold",
+        type=float,
+        default=None,
+        help="Physical width-change threshold in metres used by delta_width control.",
+    )
+    parser.add_argument(
+        "--gripper-target-tolerance",
+        type=float,
+        default=None,
+        help="Physical width deadband in metres used by target_width closed-loop control.",
     )
     parser.add_argument("--gripper-qpos-max-width", type=float, default=None)
     parser.add_argument("--add-gripper-cloud", action=argparse.BooleanOptionalAction, default=None)
@@ -355,6 +515,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum number of distinct tasks evaluated concurrently by this GPU model service.",
+    )
+    parser.add_argument(
+        "--isolated-policy-workers",
+        type=int,
+        default=None,
+        help=(
+            "Independent model processes per visible GPU. Each process owns one checkpoint copy and "
+            "serially evaluates a disjoint task shard with inference batch size 1. On a 24 GB GPU, "
+            "2 workers is the recommended upper bound for this checkpoint."
+        ),
     )
     parser.add_argument(
         "--episode-workers-per-task",
@@ -820,12 +990,100 @@ def gripper_threshold_command(
     threshold: float,
     max_physical_width: float,
 ) -> float:
-    """LIBERO / robosuite PandaGripper convention: -1 opens, +1 closes."""
-    width_pct = gripper_width_percent_from_scalar(
-        float(predicted_width),
-        max_physical_width=float(max_physical_width),
-    )
-    return -1.0 if width_pct >= float(threshold) else 1.0
+    """Threshold a physical width using the LIBERO -1=open, +1=close convention."""
+    width = float(np.clip(float(predicted_width), 0.0, float(max_physical_width)))
+    return -1.0 if width >= float(threshold) else 1.0
+
+
+def gripper_target_width_command(
+    predicted_width: float,
+    measured_width: float,
+    *,
+    tolerance: float,
+    max_physical_width: float,
+) -> float:
+    """Track a predicted physical opening using LIBERO's directional command."""
+    target = float(np.clip(float(predicted_width), 0.0, float(max_physical_width)))
+    measured = float(np.clip(float(measured_width), 0.0, float(max_physical_width)))
+    if target > measured + float(tolerance):
+        return -1.0
+    if target < measured - float(tolerance):
+        return 1.0
+    return 0.0
+
+
+def rotation_error_radians(actual: np.ndarray, target: np.ndarray) -> float:
+    """Return the shortest SO(3) angle between two rotation matrices."""
+    relative = np.asarray(actual, dtype=np.float64) @ np.asarray(target, dtype=np.float64).T
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.arccos(cosine))
+
+
+def deterministic_policy_noise_seed(
+    base_seed: int,
+    *,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+    model_call_index: int,
+) -> int | None:
+    """Derive a stable per-request seed independent of process and batch scheduling."""
+    if int(base_seed) < 0:
+        return None
+    payload = (
+        f"{int(base_seed)}\0{suite_name}\0{int(task_id)}\0"
+        f"{int(episode_index)}\0{int(model_call_index)}"
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") & ((1 << 63) - 1)
+
+
+def model_observation_fingerprints(observation: dict[str, Any]) -> dict[str, str]:
+    """Return exact, transport-independent hashes for one policy observation."""
+    fingerprints: dict[str, str] = {}
+    overall = hashlib.sha256()
+    for key in sorted(observation):
+        array = np.ascontiguousarray(np.asarray(observation[key]))
+        header = f"{key}\0{array.dtype.str}\0{tuple(array.shape)}\0".encode()
+        digest = hashlib.sha256()
+        digest.update(header)
+        digest.update(array.view(np.uint8))
+        fingerprints[str(key)] = digest.hexdigest()
+        overall.update(header)
+        overall.update(array.view(np.uint8))
+    fingerprints["__all__"] = overall.hexdigest()
+    return fingerprints
+
+
+def configure_torch_determinism(enabled: bool) -> dict[str, Any]:
+    """Configure repeatable policy inference without making env workers import torch."""
+    if not bool(enabled):
+        return {
+            "enabled": False,
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        }
+
+    import torch
+
+    # Some CUDA cumsum versions only advertise a non-deterministic kernel even
+    # though this evaluator's fixed masks repeat exactly.  warn_only retains the
+    # strongest available deterministic kernels instead of aborting evaluation.
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    return {
+        "enabled": True,
+        "warn_only": True,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "float32_matmul_precision": str(torch.get_float32_matmul_precision()),
+    }
 
 
 def action_chunk_to_absolute_libero_actions(
@@ -835,6 +1093,8 @@ def action_chunk_to_absolute_libero_actions(
     action_chunk: np.ndarray,
     gripper_threshold: float,
     gripper_max_width: float,
+    gripper_control_mode: str,
+    gripper_delta_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Convert one model chunk to directly executable absolute OSC actions.
 
@@ -857,12 +1117,28 @@ def action_chunk_to_absolute_libero_actions(
 
     libero_actions: list[np.ndarray] = []
     target_controller_pose9: list[np.ndarray] = []
+    control_mode = str(gripper_control_mode)
+    if control_mode not in {"delta_width", "absolute_width", "target_width"}:
+        raise ValueError(f"Unsupported gripper_control_mode={control_mode!r}.")
     for idx, (row, target_model_world) in enumerate(zip(chunk, target_model_worlds, strict=True)):
         target_controller_world = target_model_world @ model_to_controller
         arm_action = world_pose_to_libero_absolute_action(target_controller_world)
-        delta_pre_width = chunk[idx+1,-1]-chunk[idx,-1] if idx< chunk.shape[0]-1 else 0
-        # print("delta_pre_width = ", delta_pre_width)
-        gripper_action = -1.0 if delta_pre_width > 0.002 else (1.0 if delta_pre_width < -0.002 else 0.0)
+        if control_mode == "absolute_width":
+            gripper_action = gripper_threshold_command(
+                float(row[-1]),
+                threshold=float(gripper_threshold),
+                max_physical_width=float(gripper_max_width),
+            )
+        elif control_mode == "delta_width":
+            # The command applied while moving from row i to row i+1 is the
+            # direction of the predicted width change over that interval.
+            delta_width = float(chunk[idx + 1, -1] - row[-1]) if idx < chunk.shape[0] - 1 else 0.0
+            threshold = float(gripper_delta_threshold)
+            gripper_action = -1.0 if delta_width > threshold else 1.0 if delta_width < -threshold else 0.0
+        else:
+            # The measured width is available only after each environment
+            # step, so run_episode replaces this placeholder online.
+            gripper_action = 0.0
         libero_actions.append(np.concatenate([arm_action, np.asarray([gripper_action], dtype=np.float32)]))
         target_controller_pose9.append(matrix_to_pose9(target_controller_world))
 
@@ -929,15 +1205,54 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
         "render_mode": str(cfg.get("render_mode", "offscreen")),
+        "evaluation_identity": cfg.get("evaluation_identity", {}),
+        "env_seed": int(cfg.get("env_seed", 7)),
+        "use_suite_max_steps": bool(cfg.get("use_suite_max_steps", True)),
+        "suite_max_steps": {
+            suite_name: int(LIBERO_STANDARD_MAX_STEPS.get(suite_name, cfg["control"]["max_steps"]))
+            for suite_name in suite_names
+        },
+        "execution": {
+            "task_workers": int(cfg["task_workers"]),
+            "isolated_policy_workers": int(cfg.get("isolated_policy_workers", 1)),
+            "episode_workers_per_task": int(cfg["episode_workers_per_task"]),
+            "task_worker_backend": str(cfg["task_worker_backend"]),
+            "inference_batch_size": int(cfg["inference_batch_size"]),
+            "inference_batch_wait_ms": float(cfg["inference_batch_wait_ms"]),
+            "recreate_env_per_episode": bool(cfg["recreate_env_per_episode"]),
+            "deterministic_torch": bool(cfg["deterministic_torch"]),
+            "torch_determinism": cfg.get("torch_determinism", {}),
+        },
+        "initialization": {
+            "settle_steps": int(cfg["settle_steps"]),
+            "settle_min_seconds": float(cfg["settle_min_seconds"]),
+            "settle_stable_seconds": float(cfg["settle_stable_seconds"]),
+            "settle_max_seconds": float(cfg["settle_max_seconds"]),
+            "settle_require_stable": bool(cfg["settle_require_stable"]),
+            "settle_keep_robot_fixed": bool(cfg["settle_keep_robot_fixed"]),
+            "initial_gripper_open": bool(cfg["initial_gripper_open"]),
+        },
+        "observation": {
+            "num_points": int(cfg["num_points"]),
+            "height": int(cfg["observation_height"]),
+            "width": int(cfg["observation_width"]),
+            "add_gripper_cloud": bool(cfg["add_gripper_cloud"]),
+            "gripper_points": int(cfg.get("gripper_points", 0)),
+        },
         "control": {
             "controller_mode": "OSC_POSE absolute pose",
             "action_dim": 7,
             "action_format": ["abs_x", "abs_y", "abs_z", "abs_rx", "abs_ry", "abs_rz", "gripper"],
             "gripper_convention": "-1=open, +1=close",
             "gripper_threshold": float(cfg["control"]["gripper_threshold"]),
+            "gripper_control_mode": str(cfg["control"]["gripper_control_mode"]),
+            "gripper_delta_threshold": float(cfg["control"]["gripper_delta_threshold"]),
+            "gripper_delta_alignment": "next_width_minus_current_width",
+            "gripper_target_tolerance": float(cfg["control"]["gripper_target_tolerance"]),
             "exec_action_steps": int(cfg["control"]["exec_action_steps"]),
             "action_index": int(cfg["control"]["action_index"]),
             "control_freq": float(cfg["control"].get("control_freq", cfg.get("control_freq", 20))),
+            "policy_noise_seed": int(cfg["policy_noise_seed"]),
         },
         "overall": aggregate_task_results(tasks),
         "suite_reports": suite_reports,
@@ -961,6 +1276,18 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "model_action_rows",
         "target_controller_pose9",
         "target_model_worlds",
+        "achieved_model_worlds",
+        "tracking_position_errors",
+        "tracking_rotation_errors",
+        "chunk_start_model_worlds",
+        "chunk_previous_target_model_worlds",
+        "chunk_boundary_position_errors",
+        "chunk_boundary_rotation_errors",
+        "gripper_commands",
+        "gripper_raw_widths",
+        "gripper_width_pcts",
+        "gripper_actual_widths",
+        "gripper_width_errors",
     }
     record = {k: v for k, v in result.items() if k not in drop_keys}
     record["episode_index"] = int(episode_idx)
@@ -975,6 +1302,24 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         "model_action_rows": np.asarray(result.get("model_action_rows", []), dtype=np.float32),
         "target_controller_pose9": np.asarray(result.get("target_controller_pose9", []), dtype=np.float32),
         "target_model_worlds": np.asarray(result.get("target_model_worlds", []), dtype=np.float32),
+        "achieved_model_worlds": np.asarray(result.get("achieved_model_worlds", []), dtype=np.float32),
+        "tracking_position_errors": np.asarray(result.get("tracking_position_errors", []), dtype=np.float32),
+        "tracking_rotation_errors": np.asarray(result.get("tracking_rotation_errors", []), dtype=np.float32),
+        "chunk_start_model_worlds": np.asarray(result.get("chunk_start_model_worlds", []), dtype=np.float32),
+        "chunk_previous_target_model_worlds": np.asarray(
+            result.get("chunk_previous_target_model_worlds", []), dtype=np.float32
+        ),
+        "chunk_boundary_position_errors": np.asarray(
+            result.get("chunk_boundary_position_errors", []), dtype=np.float32
+        ),
+        "chunk_boundary_rotation_errors": np.asarray(
+            result.get("chunk_boundary_rotation_errors", []), dtype=np.float32
+        ),
+        "gripper_commands": np.asarray(result.get("gripper_commands", []), dtype=np.float32),
+        "gripper_raw_widths": np.asarray(result.get("gripper_raw_widths", []), dtype=np.float32),
+        "gripper_width_pcts": np.asarray(result.get("gripper_width_pcts", []), dtype=np.float32),
+        "gripper_actual_widths": np.asarray(result.get("gripper_actual_widths", []), dtype=np.float32),
+        "gripper_width_errors": np.asarray(result.get("gripper_width_errors", []), dtype=np.float32),
     }
     if arrays["libero_actions"].size == 0:
         return None
@@ -1148,6 +1493,7 @@ class _InferenceRequest:
     task: str
     postprocess: bool
     state_pose_mode: str
+    noise_seed: int | None
     future: Future[Any]
 
 
@@ -1220,6 +1566,7 @@ class BatchedInferenceScheduler:
         task: str | list[str] = "",
         postprocess: bool = True,
         state_pose_mode: str = "identity",
+        noise_seed: int | None = None,
     ) -> Any:
         if self._closed:
             raise RuntimeError("Parallel inference scheduler is already closed.")
@@ -1234,6 +1581,7 @@ class BatchedInferenceScheduler:
                 task=str(task),
                 postprocess=bool(postprocess),
                 state_pose_mode=str(state_pose_mode),
+                noise_seed=None if noise_seed is None else int(noise_seed),
                 future=future,
             )
         )
@@ -1263,15 +1611,32 @@ class BatchedInferenceScheduler:
             state_modes = {request.state_pose_mode for request in requests}
             if len(postprocess_values) != 1 or len(state_modes) != 1:
                 raise ValueError("All requests in one dynamic batch must use the same inference options.")
-            observation_batch = _stack_model_observations(
-                [request.observation for request in requests]
-            )
-            action_chunks = self.infer.predict_action_chunk_obs(
-                observation_batch,
-                task=[request.task for request in requests],
-                postprocess=requests[0].postprocess,
-                state_pose_mode=requests[0].state_pose_mode,
-            )
+            if len(requests) == 1:
+                # Preserve the exact serial preprocessing path.  Stacking a
+                # singleton and wrapping task/seed in lists is numerically very
+                # close, but the resulting sub-millimetre action difference can
+                # bifurcate a contact-rich closed-loop rollout.
+                request = requests[0]
+                action_chunks = self.infer.predict_action_chunk_obs(
+                    request.observation,
+                    task=request.task,
+                    postprocess=request.postprocess,
+                    state_pose_mode=request.state_pose_mode,
+                    noise_seed=request.noise_seed,
+                )
+            else:
+                observation_batch = _stack_model_observations(
+                    [request.observation for request in requests]
+                )
+                action_chunks = self.infer.predict_action_chunk_obs(
+                    observation_batch,
+                    task=[request.task for request in requests],
+                    postprocess=requests[0].postprocess,
+                    state_pose_mode=requests[0].state_pose_mode,
+                    noise_seed=[request.noise_seed for request in requests]
+                    if all(request.noise_seed is not None for request in requests)
+                    else None,
+                )
             if int(action_chunks.shape[0]) != len(requests):
                 raise RuntimeError(
                     f"Policy returned batch {int(action_chunks.shape[0])}, expected {len(requests)}."
@@ -1319,6 +1684,7 @@ class _ProcessInferenceRequest:
     task: str
     postprocess: bool
     state_pose_mode: str
+    noise_seed: int | None
 
 
 class ProcessInferenceProxy:
@@ -1358,6 +1724,7 @@ class ProcessInferenceProxy:
         task: str | list[str] = "",
         postprocess: bool = True,
         state_pose_mode: str = "identity",
+        noise_seed: int | None = None,
     ) -> np.ndarray:
         if not isinstance(task, str):
             if len(task) != 1:
@@ -1373,6 +1740,7 @@ class ProcessInferenceProxy:
                 task=str(task),
                 postprocess=bool(postprocess),
                 state_pose_mode=str(state_pose_mode),
+                noise_seed=None if noise_seed is None else int(noise_seed),
             )
         )
         status, response_request_id, payload = self.response_queue.get()
@@ -1468,13 +1836,26 @@ def _execute_process_inference_batch(
         state_modes = {request.state_pose_mode for request in requests}
         if len(postprocess_values) != 1 or len(state_modes) != 1:
             raise ValueError("All requests in one dynamic batch must use the same inference options.")
-        observation_batch = _stack_model_observations([request.observation for request in requests])
-        action_chunks = infer.predict_action_chunk_obs(
-            observation_batch,
-            task=[request.task for request in requests],
-            postprocess=requests[0].postprocess,
-            state_pose_mode=requests[0].state_pose_mode,
-        )
+        if len(requests) == 1:
+            request = requests[0]
+            action_chunks = infer.predict_action_chunk_obs(
+                request.observation,
+                task=request.task,
+                postprocess=request.postprocess,
+                state_pose_mode=request.state_pose_mode,
+                noise_seed=request.noise_seed,
+            )
+        else:
+            observation_batch = _stack_model_observations([request.observation for request in requests])
+            action_chunks = infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in requests],
+                postprocess=requests[0].postprocess,
+                state_pose_mode=requests[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in requests]
+                if all(request.noise_seed is not None for request in requests)
+                else None,
+            )
         if hasattr(action_chunks, "detach"):
             action_chunks = action_chunks.detach().cpu().numpy()
         else:
@@ -2024,6 +2405,7 @@ def settle_scene_after_reset(
             qvel_adr = int(rec.get("qvel_adr", -1))
             if 0 <= qvel_adr < len(sim.data.qvel):
                 sim.data.qvel[qvel_adr] = 0.0
+
         sim.forward()
 
     fixed_arm_qpos = np.asarray(sim.data.qpos[arm_qpos_idx], dtype=np.float64).copy() if arm_qpos_idx else None
@@ -2225,17 +2607,29 @@ def run_episode(
     *,
     infer: Any,
     env: Any,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
     task_language: str,
     init_state: np.ndarray,
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
     control = cfg["control"]
-    max_steps = int(control.get("max_steps", getattr(env, "horizon", 500)))
+    configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 500)))
+    max_steps = (
+        int(LIBERO_STANDARD_MAX_STEPS[suite_name])
+        if bool(cfg.get("use_suite_max_steps", True)) and suite_name in LIBERO_STANDARD_MAX_STEPS
+        else configured_max_steps
+    )
     action_index = max(0, int(control.get("action_index", 0)))
     exec_action_steps = int(control.get("exec_action_steps", 16))
     warmup_steps = max(0, int(control.get("warmup_steps", 0)))
     gripper_threshold = float(control.get("gripper_threshold", 0.5))
     gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
+    gripper_control_mode = str(control.get("gripper_control_mode", "delta_width"))
+    gripper_delta_threshold = float(control.get("gripper_delta_threshold", 0.002))
+    gripper_target_tolerance = float(control.get("gripper_target_tolerance", 0.004))
+    policy_noise_seed_base = int(cfg.get("policy_noise_seed", 0))
 
 
     raw_obs = env.reset()
@@ -2288,6 +2682,18 @@ def run_episode(
     gripper_commands: list[float] = []
     gripper_raw_widths: list[float] = []
     gripper_width_pcts: list[float] = []
+    gripper_actual_widths: list[float] = []
+    gripper_width_errors: list[float] = []
+    achieved_model_worlds: list[np.ndarray] = []
+    tracking_position_errors: list[float] = []
+    tracking_rotation_errors: list[float] = []
+    model_input_hashes: list[str] = []
+    first_model_input_component_hashes: dict[str, str] = {}
+    chunk_start_model_worlds: list[np.ndarray] = []
+    chunk_previous_target_model_worlds: list[np.ndarray] = []
+    chunk_boundary_position_errors: list[float] = []
+    chunk_boundary_rotation_errors: list[float] = []
+    previous_issued_target_model_world: np.ndarray | None = None
 
     success_ever = False
     done = False
@@ -2339,13 +2745,35 @@ def run_episode(
                 "point_cloud": point_cloud,
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
             }
+            chunk_start_model_world = pose9_to_homo_np(np.asarray(eef_pose[:9], dtype=np.float32))
+            chunk_start_model_worlds.append(np.asarray(chunk_start_model_world, dtype=np.float32))
+            if previous_issued_target_model_world is not None:
+                previous_target = np.asarray(previous_issued_target_model_world, dtype=np.float32)
+                chunk_previous_target_model_worlds.append(previous_target)
+                chunk_boundary_position_errors.append(
+                    float(np.linalg.norm(chunk_start_model_world[:3, 3] - previous_target[:3, 3]))
+                )
+                chunk_boundary_rotation_errors.append(
+                    rotation_error_radians(chunk_start_model_world[:3, :3], previous_target[:3, :3])
+                )
             if infer.policy.config.vla_adapter_enable:
                 model_observation.update(build_policy_rgb_observation(policy_rgb_camera_map, raw_obs))
+            input_fingerprints = model_observation_fingerprints(model_observation)
+            model_input_hashes.append(input_fingerprints["__all__"])
+            if not first_model_input_component_hashes:
+                first_model_input_component_hashes = input_fingerprints
             chunk_batch = infer.predict_action_chunk_obs(
                 model_observation,
                 task=task_language,
                 postprocess=True,
                 state_pose_mode="identity",
+                noise_seed=deterministic_policy_noise_seed(
+                    policy_noise_seed_base,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    episode_index=int(episode_index),
+                    model_call_index=int(model_call_count),
+                ),
             )
             if hasattr(chunk_batch, "detach"):
                 chunk = chunk_batch[0].detach().cpu().numpy()
@@ -2360,13 +2788,14 @@ def run_episode(
             start_idx = min(action_index, max(0, len(chunk) - 1))
             end_idx = len(chunk) if exec_action_steps <= 0 else min(len(chunk), start_idx + exec_action_steps)
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
-
             actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
                 env=env,
                 current_eef_pose9_gripper=eef_pose,
                 action_chunk=selected_chunk,
                 gripper_threshold=gripper_threshold,
                 gripper_max_width=gripper_max_width,
+                gripper_control_mode=gripper_control_mode,
+                gripper_delta_threshold=gripper_delta_threshold,
             )
 
             for row, action, model_world, controller_pose in zip(
@@ -2379,6 +2808,14 @@ def run_episode(
                 if steps >= max_steps or done or success_ever or keyboard.poll():
                     manual_failure = keyboard.poll()
                     break
+                action = np.asarray(action, dtype=np.float32).copy()
+                if gripper_control_mode == "target_width":
+                    action[-1] = gripper_target_width_command(
+                        float(row[-1]),
+                        gripper_scalar(raw_obs),
+                        tolerance=gripper_target_tolerance,
+                        max_physical_width=gripper_max_width,
+                    )
                 try:
                     raw_obs, reward, done, _ = env.step(action)
                 except ValueError as exc:
@@ -2400,6 +2837,18 @@ def run_episode(
                 gripper_width_pcts.append(
                     gripper_width_percent_from_scalar(float(row[-1]), max_physical_width=gripper_max_width)
                 )
+                achieved_pose = eef_pose9_gripper_from_obs(raw_obs)
+                gripper_actual_widths.append(float(achieved_pose[-1]))
+                gripper_width_errors.append(float(achieved_pose[-1] - row[-1]))
+                achieved_model_world = pose9_to_homo_np(np.asarray(achieved_pose[:9], dtype=np.float32))
+                achieved_model_worlds.append(np.asarray(achieved_model_world, dtype=np.float32))
+                tracking_position_errors.append(
+                    float(np.linalg.norm(achieved_model_world[:3, 3] - model_world[:3, 3]))
+                )
+                tracking_rotation_errors.append(
+                    rotation_error_radians(achieved_model_world[:3, :3], model_world[:3, :3])
+                )
+                previous_issued_target_model_world = np.asarray(model_world, dtype=np.float32)
 
                 if save_video:
                     append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
@@ -2437,23 +2886,78 @@ def run_episode(
             else "max_steps"
         ),
         "steps": int(steps),
+        "max_steps": int(max_steps),
         "action_rows_executed": int(len(libero_actions)),
         "model_call_count": int(model_call_count),
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
         "max_reward": float(np.max(rewards)) if rewards else 0.0,
         "wall_s": float(time.perf_counter() - start_s),
         "gripper_threshold": float(gripper_threshold),
+        "gripper_control_mode": gripper_control_mode,
+        "gripper_delta_threshold": float(gripper_delta_threshold),
+        "gripper_delta_alignment": "next_width_minus_current_width",
+        "gripper_target_tolerance": float(gripper_target_tolerance),
+        "policy_noise_seed_base": int(policy_noise_seed_base),
+        "model_input_hashes": model_input_hashes,
+        "first_model_input_component_hashes": first_model_input_component_hashes,
         "gripper_open_steps": int(np.sum(np.asarray(gripper_commands) < 0.0)),
         "gripper_close_steps": int(np.sum(np.asarray(gripper_commands) > 0.0)),
         "final_gripper_qpos_sum": float(gripper_scalar(raw_obs)),
+        "gripper_width_error_median_abs_m": (
+            float(np.median(np.abs(gripper_width_errors))) if gripper_width_errors else 0.0
+        ),
+        "gripper_width_error_p95_abs_m": (
+            float(np.quantile(np.abs(gripper_width_errors), 0.95)) if gripper_width_errors else 0.0
+        ),
         "final_eef_pose9_gripper": final_eef_pose,
+        "tracking_position_error_median_m": (
+            float(np.median(tracking_position_errors)) if tracking_position_errors else 0.0
+        ),
+        "tracking_position_error_p95_m": (
+            float(np.quantile(tracking_position_errors, 0.95)) if tracking_position_errors else 0.0
+        ),
+        "tracking_position_error_max_m": (
+            float(np.max(tracking_position_errors)) if tracking_position_errors else 0.0
+        ),
+        "tracking_rotation_error_median_rad": (
+            float(np.median(tracking_rotation_errors)) if tracking_rotation_errors else 0.0
+        ),
+        "tracking_rotation_error_p95_rad": (
+            float(np.quantile(tracking_rotation_errors, 0.95)) if tracking_rotation_errors else 0.0
+        ),
+        "tracking_rotation_error_max_rad": (
+            float(np.max(tracking_rotation_errors)) if tracking_rotation_errors else 0.0
+        ),
+        "chunk_boundary_position_error_median_m": (
+            float(np.median(chunk_boundary_position_errors)) if chunk_boundary_position_errors else 0.0
+        ),
+        "chunk_boundary_position_error_max_m": (
+            float(np.max(chunk_boundary_position_errors)) if chunk_boundary_position_errors else 0.0
+        ),
+        "chunk_boundary_rotation_error_median_rad": (
+            float(np.median(chunk_boundary_rotation_errors)) if chunk_boundary_rotation_errors else 0.0
+        ),
+        "chunk_boundary_rotation_error_max_rad": (
+            float(np.max(chunk_boundary_rotation_errors)) if chunk_boundary_rotation_errors else 0.0
+        ),
         "libero_actions": np.asarray(libero_actions, dtype=np.float32),
         "model_action_rows": np.asarray(model_action_rows, dtype=np.float32),
         "target_model_worlds": np.asarray(target_model_worlds, dtype=np.float32),
         "target_controller_pose9": np.asarray(target_controller_pose9, dtype=np.float32),
-        #"gripper_commands": np.asarray(gripper_commands, dtype=np.float32),
-        #"gripper_raw_widths": np.asarray(gripper_raw_widths, dtype=np.float32),
-        #"gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
+        "achieved_model_worlds": np.asarray(achieved_model_worlds, dtype=np.float32),
+        "tracking_position_errors": np.asarray(tracking_position_errors, dtype=np.float32),
+        "tracking_rotation_errors": np.asarray(tracking_rotation_errors, dtype=np.float32),
+        "chunk_start_model_worlds": np.asarray(chunk_start_model_worlds, dtype=np.float32),
+        "chunk_previous_target_model_worlds": np.asarray(
+            chunk_previous_target_model_worlds, dtype=np.float32
+        ),
+        "chunk_boundary_position_errors": np.asarray(chunk_boundary_position_errors, dtype=np.float32),
+        "chunk_boundary_rotation_errors": np.asarray(chunk_boundary_rotation_errors, dtype=np.float32),
+        "gripper_commands": np.asarray(gripper_commands, dtype=np.float32),
+        "gripper_raw_widths": np.asarray(gripper_raw_widths, dtype=np.float32),
+        "gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
+        "gripper_actual_widths": np.asarray(gripper_actual_widths, dtype=np.float32),
+        "gripper_width_errors": np.asarray(gripper_width_errors, dtype=np.float32),
         "video_frames": video_frames,
     }
 
@@ -2512,6 +3016,7 @@ def evaluate_task(
                 render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
                 control_delta=False,
                 control_freq=float(cfg["control"].get("control_freq", 20.0)),
+                env_seed=int(cfg.get("env_seed", 7)),
             )
 
     shared_env = None
@@ -2558,6 +3063,9 @@ def evaluate_task(
                 result = run_episode(
                     infer=infer,
                     env=env,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    episode_index=int(episode_idx),
                     task_language=task_language,
                     init_state=init_states[episode_idx % len(init_states)],
                     cfg=cfg,
@@ -3057,13 +3565,224 @@ def evaluate_suite_process_parallel(
     )
 
 
+def _isolated_policy_worker_entry(
+    *,
+    worker_id: int,
+    suite_name: str,
+    task_ids: list[int],
+    cfg: dict[str, Any],
+    output_dir: Path,
+    result_queue: Any,
+) -> None:
+    """Evaluate a fixed task shard with a private policy and private RNG state."""
+    try:
+        # The spawn bootstrap intentionally skips the heavyweight policy import
+        # at module import time. Import it only inside the process that owns it.
+        if __package__ and __package__.startswith("benchmarks."):
+            from ..smolvla_model_inference import SmolVLA_ModelInference as WorkerInference
+        else:
+            from smolvla_model_inference import SmolVLA_ModelInference as WorkerInference
+
+        ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+        configure_torch_determinism(bool(cfg.get("deterministic_torch", True)))
+
+        from libero.libero import benchmark
+
+        infer = WorkerInference(
+            policy_path=cfg["policy_path"],
+            policy_repo_id=cfg.get("policy_repo_id"),
+            device=cfg["device"],
+            visualize_foreground=False,
+            foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
+        )
+        suite = benchmark.get_benchmark_dict()[suite_name]()
+        summaries: list[dict[str, Any]] = []
+        for task_id in task_ids:
+            summaries.append(
+                evaluate_task(
+                    infer=infer,
+                    suite=suite,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    cfg=cfg,
+                    output_dir=output_dir,
+                )
+            )
+        result_queue.put(("ok", int(worker_id), summaries))
+    except BaseException as exc:
+        result_queue.put(
+            (
+                "error",
+                int(worker_id),
+                [int(task_id) for task_id in task_ids],
+                repr(exc),
+                traceback.format_exc(),
+            )
+        )
+
+
+def evaluate_suite_isolated_policy_processes(
+    *,
+    suite_name: str,
+    task_ids: list[int],
+    cfg: dict[str, Any],
+    output_dir: Path,
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    """Run disjoint task shards in processes that each own a policy copy.
+
+    Unlike the dynamic-batch path, no observation from one task is combined
+    with another task. A worker serially evaluates its assigned tasks, so each
+    model has an independent flow-matching RNG and CUDA execution history.
+    """
+    worker_count = min(max(1, int(worker_count)), max(1, len(task_ids)))
+    task_shards = [
+        [int(task_id) for task_id in task_ids[worker_id::worker_count]]
+        for worker_id in range(worker_count)
+    ]
+    task_shards = [shard for shard in task_shards if shard]
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes: dict[int, Any] = {}
+
+    worker_environment = {
+        "SONG_LIBERO_ISOLATED_POLICY_WORKER": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "MALLOC_ARENA_MAX": "2",
+    }
+    previous_environment = {key: os.environ.get(key) for key in worker_environment}
+    os.environ.update(worker_environment)
+    try:
+        for worker_id, worker_task_ids in enumerate(task_shards):
+            process = context.Process(
+                target=_isolated_policy_worker_entry,
+                kwargs={
+                    "worker_id": int(worker_id),
+                    "suite_name": suite_name,
+                    "task_ids": worker_task_ids,
+                    "cfg": cfg,
+                    "output_dir": output_dir,
+                    "result_queue": result_queue,
+                },
+                name=f"libero-{suite_name}-isolated-policy-{worker_id}",
+            )
+            process.start()
+            processes[int(worker_id)] = process
+    finally:
+        for key, previous_value in previous_environment.items():
+            if previous_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
+
+    print(
+        f"[isolated-policy] suite={suite_name}: started {len(processes)} independent model "
+        f"processes with task shards={task_shards}",
+        flush=True,
+    )
+    finished: set[int] = set()
+    summaries: list[dict[str, Any]] = []
+    failures: list[str] = []
+    try:
+        while len(finished) < len(processes):
+            try:
+                message = result_queue.get(timeout=0.2)
+            except queue.Empty:
+                message = None
+            if message is not None:
+                status = str(message[0])
+                worker_id = int(message[1])
+                if worker_id in finished:
+                    continue
+                if status == "ok":
+                    summaries.extend(message[2])
+                else:
+                    worker_task_ids = [int(task_id) for task_id in message[2]]
+                    error_repr = str(message[3])
+                    error_traceback = str(message[4])
+                    failures.append(
+                        f"worker={worker_id} tasks={worker_task_ids}: {error_repr}"
+                    )
+                    print(
+                        f"[warn] isolated policy worker failed suite={suite_name} "
+                        f"worker={worker_id} tasks={worker_task_ids}: "
+                        f"{error_repr}\n{error_traceback}",
+                        flush=True,
+                    )
+                    summaries.extend(
+                        failed_task_summary(
+                            suite_name=suite_name,
+                            task_id=task_id,
+                            episode_count=int(cfg["episodes"]),
+                            exc=RuntimeError(error_repr),
+                        )
+                        for task_id in worker_task_ids
+                    )
+                finished.add(worker_id)
+
+            for worker_id, process in processes.items():
+                if worker_id in finished or process.is_alive() or process.exitcode is None:
+                    continue
+                worker_task_ids = task_shards[worker_id]
+                error = (
+                    f"worker={worker_id} tasks={worker_task_ids} exited without a result "
+                    f"(exitcode={process.exitcode})"
+                )
+                failures.append(error)
+                summaries.extend(
+                    failed_task_summary(
+                        suite_name=suite_name,
+                        task_id=task_id,
+                        episode_count=int(cfg["episodes"]),
+                        exc=RuntimeError(error),
+                    )
+                    for task_id in worker_task_ids
+                )
+                finished.add(worker_id)
+    except BaseException:
+        for process in processes.values():
+            if process.is_alive():
+                process.terminate()
+        raise
+    finally:
+        for process in processes.values():
+            process.join(timeout=30.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+
+    summaries.sort(key=lambda item: int(item["task_id"]))
+    if failures:
+        error_message = "Isolated policy workers failed:\n" + "\n".join(failures)
+        mark_realtime_suite_failed(
+            output_dir=output_dir,
+            suite_name=suite_name,
+            error=error_message,
+        )
+        raise RuntimeError(error_message)
+    return summaries
+
+
 def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str], Path]:
     cfg = load_config(args.config)
     cfg.setdefault("control", {})
 
     cfg["policy_path"] = cfg_get(cfg, args.policy_path, "policy_path")
     cfg["policy_repo_id"] = cfg_get(cfg, args.policy_repo_id, "policy_repo_id")
+    cfg["evaluation_identity"] = collect_evaluation_identity(cfg["policy_path"])
+    config_path = Path(args.config).expanduser().resolve()
+    cfg["evaluation_identity"]["eval_config_path"] = str(config_path)
+    cfg["evaluation_identity"]["eval_config_sha256"] = _sha256_file(config_path)
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
+    cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 7))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 4096))
     cfg["observation_height"] = int(cfg_get(cfg, args.observation_height, "observation_height", 128))
@@ -3090,9 +3809,31 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["control"]["action_index"] = int(cfg_get(cfg["control"], args.action_index, "action_index", 0))
     cfg["control"]["exec_action_steps"] = int(cfg_get(cfg["control"], args.exec_action_steps, "exec_action_steps", 16))
     cfg["control"]["max_steps"] = int(cfg_get(cfg["control"], args.max_steps, "max_steps", 500))
+    cfg["use_suite_max_steps"] = bool(
+        cfg_get(cfg, args.use_suite_max_steps, "use_suite_max_steps", True)
+    )
     cfg["control"]["warmup_steps"] = int(cfg_get(cfg["control"], args.warmup_steps, "warmup_steps", 0))
+    cfg["policy_noise_seed"] = int(cfg_get(cfg, args.policy_noise_seed, "policy_noise_seed", 0))
+    cfg["deterministic_torch"] = bool(
+        cfg_get(cfg, args.deterministic_torch, "deterministic_torch", True)
+    )
+    cfg["torch_determinism"] = {
+        "enabled": bool(cfg["deterministic_torch"]),
+        "configured_in_policy_process": True,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+    cfg["evaluation_identity"]["torch_determinism"] = cfg["torch_determinism"]
     cfg["control"]["gripper_threshold"] = float(
         cfg_get(cfg["control"], args.gripper_threshold, "gripper_threshold", 0.5)
+    )
+    cfg["control"]["gripper_control_mode"] = str(
+        cfg_get(cfg["control"], args.gripper_control_mode, "gripper_control_mode", "delta_width")
+    )
+    cfg["control"]["gripper_delta_threshold"] = float(
+        cfg_get(cfg["control"], args.gripper_delta_threshold, "gripper_delta_threshold", 0.003)
+    )
+    cfg["control"]["gripper_target_tolerance"] = float(
+        cfg_get(cfg["control"], args.gripper_target_tolerance, "gripper_target_tolerance", 0.004)
     )
     if args.gripper_qpos_max_width is not None:
         cfg["gripper_qpos_max_width"] = float(args.gripper_qpos_max_width)
@@ -3107,6 +3848,17 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg["output_dir"] = str(output_dir)
     cfg["task_workers"] = max(1, int(cfg_get(cfg, args.task_workers, "task_workers", 1)))
+    cfg["isolated_policy_workers"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg,
+                args.isolated_policy_workers,
+                "isolated_policy_workers",
+                1,
+            )
+        ),
+    )
     cfg["episode_workers_per_task"] = max(
         1,
         int(
@@ -3189,6 +3941,13 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             raise ValueError("Parallel environment workers require --no-visualize-foreground.")
     if cfg["episode_workers_per_task"] > 1 and cfg["task_worker_backend"] != "process":
         raise ValueError("--episode-workers-per-task > 1 requires --task-worker-backend process.")
+    if cfg["isolated_policy_workers"] > 1 and cfg["episode_workers_per_task"] > 1:
+        raise ValueError(
+            "--isolated-policy-workers > 1 already provides independent rollout processes; "
+            "combine it with --episode-workers-per-task 1."
+        )
+    if cfg["isolated_policy_workers"] > 1 and bool(cfg.get("visualize_foreground", False)):
+        raise ValueError("Isolated policy workers require --no-visualize-foreground.")
 
     return cfg, suite_names, output_dir
 
@@ -3322,7 +4081,62 @@ def main() -> None:
     ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
 
     from libero.libero import benchmark
+    episode_horizons = {
+        suite_name: (
+            int(LIBERO_STANDARD_MAX_STEPS[suite_name])
+            if bool(cfg.get("use_suite_max_steps", True))
+            and suite_name in LIBERO_STANDARD_MAX_STEPS
+            else int(cfg["control"]["max_steps"])
+        )
+        for suite_name in suite_names
+    }
 
+    if int(cfg.get("isolated_policy_workers", 1)) > 1:
+        benchmark_dict = benchmark.get_benchmark_dict()
+        all_task_summaries: list[dict[str, Any]] = []
+        print(
+            "[info] isolated-policy evaluation: "
+            f"suites={suite_names}, independent_models_per_gpu={cfg['isolated_policy_workers']}, "
+            f"episodes={cfg['episodes']}, inference_batch_size=1, "
+            f"exec_action_steps={cfg['control']['exec_action_steps']}, "
+            f"policy_noise_seed={cfg['policy_noise_seed']}, "
+            f"episode_horizons={episode_horizons}",
+            flush=True,
+        )
+        for suite_name in suite_names:
+            suite = benchmark_dict[suite_name]()
+            task_ids = resolve_task_ids_for_suite(
+                suite_name=suite_name,
+                task_count=len(suite.tasks),
+                cli_task_ids=args.task_id,
+                cfg=cfg,
+            )
+            initialize_realtime_suite_progress(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                task_ids=[int(task_id) for task_id in task_ids],
+                episodes_per_task=int(cfg["episodes"]),
+            )
+            suite_summaries = evaluate_suite_isolated_policy_processes(
+                suite_name=suite_name,
+                task_ids=[int(task_id) for task_id in task_ids],
+                cfg=cfg,
+                output_dir=output_dir,
+                worker_count=int(cfg["isolated_policy_workers"]),
+            )
+            all_task_summaries.extend(suite_summaries)
+            all_task_summaries.sort(
+                key=lambda item: (
+                    suite_names.index(str(item["suite"])),
+                    int(item["task_id"]),
+                )
+            )
+            write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
+        print(json.dumps(aggregate_task_results(all_task_summaries), indent=2, ensure_ascii=False))
+        return
+
+    cfg["torch_determinism"] = configure_torch_determinism(bool(cfg["deterministic_torch"]))
+    cfg["evaluation_identity"]["torch_determinism"] = cfg["torch_determinism"]
     infer = SmolVLA_ModelInference(
         policy_path=cfg["policy_path"],
         policy_repo_id=cfg.get("policy_repo_id"),
@@ -3335,12 +4149,21 @@ def main() -> None:
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={cfg['episodes']}, "
         f"task_workers={cfg['task_workers']}, "
+        f"isolated_policy_workers={cfg['isolated_policy_workers']}, "
         f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
         f"task_worker_backend={cfg['task_worker_backend']}, "
         f"inference_batch_size={cfg['inference_batch_size']}, "
         f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
         f"gripper_threshold={cfg['control']['gripper_threshold']}, "
+        f"gripper_control_mode={cfg['control']['gripper_control_mode']}, "
+        f"gripper_delta_threshold={cfg['control']['gripper_delta_threshold']}, "
+        f"gripper_target_tolerance={cfg['control']['gripper_target_tolerance']}, "
+        f"policy_noise_seed={cfg['policy_noise_seed']}, "
+        f"deterministic_torch={cfg['deterministic_torch']}, "
+        f"env_seed={cfg['env_seed']}, "
+        f"use_suite_max_steps={cfg['use_suite_max_steps']}, "
+        f"episode_horizons={episode_horizons}, "
         f"save_video={cfg['save_video']}, "
         f"render_mode={cfg.get('render_mode')}, "
         f"render_every_n_steps={cfg.get('render_every_n_steps')}, "

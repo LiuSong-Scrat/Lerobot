@@ -447,17 +447,95 @@ class SmolVLA_ModelInference:
         task: str | list[str] = "",
         postprocess: bool = True,
         state_pose_mode: str = "identity",
+        noise_seed: int | list[int] | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         model_batch = self.build_model_batch(
             observation,
             task=task,
             state_pose_mode=state_pose_mode,
         )
-        action_chunk = self.policy.predict_action_chunk(model_batch)
+        if noise_seed is None:
+            action_chunk = self.policy.predict_action_chunk(model_batch)
+        else:
+            if isinstance(noise_seed, int):
+                forward_seeds = [int(noise_seed)]
+            else:
+                forward_seeds = [int(seed) for seed in noise_seed]
+            forward_seed = forward_seeds[0]
+            if len(forward_seeds) > 1:
+                forward_seed = 0
+                for index, seed in enumerate(forward_seeds):
+                    forward_seed = (
+                        forward_seed * 1_000_003 + (index + 1) * (int(seed) + 0x9E3779B9)
+                    ) & ((1 << 63) - 1)
+
+            policy_device = next(self.policy.parameters()).device
+            cuda_devices: list[int] = []
+            if policy_device.type == "cuda":
+                cuda_devices = [
+                    policy_device.index if policy_device.index is not None else torch.cuda.current_device()
+                ]
+            # Preserve the checkpoint's original LitePT / PointSeg operations,
+            # but make all random choices inside one policy call reproducible.
+            # This avoids changing the voxelization or token distribution merely
+            # for evaluation determinism.
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(int(forward_seed))
+                if policy_device.type == "cuda":
+                    torch.cuda.manual_seed_all(int(forward_seed))
+                noise = self._make_seeded_action_noise(model_batch, noise_seed)
+                action_chunk = self.policy.predict_action_chunk(model_batch, noise=noise)
         self._update_foreground_visualization()
         if postprocess:
             action_chunk = self.postprocessor(action_chunk)
         return action_chunk.detach().cpu()
+
+    def _make_seeded_action_noise(
+        self,
+        model_batch: dict[str, Any],
+        noise_seed: int | list[int] | tuple[int, ...] | None,
+    ) -> torch.Tensor | None:
+        """Build per-sample seeded flow-matching noise for online evaluation.
+
+        This keeps each sample's initial flow state independent of request
+        order. It does not make the complete policy batch-invariant: tensor
+        shape, sparse CUDA kernels, and floating-point execution can still make
+        a batched forward differ slightly from singleton inference.
+        """
+        if noise_seed is None:
+            return None
+
+        state = self.policy.prepare_state(model_batch)
+        batch_size = int(state.shape[0])
+        if isinstance(noise_seed, int):
+            seeds = [int(noise_seed)] * batch_size
+        else:
+            seeds = [int(seed) for seed in noise_seed]
+            if len(seeds) != batch_size:
+                raise ValueError(
+                    f"noise_seed has {len(seeds)} entries for inference batch size {batch_size}."
+                )
+
+        model = self.policy.model
+        device = state.device
+        cuda_devices: list[int] = []
+        if device.type == "cuda":
+            cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+
+        samples: list[torch.Tensor] = []
+        shape = (1, model.config.chunk_size, model.config.max_action_dim)
+        for seed in seeds:
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(int(seed))
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(int(seed))
+                if model.config.se3_enable:
+                    dummy = torch.zeros(shape, dtype=torch.float32, device=device)
+                    sample = model.sample_se3_action_noise(dummy)[2]
+                else:
+                    sample = model.sample_noise(shape, device)
+            samples.append(sample)
+        return torch.cat(samples, dim=0)
 
     @torch.inference_mode()
     def select_action(
