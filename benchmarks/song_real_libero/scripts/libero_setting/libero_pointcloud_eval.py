@@ -15,35 +15,48 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import queue
 import re
 import select
+import subprocess
 import sys
 import termios
 import threading
 import time
+import traceback
 import tty
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 _ENV_CREATION_LOCK = threading.Lock()
+_ENV_WORKER_BOOTSTRAP = os.environ.get("SONG_LIBERO_ENV_WORKER", "0") == "1"
+_SUITE_LAUNCHER_BOOTSTRAP = any(
+    arg == "--suite-gpu-ids" or arg.startswith("--suite-gpu-ids=") for arg in sys.argv[1:]
+)
+
+
+def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
+    state = np.zeros(10, dtype=np.float32)
+    state[3] = 1.0
+    state[7] = 1.0
+    state[-1] = float(gripper)
+    return state
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
-    from ..smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
-    from .libero_hdf5_to_dataset import (
-        append_video_frames,
-        dataset_image_from_raw_obs,
-        export_episode_videos,
-        resolve_suite_names,
-        resolve_task_ids_for_suite,
-    )
+    if not _ENV_WORKER_BOOTSTRAP and not _SUITE_LAUNCHER_BOOTSTRAP:
+        from ..smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
+    else:
+        SmolVLA_ModelInference = Any
+        identity_pose9_gripper = _identity_pose9_gripper
     from .libero_pointcloud_utils import (
         add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
@@ -63,13 +76,6 @@ if __package__ and __package__.startswith("benchmarks."):
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
-    from libero_setting.libero_hdf5_to_dataset import (
-        append_video_frames,
-        dataset_image_from_raw_obs,
-        export_episode_videos,
-        resolve_suite_names,
-        resolve_task_ids_for_suite,
-    )
     from libero_setting.libero_pointcloud_utils import (
         add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
@@ -86,7 +92,147 @@ else:
         pose9_to_homo_np,
         render_camera_names_from_config,
     )
-    from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
+    if not _ENV_WORKER_BOOTSTRAP and not _SUITE_LAUNCHER_BOOTSTRAP:
+        from smolvla_model_inference import SmolVLA_ModelInference, identity_pose9_gripper
+    else:
+        SmolVLA_ModelInference = Any
+        identity_pose9_gripper = _identity_pose9_gripper
+
+
+def resolve_suite_names(cli_suites: list[str] | None, cfg: dict[str, Any]) -> list[str]:
+    suites = cli_suites if cli_suites is not None else cfg.get("suites", cfg.get("suite", "libero_object"))
+    if isinstance(suites, str):
+        suites = [suites]
+    suites = [str(suite) for suite in suites]
+    if not suites:
+        raise ValueError("At least one LIBERO suite must be configured.")
+    return suites
+
+
+def resolve_task_ids_for_suite(
+    *,
+    suite_name: str,
+    task_count: int,
+    cli_task_ids: list[int] | None,
+    cfg: dict[str, Any],
+) -> list[int]:
+    if bool(cfg.get("all_tasks", False)):
+        return list(range(task_count))
+    if cli_task_ids is not None:
+        task_ids = cli_task_ids
+    else:
+        suite_task_ids = cfg.get("suite_task_ids", {})
+        if isinstance(suite_task_ids, dict) and suite_name in suite_task_ids:
+            task_ids = suite_task_ids[suite_name]
+        else:
+            task_ids = cfg.get("task_ids")
+    if task_ids is None:
+        return list(range(task_count))
+    resolved = [int(task_id) for task_id in task_ids]
+    invalid = [task_id for task_id in resolved if task_id < 0 or task_id >= task_count]
+    if invalid:
+        raise ValueError(
+            f"Invalid task id(s) for {suite_name}: {invalid}; valid range is [0, {task_count - 1}]"
+        )
+    return resolved
+
+
+def _camera_image_keys(camera_names: list[str]) -> list[str]:
+    return [
+        str(camera_name)
+        if str(camera_name).endswith("_image")
+        else f"{camera_name}_image"
+        for camera_name in camera_names
+    ]
+
+
+def _image_from_raw_obs(raw_obs: dict[str, Any], image_key: str) -> np.ndarray | None:
+    if image_key not in raw_obs:
+        return None
+    image = np.asarray(raw_obs[image_key])
+    if image.ndim != 3 or image.shape[-1] != 3:
+        return None
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def dataset_image_from_raw_obs(raw_obs: dict[str, Any], camera_name: str) -> np.ndarray | None:
+    image_key = str(camera_name) if str(camera_name).endswith("_image") else f"{camera_name}_image"
+    image = _image_from_raw_obs(raw_obs, image_key)
+    if image is None:
+        return None
+    if image_key == "agentview_image":
+        image = np.ascontiguousarray(image[:, ::-1])
+    return image.copy()
+
+
+def append_video_frames(
+    video_frames: dict[str, list[np.ndarray]],
+    raw_obs: dict[str, Any],
+    camera_names: list[str],
+) -> None:
+    for image_key in _camera_image_keys(camera_names):
+        image = _image_from_raw_obs(raw_obs, image_key)
+        if image is not None:
+            if image_key == "agentview_image":
+                image = np.ascontiguousarray(image[:, ::-1])
+            video_frames.setdefault(image_key, []).append(image.copy())
+
+
+def _write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
+    if not frames:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio.v3 as iio
+
+        iio.imwrite(path, np.asarray(frames, dtype=np.uint8), fps=fps)
+        return
+    except Exception:
+        pass
+
+    import cv2
+
+    first = np.asarray(frames[0], dtype=np.uint8)
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {path}")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+
+def export_episode_videos(
+    episode: dict[str, Any],
+    video_dir: Path,
+    record: dict[str, Any],
+    cfg: dict[str, Any],
+) -> list[str]:
+    if not cfg.get("save_video", False):
+        return []
+    video_frames = episode.get("video_frames") or {}
+    if not video_frames:
+        return []
+    video_dir_name = record.get("video_dir_name")
+    if video_dir_name is None:
+        video_dir_name = f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+    episode_dir = video_dir / video_dir_name
+    written: list[str] = []
+    for image_key, frames in video_frames.items():
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", image_key)
+        path = episode_dir / f"{safe_key}.mp4"
+        _write_video(path, frames, int(cfg["fps"]))
+        written.append(str(path))
+    return written
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +303,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
     parser.add_argument("--suite", action="append", default=None)
+    parser.add_argument(
+        "--suite-gpu-ids",
+        default=None,
+        help=(
+            "Comma-separated GPU ids for one-process-per-suite evaluation, for example 0,1,2,3. "
+            "The number of ids must match the number of suites."
+        ),
+    )
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--episodes", type=int, default=None)
@@ -199,7 +353,16 @@ def parse_args() -> argparse.Namespace:
         "--task-workers",
         type=int,
         default=None,
-        help="Number of task environments evaluated concurrently in this GPU process.",
+        help="Number of task environments evaluated concurrently by this GPU model service.",
+    )
+    parser.add_argument(
+        "--task-worker-backend",
+        choices=("process", "thread"),
+        default=None,
+        help=(
+            "Parallel environment backend. 'process' gives real MuJoCo task parallelism and is the default "
+            "when task-workers > 1; 'thread' is retained only for compatibility."
+        ),
     )
     parser.add_argument(
         "--inference-batch-size",
@@ -213,7 +376,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Short collection window used by the shared-GPU dynamic batcher.",
     )
-    parser.add_argument("--recreate-env-per-episode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--recreate-env-per-episode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Rebuild a task environment before every episode (disabled by default for parallel evaluation).",
+    )
     return parser.parse_args()
 
 
@@ -455,7 +623,7 @@ def action_chunk_to_absolute_libero_actions(
         arm_action = world_pose_to_libero_absolute_action(target_controller_world)
         delta_pre_width = chunk[idx+1,-1]-chunk[idx,-1] if idx< chunk.shape[0]-1 else 0
         # print("delta_pre_width = ", delta_pre_width)
-        gripper_action = -1.0 if delta_pre_width > 0.004 else (1.0 if delta_pre_width < -0.004 else 0.0)
+        gripper_action = -1.0 if delta_pre_width > 0.002 else (1.0 if delta_pre_width < -0.002 else 0.0)
         libero_actions.append(np.concatenate([arm_action, np.asarray([gripper_action], dtype=np.float32)]))
         target_controller_pose9.append(matrix_to_pose9(target_controller_world))
 
@@ -536,10 +704,15 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "suite_reports": suite_reports,
         "results": tasks,
     }
-    write_json_atomic(output_dir / "summary.json", summary)
-    write_json_atomic(output_dir / "overall_report.json", {"overall": summary["overall"], "suites": suite_reports})
     for suite in suite_reports:
         write_json_atomic(output_dir / str(suite["suite"]) / "suite_report.json", suite)
+    # Multi-GPU suite children share one output root but own disjoint suite
+    # directories.  They leave the two global reports to the launcher so no
+    # cross-process file can overwrite another suite's results.
+    if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") == "1":
+        return
+    write_json_atomic(output_dir / "summary.json", summary)
+    write_json_atomic(output_dir / "overall_report.json", {"overall": summary["overall"], "suites": suite_reports})
 
 
 def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz: str | None) -> dict[str, Any]:
@@ -897,6 +1070,190 @@ class BatchedInferenceScheduler:
             f"mean_batch={mean_batch:.2f}, max_batch={self._max_observed_batch}",
             flush=True,
         )
+
+
+@dataclass(slots=True)
+class _ProcessInferenceRequest:
+    worker_id: int
+    request_id: int
+    observation: dict[str, Any]
+    task: str
+    postprocess: bool
+    state_pose_mode: str
+
+
+class ProcessInferenceProxy:
+    """Child-process policy facade backed by the parent GPU model service."""
+
+    shared_parallel_inference = True
+
+    def __init__(
+        self,
+        *,
+        worker_id: int,
+        request_queue: Any,
+        response_queue: Any,
+        vla_adapter_enable: bool,
+        image_feature_keys: list[str],
+    ) -> None:
+        self.worker_id = int(worker_id)
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        self._next_request_id = 0
+        self.policy = SimpleNamespace(
+            config=SimpleNamespace(
+                vla_adapter_enable=bool(vla_adapter_enable),
+                image_features={str(key): None for key in image_feature_keys},
+            )
+        )
+
+    def policy_reset(self) -> None:
+        # Chunk inference does not consume the policy action queue.  Resetting a
+        # shared parent policy from an individual environment would be racy.
+        return None
+
+    def predict_action_chunk_obs(
+        self,
+        observation: dict[str, Any],
+        *,
+        task: str | list[str] = "",
+        postprocess: bool = True,
+        state_pose_mode: str = "identity",
+    ) -> np.ndarray:
+        if not isinstance(task, str):
+            if len(task) != 1:
+                raise ValueError("An environment worker must submit exactly one language instruction.")
+            task = str(task[0])
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        self.request_queue.put(
+            _ProcessInferenceRequest(
+                worker_id=self.worker_id,
+                request_id=request_id,
+                observation=observation,
+                task=str(task),
+                postprocess=bool(postprocess),
+                state_pose_mode=str(state_pose_mode),
+            )
+        )
+        status, response_request_id, payload = self.response_queue.get()
+        if int(response_request_id) != request_id:
+            raise RuntimeError(
+                f"Inference IPC response id {response_request_id} does not match request id {request_id}."
+            )
+        if status != "ok":
+            raise RuntimeError(f"Parent GPU inference failed:\n{payload}")
+        return np.asarray(payload)
+
+
+def _process_task_worker_entry(
+    *,
+    worker_id: int,
+    suite_name: str,
+    task_id: int,
+    cfg: dict[str, Any],
+    output_dir: Path,
+    request_queue: Any,
+    response_queue: Any,
+    ready_queue: Any,
+    result_queue: Any,
+    start_event: Any,
+    vla_adapter_enable: bool,
+    image_feature_keys: list[str],
+) -> None:
+    """Own one MuJoCo task environment in a process that never loads the policy."""
+    try:
+        ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+        from libero.libero import benchmark
+
+        suite = benchmark.get_benchmark_dict()[suite_name]()
+        infer = ProcessInferenceProxy(
+            worker_id=worker_id,
+            request_queue=request_queue,
+            response_queue=response_queue,
+            vla_adapter_enable=vla_adapter_enable,
+            image_feature_keys=image_feature_keys,
+        )
+
+        def _announce_ready_and_wait() -> None:
+            ready_queue.put(int(worker_id))
+            start_event.wait()
+
+        summary = evaluate_task(
+            infer=infer,
+            suite=suite,
+            suite_name=suite_name,
+            task_id=int(task_id),
+            cfg=cfg,
+            output_dir=output_dir,
+            on_environment_ready=_announce_ready_and_wait,
+        )
+        result_queue.put(("ok", int(worker_id), int(task_id), summary))
+    except BaseException as exc:
+        result_queue.put(
+            (
+                "error",
+                int(worker_id),
+                int(task_id),
+                repr(exc),
+                traceback.format_exc(),
+            )
+        )
+
+
+def _execute_process_inference_batch(
+    infer: SmolVLA_ModelInference,
+    requests: list[_ProcessInferenceRequest],
+    response_queues: dict[int, Any],
+) -> None:
+    try:
+        postprocess_values = {request.postprocess for request in requests}
+        state_modes = {request.state_pose_mode for request in requests}
+        if len(postprocess_values) != 1 or len(state_modes) != 1:
+            raise ValueError("All requests in one dynamic batch must use the same inference options.")
+        observation_batch = _stack_model_observations([request.observation for request in requests])
+        action_chunks = infer.predict_action_chunk_obs(
+            observation_batch,
+            task=[request.task for request in requests],
+            postprocess=requests[0].postprocess,
+            state_pose_mode=requests[0].state_pose_mode,
+        )
+        if hasattr(action_chunks, "detach"):
+            action_chunks = action_chunks.detach().cpu().numpy()
+        else:
+            action_chunks = np.asarray(action_chunks)
+        if int(action_chunks.shape[0]) != len(requests):
+            raise RuntimeError(
+                f"Policy returned batch {int(action_chunks.shape[0])}, expected {len(requests)}."
+            )
+        for index, request in enumerate(requests):
+            response_queues[request.worker_id].put(
+                ("ok", request.request_id, np.asarray(action_chunks[index : index + 1]))
+            )
+    except BaseException:
+        error_text = traceback.format_exc()
+        for request in requests:
+            response_queues[request.worker_id].put(("error", request.request_id, error_text))
+
+
+def _collect_process_request_batch(
+    request_queue: Any,
+    first: _ProcessInferenceRequest,
+    *,
+    max_batch_size: int,
+    batch_wait_s: float,
+) -> list[_ProcessInferenceRequest]:
+    requests = [first]
+    deadline = time.monotonic() + max(0.0, float(batch_wait_s))
+    while len(requests) < max(1, int(max_batch_size)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        try:
+            requests.append(request_queue.get(timeout=remaining))
+        except queue.Empty:
+            break
+    return requests
 
 
 def _axis_points(origin: np.ndarray, rot: np.ndarray, *, scale: float = 0.04, samples: int = 12) -> tuple[np.ndarray, np.ndarray]:
@@ -1727,12 +2084,16 @@ def run_episode(
             }
             if infer.policy.config.vla_adapter_enable:
                 model_observation.update(build_policy_rgb_observation(policy_rgb_camera_map, raw_obs))
-            chunk = infer.predict_action_chunk_obs(
+            chunk_batch = infer.predict_action_chunk_obs(
                 model_observation,
                 task=task_language,
                 postprocess=True,
                 state_pose_mode="identity",
-            )[0].detach().cpu().numpy()
+            )
+            if hasattr(chunk_batch, "detach"):
+                chunk = chunk_batch[0].detach().cpu().numpy()
+            else:
+                chunk = np.asarray(chunk_batch)[0]
             model_call_count += 1
 
             if keyboard.poll():
@@ -1848,8 +2209,9 @@ def evaluate_task(
     task_id: int,
     cfg: dict[str, Any],
     output_dir: Path,
+    on_environment_ready: Any | None = None,
 ) -> dict[str, Any]:
-    """Evaluate all configured episodes for one task in its owning worker thread."""
+    """Evaluate all configured episodes for one task in its owning worker."""
     init_states = get_task_init_states(suite, int(task_id))
     task_results: list[dict[str, Any]] = []
     task_name = f"task_{int(task_id):03d}"
@@ -1879,6 +2241,12 @@ def evaluate_task(
             shared_env, shared_task = _make_task_env()
             task_name = str(getattr(shared_task, "name", task_name))
             task_language = str(getattr(shared_task, "language", task_language))
+            if on_environment_ready is not None:
+                on_environment_ready()
+        elif on_environment_ready is not None:
+            # All process workers cross the startup barrier together, then
+            # construct their per-episode environments concurrently.
+            on_environment_ready()
 
         for episode_idx in range(int(cfg["episodes"])):
             episode_dir = (
@@ -2003,6 +2371,207 @@ def failed_task_summary(
     )
 
 
+def evaluate_suite_process_parallel(
+    *,
+    infer: SmolVLA_ModelInference,
+    suite_name: str,
+    task_ids: list[int],
+    cfg: dict[str, Any],
+    output_dir: Path,
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    """Run MuJoCo tasks in child processes and serve all policy calls in this process.
+
+    Each child owns one persistent task environment.  The parent owns the only
+    policy copy on the GPU and dynamically batches requests arriving over IPC.
+    Tasks are processed in waves when task_ids exceeds worker_count.
+    """
+    context = mp.get_context("spawn")
+    adapter_enabled = bool(infer.policy.config.vla_adapter_enable)
+    image_feature_keys = [str(key) for key in infer.policy.config.image_features]
+    max_batch_size = max(1, int(cfg["inference_batch_size"]))
+    batch_wait_s = max(0.0, float(cfg["inference_batch_wait_ms"])) / 1000.0
+    summaries: list[dict[str, Any]] = []
+    request_count = 0
+    batch_count = 0
+    max_observed_batch = 0
+
+    for wave_start in range(0, len(task_ids), max(1, int(worker_count))):
+        wave_task_ids = [int(task_id) for task_id in task_ids[wave_start : wave_start + worker_count]]
+        request_queue = context.Queue(maxsize=max(2, len(wave_task_ids) * 2))
+        ready_queue = context.Queue()
+        result_queue = context.Queue()
+        start_event = context.Event()
+        response_queues = {
+            worker_id: context.Queue(maxsize=1) for worker_id in range(len(wave_task_ids))
+        }
+        processes: dict[int, Any] = {}
+        task_by_worker = {
+            worker_id: int(task_id) for worker_id, task_id in enumerate(wave_task_ids)
+        }
+
+        previous_bootstrap = os.environ.get("SONG_LIBERO_ENV_WORKER")
+        os.environ["SONG_LIBERO_ENV_WORKER"] = "1"
+        try:
+            for worker_id, task_id in task_by_worker.items():
+                process = context.Process(
+                    target=_process_task_worker_entry,
+                    kwargs={
+                        "worker_id": worker_id,
+                        "suite_name": suite_name,
+                        "task_id": task_id,
+                        "cfg": cfg,
+                        "output_dir": output_dir,
+                        "request_queue": request_queue,
+                        "response_queue": response_queues[worker_id],
+                        "ready_queue": ready_queue,
+                        "result_queue": result_queue,
+                        "start_event": start_event,
+                        "vla_adapter_enable": adapter_enabled,
+                        "image_feature_keys": image_feature_keys,
+                    },
+                    name=f"libero-{suite_name}-task-{task_id}",
+                )
+                process.start()
+                processes[worker_id] = process
+        finally:
+            if previous_bootstrap is None:
+                os.environ.pop("SONG_LIBERO_ENV_WORKER", None)
+            else:
+                os.environ["SONG_LIBERO_ENV_WORKER"] = previous_bootstrap
+
+        ready_workers: set[int] = set()
+        finished_workers: set[int] = set()
+        worker_summaries: dict[int, dict[str, Any]] = {}
+
+        def _record_result(message: tuple[Any, ...]) -> None:
+            status = str(message[0])
+            worker_id = int(message[1])
+            task_id = int(message[2])
+            if worker_id in finished_workers:
+                return
+            if status == "ok":
+                summary = message[3]
+            else:
+                error_repr = str(message[3])
+                error_traceback = str(message[4])
+                print(
+                    f"[warn] process worker failed suite={suite_name} task={task_id}: "
+                    f"{error_repr}\n{error_traceback}",
+                    flush=True,
+                )
+                summary = failed_task_summary(
+                    suite_name=suite_name,
+                    task_id=task_id,
+                    episode_count=int(cfg["episodes"]),
+                    exc=RuntimeError(error_repr),
+                )
+            worker_summaries[worker_id] = summary
+            finished_workers.add(worker_id)
+
+        def _drain_results() -> None:
+            while True:
+                try:
+                    _record_result(result_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+        def _record_dead_workers() -> None:
+            for worker_id, process in processes.items():
+                if worker_id in finished_workers or process.is_alive() or process.exitcode is None:
+                    continue
+                task_id = task_by_worker[worker_id]
+                exc = RuntimeError(
+                    f"Environment worker exited without a result (exitcode={process.exitcode})."
+                )
+                print(
+                    f"[warn] process worker died suite={suite_name} task={task_id}: {exc}",
+                    flush=True,
+                )
+                worker_summaries[worker_id] = failed_task_summary(
+                    suite_name=suite_name,
+                    task_id=task_id,
+                    episode_count=int(cfg["episodes"]),
+                    exc=exc,
+                )
+                finished_workers.add(worker_id)
+
+        try:
+            # No task starts policy rollout before every successfully-created
+            # environment in this wave is ready.  This removes the old startup
+            # artifact where task 0 could run several episodes while other
+            # tasks were still serially constructing EGL contexts.
+            while len(ready_workers | finished_workers) < len(wave_task_ids):
+                try:
+                    ready_workers.add(int(ready_queue.get(timeout=0.1)))
+                except queue.Empty:
+                    pass
+                _drain_results()
+                _record_dead_workers()
+            print(
+                f"[parallel] suite={suite_name}: environments ready "
+                f"{len(ready_workers)}/{len(wave_task_ids)}; starting rollout wave",
+                flush=True,
+            )
+            start_event.set()
+
+            while len(finished_workers) < len(wave_task_ids):
+                _drain_results()
+                _record_dead_workers()
+                if len(finished_workers) >= len(wave_task_ids):
+                    break
+                try:
+                    first_request = request_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                requests = _collect_process_request_batch(
+                    request_queue,
+                    first_request,
+                    max_batch_size=max_batch_size,
+                    batch_wait_s=batch_wait_s,
+                )
+                _execute_process_inference_batch(infer, requests, response_queues)
+                request_count += len(requests)
+                batch_count += 1
+                max_observed_batch = max(max_observed_batch, len(requests))
+        except BaseException:
+            start_event.set()
+            for process in processes.values():
+                if process.is_alive():
+                    process.terminate()
+            raise
+        finally:
+            start_event.set()
+            for process in processes.values():
+                process.join(timeout=30.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5.0)
+
+            for ipc_queue in (
+                request_queue,
+                ready_queue,
+                result_queue,
+                *response_queues.values(),
+            ):
+                try:
+                    ipc_queue.close()
+                    ipc_queue.join_thread()
+                except Exception:
+                    pass
+
+        summaries.extend(worker_summaries[index] for index in sorted(worker_summaries))
+
+    mean_batch = request_count / batch_count if batch_count else 0.0
+    print(
+        "[parallel] process inference batches: "
+        f"requests={request_count}, batches={batch_count}, "
+        f"mean_batch={mean_batch:.2f}, max_batch={max_observed_batch}",
+        flush=True,
+    )
+    return summaries
+
+
 def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str], Path]:
     cfg = load_config(args.config)
     cfg.setdefault("control", {})
@@ -2052,6 +2621,15 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     output_dir = Path(cfg_get(cfg, args.output_dir, "output_dir", BENCHMARK_ROOT / "outputs" / "libero_setting" / "eval")).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg["output_dir"] = str(output_dir)
+    cfg["task_workers"] = max(1, int(cfg_get(cfg, args.task_workers, "task_workers", 1)))
+    cfg["task_worker_backend"] = str(
+        cfg_get(
+            cfg,
+            args.task_worker_backend,
+            "task_worker_backend",
+            "process" if cfg["task_workers"] > 1 else "thread",
+        )
+    ).lower()
     cfg["recreate_env_per_episode"] = bool(
         cfg_get(cfg, args.recreate_env_per_episode, "recreate_env_per_episode", False)
     )
@@ -2083,7 +2661,6 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["initial_gripper_open"] = bool(
         cfg_get(cfg, args.initial_gripper_open, "initial_gripper_open", True)
     )
-    cfg["task_workers"] = max(1, int(cfg_get(cfg, args.task_workers, "task_workers", 1)))
     cfg["inference_batch_size"] = max(
         1,
         int(
@@ -2101,6 +2678,11 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     )
     cfg["keyboard_control_enabled"] = cfg["task_workers"] == 1
     if cfg["task_workers"] > 1:
+        if cfg["task_worker_backend"] not in {"process", "thread"}:
+            raise ValueError(
+                "task_worker_backend must be either 'process' or 'thread', got "
+                f"{cfg['task_worker_backend']!r}."
+            )
         if str(cfg.get("render_mode", "offscreen")).lower() != "offscreen":
             raise ValueError("--task-workers > 1 requires --render-mode offscreen.")
         if bool(cfg.get("visualize_foreground", False)):
@@ -2109,9 +2691,128 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     return cfg, suite_names, output_dir
 
 
+def _strip_cli_options(argv: list[str], option_names: set[str]) -> list[str]:
+    """Remove repeatable value-taking options from argv, including --name=value."""
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        option = argument.split("=", 1)[0]
+        if option not in option_names:
+            result.append(argument)
+            index += 1
+            continue
+        if "=" not in argument:
+            index += 2
+        else:
+            index += 1
+    return result
+
+
+def run_multi_gpu_suite_launcher(
+    *,
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    suite_names: list[str],
+    output_dir: Path,
+) -> None:
+    gpu_ids = [item.strip() for item in str(args.suite_gpu_ids).split(",") if item.strip()]
+    if len(gpu_ids) != len(suite_names):
+        raise ValueError(
+            f"--suite-gpu-ids supplied {len(gpu_ids)} ids for {len(suite_names)} suites: "
+            f"gpu_ids={gpu_ids}, suites={suite_names}."
+        )
+    if len(set(suite_names)) != len(suite_names):
+        raise ValueError(f"Multi-GPU suite names must be unique, got {suite_names}.")
+
+    base_argv = _strip_cli_options(
+        list(sys.argv[1:]),
+        {
+            "--suite",
+            "--suite-gpu-ids",
+            "--output-dir",
+            "--device",
+            "--render-gpu-device-id",
+        },
+    )
+    processes: list[tuple[str, str, subprocess.Popen[Any]]] = []
+    print(
+        "[multi-gpu] launching one model service per suite: "
+        + ", ".join(f"{suite}->GPU{gpu_id}" for suite, gpu_id in zip(suite_names, gpu_ids, strict=True)),
+        flush=True,
+    )
+    try:
+        for suite_name, gpu_id in zip(suite_names, gpu_ids, strict=True):
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *base_argv,
+                "--suite",
+                suite_name,
+                "--output-dir",
+                str(output_dir),
+                "--device",
+                "cuda",
+                "--render-gpu-device-id",
+                "0",
+            ]
+            child_env = os.environ.copy()
+            child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            child_env["MUJOCO_EGL_DEVICE_ID"] = "0"
+            child_env["SONG_LIBERO_SUITE_WORKER"] = "1"
+            process = subprocess.Popen(command, env=child_env, cwd=str(Path.cwd()))
+            processes.append((suite_name, gpu_id, process))
+
+        return_codes = {
+            suite_name: process.wait() for suite_name, _gpu_id, process in processes
+        }
+    except BaseException:
+        for _suite_name, _gpu_id, process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for _suite_name, _gpu_id, process in processes:
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        raise
+
+    all_task_summaries: list[dict[str, Any]] = []
+    for suite_name in suite_names:
+        report_path = output_dir / suite_name / "suite_report.json"
+        if return_codes[suite_name] == 0 and report_path.is_file():
+            with open(report_path, encoding="utf-8") as report_file:
+                suite_report = json.load(report_file)
+            all_task_summaries.extend(suite_report.get("tasks", []))
+    all_task_summaries.sort(
+        key=lambda item: (
+            suite_names.index(str(item["suite"])),
+            int(item["task_id"]),
+        )
+    )
+    write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
+    print(json.dumps(aggregate_task_results(all_task_summaries), indent=2, ensure_ascii=False))
+
+    failed = [
+        f"{suite_name}(GPU{gpu_id}, exit={return_codes[suite_name]})"
+        for suite_name, gpu_id, _process in processes
+        if return_codes[suite_name] != 0
+    ]
+    if failed:
+        raise RuntimeError("Multi-GPU suite evaluation failed: " + ", ".join(failed))
+
+
 def main() -> None:
     args = parse_args()
     cfg, suite_names, output_dir = prepare_config(args)
+    if args.suite_gpu_ids is not None:
+        run_multi_gpu_suite_launcher(
+            args=args,
+            cfg=cfg,
+            suite_names=suite_names,
+            output_dir=output_dir,
+        )
+        return
     ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
 
     from libero.libero import benchmark
@@ -2128,7 +2829,9 @@ def main() -> None:
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={cfg['episodes']}, "
         f"task_workers={cfg['task_workers']}, "
+        f"task_worker_backend={cfg['task_worker_backend']}, "
         f"inference_batch_size={cfg['inference_batch_size']}, "
+        f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
         f"gripper_threshold={cfg['control']['gripper_threshold']}, "
         f"save_video={cfg['save_video']}, "
@@ -2141,7 +2844,7 @@ def main() -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     scheduler: BatchedInferenceScheduler | None = None
     eval_infer: Any = infer
-    if int(cfg["task_workers"]) > 1:
+    if int(cfg["task_workers"]) > 1 and str(cfg["task_worker_backend"]) == "thread":
         scheduler = BatchedInferenceScheduler(
             infer,
             max_batch_size=int(cfg["inference_batch_size"]),
@@ -2174,8 +2877,32 @@ def main() -> None:
                     write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
                 continue
 
+            if str(cfg["task_worker_backend"]) == "process":
+                print(
+                    f"[parallel] suite={suite_name}: starting {worker_count} MuJoCo processes "
+                    f"for task_ids={list(map(int, task_ids))}; policy remains in the parent process",
+                    flush=True,
+                )
+                suite_summaries = evaluate_suite_process_parallel(
+                    infer=infer,
+                    suite_name=suite_name,
+                    task_ids=[int(task_id) for task_id in task_ids],
+                    cfg=cfg,
+                    output_dir=output_dir,
+                    worker_count=worker_count,
+                )
+                all_task_summaries.extend(suite_summaries)
+                all_task_summaries.sort(
+                    key=lambda item: (
+                        suite_names.index(str(item["suite"])),
+                        int(item["task_id"]),
+                    )
+                )
+                write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)
+                continue
+
             print(
-                f"[parallel] suite={suite_name}: starting {worker_count} task workers "
+                f"[parallel] suite={suite_name}: starting {worker_count} compatibility task threads "
                 f"for task_ids={list(map(int, task_ids))}",
                 flush=True,
             )
