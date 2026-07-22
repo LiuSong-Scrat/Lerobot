@@ -1385,6 +1385,19 @@ class ProcessInferenceProxy:
         return np.asarray(payload)
 
 
+class _SingleTaskSuiteProxy:
+    """Minimal suite interface needed by make_libero_env inside a worker."""
+
+    def __init__(self, task_id: int, task_spec: dict[str, str]) -> None:
+        self.task_id = int(task_id)
+        self.task = SimpleNamespace(**{str(key): str(value) for key, value in task_spec.items()})
+
+    def get_task(self, task_id: int) -> Any:
+        if int(task_id) != self.task_id:
+            raise KeyError(f"Single-task worker owns task {self.task_id}, requested {task_id}.")
+        return self.task
+
+
 def _process_task_worker_entry(
     *,
     worker_id: int,
@@ -1392,6 +1405,8 @@ def _process_task_worker_entry(
     task_id: int,
     shard_index: int,
     episode_indices: list[int],
+    task_spec: dict[str, str],
+    task_init_states: np.ndarray,
     cfg: dict[str, Any],
     output_dir: Path,
     request_queue: Any,
@@ -1405,9 +1420,7 @@ def _process_task_worker_entry(
     """Own one MuJoCo task environment in a process that never loads the policy."""
     try:
         ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
-        from libero.libero import benchmark
-
-        suite = benchmark.get_benchmark_dict()[suite_name]()
+        suite = _SingleTaskSuiteProxy(task_id, task_spec)
         infer = ProcessInferenceProxy(
             worker_id=worker_id,
             request_queue=request_queue,
@@ -1428,6 +1441,7 @@ def _process_task_worker_entry(
             cfg=cfg,
             output_dir=output_dir,
             episode_indices=episode_indices,
+            task_init_states=task_init_states,
             on_environment_ready=_announce_ready_and_wait,
         )
         result_queue.put(("ok", int(worker_id), int(task_id), int(shard_index), summary))
@@ -2453,10 +2467,15 @@ def evaluate_task(
     cfg: dict[str, Any],
     output_dir: Path,
     episode_indices: list[int] | None = None,
+    task_init_states: np.ndarray | None = None,
     on_environment_ready: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate all or one deterministic episode shard for a task."""
-    init_states = get_task_init_states(suite, int(task_id))
+    init_states = (
+        get_task_init_states(suite, int(task_id))
+        if task_init_states is None
+        else np.asarray(task_init_states)
+    )
     if episode_indices is None:
         resolved_episode_indices = list(range(int(cfg["episodes"])))
     else:
@@ -2690,6 +2709,35 @@ def _build_episode_worker_jobs(
     return jobs
 
 
+def serialize_libero_task(task: Any) -> dict[str, str]:
+    required_fields = ("name", "language", "problem_folder", "bddl_file")
+    missing = [field for field in required_fields if not hasattr(task, field)]
+    if missing:
+        raise AttributeError(f"LIBERO task is missing required fields: {missing}")
+    if hasattr(task, "_asdict"):
+        values = task._asdict()
+    else:
+        values = {
+            field: getattr(task, field)
+            for field in (
+                "name",
+                "language",
+                "problem",
+                "problem_folder",
+                "bddl_file",
+                "init_states_file",
+            )
+            if hasattr(task, field)
+        }
+    return {str(key): str(value) for key, value in values.items()}
+
+
+def init_states_as_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.ascontiguousarray(np.asarray(value))
+
+
 def merge_task_episode_shards(
     *,
     suite_name: str,
@@ -2745,6 +2793,8 @@ def evaluate_suite_process_parallel(
     infer: SmolVLA_ModelInference,
     suite_name: str,
     task_ids: list[int],
+    task_specs_by_id: dict[int, dict[str, str]],
+    task_init_states_by_id: dict[int, np.ndarray],
     cfg: dict[str, Any],
     output_dir: Path,
     worker_count: int,
@@ -2788,8 +2838,18 @@ def evaluate_suite_process_parallel(
         processes: dict[int, Any] = {}
         job_by_worker = {job.worker_id: job for job in jobs}
 
-        previous_bootstrap = os.environ.get("SONG_LIBERO_ENV_WORKER")
-        os.environ["SONG_LIBERO_ENV_WORKER"] = "1"
+        worker_environment = {
+            "SONG_LIBERO_ENV_WORKER": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "MALLOC_ARENA_MAX": "2",
+        }
+        previous_worker_environment = {
+            key: os.environ.get(key) for key in worker_environment
+        }
+        os.environ.update(worker_environment)
         try:
             for job in jobs:
                 process = context.Process(
@@ -2800,6 +2860,8 @@ def evaluate_suite_process_parallel(
                         "task_id": job.task_id,
                         "shard_index": job.shard_index,
                         "episode_indices": list(job.episode_indices),
+                        "task_spec": task_specs_by_id[job.task_id],
+                        "task_init_states": task_init_states_by_id[job.task_id],
                         "cfg": cfg,
                         "output_dir": output_dir,
                         "request_queue": request_queue,
@@ -2818,10 +2880,11 @@ def evaluate_suite_process_parallel(
                 process.start()
                 processes[job.worker_id] = process
         finally:
-            if previous_bootstrap is None:
-                os.environ.pop("SONG_LIBERO_ENV_WORKER", None)
-            else:
-                os.environ["SONG_LIBERO_ENV_WORKER"] = previous_bootstrap
+            for key, previous_value in previous_worker_environment.items():
+                if previous_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous_value
 
         ready_workers: set[int] = set()
         finished_workers: set[int] = set()
@@ -3333,6 +3396,14 @@ def main() -> None:
                 continue
 
             if str(cfg["task_worker_backend"]) == "process":
+                task_specs_by_id = {
+                    int(task_id): serialize_libero_task(suite.get_task(int(task_id)))
+                    for task_id in task_ids
+                }
+                task_init_states_by_id = {
+                    int(task_id): init_states_as_numpy(get_task_init_states(suite, int(task_id)))
+                    for task_id in task_ids
+                }
                 print(
                     f"[parallel] suite={suite_name}: starting up to {environment_worker_count} "
                     f"MuJoCo processes ({worker_count} tasks x {episode_worker_count} episode shards) "
@@ -3343,6 +3414,8 @@ def main() -> None:
                     infer=infer,
                     suite_name=suite_name,
                     task_ids=[int(task_id) for task_id in task_ids],
+                    task_specs_by_id=task_specs_by_id,
+                    task_init_states_by_id=task_init_states_by_id,
                     cfg=cfg,
                     output_dir=output_dir,
                     worker_count=worker_count,

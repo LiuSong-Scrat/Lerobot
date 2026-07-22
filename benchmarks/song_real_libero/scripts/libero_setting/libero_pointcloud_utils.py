@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from scipy.spatial.transform import Rotation as R
 
 if __package__ and __package__.startswith("benchmarks."):
@@ -888,6 +887,8 @@ def action_pose9_to_libero(
 
 
 def get_task_init_states(task_suite: Any, task_id: int) -> np.ndarray:
+    import torch
+
     from libero.libero import get_libero_path
 
     init_states_path = (
