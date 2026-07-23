@@ -435,3 +435,80 @@ privileged goal-state control.  The archived complete evaluation of the same
 single checkpoint remains 98% Spatial, 98% Object, 77% Goal, and 79%
 LIBERO-10.  A 99% claim for Goal or LIBERO-10 is therefore not supported by the
 current weights.
+
+
+
+
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 1 \
+  --task-workers 1 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 1 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-alignment current_minus_previous \
+  --synchronize-gripper-controller-state \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model \
+  --suite libero_spatial \
+  --all-tasks \
+  --episodes 10 \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 16 \
+  --adaptive-exec-max-steps 16 \
+  --grasp-exec-steps 16 \
+  --gripper-delta-threshold 0.002 \
+  --max-steps 600 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_fixed16_spatial
+
+
+
+
+
+  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v031_v7_adapter_libero_after_3w2_after3w2_after2w4/checkpoints/026000/pretrained_model \
+  --suite libero_spatial \
+  --suite libero_object \
+  --suite libero_10 \
+  --suite libero_goal \
+  --suite-gpu-ids 0,1,2,3 \
+  --all-tasks \
+  --episodes 10 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 7 \
+  --task-workers 1 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 1 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --initial-gripper-open \
+  --settle-keep-robot-fixed \
+  --synchronize-gripper-controller-state \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 16 \
+  --adaptive-exec-max-steps 16 \
+  --grasp-exec-steps 16 \
+  --max-steps 600 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_fixed16_4suite_4gpu_7workers
