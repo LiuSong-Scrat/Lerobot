@@ -911,6 +911,8 @@ def make_libero_env(
     render_gpu_device_id: int = -1,
     control_delta: bool = True,
     control_freq=20,
+    horizon: int = 1000,
+    ignore_done: bool = False,
     env_seed: int | None = None,
 ):
     from libero.libero import get_libero_path
@@ -928,6 +930,8 @@ def make_libero_env(
         "camera_names": cameras,
         "camera_depths": True,
         "control_freq": control_freq,
+        "horizon": int(horizon),
+        "ignore_done": bool(ignore_done),
     }
     viewer_camera = normalize_render_camera_name(render_camera, cameras[0])
     if render_mode in {"viewer3d", "mujoco"}:

@@ -456,7 +456,7 @@ Run online evaluation on the four suites with each task's own LIBERO language pr
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /absolute/path/to/checkpoints/020000_after32k_after32k/pretrained_model \
+  --policy.path /absolute/path/to/checkpoints/024000_after32k_after32k/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
@@ -470,11 +470,26 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --inference-batch-size 1 \
   --policy-noise-seed 0 \
   --env-seed 7 \
-  --action-index 1 \
-  --exec-action-steps 16 \
+  --control-freq 0.75 \
+  --max-steps 600 \
+  --action-index 0 \
+  --exec-action-steps 12 \
+  --adaptive-exec-max-steps 14 \
+  --adaptive-exec-position-error-threshold 0.009 \
+  --adaptive-exec-rotation-error-threshold 0.10 \
+  --adaptive-exec-position-error-max 0.03 \
+  --adaptive-exec-rotation-error-max 0.15 \
+  --grasp-exec-steps 16 \
+  --grasp-width-min 0.003 \
+  --grasp-width-max 0.07 \
+  --grasp-lift-threshold 0.015 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
   --gripper-control-mode delta_width \
   --gripper-delta-threshold 0.002 \
-  --use-suite-max-steps \
+  --gripper-delta-alignment current_minus_previous \
+  --synchronize-gripper-controller-state \
+  --no-use-suite-max-steps \
   --no-recreate-env-per-episode \
   --render-mode offscreen \
   --no-visualize-foreground \
@@ -482,10 +497,10 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --output-dir /absolute/path/to/eval_libero_4suite
 ```
 
-For a faster stochastic-policy run on 24 GB GPUs, use
+For a faster private-policy-process run on 24 GB GPUs, use
 `--isolated-policy-workers 2`; keep task workers, episode workers, and actual
-inference batch size at 1. Do not compare this throughput run directly with a
-single-model serial score.
+inference batch size at 1. Keep the checkpoint, seeds, reset-sequence handling,
+and all control settings identical when comparing it with a serial run.
 
 
 Each worker creates its own LIBERO/robosuite environment and writes lightweight temporary episode artifacts. The main process moves the final point-cloud arrays into the LeRobot dataset sequentially, so dataset writes remain deterministic without duplicating large point clouds through pickle files.
@@ -561,7 +576,7 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run -n reap python \
   --episodes 1
 ```
 
-This online runner resets a LIBERO/robosuite environment, waits for the scene to stabilize with the robot fixed and gripper open, reads RGB-D observations, builds the same UMI-frame point-cloud input, predicts `pose9 + gripper`, converts pose rows to LIBERO absolute OSC targets plus a directional gripper command, and reports success/reward. Standard evaluation uses the per-suite horizons documented in `LIBERO_EVALUATION_AUDIT.md`.
+This online runner resets a LIBERO/robosuite environment once, waits for the scene to stabilize with the robot fixed and gripper open, reads RGB-D observations, builds the same UMI-frame point-cloud input, predicts `pose9 + gripper`, converts pose rows to LIBERO absolute OSC targets plus a directional gripper command, and reports success/reward. The active project profile uses 0.75 Hz and a fixed 600-step horizon for every suite; official-horizon and archived 5 Hz measurements are retained separately in `LIBERO_EVALUATION_AUDIT.md` and must not be mixed with this profile. A failed rollout is not reset or retried.
 
 ## Notes
 
@@ -694,7 +709,7 @@ python benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /absolute/path/to/checkpoints/020000_after32k_after32k/pretrained_model \
+  --policy.path /absolute/path/to/checkpoints/024000_after32k_after32k/pretrained_model \
   --suite libero_spatial \
   --suite libero_object \
   --suite libero_goal \
@@ -706,11 +721,26 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
   --task-workers 1 \
   --episode-workers-per-task 1 \
   --inference-batch-size 1 \
-  --action-index 1 \
-  --exec-action-steps 16 \
+  --control-freq 0.75 \
+  --max-steps 600 \
+  --action-index 0 \
+  --exec-action-steps 12 \
+  --adaptive-exec-max-steps 14 \
+  --adaptive-exec-position-error-threshold 0.009 \
+  --adaptive-exec-rotation-error-threshold 0.10 \
+  --adaptive-exec-position-error-max 0.03 \
+  --adaptive-exec-rotation-error-max 0.15 \
+  --grasp-exec-steps 16 \
+  --grasp-width-min 0.003 \
+  --grasp-width-max 0.07 \
+  --grasp-lift-threshold 0.015 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
   --gripper-control-mode delta_width \
   --gripper-delta-threshold 0.002 \
-  --use-suite-max-steps \
+  --gripper-delta-alignment current_minus_previous \
+  --synchronize-gripper-controller-state \
+  --no-use-suite-max-steps \
   --no-recreate-env-per-episode \
   --render-mode offscreen \
   --no-visualize-foreground \
@@ -720,7 +750,11 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
 
 
 `libero_pointcloud_eval.py` saves rollout videos by default. Add `--no-save-video` to disable video output for faster evaluation.
-The recommended policy skips the near-identity row 0 and executes rows 1 through 16 before replanning. LIBERO's Panda gripper accepts directional commands, so `delta_width` maps the predicted next-minus-current width change to open, close, or hold using `gripper_delta_threshold`; it does not repeatedly chase a physical target width. Each episode saves `actions.npz` with model rows, controller commands and targets, achieved poses, tracking errors, chunk-boundary errors, and gripper diagnostics.
+The active same-checkpoint WEP-VLA v0.4 evaluation profile uses a 0.75 Hz environment, a 600-step horizon, and action rows starting at row 0. It normally executes 12 rows per replan, then may use rows 13-14 only while the robot end-effector tracking error is above 9 mm or 0.10 rad and below the 30 mm / 0.15 rad stale-chunk safety bound. It executes 16 rows only after measured finger width remains in `(3 mm, 70 mm)` and the end effector subsequently rises at least 15 mm, which is a robot-only indication that a blocked closure has become a transported grasp rather than a fixed-handle interaction. On the final checkpoint-compatible path, Long task 7 episode 3 succeeded at step 377 and Long task 0 episode 1 remained successful at step 336; globally executing 16 rows had failed the latter. Goal task 3 episode 2 still failed at 600 steps, so the controller is not presented as a repair for incorrect policy subgoals. All decisions use robot state only—no object state, contacts, language, predicate, or success signal. Release-event suffix execution is experimental and disabled in the active configuration; it did not repair a two-object placement weak case. The active candidate is the immutable `024000_after32k_after32k` checkpoint; no checkpoint averaging, model soup, action averaging, or multi-sample selection is used. This is not the official 20 Hz LIBERO protocol, so report the frequency and horizon with every score. Each LIBERO initial state receives exactly one uninterrupted rollout: failed episodes are never reset and retried, and each replan uses one Flow Matching sample. `max_steps` is passed to robosuite's internal horizon, so the configured limit is not silently truncated at 1000. LIBERO's Panda gripper accepts directional commands, so `delta_width` maps the predicted current-minus-previous width change to open, close, or hold using `gripper_delta_threshold`. After directly opening the fingers during settling, the evaluator synchronizes robosuite's internal gripper target to the physical qpos; otherwise a zero command silently closes the gripper toward half width. Each episode saves `actions.npz` with model rows, controller commands and targets, achieved poses, object poses, tracking errors, chunk-boundary errors, gripper values, per-chunk grasp-lift/transport flags, goal-predicate states, non-robot joint values, and end-effector contact pairs. The predicate/joint/contact fields are diagnostics only and never affect policy input or control.
+
+PointSeg, LitePT voxelization, and equal-score `topk` selection remain checkpoint-compatible. An attempted deterministic one-representative-per-voxel rewrite changed the model function and made a drawer task stop opening the drawer, so it was removed. `model.eval()` does disable LitePT serialization-order shuffling because that flag is training augmentation, but sparse CUDA is still not guaranteed bitwise deterministic. Keep `--inference-batch-size 1` for comparable evaluation because batching different scenes can change floating-point execution and point-cloud packing.
+
+Private process-level parallelism uses independent copies of the same immutable checkpoint and one action sample per replan, but it is statistically—not bitwise—equivalent to a serial process because checkpoint-compatible `torch.topk`, sparse-CUDA numerical differences, and contact dynamics can amplify small execution differences. No model soup, parameter interpolation, action averaging, best-of-N selection, or failed-rollout retry is used.
 During interactive evaluation, press `v` in the terminal to save the latest predicted UMI action chunk visualization under `<output-dir>/keyboard_vis/`. The default mode writes PLY/NPZ files and is safe for `MUJOCO_GL=egl`; use `--keyboard-vis-mode window` only on a local desktop session with working Open3D/GLX.
 
 For local 3D debugging on a desktop session, use the MuJoCo viewer mode instead of EGL:

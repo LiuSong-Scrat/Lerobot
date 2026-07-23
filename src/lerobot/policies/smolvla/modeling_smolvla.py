@@ -1077,6 +1077,19 @@ class LitePTTokenizer(nn.Module):
         self.backbone = LitePT(in_channels=in_dim, enc_mode=enc_mode)
         self.out_proj = nn.Linear(infer_litept_output_channels(self.backbone), dim)
 
+    def train(self, mode: bool = True):
+        """Keep serialization shuffling as training-only augmentation.
+
+        LitePT stores ``shuffle_orders`` as a plain boolean, so ``model.eval()``
+        does not disable it automatically.  Leaving it enabled entangles the
+        point-cloud encoding order with the Flow Matching RNG seed and makes
+        identical singleton observations produce different policy features.
+        """
+        super().train(mode)
+        if hasattr(self.backbone, "shuffle_orders"):
+            self.backbone.shuffle_orders = bool(mode)
+        return self
+
     def _is_degenerate(self, xyz, eps=1e-6):
         rng = (xyz.max(dim=0).values - xyz.min(dim=0).values).abs().sum()
         return (not torch.isfinite(xyz).all()) or (rng < eps)

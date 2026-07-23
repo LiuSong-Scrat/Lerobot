@@ -14,6 +14,7 @@ Removed from the original evaluator:
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import importlib.metadata
 import json
@@ -47,6 +48,7 @@ _ISOLATED_POLICY_WORKER_BOOTSTRAP = (
 _SUITE_LAUNCHER_BOOTSTRAP = any(
     arg == "--suite-gpu-ids" or arg.startswith("--suite-gpu-ids=") for arg in sys.argv[1:]
 )
+_EVALUATION_RUN_LOCK_FILE: Any | None = None
 # This must be set before the policy import performs the first CUDA operation.
 # PyTorch uses it when deterministic cuBLAS execution is requested below.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -58,6 +60,76 @@ LIBERO_STANDARD_MAX_STEPS = {
     "libero_10": 520,
     "libero_90": 400,
 }
+
+# A benchmark initial state is evaluated by exactly one uninterrupted rollout.
+# Frequency and horizon may be configured, but failures are never reset and
+# retried, and a model call never samples several chunks and selects among them.
+FAIR_EVALUATION_PROTOCOL = {
+    "name": "single_uninterrupted_rollout",
+    "rollouts_per_initial_state": 1,
+    "retry_failed_rollout": False,
+    "action_samples_per_model_call": 1,
+    "action_sample_selection": "none",
+}
+
+
+def acquire_evaluation_run_lock(output_dir: Path) -> None:
+    """Prevent two top-level evaluators from corrupting one output directory.
+
+    Multi-GPU suite children intentionally share their launcher's output root,
+    so only the top-level launcher (or a normal single-process run) owns this
+    lock. The file descriptor remains open until process exit.
+    """
+    global _EVALUATION_RUN_LOCK_FILE
+    if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") == "1":
+        return
+    if _EVALUATION_RUN_LOCK_FILE is not None:
+        return
+
+    import fcntl
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".evaluation_run.lock"
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown owner"
+        lock_file.close()
+        raise RuntimeError(
+            f"Evaluation output directory is already active: {output_dir}. "
+            f"Lock owner: {owner}"
+        ) from exc
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    json.dump(
+        {
+            "pid": os.getpid(),
+            "hostname": os.uname().nodename,
+            "started_unix_s": time.time(),
+            "argv": sys.argv,
+        },
+        lock_file,
+        ensure_ascii=False,
+    )
+    lock_file.flush()
+    os.fsync(lock_file.fileno())
+    _EVALUATION_RUN_LOCK_FILE = lock_file
+
+    def _release() -> None:
+        global _EVALUATION_RUN_LOCK_FILE
+        active_lock = _EVALUATION_RUN_LOCK_FILE
+        if active_lock is None:
+            return
+        try:
+            fcntl.flock(active_lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            active_lock.close()
+            _EVALUATION_RUN_LOCK_FILE = None
+
+    atexit.register(_release)
 
 
 def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
@@ -230,10 +302,10 @@ def resolve_task_ids_for_suite(
     cli_task_ids: list[int] | None,
     cfg: dict[str, Any],
 ) -> list[int]:
-    if bool(cfg.get("all_tasks", False)):
-        return list(range(task_count))
     if cli_task_ids is not None:
         task_ids = cli_task_ids
+    elif bool(cfg.get("all_tasks", False)):
+        return list(range(task_count))
     else:
         suite_task_ids = cfg.get("suite_task_ids", {})
         if isinstance(suite_task_ids, dict) and suite_name in suite_task_ids:
@@ -428,6 +500,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument(
+        "--episode-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Evaluate only these LIBERO initial-state indices; repeat for multiple indices.",
+    )
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
@@ -443,6 +522,125 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--action-index", type=int, default=None)
     parser.add_argument("--exec-action-steps", type=int, default=None)
+    parser.add_argument(
+        "--adaptive-exec-max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Maximum rows retained from a predicted chunk when the robot has not reached the final "
+            "base waypoint. Values at or below --exec-action-steps disable adaptive continuation."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-exec-position-error-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Continue beyond --exec-action-steps only while end-effector position tracking error "
+            "exceeds this value in metres."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-exec-rotation-error-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Continue beyond --exec-action-steps only while end-effector rotation tracking error "
+            "exceeds this value in radians."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-exec-position-error-max",
+        type=float,
+        default=None,
+        help=(
+            "Do not continue an old chunk when position tracking error exceeds this safety bound "
+            "in metres; replan immediately instead."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-exec-rotation-error-max",
+        type=float,
+        default=None,
+        help=(
+            "Do not continue an old chunk when rotation tracking error exceeds this safety bound "
+            "in radians; replan immediately instead."
+        ),
+    )
+    parser.add_argument(
+        "--grasp-exec-steps",
+        type=int,
+        default=None,
+        help=(
+            "Rows executed from a chunk when the measured gripper width indicates a stable "
+            "grasp. This lets placement reach deeper chunk rows without changing approach or "
+            "empty-gripper replanning."
+        ),
+    )
+    parser.add_argument("--grasp-width-min", type=float, default=None)
+    parser.add_argument("--grasp-width-max", type=float, default=None)
+    parser.add_argument(
+        "--grasp-lift-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum upward end-effector displacement after an intermediate-width closure "
+            "before using grasp_exec_steps. This distinguishes transported objects from "
+            "fixed handles using robot state only."
+        ),
+    )
+    parser.add_argument(
+        "--release-event-exec-enable",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When an intermediate-width grasp is present, preserve a significant predicted "
+            "gripper-opening event that falls beyond the normal chunk cutoff."
+        ),
+    )
+    parser.add_argument(
+        "--release-event-exec-max-steps",
+        type=int,
+        default=None,
+        help="Maximum predicted chunk rows that may be committed to complete a release event.",
+    )
+    parser.add_argument(
+        "--release-event-min-width-change",
+        type=float,
+        default=None,
+        help=(
+            "Minimum predicted opening increase in metres required to preserve a release event."
+        ),
+    )
+    parser.add_argument(
+        "--waypoint-max-hold-steps",
+        type=int,
+        default=None,
+        help=(
+            "Maximum controller steps spent tracking each predicted waypoint before advancing. "
+            "One preserves the original one-waypoint-per-env-step behavior."
+        ),
+    )
+    parser.add_argument(
+        "--waypoint-position-tolerance",
+        type=float,
+        default=None,
+        help="Position error in metres below which a held waypoint is considered reached.",
+    )
+    parser.add_argument(
+        "--waypoint-rotation-tolerance",
+        type=float,
+        default=None,
+        help="Rotation error in radians below which a held waypoint is considered reached.",
+    )
+    parser.add_argument(
+        "--waypoint-gripper-tolerance",
+        type=float,
+        default=None,
+        help=(
+            "Physical-width error in metres used when a held waypoint carries an open/close event."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--use-suite-max-steps",
@@ -491,6 +689,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Physical width-change threshold in metres used by delta_width control.",
+    )
+    parser.add_argument(
+        "--gripper-delta-alignment",
+        choices=("current_minus_previous", "next_minus_current"),
+        default=None,
+        help=(
+            "Align a predicted width transition with the waypoint being executed. "
+            "current_minus_previous follows trajectory time; next_minus_current is the legacy one-row-early mode."
+        ),
+    )
+    parser.add_argument(
+        "--synchronize-gripper-controller-state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Synchronize robosuite's integrated gripper.current_action with the physical finger qpos "
+            "after reset/settling, so a zero command preserves the initialized opening."
+        ),
     )
     parser.add_argument(
         "--gripper-target-tolerance",
@@ -1012,6 +1228,86 @@ def gripper_target_width_command(
     return 0.0
 
 
+def predicted_release_event_end(
+    predicted_widths: np.ndarray,
+    *,
+    base_count: int,
+    max_count: int,
+    min_width_change: float,
+) -> tuple[int, float]:
+    """Return an exclusive row count that preserves a delayed release event.
+
+    Receding-horizon execution can otherwise create a Zeno failure: every
+    prediction contains a valid opening event in its unused suffix, but the
+    fixed cutoff replans before reaching it and the next prediction moves the
+    event into the future again.  This helper only recognizes opening motion;
+    approach and closing remain closed-loop so grasp refinement is unaffected.
+    """
+    widths = np.asarray(predicted_widths, dtype=np.float64).reshape(-1)
+    if widths.size == 0:
+        return 0, 0.0
+    base = min(widths.size, max(1, int(base_count)))
+    limit = min(widths.size, max(base, int(max_count)))
+    if limit <= base:
+        return base, 0.0
+
+    reference_width = float(widths[base - 1])
+    suffix = widths[base:limit]
+    peak_offset = int(np.argmax(suffix))
+    opening_change = float(suffix[peak_offset] - reference_width)
+    if not np.isfinite(opening_change) or opening_change < float(min_width_change):
+        return base, max(0.0, opening_change)
+    return base + peak_offset + 1, opening_change
+
+
+def synchronize_gripper_controller_state(env: Any) -> list[list[float]]:
+    """Match robosuite's integrated gripper target to the physical finger qpos.
+
+    ``PandaGripper.format_action`` integrates direction commands into an
+    internal normalized ``current_action``. Directly setting finger qpos during
+    episode initialization does not update that state. Its default is zero,
+    which maps to a half-open actuator target; consequently a later zero command
+    closes a physically open gripper toward half width instead of holding it.
+
+    This routine derives the normalized actuator target from the actual joint
+    positions and updates both the gripper model state and MuJoCo controls. It
+    uses only actuator/joint metadata and therefore has no task-specific logic.
+    """
+    sim = get_sim(env)
+    model = sim.model
+    synchronized: list[list[float]] = []
+
+    for robot in getattr(env, "robots", []):
+        raw_grippers = getattr(robot, "gripper", None)
+        if raw_grippers is None:
+            continue
+        grippers = list(raw_grippers.values()) if isinstance(raw_grippers, dict) else [raw_grippers]
+        for gripper in grippers:
+            actuator_names = list(getattr(gripper, "actuators", []))
+            if not actuator_names:
+                continue
+            actuator_ids = np.asarray(
+                [model.actuator_name2id(name) for name in actuator_names],
+                dtype=np.int64,
+            )
+            ctrl_range = np.asarray(model.actuator_ctrlrange[actuator_ids], dtype=np.float64)
+            bias = 0.5 * (ctrl_range[:, 1] + ctrl_range[:, 0])
+            weight = 0.5 * (ctrl_range[:, 1] - ctrl_range[:, 0])
+            if np.any(np.abs(weight) < 1e-12):
+                raise RuntimeError(f"Gripper actuator has a degenerate control range: {ctrl_range!r}.")
+
+            joint_ids = np.asarray(model.actuator_trnid[actuator_ids, 0], dtype=np.int64)
+            qpos_addresses = np.asarray(model.jnt_qposadr[joint_ids], dtype=np.int64)
+            physical_targets = np.asarray(sim.data.qpos[qpos_addresses], dtype=np.float64)
+            normalized = np.clip((physical_targets - bias) / weight, -1.0, 1.0)
+            gripper.current_action = normalized.copy()
+            sim.data.ctrl[actuator_ids] = physical_targets
+            synchronized.append(normalized.astype(np.float32).tolist())
+
+    sim.forward()
+    return synchronized
+
+
 def rotation_error_radians(actual: np.ndarray, target: np.ndarray) -> float:
     """Return the shortest SO(3) angle between two rotation matrices."""
     relative = np.asarray(actual, dtype=np.float64) @ np.asarray(target, dtype=np.float64).T
@@ -1095,6 +1391,8 @@ def action_chunk_to_absolute_libero_actions(
     gripper_max_width: float,
     gripper_control_mode: str,
     gripper_delta_threshold: float,
+    gripper_delta_alignment: str = "current_minus_previous",
+    gripper_previous_width: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Convert one model chunk to directly executable absolute OSC actions.
 
@@ -1120,6 +1418,10 @@ def action_chunk_to_absolute_libero_actions(
     control_mode = str(gripper_control_mode)
     if control_mode not in {"delta_width", "absolute_width", "target_width"}:
         raise ValueError(f"Unsupported gripper_control_mode={control_mode!r}.")
+    delta_alignment = str(gripper_delta_alignment)
+    if delta_alignment not in {"current_minus_previous", "next_minus_current"}:
+        raise ValueError(f"Unsupported gripper_delta_alignment={delta_alignment!r}.")
+    previous_width = float(chunk[0, -1] if gripper_previous_width is None else gripper_previous_width)
     for idx, (row, target_model_world) in enumerate(zip(chunk, target_model_worlds, strict=True)):
         target_controller_world = target_model_world @ model_to_controller
         arm_action = world_pose_to_libero_absolute_action(target_controller_world)
@@ -1130,9 +1432,15 @@ def action_chunk_to_absolute_libero_actions(
                 max_physical_width=float(gripper_max_width),
             )
         elif control_mode == "delta_width":
-            # The command applied while moving from row i to row i+1 is the
-            # direction of the predicted width change over that interval.
-            delta_width = float(chunk[idx + 1, -1] - row[-1]) if idx < chunk.shape[0] - 1 else 0.0
+            if delta_alignment == "current_minus_previous":
+                # Row i is the endpoint of the previous->current trajectory
+                # interval, so its gripper event belongs to this same env step.
+                delta_width = float(row[-1] - previous_width)
+                previous_width = float(row[-1])
+            else:
+                # Legacy behavior triggers the i->i+1 transition while the arm
+                # is still moving to row i, i.e. one waypoint early.
+                delta_width = float(chunk[idx + 1, -1] - row[-1]) if idx < chunk.shape[0] - 1 else 0.0
             threshold = float(gripper_delta_threshold)
             gripper_action = -1.0 if delta_width > threshold else 1.0 if delta_width < -threshold else 0.0
         else:
@@ -1207,9 +1515,15 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "render_mode": str(cfg.get("render_mode", "offscreen")),
         "evaluation_identity": cfg.get("evaluation_identity", {}),
         "env_seed": int(cfg.get("env_seed", 7)),
-        "use_suite_max_steps": bool(cfg.get("use_suite_max_steps", True)),
+        "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
+        "use_suite_max_steps": bool(cfg.get("use_suite_max_steps", False)),
         "suite_max_steps": {
-            suite_name: int(LIBERO_STANDARD_MAX_STEPS.get(suite_name, cfg["control"]["max_steps"]))
+            suite_name: (
+                int(LIBERO_STANDARD_MAX_STEPS[suite_name])
+                if bool(cfg.get("use_suite_max_steps", False))
+                and suite_name in LIBERO_STANDARD_MAX_STEPS
+                else int(cfg["control"]["max_steps"])
+            )
             for suite_name in suite_names
         },
         "execution": {
@@ -1247,11 +1561,50 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "gripper_threshold": float(cfg["control"]["gripper_threshold"]),
             "gripper_control_mode": str(cfg["control"]["gripper_control_mode"]),
             "gripper_delta_threshold": float(cfg["control"]["gripper_delta_threshold"]),
-            "gripper_delta_alignment": "next_width_minus_current_width",
+            "gripper_delta_alignment": str(cfg["control"]["gripper_delta_alignment"]),
+            "synchronize_gripper_controller_state": bool(
+                cfg["control"]["synchronize_gripper_controller_state"]
+            ),
             "gripper_target_tolerance": float(cfg["control"]["gripper_target_tolerance"]),
             "exec_action_steps": int(cfg["control"]["exec_action_steps"]),
+            "adaptive_exec_max_steps": int(cfg["control"]["adaptive_exec_max_steps"]),
+            "adaptive_exec_position_error_threshold": float(
+                cfg["control"]["adaptive_exec_position_error_threshold"]
+            ),
+            "adaptive_exec_rotation_error_threshold": float(
+                cfg["control"]["adaptive_exec_rotation_error_threshold"]
+            ),
+            "adaptive_exec_position_error_max": float(
+                cfg["control"]["adaptive_exec_position_error_max"]
+            ),
+            "adaptive_exec_rotation_error_max": float(
+                cfg["control"]["adaptive_exec_rotation_error_max"]
+            ),
+            "grasp_exec_steps": int(cfg["control"]["grasp_exec_steps"]),
+            "grasp_width_min": float(cfg["control"]["grasp_width_min"]),
+            "grasp_width_max": float(cfg["control"]["grasp_width_max"]),
+            "grasp_lift_threshold": float(cfg["control"]["grasp_lift_threshold"]),
+            "release_event_exec_enable": bool(
+                cfg["control"]["release_event_exec_enable"]
+            ),
+            "release_event_exec_max_steps": int(
+                cfg["control"]["release_event_exec_max_steps"]
+            ),
+            "release_event_min_width_change": float(
+                cfg["control"]["release_event_min_width_change"]
+            ),
+            "waypoint_max_hold_steps": int(cfg["control"]["waypoint_max_hold_steps"]),
+            "waypoint_position_tolerance": float(
+                cfg["control"]["waypoint_position_tolerance"]
+            ),
+            "waypoint_rotation_tolerance": float(
+                cfg["control"]["waypoint_rotation_tolerance"]
+            ),
+            "waypoint_gripper_tolerance": float(
+                cfg["control"]["waypoint_gripper_tolerance"]
+            ),
             "action_index": int(cfg["control"]["action_index"]),
-            "control_freq": float(cfg["control"].get("control_freq", cfg.get("control_freq", 20))),
+            "control_freq": float(cfg["control"].get("control_freq", cfg.get("control_freq", 5))),
             "policy_noise_seed": int(cfg["policy_noise_seed"]),
         },
         "overall": aggregate_task_results(tasks),
@@ -1274,6 +1627,7 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "video_frames",
         "libero_actions",
         "model_action_rows",
+        "predicted_action_chunks",
         "target_controller_pose9",
         "target_model_worlds",
         "achieved_model_worlds",
@@ -1288,6 +1642,22 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "gripper_width_pcts",
         "gripper_actual_widths",
         "gripper_width_errors",
+        "initial_object_positions",
+        "initial_object_quaternions",
+        "object_positions",
+        "object_quaternions",
+        "goal_predicate_values",
+        "scene_joint_values",
+        "contact_pair_strings",
+        "robot_scene_contact_pair_strings",
+        "contact_counts",
+        "robot_scene_contact_counts",
+        "waypoint_hold_counts",
+        "release_event_predicted_width_changes",
+        "chunk_executed_waypoint_counts",
+        "chunk_release_event_end_counts",
+        "chunk_grasp_upward_displacements",
+        "chunk_transported_grasp_flags",
     }
     record = {k: v for k, v in result.items() if k not in drop_keys}
     record["episode_index"] = int(episode_idx)
@@ -1300,6 +1670,9 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
     arrays = {
         "libero_actions": np.asarray(result.get("libero_actions", []), dtype=np.float32),
         "model_action_rows": np.asarray(result.get("model_action_rows", []), dtype=np.float32),
+        "predicted_action_chunks": np.asarray(
+            result.get("predicted_action_chunks", []), dtype=np.float32
+        ),
         "target_controller_pose9": np.asarray(result.get("target_controller_pose9", []), dtype=np.float32),
         "target_model_worlds": np.asarray(result.get("target_model_worlds", []), dtype=np.float32),
         "achieved_model_worlds": np.asarray(result.get("achieved_model_worlds", []), dtype=np.float32),
@@ -1320,12 +1693,219 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         "gripper_width_pcts": np.asarray(result.get("gripper_width_pcts", []), dtype=np.float32),
         "gripper_actual_widths": np.asarray(result.get("gripper_actual_widths", []), dtype=np.float32),
         "gripper_width_errors": np.asarray(result.get("gripper_width_errors", []), dtype=np.float32),
+        "release_event_predicted_width_changes": np.asarray(
+            result.get("release_event_predicted_width_changes", []), dtype=np.float32
+        ),
+        "chunk_executed_waypoint_counts": np.asarray(
+            result.get("chunk_executed_waypoint_counts", []), dtype=np.int16
+        ),
+        "chunk_release_event_end_counts": np.asarray(
+            result.get("chunk_release_event_end_counts", []), dtype=np.int16
+        ),
+        "chunk_grasp_upward_displacements": np.asarray(
+            result.get("chunk_grasp_upward_displacements", []), dtype=np.float32
+        ),
+        "chunk_transported_grasp_flags": np.asarray(
+            result.get("chunk_transported_grasp_flags", []), dtype=np.bool_
+        ),
+        "object_pose_names": np.asarray(result.get("object_pose_names", []), dtype=np.str_),
+        "initial_object_positions": np.asarray(
+            result.get("initial_object_positions", []), dtype=np.float32
+        ),
+        "initial_object_quaternions": np.asarray(
+            result.get("initial_object_quaternions", []), dtype=np.float32
+        ),
+        "object_positions": np.asarray(result.get("object_positions", []), dtype=np.float32),
+        "object_quaternions": np.asarray(result.get("object_quaternions", []), dtype=np.float32),
+        "goal_predicate_names": np.asarray(result.get("goal_predicate_names", []), dtype=np.str_),
+        "initial_goal_predicate_values": np.asarray(
+            result.get("initial_goal_predicate_values", []), dtype=np.bool_
+        ),
+        "goal_predicate_values": np.asarray(result.get("goal_predicate_values", []), dtype=np.bool_),
+        "scene_joint_names": np.asarray(result.get("scene_joint_names", []), dtype=np.str_),
+        "scene_joint_types": np.asarray(result.get("scene_joint_types", []), dtype=np.str_),
+        "scene_joint_ranges": np.asarray(result.get("scene_joint_ranges", []), dtype=np.float32),
+        "initial_scene_joint_values": np.asarray(
+            result.get("initial_scene_joint_values", []), dtype=np.float32
+        ),
+        "scene_joint_values": np.asarray(result.get("scene_joint_values", []), dtype=np.float32),
+        "contact_pair_strings": np.asarray(result.get("contact_pair_strings", []), dtype=np.str_),
+        "robot_scene_contact_pair_strings": np.asarray(
+            result.get("robot_scene_contact_pair_strings", []), dtype=np.str_
+        ),
+        "contact_counts": np.asarray(result.get("contact_counts", []), dtype=np.int32),
+        "robot_scene_contact_counts": np.asarray(
+            result.get("robot_scene_contact_counts", []), dtype=np.int32
+        ),
+        "waypoint_hold_counts": np.asarray(
+            result.get("waypoint_hold_counts", []), dtype=np.int16
+        ),
     }
     if arrays["libero_actions"].size == 0:
         return None
     path = episode_dir / "actions.npz"
     np.savez_compressed(path, **arrays)
     return str(path)
+
+
+def observable_object_pose_names(raw_obs: dict[str, Any]) -> list[str]:
+    """Return scene-object names with directly observable world poses.
+
+    LIBERO exposes keys such as ``akita_black_bowl_1_pos`` and
+    ``akita_black_bowl_1_quat``. Robot proprioception and relative
+    ``*_to_robot0_eef_*`` fields are intentionally excluded. These values are
+    recorded only for post-hoc evaluation diagnostics and never enter policy
+    inference.
+    """
+    names: list[str] = []
+    for key in raw_obs:
+        if not key.endswith("_pos"):
+            continue
+        name = key[: -len("_pos")]
+        if name.startswith("robot") or "_to_robot" in name:
+            continue
+        quat_key = f"{name}_quat"
+        if quat_key not in raw_obs:
+            continue
+        position = np.asarray(raw_obs[key]).reshape(-1)
+        quaternion = np.asarray(raw_obs[quat_key]).reshape(-1)
+        if position.size == 3 and quaternion.size == 4:
+            names.append(name)
+    return sorted(names)
+
+
+def capture_observable_object_poses(
+    raw_obs: dict[str, Any],
+    object_pose_names: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    if not object_pose_names:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 4), dtype=np.float32)
+    positions = np.stack(
+        [np.asarray(raw_obs[f"{name}_pos"], dtype=np.float32).reshape(3) for name in object_pose_names],
+        axis=0,
+    )
+    quaternions = np.stack(
+        [np.asarray(raw_obs[f"{name}_quat"], dtype=np.float32).reshape(4) for name in object_pose_names],
+        axis=0,
+    )
+    return positions, quaternions
+
+
+def find_libero_task_env(env: Any) -> Any | None:
+    """Find the inner LIBERO task object without relying on wrapper depth."""
+    for candidate in reversed(_iter_env_chain(env)):
+        if hasattr(candidate, "parsed_problem") and callable(getattr(candidate, "_eval_predicate", None)):
+            return candidate
+    return None
+
+
+def goal_predicate_spec(env: Any) -> tuple[list[str], list[Any]]:
+    """Return stable labels and raw LIBERO goal predicates for diagnostics only."""
+    task_env = find_libero_task_env(env)
+    if task_env is None:
+        return [], []
+    states = list(getattr(task_env, "parsed_problem", {}).get("goal_state", []) or [])
+    labels = [" ".join(map(str, state)) for state in states]
+    return labels, states
+
+
+def capture_goal_predicates(env: Any, states: list[Any]) -> np.ndarray:
+    """Evaluate each benchmark predicate without feeding it back into control."""
+    if not states:
+        return np.empty((0,), dtype=np.bool_)
+    task_env = find_libero_task_env(env)
+    if task_env is None:
+        return np.zeros((len(states),), dtype=np.bool_)
+    values: list[bool] = []
+    for state in states:
+        try:
+            values.append(bool(task_env._eval_predicate(state)))  # noqa: SLF001
+        except Exception:
+            values.append(False)
+    return np.asarray(values, dtype=np.bool_)
+
+
+def scene_scalar_joint_spec(env: Any) -> list[dict[str, Any]]:
+    """Describe non-robot slide/hinge joints such as drawers, doors and knobs."""
+    sim = get_sim(env)
+    model = sim.model
+    excluded_qpos: set[int] = set()
+    try:
+        arm_qpos, _ = robot_arm_indices(env)
+        excluded_qpos.update(map(int, arm_qpos))
+    except Exception:
+        pass
+    try:
+        excluded_qpos.update(int(record["qpos_adr"]) for record in gripper_joint_records(env))
+    except Exception:
+        pass
+
+    names = model_names(model, "joint")
+    records: list[dict[str, Any]] = []
+    for joint_id in range(int(getattr(model, "njnt", len(names)))):
+        joint_type = int(model.jnt_type[joint_id])
+        if joint_type not in (2, 3):
+            continue
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        name = names[joint_id] if joint_id < len(names) else f"joint_{joint_id}"
+        if qpos_address in excluded_qpos or re.search(r"robot|panda|gripper|finger", name, re.I):
+            continue
+        joint_range = np.asarray(model.jnt_range[joint_id], dtype=np.float32).reshape(-1)
+        records.append(
+            {
+                "name": str(name),
+                "type": _joint_type_name(model, joint_id),
+                "qpos_adr": qpos_address,
+                "range": joint_range[:2] if joint_range.size >= 2 else np.asarray([np.nan, np.nan]),
+            }
+        )
+    return records
+
+
+def capture_scene_scalar_joints(env: Any, records: list[dict[str, Any]]) -> np.ndarray:
+    if not records:
+        return np.empty((0,), dtype=np.float32)
+    qpos = np.asarray(get_sim(env).data.qpos)
+    return np.asarray([qpos[int(record["qpos_adr"])] for record in records], dtype=np.float32)
+
+
+def robot_contact_geom_names(env: Any) -> set[str]:
+    """Collect end-effector contact geoms, excluding fixed robot-base contacts."""
+    names: set[str] = set()
+    for env_layer in _iter_env_chain(env):
+        for robot in getattr(env_layer, "robots", []) or []:
+            raw_grippers = getattr(robot, "gripper", None)
+            grippers = list(raw_grippers.values()) if isinstance(raw_grippers, dict) else [raw_grippers]
+            for gripper in grippers:
+                if gripper is not None:
+                    names.update(str(name) for name in (getattr(gripper, "contact_geoms", None) or []))
+    if not names:
+        # Defensive fallback for wrappers that do not expose gripper metadata.
+        for geom_name in model_names(get_sim(env).model, "geom"):
+            if re.search(r"gripper|finger|hand", geom_name, re.I) and not re.search(r"vis", geom_name, re.I):
+                names.add(str(geom_name))
+    return names
+
+
+def capture_contact_pairs(env: Any, robot_geoms: set[str]) -> tuple[str, str, int, int]:
+    """Serialize current contact pairs and the robot-scene subset per step."""
+    sim = get_sim(env)
+    model = sim.model
+    geom_names = model_names(model, "geom")
+    all_pairs: set[str] = set()
+    robot_scene_pairs: set[str] = set()
+    for contact_index in range(int(getattr(sim.data, "ncon", 0))):
+        contact = sim.data.contact[contact_index]
+        geom1_id, geom2_id = int(contact.geom1), int(contact.geom2)
+        geom1 = geom_names[geom1_id] if geom1_id < len(geom_names) else f"geom_{geom1_id}"
+        geom2 = geom_names[geom2_id] if geom2_id < len(geom_names) else f"geom_{geom2_id}"
+        pair = " <-> ".join(sorted((str(geom1), str(geom2))))
+        all_pairs.add(pair)
+        if (geom1 in robot_geoms) != (geom2 in robot_geoms):
+            robot_scene_pairs.add(pair)
+    all_sorted = sorted(all_pairs)
+    robot_sorted = sorted(robot_scene_pairs)
+    return "; ".join(all_sorted), "; ".join(robot_sorted), len(all_sorted), len(robot_sorted)
 
 def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[str, Any], seed: int) -> tuple[np.ndarray, np.ndarray, float]:
     """Build the exact online UMI observation used for model inference.
@@ -2615,19 +3195,86 @@ def run_episode(
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
     control = cfg["control"]
-    configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 500)))
+    configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 1000)))
     max_steps = (
         int(LIBERO_STANDARD_MAX_STEPS[suite_name])
-        if bool(cfg.get("use_suite_max_steps", True)) and suite_name in LIBERO_STANDARD_MAX_STEPS
+        if bool(cfg.get("use_suite_max_steps", False)) and suite_name in LIBERO_STANDARD_MAX_STEPS
         else configured_max_steps
     )
+    environment_horizon = None
+    environment_ignore_done = False
+    for env_layer in reversed(_iter_env_chain(env)):
+        if environment_horizon is None and hasattr(env_layer, "horizon"):
+            environment_horizon = int(env_layer.horizon)
+        if hasattr(env_layer, "ignore_done"):
+            environment_ignore_done = bool(env_layer.ignore_done)
+    if (
+        environment_horizon is not None
+        and not environment_ignore_done
+        and environment_horizon < max_steps
+    ):
+        raise RuntimeError(
+            "LIBERO environment horizon is shorter than the requested evaluation limit: "
+            f"environment_horizon={environment_horizon}, max_steps={max_steps}."
+        )
     action_index = max(0, int(control.get("action_index", 0)))
-    exec_action_steps = int(control.get("exec_action_steps", 16))
+    exec_action_steps = int(control.get("exec_action_steps", 12))
+    adaptive_exec_max_steps = max(
+        exec_action_steps,
+        int(control.get("adaptive_exec_max_steps", exec_action_steps)),
+    )
+    adaptive_exec_position_error_threshold = max(
+        0.0, float(control.get("adaptive_exec_position_error_threshold", 0.012))
+    )
+    adaptive_exec_rotation_error_threshold = max(
+        0.0, float(control.get("adaptive_exec_rotation_error_threshold", 0.10))
+    )
+    adaptive_exec_position_error_max = max(
+        adaptive_exec_position_error_threshold,
+        float(control.get("adaptive_exec_position_error_max", 0.03)),
+    )
+    adaptive_exec_rotation_error_max = max(
+        adaptive_exec_rotation_error_threshold,
+        float(control.get("adaptive_exec_rotation_error_max", 0.15)),
+    )
+    grasp_exec_steps = max(
+        exec_action_steps,
+        int(control.get("grasp_exec_steps", exec_action_steps)),
+    )
+    grasp_width_min = max(0.0, float(control.get("grasp_width_min", 0.003)))
+    grasp_width_max = max(
+        grasp_width_min,
+        float(control.get("grasp_width_max", 0.070)),
+    )
+    grasp_lift_threshold = max(
+        0.0,
+        float(control.get("grasp_lift_threshold", 0.015)),
+    )
+    release_event_exec_enable = bool(control.get("release_event_exec_enable", False))
+    release_event_exec_max_steps = max(
+        grasp_exec_steps,
+        int(control.get("release_event_exec_max_steps", 32)),
+    )
+    release_event_min_width_change = max(
+        0.0,
+        float(control.get("release_event_min_width_change", 0.02)),
+    )
+    waypoint_max_hold_steps = max(1, int(control.get("waypoint_max_hold_steps", 1)))
+    waypoint_position_tolerance = max(
+        0.0, float(control.get("waypoint_position_tolerance", 0.002))
+    )
+    waypoint_rotation_tolerance = max(
+        0.0, float(control.get("waypoint_rotation_tolerance", 0.03))
+    )
+    waypoint_gripper_tolerance = max(
+        0.0, float(control.get("waypoint_gripper_tolerance", 0.004))
+    )
     warmup_steps = max(0, int(control.get("warmup_steps", 0)))
     gripper_threshold = float(control.get("gripper_threshold", 0.5))
     gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
     gripper_control_mode = str(control.get("gripper_control_mode", "delta_width"))
     gripper_delta_threshold = float(control.get("gripper_delta_threshold", 0.002))
+    gripper_delta_alignment = str(control.get("gripper_delta_alignment", "current_minus_previous"))
     gripper_target_tolerance = float(control.get("gripper_target_tolerance", 0.004))
     policy_noise_seed_base = int(cfg.get("policy_noise_seed", 0))
 
@@ -2649,6 +3296,10 @@ def run_episode(
         open_gripper=bool(cfg["initial_gripper_open"]),
         cfg=cfg,
     )
+    synchronized_gripper_controller_actions: list[list[float]] = []
+    if bool(control.get("synchronize_gripper_controller_state", True)):
+        synchronized_gripper_controller_actions = synchronize_gripper_controller_state(env)
+        raw_obs = get_raw_obs(env, force_update=True)
 
 
     # Absolute pose execution only.
@@ -2668,6 +3319,30 @@ def run_episode(
         policy_rgb_camera_map = resolve_policy_rgb_cameras(infer, raw_obs, cfg)
         # print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
 
+    object_pose_names = observable_object_pose_names(raw_obs)
+    initial_object_positions, initial_object_quaternions = capture_observable_object_poses(
+        raw_obs,
+        object_pose_names,
+    )
+    object_positions: list[np.ndarray] = []
+    object_quaternions: list[np.ndarray] = []
+    goal_predicate_names, raw_goal_predicates = goal_predicate_spec(env)
+    initial_goal_predicate_values = capture_goal_predicates(env, raw_goal_predicates)
+    goal_predicate_values: list[np.ndarray] = []
+    scene_joint_records = scene_scalar_joint_spec(env)
+    scene_joint_names = [str(record["name"]) for record in scene_joint_records]
+    scene_joint_types = [str(record["type"]) for record in scene_joint_records]
+    scene_joint_ranges = np.asarray(
+        [record["range"] for record in scene_joint_records], dtype=np.float32
+    ).reshape(-1, 2)
+    initial_scene_joint_values = capture_scene_scalar_joints(env, scene_joint_records)
+    scene_joint_values: list[np.ndarray] = []
+    robot_contact_geoms = robot_contact_geom_names(env)
+    contact_pair_strings: list[str] = []
+    robot_scene_contact_pair_strings: list[str] = []
+    contact_counts: list[int] = []
+    robot_scene_contact_counts: list[int] = []
+
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
     save_video = bool(cfg.get("save_video", True))
     video_frames: dict[str, list[np.ndarray]] = {}
@@ -2677,6 +3352,10 @@ def run_episode(
     rewards: list[float] = []
     libero_actions: list[np.ndarray] = []
     model_action_rows: list[np.ndarray] = []
+    # Keep every complete policy prediction for post-hoc diagnosis.  The
+    # executed rows alone cannot reveal whether replanning truncated a
+    # coherent sub-action in the unused suffix of an action chunk.
+    predicted_action_chunks: list[np.ndarray] = []
     target_controller_pose9: list[np.ndarray] = []
     target_model_worlds: list[np.ndarray] = []
     gripper_commands: list[float] = []
@@ -2694,6 +3373,38 @@ def run_episode(
     chunk_boundary_position_errors: list[float] = []
     chunk_boundary_rotation_errors: list[float] = []
     previous_issued_target_model_world: np.ndarray | None = None
+    model_waypoints_executed = 0
+    adaptive_waypoints_executed = 0
+    grasp_extended_waypoints_executed = 0
+    grasp_extended_model_calls = 0
+    grasp_anchor_position: np.ndarray | None = None
+    grasp_max_upward_displacement = 0.0
+    release_event_extended_waypoints_executed = 0
+    release_event_extended_model_calls = 0
+    release_event_predicted_width_changes: list[float] = []
+    chunk_executed_waypoint_counts: list[int] = []
+    chunk_release_event_end_counts: list[int] = []
+    chunk_grasp_upward_displacements: list[float] = []
+    chunk_transported_grasp_flags: list[bool] = []
+    waypoint_hold_counts: list[int] = []
+
+    def update_grasp_transport_state(pose9_gripper: np.ndarray) -> bool:
+        """Track whether an intermediate-width closure has subsequently lifted."""
+        nonlocal grasp_anchor_position, grasp_max_upward_displacement
+        pose = np.asarray(pose9_gripper, dtype=np.float32).reshape(-1)
+        width = float(pose[-1])
+        if not (grasp_width_min < width < grasp_width_max):
+            grasp_anchor_position = None
+            grasp_max_upward_displacement = 0.0
+            return False
+        if grasp_anchor_position is None:
+            grasp_anchor_position = pose[:3].copy()
+            grasp_max_upward_displacement = 0.0
+        grasp_max_upward_displacement = max(
+            grasp_max_upward_displacement,
+            float(pose[2] - grasp_anchor_position[2]),
+        )
+        return grasp_max_upward_displacement >= grasp_lift_threshold
 
     success_ever = False
     done = False
@@ -2741,6 +3452,8 @@ def run_episode(
                     shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
                 )
 
+            transported_grasp = update_grasp_transport_state(eef_pose)
+
             model_observation = {
                 "point_cloud": point_cloud,
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
@@ -2779,6 +3492,7 @@ def run_episode(
                 chunk = chunk_batch[0].detach().cpu().numpy()
             else:
                 chunk = np.asarray(chunk_batch)[0]
+            predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
 
             if keyboard.poll():
@@ -2786,8 +3500,67 @@ def run_episode(
                 break
 
             start_idx = min(action_index, max(0, len(chunk) - 1))
-            end_idx = len(chunk) if exec_action_steps <= 0 else min(len(chunk), start_idx + exec_action_steps)
+            measured_gripper_width = float(eef_pose[-1])
+            inferred_stable_grasp = (
+                grasp_exec_steps > exec_action_steps
+                and grasp_width_min < measured_gripper_width < grasp_width_max
+                and transported_grasp
+            )
+            chunk_grasp_upward_displacements.append(
+                float(grasp_max_upward_displacement)
+            )
+            chunk_transported_grasp_flags.append(bool(inferred_stable_grasp))
+            current_exec_action_steps = (
+                grasp_exec_steps if inferred_stable_grasp else exec_action_steps
+            )
+            if inferred_stable_grasp:
+                grasp_extended_model_calls += 1
+            normal_base_end_idx = (
+                len(chunk)
+                if exec_action_steps <= 0
+                else min(len(chunk), start_idx + current_exec_action_steps)
+            )
+            release_event_end_count = max(0, normal_base_end_idx - start_idx)
+            release_event_width_change = 0.0
+            if (
+                exec_action_steps > 0
+                and release_event_exec_enable
+                and inferred_stable_grasp
+            ):
+                release_event_end_count, release_event_width_change = (
+                    predicted_release_event_end(
+                        chunk[start_idx:, -1],
+                        base_count=current_exec_action_steps,
+                        max_count=release_event_exec_max_steps,
+                        min_width_change=release_event_min_width_change,
+                    )
+                )
+            committed_end_idx = min(len(chunk), start_idx + release_event_end_count)
+            release_event_planned = committed_end_idx > normal_base_end_idx
+            if release_event_planned:
+                release_event_extended_model_calls += 1
+            release_event_predicted_width_changes.append(
+                float(release_event_width_change)
+            )
+            chunk_release_event_end_counts.append(
+                int(committed_end_idx - start_idx)
+            )
+            end_idx = (
+                len(chunk)
+                if exec_action_steps <= 0
+                else min(
+                    len(chunk),
+                    max(
+                        start_idx + adaptive_exec_max_steps,
+                        normal_base_end_idx,
+                        committed_end_idx,
+                    ),
+                )
+            )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
+            previous_predicted_width = float(
+                chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
+            )
             actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
                 env=env,
                 current_eef_pose9_gripper=eef_pose,
@@ -2796,71 +3569,164 @@ def run_episode(
                 gripper_max_width=gripper_max_width,
                 gripper_control_mode=gripper_control_mode,
                 gripper_delta_threshold=gripper_delta_threshold,
+                gripper_delta_alignment=gripper_delta_alignment,
+                gripper_previous_width=previous_predicted_width,
             )
 
-            for row, action, model_world, controller_pose in zip(
+            latest_position_error = 0.0
+            latest_rotation_error = 0.0
+            normal_base_selected_count = max(0, normal_base_end_idx - start_idx)
+            committed_selected_count = max(0, committed_end_idx - start_idx)
+            executed_waypoints_this_chunk = 0
+            for selected_row_index, (row, action, model_world, controller_pose) in enumerate(zip(
                 selected_chunk,
                 actions,
                 model_worlds,
                 controller_pose9,
                 strict=True,
-            ):
+            )):
+                if selected_row_index >= normal_base_selected_count:
+                    stale_chunk = (
+                        latest_position_error > adaptive_exec_position_error_max
+                        or latest_rotation_error > adaptive_exec_rotation_error_max
+                    )
+                    if stale_chunk:
+                        break
+                    if selected_row_index < committed_selected_count:
+                        release_event_extended_waypoints_executed += 1
+                    else:
+                        if (
+                            latest_position_error <= adaptive_exec_position_error_threshold
+                            and latest_rotation_error <= adaptive_exec_rotation_error_threshold
+                        ):
+                            break
+                        adaptive_waypoints_executed += 1
                 if steps >= max_steps or done or success_ever or keyboard.poll():
                     manual_failure = keyboard.poll()
                     break
-                action = np.asarray(action, dtype=np.float32).copy()
-                if gripper_control_mode == "target_width":
-                    action[-1] = gripper_target_width_command(
-                        float(row[-1]),
-                        gripper_scalar(raw_obs),
-                        tolerance=gripper_target_tolerance,
-                        max_physical_width=gripper_max_width,
-                    )
-                try:
-                    raw_obs, reward, done, _ = env.step(action)
-                except ValueError as exc:
-                    if "terminated episode" in str(exc):
-                        done = True
+                if inferred_stable_grasp and selected_row_index >= exec_action_steps:
+                    grasp_extended_waypoints_executed += 1
+                model_waypoints_executed += 1
+                executed_waypoints_this_chunk += 1
+                hold_count = 0
+                waypoint_gripper_direction = float(action[-1])
+                for _hold_index in range(waypoint_max_hold_steps):
+                    if steps >= max_steps or done or success_ever or keyboard.poll():
+                        manual_failure = keyboard.poll()
                         break
-                    raise
+                    step_action = np.asarray(action, dtype=np.float32).copy()
+                    if gripper_control_mode == "target_width":
+                        step_action[-1] = gripper_target_width_command(
+                            float(row[-1]),
+                            gripper_scalar(raw_obs),
+                            tolerance=gripper_target_tolerance,
+                            max_physical_width=gripper_max_width,
+                        )
+                    elif _hold_index > 0:
+                        # LIBERO's Panda gripper integrates a directional
+                        # command into an internal target. Repeating the same
+                        # event while holding an arm waypoint changes one
+                        # predicted open/close event into several events.
+                        # A zero command keeps tracking the target established
+                        # on the first controller step.
+                        step_action[-1] = 0.0
+                    gripper_reach_direction = (
+                        float(step_action[-1])
+                        if gripper_control_mode == "target_width"
+                        else waypoint_gripper_direction
+                    )
+                    try:
+                        raw_obs, reward, done, _ = env.step(step_action)
+                    except ValueError as exc:
+                        if "terminated episode" in str(exc):
+                            done = True
+                            break
+                        raise
 
-                steps += 1
-                render_viewer3d(env, cfg, steps)
-                reward = float(reward)
-                rewards.append(reward)
-                libero_actions.append(np.asarray(action, dtype=np.float32))
-                model_action_rows.append(np.asarray(row, dtype=np.float32))
-                target_model_worlds.append(np.asarray(model_world, dtype=np.float32))
-                target_controller_pose9.append(np.asarray(controller_pose, dtype=np.float32))
-                gripper_commands.append(float(action[-1]))
-                gripper_raw_widths.append(float(row[-1]))
-                gripper_width_pcts.append(
-                    gripper_width_percent_from_scalar(float(row[-1]), max_physical_width=gripper_max_width)
-                )
-                achieved_pose = eef_pose9_gripper_from_obs(raw_obs)
-                gripper_actual_widths.append(float(achieved_pose[-1]))
-                gripper_width_errors.append(float(achieved_pose[-1] - row[-1]))
-                achieved_model_world = pose9_to_homo_np(np.asarray(achieved_pose[:9], dtype=np.float32))
-                achieved_model_worlds.append(np.asarray(achieved_model_world, dtype=np.float32))
-                tracking_position_errors.append(
-                    float(np.linalg.norm(achieved_model_world[:3, 3] - model_world[:3, 3]))
-                )
-                tracking_rotation_errors.append(
-                    rotation_error_radians(achieved_model_world[:3, :3], model_world[:3, :3])
-                )
-                previous_issued_target_model_world = np.asarray(model_world, dtype=np.float32)
+                    steps += 1
+                    hold_count += 1
+                    step_object_positions, step_object_quaternions = capture_observable_object_poses(
+                        raw_obs,
+                        object_pose_names,
+                    )
+                    object_positions.append(step_object_positions)
+                    object_quaternions.append(step_object_quaternions)
+                    goal_predicate_values.append(capture_goal_predicates(env, raw_goal_predicates))
+                    scene_joint_values.append(capture_scene_scalar_joints(env, scene_joint_records))
+                    all_contacts, robot_contacts, all_contact_count, robot_contact_count = capture_contact_pairs(
+                        env,
+                        robot_contact_geoms,
+                    )
+                    contact_pair_strings.append(all_contacts)
+                    robot_scene_contact_pair_strings.append(robot_contacts)
+                    contact_counts.append(int(all_contact_count))
+                    robot_scene_contact_counts.append(int(robot_contact_count))
+                    render_viewer3d(env, cfg, steps)
+                    reward = float(reward)
+                    rewards.append(reward)
+                    libero_actions.append(np.asarray(step_action, dtype=np.float32))
+                    model_action_rows.append(np.asarray(row, dtype=np.float32))
+                    target_model_worlds.append(np.asarray(model_world, dtype=np.float32))
+                    target_controller_pose9.append(np.asarray(controller_pose, dtype=np.float32))
+                    gripper_commands.append(float(step_action[-1]))
+                    gripper_raw_widths.append(float(row[-1]))
+                    gripper_width_pcts.append(
+                        gripper_width_percent_from_scalar(
+                            float(row[-1]), max_physical_width=gripper_max_width
+                        )
+                    )
+                    achieved_pose = eef_pose9_gripper_from_obs(raw_obs)
+                    update_grasp_transport_state(achieved_pose)
+                    gripper_actual_widths.append(float(achieved_pose[-1]))
+                    gripper_width_errors.append(float(achieved_pose[-1] - row[-1]))
+                    achieved_model_world = pose9_to_homo_np(
+                        np.asarray(achieved_pose[:9], dtype=np.float32)
+                    )
+                    achieved_model_worlds.append(np.asarray(achieved_model_world, dtype=np.float32))
+                    position_error = float(
+                        np.linalg.norm(achieved_model_world[:3, 3] - model_world[:3, 3])
+                    )
+                    rotation_error = rotation_error_radians(
+                        achieved_model_world[:3, :3], model_world[:3, :3]
+                    )
+                    latest_position_error = position_error
+                    latest_rotation_error = rotation_error
+                    tracking_position_errors.append(position_error)
+                    tracking_rotation_errors.append(rotation_error)
+                    previous_issued_target_model_world = np.asarray(model_world, dtype=np.float32)
 
-                if save_video:
-                    append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+                    if save_video:
+                        append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
 
-                if keyboard.poll():
-                    manual_failure = True
-                    break
+                    if keyboard.poll():
+                        manual_failure = True
+                        break
 
-                try:
-                    success_ever = success_ever or bool(env.check_success())
-                except Exception:
-                    success_ever = success_ever or bool(reward > 0.0)
+                    try:
+                        success_ever = success_ever or bool(env.check_success())
+                    except Exception:
+                        success_ever = success_ever or bool(reward > 0.0)
+                    if success_ever or done:
+                        break
+
+                    gripper_reached = True
+                    if gripper_control_mode == "target_width":
+                        if gripper_reach_direction > 0.0:
+                            gripper_reached = float(achieved_pose[-1]) <= (
+                                float(row[-1]) + waypoint_gripper_tolerance
+                            )
+                        elif gripper_reach_direction < 0.0:
+                            gripper_reached = float(achieved_pose[-1]) >= (
+                                float(row[-1]) - waypoint_gripper_tolerance
+                            )
+                    if (
+                        position_error <= waypoint_position_tolerance
+                        and rotation_error <= waypoint_rotation_tolerance
+                        and gripper_reached
+                    ):
+                        break
+                waypoint_hold_counts.append(int(hold_count))
+            chunk_executed_waypoint_counts.append(int(executed_waypoints_this_chunk))
 
             if manual_failure:
                 break
@@ -2873,6 +3739,7 @@ def run_episode(
 
     final_eef_pose = eef_pose9_gripper_from_obs(raw_obs)
     return {
+        "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
         "success": bool(success_ever),
         "done": bool(done),
         "manual_failure": bool(manual_failure),
@@ -2887,7 +3754,19 @@ def run_episode(
         ),
         "steps": int(steps),
         "max_steps": int(max_steps),
+        "environment_horizon": (
+            int(environment_horizon) if environment_horizon is not None else None
+        ),
+        "environment_ignore_done": bool(environment_ignore_done),
         "action_rows_executed": int(len(libero_actions)),
+        "model_waypoints_executed": int(model_waypoints_executed),
+        "adaptive_waypoints_executed": int(adaptive_waypoints_executed),
+        "grasp_extended_waypoints_executed": int(grasp_extended_waypoints_executed),
+        "grasp_extended_model_calls": int(grasp_extended_model_calls),
+        "release_event_extended_waypoints_executed": int(
+            release_event_extended_waypoints_executed
+        ),
+        "release_event_extended_model_calls": int(release_event_extended_model_calls),
         "model_call_count": int(model_call_count),
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
         "max_reward": float(np.max(rewards)) if rewards else 0.0,
@@ -2895,8 +3774,36 @@ def run_episode(
         "gripper_threshold": float(gripper_threshold),
         "gripper_control_mode": gripper_control_mode,
         "gripper_delta_threshold": float(gripper_delta_threshold),
-        "gripper_delta_alignment": "next_width_minus_current_width",
+        "gripper_delta_alignment": gripper_delta_alignment,
+        "synchronize_gripper_controller_state": bool(
+            control.get("synchronize_gripper_controller_state", True)
+        ),
+        "initial_gripper_controller_actions": synchronized_gripper_controller_actions,
         "gripper_target_tolerance": float(gripper_target_tolerance),
+        "waypoint_max_hold_steps": int(waypoint_max_hold_steps),
+        "adaptive_exec_max_steps": int(adaptive_exec_max_steps),
+        "adaptive_exec_position_error_threshold": float(
+            adaptive_exec_position_error_threshold
+        ),
+        "adaptive_exec_rotation_error_threshold": float(
+            adaptive_exec_rotation_error_threshold
+        ),
+        "adaptive_exec_position_error_max": float(adaptive_exec_position_error_max),
+        "adaptive_exec_rotation_error_max": float(adaptive_exec_rotation_error_max),
+        "grasp_exec_steps": int(grasp_exec_steps),
+        "grasp_width_min": float(grasp_width_min),
+        "grasp_width_max": float(grasp_width_max),
+        "grasp_lift_threshold": float(grasp_lift_threshold),
+        "release_event_exec_enable": bool(release_event_exec_enable),
+        "release_event_exec_max_steps": int(release_event_exec_max_steps),
+        "release_event_min_width_change": float(release_event_min_width_change),
+        "waypoint_position_tolerance": float(waypoint_position_tolerance),
+        "waypoint_rotation_tolerance": float(waypoint_rotation_tolerance),
+        "waypoint_gripper_tolerance": float(waypoint_gripper_tolerance),
+        "waypoint_hold_mean": (
+            float(np.mean(waypoint_hold_counts)) if waypoint_hold_counts else 0.0
+        ),
+        "waypoint_hold_max": int(np.max(waypoint_hold_counts)) if waypoint_hold_counts else 0,
         "policy_noise_seed_base": int(policy_noise_seed_base),
         "model_input_hashes": model_input_hashes,
         "first_model_input_component_hashes": first_model_input_component_hashes,
@@ -2910,6 +3817,24 @@ def run_episode(
             float(np.quantile(np.abs(gripper_width_errors), 0.95)) if gripper_width_errors else 0.0
         ),
         "final_eef_pose9_gripper": final_eef_pose,
+        "goal_predicate_names": goal_predicate_names,
+        "initial_goal_predicate_values": initial_goal_predicate_values,
+        "final_goal_predicate_values": (
+            goal_predicate_values[-1] if goal_predicate_values else initial_goal_predicate_values
+        ),
+        "scene_joint_names": scene_joint_names,
+        "scene_joint_types": scene_joint_types,
+        "scene_joint_ranges": scene_joint_ranges,
+        "initial_scene_joint_values": initial_scene_joint_values,
+        "final_scene_joint_values": (
+            scene_joint_values[-1] if scene_joint_values else initial_scene_joint_values
+        ),
+        "robot_scene_contact_step_count": int(np.sum(np.asarray(robot_scene_contact_counts) > 0)),
+        "robot_scene_contact_step_ratio": (
+            float(np.mean(np.asarray(robot_scene_contact_counts) > 0))
+            if robot_scene_contact_counts
+            else 0.0
+        ),
         "tracking_position_error_median_m": (
             float(np.median(tracking_position_errors)) if tracking_position_errors else 0.0
         ),
@@ -2942,6 +3867,7 @@ def run_episode(
         ),
         "libero_actions": np.asarray(libero_actions, dtype=np.float32),
         "model_action_rows": np.asarray(model_action_rows, dtype=np.float32),
+        "predicted_action_chunks": np.asarray(predicted_action_chunks, dtype=np.float32),
         "target_model_worlds": np.asarray(target_model_worlds, dtype=np.float32),
         "target_controller_pose9": np.asarray(target_controller_pose9, dtype=np.float32),
         "achieved_model_worlds": np.asarray(achieved_model_worlds, dtype=np.float32),
@@ -2958,6 +3884,35 @@ def run_episode(
         "gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
         "gripper_actual_widths": np.asarray(gripper_actual_widths, dtype=np.float32),
         "gripper_width_errors": np.asarray(gripper_width_errors, dtype=np.float32),
+        "release_event_predicted_width_changes": np.asarray(
+            release_event_predicted_width_changes, dtype=np.float32
+        ),
+        "chunk_executed_waypoint_counts": np.asarray(
+            chunk_executed_waypoint_counts, dtype=np.int16
+        ),
+        "chunk_release_event_end_counts": np.asarray(
+            chunk_release_event_end_counts, dtype=np.int16
+        ),
+        "chunk_grasp_upward_displacements": np.asarray(
+            chunk_grasp_upward_displacements, dtype=np.float32
+        ),
+        "chunk_transported_grasp_flags": np.asarray(
+            chunk_transported_grasp_flags, dtype=np.bool_
+        ),
+        "object_pose_names": object_pose_names,
+        "initial_object_positions": initial_object_positions,
+        "initial_object_quaternions": initial_object_quaternions,
+        "object_positions": np.asarray(object_positions, dtype=np.float32),
+        "object_quaternions": np.asarray(object_quaternions, dtype=np.float32),
+        "goal_predicate_values": np.asarray(goal_predicate_values, dtype=np.bool_),
+        "scene_joint_values": np.asarray(scene_joint_values, dtype=np.float32),
+        "contact_pair_strings": np.asarray(contact_pair_strings, dtype=np.str_),
+        "robot_scene_contact_pair_strings": np.asarray(
+            robot_scene_contact_pair_strings, dtype=np.str_
+        ),
+        "contact_counts": np.asarray(contact_counts, dtype=np.int32),
+        "robot_scene_contact_counts": np.asarray(robot_scene_contact_counts, dtype=np.int32),
+        "waypoint_hold_counts": np.asarray(waypoint_hold_counts, dtype=np.int16),
         "video_frames": video_frames,
     }
 
@@ -2981,21 +3936,30 @@ def evaluate_task(
         else np.asarray(task_init_states)
     )
     if episode_indices is None:
-        resolved_episode_indices = list(range(int(cfg["episodes"])))
+        configured_episode_ids = cfg.get("episode_ids")
+        if configured_episode_ids is None:
+            resolved_episode_indices = list(range(int(cfg["episodes"])))
+        else:
+            resolved_episode_indices = [int(episode_index) for episode_index in configured_episode_ids]
     else:
         resolved_episode_indices = [int(episode_index) for episode_index in episode_indices]
-        if len(set(resolved_episode_indices)) != len(resolved_episode_indices):
-            raise ValueError(f"Duplicate episode indices for task {task_id}: {resolved_episode_indices}")
-        invalid_episode_indices = [
-            episode_index
-            for episode_index in resolved_episode_indices
-            if episode_index < 0 or episode_index >= int(cfg["episodes"])
-        ]
-        if invalid_episode_indices:
-            raise ValueError(
-                f"Invalid episode indices for task {task_id}: {invalid_episode_indices}; "
-                f"configured episode count is {int(cfg['episodes'])}."
-            )
+    if len(set(resolved_episode_indices)) != len(resolved_episode_indices):
+        raise ValueError(f"Duplicate episode indices for task {task_id}: {resolved_episode_indices}")
+    invalid_episode_indices = [
+        episode_index
+        for episode_index in resolved_episode_indices
+        if episode_index < 0 or episode_index >= len(init_states)
+    ]
+    if invalid_episode_indices:
+        raise ValueError(
+            f"Invalid episode indices for task {task_id}: {invalid_episode_indices}; "
+            f"task provides {len(init_states)} initial states."
+        )
+    # LIBERO hard reset randomizes model-level bodies that are not represented
+    # by the flattened init_state. Preserve the canonical serial reset index so
+    # targeted runs and episode shards see the same fixture layout as episode N
+    # in a normal 0..N evaluation.
+    resolved_episode_indices = sorted(resolved_episode_indices)
     task_results: list[dict[str, Any]] = []
     task_name = f"task_{int(task_id):03d}"
     task_language = f"{suite_name}:{int(task_id)}"
@@ -3015,7 +3979,14 @@ def evaluate_task(
                 render_camera=str(cfg.get("render_camera", "agentview")),
                 render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
                 control_delta=False,
-                control_freq=float(cfg["control"].get("control_freq", 20.0)),
+                control_freq=float(cfg["control"].get("control_freq", 5.0)),
+                horizon=(
+                    int(LIBERO_STANDARD_MAX_STEPS[suite_name])
+                    if bool(cfg.get("use_suite_max_steps", False))
+                    and suite_name in LIBERO_STANDARD_MAX_STEPS
+                    else int(cfg["control"]["max_steps"])
+                ),
+                ignore_done=False,
                 env_seed=int(cfg.get("env_seed", 7)),
             )
 
@@ -3032,6 +4003,7 @@ def evaluate_task(
             # construct their per-episode environments concurrently.
             on_environment_ready()
 
+        next_shared_reset_index = 0
         for episode_idx in resolved_episode_indices:
             episode_dir = (
                 output_dir
@@ -3060,6 +4032,28 @@ def evaluate_task(
                     task_language = str(getattr(task, "language", task_language))
 
                 assert env is not None
+                if bool(cfg.get("recreate_env_per_episode", False)):
+                    reset_warmup_count = int(episode_idx)
+                else:
+                    if int(episode_idx) < next_shared_reset_index:
+                        raise RuntimeError(
+                            "Episode reset sequence cannot move backwards: "
+                            f"next={next_shared_reset_index}, requested={episode_idx}."
+                        )
+                    reset_warmup_count = int(episode_idx) - next_shared_reset_index
+                for _ in range(reset_warmup_count):
+                    env.reset()
+                if reset_warmup_count:
+                    print(
+                        "[eval] advanced LIBERO hard-reset RNG sequence: "
+                        f"suite={suite_name} task={task_id} episode={episode_idx} "
+                        f"skipped_resets={reset_warmup_count}",
+                        flush=True,
+                    )
+
+                # run_episode consumes the canonical reset for episode_idx.
+                if not bool(cfg.get("recreate_env_per_episode", False)):
+                    next_shared_reset_index = int(episode_idx) + 1
                 result = run_episode(
                     infer=infer,
                     env=env,
@@ -3070,6 +4064,8 @@ def evaluate_task(
                     init_state=init_states[episode_idx % len(init_states)],
                     cfg=cfg,
                 )
+                result["hard_reset_sequence_index"] = int(episode_idx)
+                result["hard_reset_warmup_count"] = int(reset_warmup_count)
 
                 action_npz = save_episode_actions(result, episode_dir)
                 episode_record = compact_episode_record(result, episode_idx, action_npz)
@@ -3107,6 +4103,7 @@ def evaluate_task(
                 )
             except Exception as exc:
                 failure = {
+                    "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
                     "episode_index": int(episode_idx),
                     "success": False,
                     "steps": 0,
@@ -3804,13 +4801,172 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
 
     cfg["control"]["control_freq"] = float(
-        cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 20.0))
+        cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 5.0))
     )
     cfg["control"]["action_index"] = int(cfg_get(cfg["control"], args.action_index, "action_index", 0))
-    cfg["control"]["exec_action_steps"] = int(cfg_get(cfg["control"], args.exec_action_steps, "exec_action_steps", 16))
-    cfg["control"]["max_steps"] = int(cfg_get(cfg["control"], args.max_steps, "max_steps", 500))
+    cfg["control"]["exec_action_steps"] = int(cfg_get(cfg["control"], args.exec_action_steps, "exec_action_steps", 12))
+    cfg["control"]["adaptive_exec_max_steps"] = max(
+        int(cfg["control"]["exec_action_steps"]),
+        int(
+            cfg_get(
+                cfg["control"],
+                args.adaptive_exec_max_steps,
+                "adaptive_exec_max_steps",
+                int(cfg["control"]["exec_action_steps"]),
+            )
+        ),
+    )
+    cfg["control"]["adaptive_exec_position_error_threshold"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.adaptive_exec_position_error_threshold,
+                "adaptive_exec_position_error_threshold",
+                0.012,
+            )
+        ),
+    )
+    cfg["control"]["adaptive_exec_rotation_error_threshold"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.adaptive_exec_rotation_error_threshold,
+                "adaptive_exec_rotation_error_threshold",
+                0.10,
+            )
+        ),
+    )
+    cfg["control"]["adaptive_exec_position_error_max"] = max(
+        float(cfg["control"]["adaptive_exec_position_error_threshold"]),
+        float(
+            cfg_get(
+                cfg["control"],
+                args.adaptive_exec_position_error_max,
+                "adaptive_exec_position_error_max",
+                0.03,
+            )
+        ),
+    )
+    cfg["control"]["adaptive_exec_rotation_error_max"] = max(
+        float(cfg["control"]["adaptive_exec_rotation_error_threshold"]),
+        float(
+            cfg_get(
+                cfg["control"],
+                args.adaptive_exec_rotation_error_max,
+                "adaptive_exec_rotation_error_max",
+                0.15,
+            )
+        ),
+    )
+    cfg["control"]["grasp_exec_steps"] = max(
+        int(cfg["control"]["exec_action_steps"]),
+        int(
+            cfg_get(
+                cfg["control"],
+                args.grasp_exec_steps,
+                "grasp_exec_steps",
+                int(cfg["control"]["exec_action_steps"]),
+            )
+        ),
+    )
+    cfg["control"]["grasp_width_min"] = max(
+        0.0,
+        float(cfg_get(cfg["control"], args.grasp_width_min, "grasp_width_min", 0.003)),
+    )
+    cfg["control"]["grasp_width_max"] = max(
+        float(cfg["control"]["grasp_width_min"]),
+        float(cfg_get(cfg["control"], args.grasp_width_max, "grasp_width_max", 0.070)),
+    )
+    cfg["control"]["grasp_lift_threshold"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.grasp_lift_threshold,
+                "grasp_lift_threshold",
+                0.015,
+            )
+        ),
+    )
+    cfg["control"]["release_event_exec_enable"] = bool(
+        cfg_get(
+            cfg["control"],
+            args.release_event_exec_enable,
+            "release_event_exec_enable",
+            False,
+        )
+    )
+    cfg["control"]["release_event_exec_max_steps"] = max(
+        int(cfg["control"]["grasp_exec_steps"]),
+        int(
+            cfg_get(
+                cfg["control"],
+                args.release_event_exec_max_steps,
+                "release_event_exec_max_steps",
+                32,
+            )
+        ),
+    )
+    cfg["control"]["release_event_min_width_change"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.release_event_min_width_change,
+                "release_event_min_width_change",
+                0.02,
+            )
+        ),
+    )
+    cfg["control"]["waypoint_max_hold_steps"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg["control"],
+                args.waypoint_max_hold_steps,
+                "waypoint_max_hold_steps",
+                1,
+            )
+        ),
+    )
+    cfg["control"]["waypoint_position_tolerance"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.waypoint_position_tolerance,
+                "waypoint_position_tolerance",
+                0.002,
+            )
+        ),
+    )
+    cfg["control"]["waypoint_rotation_tolerance"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.waypoint_rotation_tolerance,
+                "waypoint_rotation_tolerance",
+                0.03,
+            )
+        ),
+    )
+    cfg["control"]["waypoint_gripper_tolerance"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.waypoint_gripper_tolerance,
+                "waypoint_gripper_tolerance",
+                0.004,
+            )
+        ),
+    )
+    cfg["control"]["max_steps"] = int(cfg_get(cfg["control"], args.max_steps, "max_steps", 1000))
     cfg["use_suite_max_steps"] = bool(
-        cfg_get(cfg, args.use_suite_max_steps, "use_suite_max_steps", True)
+        cfg_get(cfg, args.use_suite_max_steps, "use_suite_max_steps", False)
     )
     cfg["control"]["warmup_steps"] = int(cfg_get(cfg["control"], args.warmup_steps, "warmup_steps", 0))
     cfg["policy_noise_seed"] = int(cfg_get(cfg, args.policy_noise_seed, "policy_noise_seed", 0))
@@ -3832,6 +4988,22 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["control"]["gripper_delta_threshold"] = float(
         cfg_get(cfg["control"], args.gripper_delta_threshold, "gripper_delta_threshold", 0.003)
     )
+    cfg["control"]["gripper_delta_alignment"] = str(
+        cfg_get(
+            cfg["control"],
+            args.gripper_delta_alignment,
+            "gripper_delta_alignment",
+            "current_minus_previous",
+        )
+    )
+    cfg["control"]["synchronize_gripper_controller_state"] = bool(
+        cfg_get(
+            cfg["control"],
+            args.synchronize_gripper_controller_state,
+            "synchronize_gripper_controller_state",
+            True,
+        )
+    )
     cfg["control"]["gripper_target_tolerance"] = float(
         cfg_get(cfg["control"], args.gripper_target_tolerance, "gripper_target_tolerance", 0.004)
     )
@@ -3843,6 +5015,11 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["suites"] = suite_names
     cfg["all_tasks"] = bool(args.all_tasks if args.all_tasks is not None else cfg.get("all_tasks", False))
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
+    cfg["episode_ids"] = (
+        [int(episode_index) for episode_index in args.episode_id]
+        if args.episode_id is not None
+        else None
+    )
 
     output_dir = Path(cfg_get(cfg, args.output_dir, "output_dir", BENCHMARK_ROOT / "outputs" / "libero_setting" / "eval")).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3929,6 +5106,11 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
     )
     cfg["keyboard_control_enabled"] = configured_environment_workers == 1
+    if cfg.get("episode_ids") is not None and configured_environment_workers > 1:
+        raise ValueError(
+            "--episode-id is a targeted debugging mode and currently requires "
+            "--task-workers 1 --episode-workers-per-task 1."
+        )
     if configured_environment_workers > 1:
         if cfg["task_worker_backend"] not in {"process", "thread"}:
             raise ValueError(
@@ -4070,6 +5252,7 @@ def run_multi_gpu_suite_launcher(
 def main() -> None:
     args = parse_args()
     cfg, suite_names, output_dir = prepare_config(args)
+    acquire_evaluation_run_lock(output_dir)
     if args.suite_gpu_ids is not None:
         run_multi_gpu_suite_launcher(
             args=args,
@@ -4081,10 +5264,15 @@ def main() -> None:
     ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
 
     from libero.libero import benchmark
+    selected_episode_count = (
+        len(cfg["episode_ids"])
+        if cfg.get("episode_ids") is not None
+        else int(cfg["episodes"])
+    )
     episode_horizons = {
         suite_name: (
             int(LIBERO_STANDARD_MAX_STEPS[suite_name])
-            if bool(cfg.get("use_suite_max_steps", True))
+            if bool(cfg.get("use_suite_max_steps", False))
             and suite_name in LIBERO_STANDARD_MAX_STEPS
             else int(cfg["control"]["max_steps"])
         )
@@ -4097,7 +5285,7 @@ def main() -> None:
         print(
             "[info] isolated-policy evaluation: "
             f"suites={suite_names}, independent_models_per_gpu={cfg['isolated_policy_workers']}, "
-            f"episodes={cfg['episodes']}, inference_batch_size=1, "
+            f"episodes={selected_episode_count}, inference_batch_size=1, "
             f"exec_action_steps={cfg['control']['exec_action_steps']}, "
             f"policy_noise_seed={cfg['policy_noise_seed']}, "
             f"episode_horizons={episode_horizons}",
@@ -4115,7 +5303,7 @@ def main() -> None:
                 output_dir=output_dir,
                 suite_name=suite_name,
                 task_ids=[int(task_id) for task_id in task_ids],
-                episodes_per_task=int(cfg["episodes"]),
+                episodes_per_task=int(selected_episode_count),
             )
             suite_summaries = evaluate_suite_isolated_policy_processes(
                 suite_name=suite_name,
@@ -4147,7 +5335,7 @@ def main() -> None:
 
     print(
         "[info] clean absolute-pose eval: "
-        f"suites={suite_names}, episodes={cfg['episodes']}, "
+        f"suites={suite_names}, episodes={selected_episode_count}, "
         f"task_workers={cfg['task_workers']}, "
         f"isolated_policy_workers={cfg['isolated_policy_workers']}, "
         f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
@@ -4155,6 +5343,20 @@ def main() -> None:
         f"inference_batch_size={cfg['inference_batch_size']}, "
         f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
+        f"adaptive_exec_max_steps={cfg['control']['adaptive_exec_max_steps']}, "
+        f"adaptive_exec_error_band=("
+        f"{cfg['control']['adaptive_exec_position_error_threshold']},"
+        f"{cfg['control']['adaptive_exec_position_error_max']})m/("
+        f"{cfg['control']['adaptive_exec_rotation_error_threshold']},"
+        f"{cfg['control']['adaptive_exec_rotation_error_max']})rad, "
+        f"grasp_exec_steps={cfg['control']['grasp_exec_steps']}, "
+        f"grasp_width_band=({cfg['control']['grasp_width_min']},"
+        f"{cfg['control']['grasp_width_max']})m, "
+        f"grasp_lift_threshold={cfg['control']['grasp_lift_threshold']}m, "
+        f"release_event_exec={cfg['control']['release_event_exec_enable']}/"
+        f"{cfg['control']['release_event_exec_max_steps']}rows/"
+        f"{cfg['control']['release_event_min_width_change']}m, "
+        f"waypoint_max_hold_steps={cfg['control']['waypoint_max_hold_steps']}, "
         f"gripper_threshold={cfg['control']['gripper_threshold']}, "
         f"gripper_control_mode={cfg['control']['gripper_control_mode']}, "
         f"gripper_delta_threshold={cfg['control']['gripper_delta_threshold']}, "
@@ -4195,7 +5397,7 @@ def main() -> None:
                 output_dir=output_dir,
                 suite_name=suite_name,
                 task_ids=[int(task_id) for task_id in task_ids],
-                episodes_per_task=int(cfg["episodes"]),
+                episodes_per_task=int(selected_episode_count),
             )
             worker_count = min(int(cfg["task_workers"]), max(1, len(task_ids)))
             episode_worker_count = min(
