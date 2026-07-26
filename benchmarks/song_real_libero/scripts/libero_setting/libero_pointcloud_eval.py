@@ -69,6 +69,8 @@ FAIR_EVALUATION_PROTOCOL = {
     "retry_failed_rollout": False,
     "action_samples_per_model_call": 1,
     "action_sample_selection": "none",
+    "initial_state_source": "task_suite.get_task_init_states",
+    "fixture_reset_sequence": "seeded_serial_episode_index",
 }
 
 
@@ -1605,7 +1607,7 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
         "render_mode": str(cfg.get("render_mode", "offscreen")),
         "evaluation_identity": cfg.get("evaluation_identity", {}),
-        "env_seed": int(cfg.get("env_seed", 7)),
+        "env_seed": int(cfg.get("env_seed", 0)),
         "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
         "use_suite_max_steps": bool(cfg.get("use_suite_max_steps", False)),
         "suite_max_steps": {
@@ -3539,6 +3541,7 @@ def run_episode(
     task_language: str,
     init_state: np.ndarray,
     cfg: dict[str, Any],
+    reset_env: bool = True,
 ) -> dict[str, Any]:
     control = cfg["control"]
     configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 1000)))
@@ -3635,7 +3638,10 @@ def run_episode(
     policy_noise_seed_base = int(cfg.get("policy_noise_seed", 0))
 
 
-    raw_obs = env.reset()
+    if reset_env:
+        raw_obs = env.reset()
+    else:
+        raw_obs = get_raw_obs(env, force_update=True)
     raw_obs = env.set_init_state(init_state)
 
     raw_obs = settle_scene_after_reset(
@@ -3992,7 +3998,6 @@ def run_episode(
                 chunk = chunk_batch[0].detach().cpu().numpy()
             else:
                 chunk = np.asarray(chunk_batch)[0]
-            chunk[:,3:9] = np.array([1,0,0,0,1,0])
             predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
 
@@ -4537,6 +4542,14 @@ def evaluate_task(
     # targeted runs and episode shards see the same fixture layout as episode N
     # in a normal 0..N evaluation.
     resolved_episode_indices = sorted(resolved_episode_indices)
+    full_official_indices = list(range(len(init_states)))
+    if resolved_episode_indices != full_official_indices:
+        print(
+            f"[info] suite={suite_name} task={task_id} uses official fixed init-state "
+            f"subset {resolved_episode_indices}; a full OpenVLA-style LIBERO score uses "
+            f"all {len(full_official_indices)} indices.",
+            flush=True,
+        )
     task_results: list[dict[str, Any]] = []
     task_name = f"task_{int(task_id):03d}"
     task_language = f"{suite_name}:{int(task_id)}"
@@ -4564,7 +4577,7 @@ def evaluate_task(
                     else int(cfg["control"]["max_steps"])
                 ),
                 ignore_done=False,
-                env_seed=int(cfg.get("env_seed", 7)),
+                env_seed=int(cfg.get("env_seed", 0)),
             )
 
     shared_env = None
@@ -4580,7 +4593,12 @@ def evaluate_task(
             # construct their per-episode environments concurrently.
             on_environment_ready()
 
-        next_shared_reset_index = 0
+        # make_libero_env() seeds the environment and performs exactly one
+        # reset, so a freshly-created environment already owns canonical
+        # fixture layout 0. Advance from that layout only as needed. This keeps
+        # serial, targeted, and episode-sharded evaluation on the same reset
+        # sequence without consuming one extra random fixture placement.
+        shared_layout_index = 0
         for episode_idx in resolved_episode_indices:
             episode_dir = (
                 output_dir
@@ -4612,12 +4630,12 @@ def evaluate_task(
                 if bool(cfg.get("recreate_env_per_episode", False)):
                     reset_warmup_count = int(episode_idx)
                 else:
-                    if int(episode_idx) < next_shared_reset_index:
+                    if int(episode_idx) < shared_layout_index:
                         raise RuntimeError(
                             "Episode reset sequence cannot move backwards: "
-                            f"next={next_shared_reset_index}, requested={episode_idx}."
+                            f"current={shared_layout_index}, requested={episode_idx}."
                         )
-                    reset_warmup_count = int(episode_idx) - next_shared_reset_index
+                    reset_warmup_count = int(episode_idx) - shared_layout_index
                 for _ in range(reset_warmup_count):
                     env.reset()
                 if reset_warmup_count:
@@ -4628,9 +4646,8 @@ def evaluate_task(
                         flush=True,
                     )
 
-                # run_episode consumes the canonical reset for episode_idx.
                 if not bool(cfg.get("recreate_env_per_episode", False)):
-                    next_shared_reset_index = int(episode_idx) + 1
+                    shared_layout_index = int(episode_idx)
                 result = run_episode(
                     infer=infer,
                     env=env,
@@ -4638,8 +4655,9 @@ def evaluate_task(
                     task_id=int(task_id),
                     episode_index=int(episode_idx),
                     task_language=task_language,
-                    init_state=init_states[episode_idx % len(init_states)],
+                    init_state=init_states[episode_idx],
                     cfg=cfg,
+                    reset_env=False,
                 )
                 result["hard_reset_sequence_index"] = int(episode_idx)
                 result["hard_reset_warmup_count"] = int(reset_warmup_count)
@@ -5356,7 +5374,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["evaluation_identity"]["eval_config_path"] = str(config_path)
     cfg["evaluation_identity"]["eval_config_sha256"] = _sha256_file(config_path)
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
-    cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 7))
+    cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 4096))
     cfg["observation_height"] = int(cfg_get(cfg, args.observation_height, "observation_height", 128))

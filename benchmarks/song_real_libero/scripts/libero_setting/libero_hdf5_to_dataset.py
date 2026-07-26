@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import re
 import shutil
 import sys
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -122,6 +124,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zarr-compression-level", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--replay-mode", choices=("states", "step"), default=None)
+    parser.add_argument(
+        "--restore-demo-model",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Restore every demonstration's HDF5 model_file before replay. This is required to "
+            "preserve LIBERO fixture placements that are not stored in flattened simulator states."
+        ),
+    )
+    parser.add_argument(
+        "--require-source-fps-match",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require the output dataset FPS to match the source LIBERO control frequency.",
+    )
     parser.add_argument("--download-demos", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--download-use-huggingface", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--vis-dir", type=Path, default=None)
@@ -478,6 +495,108 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
         export_episode_videos(episode, artifact_dir, video_record, cfg)
 
 
+def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> None:
+    """Validate worker identity and frame alignment before the parent commits an episode."""
+    required_files = (
+        "record.json",
+        "actions.npy",
+        "timestamps.npy",
+        "world_ee_poses.npy",
+    )
+    missing = [name for name in required_files if not (artifact_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Incomplete worker artifact {artifact_dir}: missing {missing}")
+
+    with open(artifact_dir / "record.json", "r", encoding="utf-8") as f:
+        record = json.load(f)
+    identity_errors = []
+    for key in ("suite", "task_id", "demo_name"):
+        if record.get(key) != episode_job.get(key):
+            identity_errors.append(
+                f"{key}: expected {episode_job.get(key)!r}, got {record.get(key)!r}"
+            )
+    if Path(record["demo_file"]).expanduser().resolve() != Path(
+        episode_job["demo_file"]
+    ).expanduser().resolve():
+        identity_errors.append(
+            f"demo_file: expected {episode_job['demo_file']!r}, got {record['demo_file']!r}"
+        )
+    restore_required = bool(episode_job["cfg"].get("restore_demo_model", True))
+    if bool(record.get("model_restoration_verified", False)) != restore_required:
+        identity_errors.append(
+            "model_restoration_verified does not match restore_demo_model configuration"
+        )
+    if identity_errors:
+        raise RuntimeError(
+            f"Worker artifact identity mismatch for job {episode_job['job_index']}:\n  "
+            + "\n  ".join(identity_errors)
+        )
+
+    actions = np.load(artifact_dir / "actions.npy", mmap_mode="r")
+    timestamps = np.load(artifact_dir / "timestamps.npy", mmap_mode="r")
+    world_ee_poses = np.load(artifact_dir / "world_ee_poses.npy", mmap_mode="r")
+    frames = int(actions.shape[0])
+    shape_errors = []
+    if actions.ndim != 2 or actions.shape[1] != 10:
+        shape_errors.append(f"actions shape={actions.shape}, expected (T, 10)")
+    if timestamps.shape != (frames,):
+        shape_errors.append(f"timestamps shape={timestamps.shape}, expected ({frames},)")
+    if world_ee_poses.shape != (frames, 9):
+        shape_errors.append(f"world_ee_poses shape={world_ee_poses.shape}, expected ({frames}, 9)")
+    if int(record.get("frames", -1)) != frames:
+        shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
+
+    expected_timestamps = np.arange(frames, dtype=np.float32) / float(episode_job["cfg"]["fps"])
+    if timestamps.shape == expected_timestamps.shape and not np.array_equal(
+        np.asarray(timestamps), expected_timestamps
+    ):
+        shape_errors.append("timestamps do not match frame_index / fps")
+
+    point_cloud_npy = artifact_dir / "point_clouds.npy"
+    point_cloud_zarr = artifact_dir / "point_clouds.zarr"
+    if point_cloud_npy.is_file():
+        point_cloud_shape = tuple(np.load(point_cloud_npy, mmap_mode="r").shape)
+    elif point_cloud_zarr.is_dir() and (point_cloud_zarr / ".zattrs").is_file():
+        with open(point_cloud_zarr / ".zattrs", "r", encoding="utf-8") as f:
+            point_cloud_shape = tuple(json.load(f).get("shape", ()))
+    else:
+        point_cloud_shape = ()
+        shape_errors.append("point-cloud artifact is missing")
+    expected_point_cloud_shape = (
+        frames,
+        int(episode_job["cfg"]["num_points"]),
+        POINT_CLOUD_CHANNELS,
+    )
+    if point_cloud_shape and point_cloud_shape != expected_point_cloud_shape:
+        shape_errors.append(
+            f"point_clouds shape={point_cloud_shape}, expected {expected_point_cloud_shape}"
+        )
+
+    images_path = artifact_dir / "images.npy"
+    save_rgb_images = bool(episode_job["cfg"].get("save_rgb_images", True))
+    if save_rgb_images:
+        if not images_path.is_file():
+            shape_errors.append("RGB image artifact is missing")
+        else:
+            images = np.load(images_path, mmap_mode="r")
+            expected_image_shape = (
+                frames,
+                int(episode_job["cfg"]["observation_height"]),
+                int(episode_job["cfg"]["observation_width"]),
+                3,
+            )
+            if images.shape != expected_image_shape:
+                shape_errors.append(f"images shape={images.shape}, expected {expected_image_shape}")
+    elif images_path.exists():
+        shape_errors.append("unexpected RGB image artifact while save_rgb_images is disabled")
+
+    if shape_errors:
+        raise RuntimeError(
+            f"Worker artifact validation failed for job {episode_job['job_index']}:\n  "
+            + "\n  ".join(shape_errors)
+        )
+
+
 def move_episode_videos(artifact_dir: Path, vis_dir: Path, record: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
     if not cfg.get("save_video", False):
         return []
@@ -732,7 +851,30 @@ def iter_demo_group_names(demo_file: Path) -> list[str]:
         )
 
 
-def load_demo_group(demo_file: Path, demo_name: str) -> tuple[np.ndarray, np.ndarray | None]:
+def _decode_hdf5_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def source_control_frequency(h5_file: h5py.File) -> float | None:
+    root = h5_file["data"] if "data" in h5_file else h5_file
+    env_args = root.attrs.get("env_args")
+    if env_args is None:
+        return None
+    try:
+        metadata = json.loads(_decode_hdf5_text(env_args))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    env_kwargs = metadata.get("env_kwargs", {})
+    value = env_kwargs.get("control_freq")
+    return float(value) if value is not None else None
+
+
+def load_demo_group(
+    demo_file: Path,
+    demo_name: str,
+) -> tuple[np.ndarray, np.ndarray | None, str | None, float | None]:
     with h5py.File(demo_file, "r") as h5_file:
         root = h5_file["data"] if "data" in h5_file else h5_file
         if demo_name not in root:
@@ -742,7 +884,144 @@ def load_demo_group(demo_file: Path, demo_name: str) -> tuple[np.ndarray, np.nda
             raise KeyError(f"Demo group {demo_name!r} in {demo_file} is missing 'states'.")
         states = group["states"][:]
         actions = group["actions"][:] if "actions" in group else None
-        return states, actions
+        model_value = group.attrs.get("model_file")
+        model_xml = _decode_hdf5_text(model_value) if model_value is not None else None
+        return states, actions, model_xml, source_control_frequency(h5_file)
+
+
+def postprocess_demo_model_xml(model_xml: str) -> str:
+    """Resolve asset paths in an official LIBERO demonstration model XML."""
+    import robosuite
+    from libero.libero import get_assets_path
+
+    root = ET.fromstring(model_xml)
+    libero_assets = Path(get_assets_path()).expanduser().resolve()
+    robosuite_root = Path(robosuite.__file__).resolve().parent
+    unresolved: list[str] = []
+
+    for element in root.findall(".//*[@file]"):
+        original = str(element.attrib["file"])
+        normalized = original.replace("\\", "/")
+        path = Path(original).expanduser()
+        replacement: Path | None = None
+        if path.is_file():
+            replacement = path.resolve()
+        elif "chiliocosm/assets/" in normalized:
+            replacement = libero_assets / normalized.split("chiliocosm/assets/", 1)[1]
+        elif "/libero/libero/assets/" in normalized:
+            replacement = libero_assets / normalized.split("/libero/libero/assets/", 1)[1]
+        elif "/libero/assets/" in normalized:
+            replacement = libero_assets / normalized.split("/libero/assets/", 1)[1]
+        elif "/robosuite/" in normalized:
+            replacement = robosuite_root / normalized.rsplit("/robosuite/", 1)[1]
+        elif normalized.startswith("robosuite/"):
+            replacement = robosuite_root / normalized.split("robosuite/", 1)[1]
+
+        if replacement is not None:
+            element.set("file", str(replacement))
+            if not replacement.is_file():
+                unresolved.append(f"{original!r} -> {str(replacement)!r}")
+        elif Path(normalized).is_absolute():
+            unresolved.append(repr(original))
+
+    if unresolved:
+        preview = "\n  ".join(unresolved[:10])
+        suffix = f"\n  ... and {len(unresolved) - 10} more" if len(unresolved) > 10 else ""
+        raise FileNotFoundError(
+            "Could not resolve asset paths from the demonstration model XML:\n  "
+            f"{preview}{suffix}"
+        )
+    return ET.tostring(root, encoding="unicode")
+
+
+def ensure_demo_model_assets_ready() -> None:
+    """Resolve/download shared assets once in the parent before workers are spawned."""
+    from libero.libero import get_assets_path
+
+    assets_path = Path(get_assets_path()).expanduser().resolve()
+    if not assets_path.is_dir():
+        raise FileNotFoundError(f"LIBERO asset directory is unavailable: {assets_path}")
+
+
+def verify_restored_demo_model(env: Any, model_xml: str, *, atol: float = 1e-10) -> None:
+    """Fail fast if a worker is not using the model belonging to its current demo."""
+    root = ET.fromstring(model_xml)
+    model = env.sim.model
+    mismatches: list[str] = []
+
+    for body in root.findall(".//body[@name]"):
+        name = body.attrib["name"]
+        try:
+            body_id = int(model.body_name2id(name))
+        except Exception:
+            mismatches.append(f"missing body {name!r}")
+            continue
+
+        if "pos" in body.attrib:
+            expected_pos = np.fromstring(body.attrib["pos"], sep=" ", dtype=np.float64)
+            actual_pos = np.asarray(model.body_pos[body_id], dtype=np.float64)
+            error = float(np.max(np.abs(actual_pos - expected_pos)))
+            if error > atol:
+                mismatches.append(f"body {name!r} position error={error:.3e}")
+
+        if "quat" in body.attrib:
+            expected_quat = np.fromstring(body.attrib["quat"], sep=" ", dtype=np.float64)
+            expected_quat /= max(float(np.linalg.norm(expected_quat)), np.finfo(np.float64).eps)
+            actual_quat = np.asarray(model.body_quat[body_id], dtype=np.float64)
+            # q and -q represent the same rotation.
+            error = min(
+                float(np.max(np.abs(actual_quat - expected_quat))),
+                float(np.max(np.abs(actual_quat + expected_quat))),
+            )
+            if error > atol:
+                mismatches.append(f"body {name!r} quaternion error={error:.3e}")
+
+    if mismatches:
+        preview = "\n  ".join(mismatches[:10])
+        suffix = f"\n  ... and {len(mismatches) - 10} more" if len(mismatches) > 10 else ""
+        raise RuntimeError(
+            "The restored MuJoCo model does not match the current demonstration XML:\n  "
+            f"{preview}{suffix}"
+        )
+
+
+def restore_demo_model(env: Any, model_xml: str | None, *, required: bool) -> str | None:
+    """Restore model-level scene state omitted by MuJoCo flattened states."""
+    if model_xml is None:
+        if required:
+            raise KeyError(
+                "The demonstration is missing the model_file attribute required for exact LIBERO replay."
+            )
+        return None
+    processed_xml = postprocess_demo_model_xml(model_xml)
+    env.reset_from_xml_string(processed_xml)
+    env.sim.reset()
+    env.sim.forward()
+    verify_restored_demo_model(env, processed_xml)
+    return hashlib.sha256(model_xml.encode("utf-8")).hexdigest()
+
+
+def validate_source_fps(
+    *,
+    demo_file: Path,
+    demo_name: str,
+    source_fps: float | None,
+    output_fps: int,
+    required: bool,
+) -> None:
+    if source_fps is None:
+        if required:
+            raise ValueError(
+                f"Cannot determine source control frequency for {demo_file}:{demo_name}."
+            )
+        return
+    if required and not np.isclose(float(source_fps), float(output_fps)):
+        raise ValueError(
+            f"FPS mismatch for {demo_file}:{demo_name}: source LIBERO control frequency is "
+            f"{source_fps:g} Hz, but output dataset FPS is {output_fps}. Use --fps "
+            f"{int(source_fps)} for official timing, or --no-require-source-fps-match only "
+            "for an intentional temporal reinterpretation."
+        )
 
 
 def set_env_state_and_get_obs(env: Any, state: np.ndarray) -> dict[str, Any]:
@@ -885,6 +1164,8 @@ def make_episode_record(
     demo_file: Path,
     demo_name: str,
     frames: int,
+    model_sha256: str | None,
+    source_fps: float | None,
 ) -> dict[str, Any]:
     return {
         "suite": suite_name,
@@ -896,6 +1177,9 @@ def make_episode_record(
         "demo_file": str(demo_file),
         "demo_name": demo_name,
         "frames": int(frames),
+        "model_sha256": model_sha256,
+        "model_restoration_verified": model_sha256 is not None,
+        "source_fps": source_fps,
     }
 
 
@@ -912,7 +1196,14 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
     task_id = int(job["task_id"])
     demo_file = Path(job["demo_file"])
     demo_name = str(job["demo_name"])
-    states, actions = load_demo_group(demo_file, demo_name)
+    states, actions, model_xml, source_fps = load_demo_group(demo_file, demo_name)
+    validate_source_fps(
+        demo_file=demo_file,
+        demo_name=demo_name,
+        source_fps=source_fps,
+        output_fps=int(cfg["fps"]),
+        required=bool(cfg.get("require_source_fps_match", True)),
+    )
 
     env, task = make_libero_env(
         suite,
@@ -922,6 +1213,11 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         render_camera_names_from_config(cfg),
     )
     try:
+        model_sha256 = (
+            restore_demo_model(env, model_xml, required=True)
+            if bool(cfg.get("restore_demo_model", True))
+            else None
+        )
         episode = collect_demo_episode(
             env=env,
             states=states,
@@ -941,6 +1237,8 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         demo_file=demo_file,
         demo_name=demo_name,
         frames=len(episode["actions"]),
+        model_sha256=model_sha256,
+        source_fps=source_fps,
     )
     artifact_dir = Path(job["tmp_path"])
     save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -972,7 +1270,19 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
         for episode_job in job["episodes"]:
             demo_file = Path(episode_job["demo_file"])
             demo_name = str(episode_job["demo_name"])
-            states, actions = load_demo_group(demo_file, demo_name)
+            states, actions, model_xml, source_fps = load_demo_group(demo_file, demo_name)
+            validate_source_fps(
+                demo_file=demo_file,
+                demo_name=demo_name,
+                source_fps=source_fps,
+                output_fps=int(cfg["fps"]),
+                required=bool(cfg.get("require_source_fps_match", True)),
+            )
+            model_sha256 = (
+                restore_demo_model(env, model_xml, required=True)
+                if bool(cfg.get("restore_demo_model", True))
+                else None
+            )
             episode = collect_demo_episode(
                 env=env,
                 states=states,
@@ -989,6 +1299,8 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
                 demo_file=demo_file,
                 demo_name=demo_name,
                 frames=len(episode["actions"]),
+                model_sha256=model_sha256,
+                source_fps=source_fps,
             )
             artifact_dir = Path(episode_job["tmp_path"])
             save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -1069,8 +1381,19 @@ def main() -> None:
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 10000))
     cfg["point_cloud_storage"] = str(cfg_get(cfg, args.point_cloud_storage, "point_cloud_storage", "zarr"))
     cfg["zarr_compression_level"] = int(cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3))
-    cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 30))
+    cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 20))
     cfg["replay_mode"] = cfg_get(cfg, args.replay_mode, "replay_mode", "states")
+    cfg["restore_demo_model"] = bool(
+        cfg_get(cfg, args.restore_demo_model, "restore_demo_model", True)
+    )
+    cfg["require_source_fps_match"] = bool(
+        cfg_get(
+            cfg,
+            args.require_source_fps_match,
+            "require_source_fps_match",
+            True,
+        )
+    )
     cfg["download_demos"] = bool(cfg_get(cfg, args.download_demos, "download_demos", True))
     cfg["download_use_huggingface"] = bool(cfg_get(cfg, args.download_use_huggingface, "download_use_huggingface", True))
     cfg["overwrite_dataset"] = bool(cfg_get(cfg, args.overwrite, "overwrite_dataset", True))
@@ -1086,6 +1409,8 @@ def main() -> None:
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
     ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
+    if cfg["restore_demo_model"]:
+        ensure_demo_model_assets_ready()
 
     output_root = Path(
         cfg_get(cfg, args.output_root, "dataset_output_root", LIBERO_DATA_ROOT / "libero_lerobot_dataset")
@@ -1145,6 +1470,21 @@ def main() -> None:
         "point_cloud_zarr_encoding": "packed_xyz_float16_rgb_uint8",
         "zarr_compression_level": int(cfg.get("zarr_compression_level", 3)),
         "num_workers": int(cfg["num_workers"]),
+        "parallel_collection_protocol": {
+            "execution_mode": (
+                "spawn_process_pool" if int(cfg["num_workers"]) > 1 else "in_process_serial"
+            ),
+            "worker_scope": "one isolated environment per task",
+            "worker_output": "unique temporary directory per episode job",
+            "dataset_commit": "single parent process in deterministic job order",
+            "episode_seed": "independent of worker count and completion order",
+            "demo_model_runtime_verification": bool(cfg["restore_demo_model"]),
+        },
+        "fps": int(cfg["fps"]),
+        "demo_model_restoration": (
+            "per_demo_model_file" if bool(cfg["restore_demo_model"]) else "disabled"
+        ),
+        "require_source_fps_match": bool(cfg["require_source_fps_match"]),
         "episodes": [],
     }
 
@@ -1202,11 +1542,30 @@ def main() -> None:
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    expected_jobs = {int(job["job_index"]): job for job in episode_jobs}
     results: dict[int, Path] = {}
+
+    def register_result(result: dict[str, Any]) -> None:
+        result_index = int(result["job_index"])
+        if result_index not in expected_jobs:
+            raise RuntimeError(f"Worker returned unknown episode job index {result_index}.")
+        if result_index in results:
+            raise RuntimeError(f"Worker returned duplicate episode job index {result_index}.")
+        expected_job = expected_jobs[result_index]
+        actual_path = Path(result["tmp_path"]).expanduser().resolve()
+        expected_path = Path(expected_job["tmp_path"]).expanduser().resolve()
+        if actual_path != expected_path:
+            raise RuntimeError(
+                f"Worker returned the wrong artifact path for job {result_index}: "
+                f"expected {expected_path}, got {actual_path}."
+            )
+        verify_episode_artifact(actual_path, expected_job)
+        results[result_index] = actual_path
+
     if int(cfg["num_workers"]) <= 1:
         for task_job in tqdm(task_jobs, desc="Collecting LIBERO tasks", unit="task"):
             for result in collect_task_worker(task_job):
-                results[int(result["job_index"])] = Path(result["tmp_path"])
+                register_result(result)
     else:
         print(
             f"[info] collecting {len(episode_jobs)} LIBERO episode(s) across {len(task_jobs)} task job(s) "
@@ -1219,7 +1578,11 @@ def main() -> None:
             futures = [executor.submit(collect_task_worker, task_job) for task_job in task_jobs]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO tasks", unit="task"):
                 for result in future.result():
-                    results[int(result["job_index"])] = Path(result["tmp_path"])
+                    register_result(result)
+
+    missing_results = sorted(set(expected_jobs) - set(results))
+    if missing_results:
+        raise RuntimeError(f"Collection finished with missing episode job(s): {missing_results}")
 
     for episode_job in episode_jobs:
         temp_path = results[int(episode_job["job_index"])]
