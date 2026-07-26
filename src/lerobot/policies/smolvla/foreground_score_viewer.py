@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Standalone Open3D frontend for SmolVLA foreground-score shared memory.
+"""Standalone Open3D frontend for SmolVLA colored point-cloud shared memory.
 
 This process intentionally does not import torch, LeRobot, or the caller's main
 module. Keeping its OpenGL context outside the policy process avoids MuJoCo /
 Open3D GLX context collisions and is safe for deploy scripts without a Python
-``if __name__ == '__main__'`` guard.
+``if __name__ == '__main__'`` guard.  The same transport is used for PointSeg
+scores and UMI observation/trajectory debugging.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ def main() -> None:
             visualizer.update_renderer()
             time.sleep(0.01)
     except Exception as exc:
-        print(f"[warn] foreground score window stopped: {exc!r}", flush=True)
+        print(f"[warn] isolated point-cloud window stopped: {exc!r}", flush=True)
     finally:
         if visualizer is not None:
             with suppress(Exception):

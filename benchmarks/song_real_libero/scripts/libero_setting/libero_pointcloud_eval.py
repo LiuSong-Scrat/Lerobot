@@ -8,8 +8,7 @@ Kept pipeline:
 
 Removed from the original evaluator:
   pose/gripper wait state machines, fast-physics executor, rim correction,
-  keyboard visualization, heavy timing diagnostics,
-  and delta-pose execution branches.
+  heavy timing diagnostics, and delta-pose execution branches.
 """
 from __future__ import annotations
 
@@ -641,6 +640,30 @@ def parse_args() -> argparse.Namespace:
             "Physical-width error in metres used when a held waypoint carries an open/close event."
         ),
     )
+    parser.add_argument(
+        "--rollback-chunks",
+        type=int,
+        default=None,
+        help="Number of completed policy chunks rewound when non-blocking key 'r' is pressed.",
+    )
+    parser.add_argument(
+        "--rollback-max-steps",
+        type=int,
+        default=None,
+        help="Maximum LIBERO controller steps used to return to the rollback target pose.",
+    )
+    parser.add_argument(
+        "--rollback-position-tolerance",
+        type=float,
+        default=None,
+        help="Position tolerance in metres for completing a manual rollback.",
+    )
+    parser.add_argument(
+        "--rollback-rotation-tolerance",
+        type=float,
+        default=None,
+        help="Rotation tolerance in radians for completing a manual rollback.",
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--use-suite-max-steps",
@@ -727,6 +750,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--foreground-vis-max-points", type=int, default=None)
     parser.add_argument(
+        "--visualize-action-trajectory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Continuously show the exact model observation point cloud and predicted UMI pose9 "
+            "trajectory in an isolated non-blocking viewer. In serial evaluation, press 'v' "
+            "for a one-shot update even when this option is disabled."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-vis-max-points",
+        type=int,
+        default=None,
+        help="Maximum combined scene/trajectory points sent to the online trajectory viewer.",
+    )
+    parser.add_argument(
+        "--trajectory-vis-every-n-model-calls",
+        type=int,
+        default=None,
+        help="Refresh continuous action-trajectory visualization every N policy calls.",
+    )
+    parser.add_argument(
         "--task-workers",
         type=int,
         default=None,
@@ -775,7 +820,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recreate-env-per-episode",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=True,
         help="Rebuild a task environment before every episode (disabled by default for parallel evaluation).",
     )
     return parser.parse_args()
@@ -1119,10 +1164,12 @@ def sync_viewer(viewer: Any) -> bool:
 
 
 class EpisodeKeyboardControl:
-    """Collect an immediate `n` request from the viewer or the terminal."""
+    """Collect immediate non-blocking episode-control and debug requests."""
 
     def __init__(self) -> None:
         self._manual_failure = threading.Event()
+        self._rollback_request = threading.Event()
+        self._trajectory_visualization_request = threading.Event()
         self._stdin_fd: int | None = None
         self._stdin_attrs: list[Any] | None = None
 
@@ -1135,10 +1182,33 @@ class EpisodeKeyboardControl:
             flush=True,
         )
 
+    def _request_rollback(self, source: str) -> None:
+        if self._rollback_request.is_set():
+            return
+        self._rollback_request.set()
+        print(
+            f"[eval] received 'r' from {source}: rollback recent policy chunk(s)",
+            flush=True,
+        )
+
+    def _request_trajectory_visualization(self, source: str) -> None:
+        if self._trajectory_visualization_request.is_set():
+            return
+        self._trajectory_visualization_request.set()
+        print(
+            f"[eval] received 'v' from {source}: visualize the next predicted UMI trajectory",
+            flush=True,
+        )
+
     def viewer_key_callback(self, keycode: int) -> None:
         """MuJoCo passive-viewer callback (GLFW letter codes are ASCII-compatible)."""
-        if int(keycode) in (ord("n"), ord("N")):
+        keycode = int(keycode)
+        if keycode in (ord("n"), ord("N")):
             self._request_manual_failure("viewer")
+        elif keycode in (ord("r"), ord("R")):
+            self._request_rollback("viewer")
+        elif keycode in (ord("v"), ord("V")):
+            self._request_trajectory_visualization("viewer")
 
     def start_terminal(self) -> bool:
         """Enable single-key terminal input without requiring Enter."""
@@ -1162,11 +1232,32 @@ class EpisodeKeyboardControl:
                     key = os.read(self._stdin_fd, 1)
                     if not key:
                         break
-                    if key.lower() == b"n":
+                    key = key.lower()
+                    if key == b"n":
                         self._request_manual_failure("terminal")
+                    elif key == b"r":
+                        self._request_rollback("terminal")
+                    elif key == b"v":
+                        self._request_trajectory_visualization("terminal")
             except OSError:
                 pass
         return self._manual_failure.is_set()
+
+    def pop_rollback_request(self) -> bool:
+        """Consume one latched rollback request without blocking."""
+        self.poll()
+        if not self._rollback_request.is_set():
+            return False
+        self._rollback_request.clear()
+        return True
+
+    def pop_trajectory_visualization_request(self) -> bool:
+        """Consume one request to display the next complete model prediction."""
+        self.poll()
+        if not self._trajectory_visualization_request.is_set():
+            return False
+        self._trajectory_visualization_request.clear()
+        return True
 
     def close(self) -> None:
         if self._stdin_fd is not None and self._stdin_attrs is not None:
@@ -1603,6 +1694,14 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "waypoint_gripper_tolerance": float(
                 cfg["control"]["waypoint_gripper_tolerance"]
             ),
+            "rollback_chunks": int(cfg["control"]["rollback_chunks"]),
+            "rollback_max_steps": int(cfg["control"]["rollback_max_steps"]),
+            "rollback_position_tolerance": float(
+                cfg["control"]["rollback_position_tolerance"]
+            ),
+            "rollback_rotation_tolerance": float(
+                cfg["control"]["rollback_rotation_tolerance"]
+            ),
             "action_index": int(cfg["control"]["action_index"]),
             "control_freq": float(cfg["control"].get("control_freq", cfg.get("control_freq", 5))),
             "policy_noise_seed": int(cfg["policy_noise_seed"]),
@@ -1658,6 +1757,12 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "chunk_release_event_end_counts",
         "chunk_grasp_upward_displacements",
         "chunk_transported_grasp_flags",
+        "rollback_actions",
+        "rollback_target_controller_pose9",
+        "rollback_achieved_controller_pose9",
+        "rollback_position_errors",
+        "rollback_rotation_errors",
+        "rollback_chunk_counts",
     }
     record = {k: v for k, v in result.items() if k not in drop_keys}
     record["episode_index"] = int(episode_idx)
@@ -1707,6 +1812,22 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         ),
         "chunk_transported_grasp_flags": np.asarray(
             result.get("chunk_transported_grasp_flags", []), dtype=np.bool_
+        ),
+        "rollback_actions": np.asarray(result.get("rollback_actions", []), dtype=np.float32),
+        "rollback_target_controller_pose9": np.asarray(
+            result.get("rollback_target_controller_pose9", []), dtype=np.float32
+        ),
+        "rollback_achieved_controller_pose9": np.asarray(
+            result.get("rollback_achieved_controller_pose9", []), dtype=np.float32
+        ),
+        "rollback_position_errors": np.asarray(
+            result.get("rollback_position_errors", []), dtype=np.float32
+        ),
+        "rollback_rotation_errors": np.asarray(
+            result.get("rollback_rotation_errors", []), dtype=np.float32
+        ),
+        "rollback_chunk_counts": np.asarray(
+            result.get("rollback_chunk_counts", []), dtype=np.int16
         ),
         "object_pose_names": np.asarray(result.get("object_pose_names", []), dtype=np.str_),
         "initial_object_positions": np.asarray(
@@ -2474,11 +2595,17 @@ def _collect_process_request_batch(
     return requests
 
 
-def _axis_points(origin: np.ndarray, rot: np.ndarray, *, scale: float = 0.04, samples: int = 12) -> tuple[np.ndarray, np.ndarray]:
+def _axis_points(
+    origin: np.ndarray,
+    rot: np.ndarray,
+    *,
+    scale: float = 0.04,
+    samples: int = 12,
+) -> tuple[np.ndarray, np.ndarray]:
     axes = [
-        (rot[:, 0], np.asarray([255, 0, 0], dtype=np.uint8)),
-        (rot[:, 1], np.asarray([0, 255, 0], dtype=np.uint8)),
-        (rot[:, 2], np.asarray([0, 80, 255], dtype=np.uint8)),
+        (rot[:, 0], np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        (rot[:, 1], np.asarray([0.0, 1.0, 0.0], dtype=np.float32)),
+        (rot[:, 2], np.asarray([0.0, 0.31, 1.0], dtype=np.float32)),
     ]
     points = []
     colors = []
@@ -2489,6 +2616,154 @@ def _axis_points(origin: np.ndarray, rot: np.ndarray, *, scale: float = 0.04, sa
     return np.concatenate(points, axis=0), np.concatenate(colors, axis=0)
 
 
+def _to_visualization_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _trajectory_time_colors(num_steps: int) -> np.ndarray:
+    """Blue/cyan at the chunk start, green in the middle, red at the end."""
+    if num_steps <= 1:
+        return np.asarray([[0.10, 0.75, 0.25]], dtype=np.float32)
+    t = np.linspace(0.0, 1.0, num_steps, dtype=np.float32)[:, None]
+    start = np.asarray([0.05, 0.55, 1.0], dtype=np.float32)
+    middle = np.asarray([0.10, 0.85, 0.25], dtype=np.float32)
+    end = np.asarray([1.0, 0.18, 0.05], dtype=np.float32)
+    first = (1.0 - 2.0 * t) * start + (2.0 * t) * middle
+    second = (2.0 - 2.0 * t) * middle + (2.0 * t - 1.0) * end
+    return np.where(t <= 0.5, first, second).clip(0.0, 1.0)
+
+
+def _sample_colored_trajectory(
+    positions: np.ndarray,
+    waypoint_colors: np.ndarray,
+    *,
+    spacing: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(positions) == 0:
+        empty = np.empty((0, 3), dtype=np.float32)
+        return empty, empty
+    if len(positions) == 1:
+        return positions.astype(np.float32, copy=True), waypoint_colors.astype(np.float32, copy=True)
+
+    sampled_points: list[np.ndarray] = []
+    sampled_colors: list[np.ndarray] = []
+    spacing = max(float(spacing), 1e-5)
+    for index in range(len(positions) - 1):
+        start = positions[index]
+        end = positions[index + 1]
+        distance = float(np.linalg.norm(end - start))
+        sample_count = max(2, int(np.ceil(distance / spacing)) + 1)
+        alpha = np.linspace(
+            0.0,
+            1.0,
+            sample_count,
+            endpoint=index == len(positions) - 2,
+            dtype=np.float32,
+        )[:, None]
+        sampled_points.append((1.0 - alpha) * start + alpha * end)
+        sampled_colors.append(
+            (1.0 - alpha) * waypoint_colors[index] + alpha * waypoint_colors[index + 1]
+        )
+    return np.concatenate(sampled_points, axis=0), np.concatenate(sampled_colors, axis=0)
+
+
+def build_umi_visualization_cloud(
+    action_chunk: Any,
+    point_cloud: Any,
+    *,
+    max_points: int = 50000,
+    max_frames: int = 12,
+    frame_scale: float = 0.035,
+    trajectory_spacing: float = 0.002,
+) -> np.ndarray:
+    """Build one RGB point cloud containing the observation and pose9 trajectory.
+
+    This deliberately creates no OpenGL / Open3D objects.  The result can be
+    streamed to the isolated viewer process or written directly to a PLY file.
+    """
+    actions = _to_visualization_numpy(action_chunk).astype(np.float32, copy=False)
+    while actions.ndim > 2 and actions.shape[0] == 1:
+        actions = actions[0]
+    if actions.ndim != 2 or actions.shape[-1] < 9:
+        raise ValueError(f"Expected UMI action chunk shape (T, >=9), got {actions.shape}.")
+
+    cloud = _to_visualization_numpy(point_cloud).astype(np.float32, copy=False)
+    while cloud.ndim > 2 and cloud.shape[0] == 1:
+        cloud = cloud[0]
+    if cloud.ndim != 2 or cloud.shape[-1] < 3:
+        raise ValueError(f"Expected point-cloud shape (N, >=3), got {cloud.shape}.")
+
+    cloud_valid = np.isfinite(cloud[:, :3]).all(axis=1)
+    cloud = cloud[cloud_valid]
+    scene_xyz = cloud[:, :3]
+    if cloud.shape[-1] >= 6:
+        scene_rgb = cloud[:, 3:6].copy()
+        if scene_rgb.size and scene_rgb.max(initial=0.0) > 1.0:
+            scene_rgb /= 255.0
+        scene_rgb = np.clip(scene_rgb, 0.0, 1.0)
+    else:
+        scene_rgb = np.full((len(scene_xyz), 3), 0.55, dtype=np.float32)
+
+    positions = actions[:, :3]
+    finite_poses = np.isfinite(actions[:, :9]).all(axis=1)
+    positions = positions[finite_poses]
+    pose_actions = actions[finite_poses]
+    waypoint_colors = _trajectory_time_colors(len(positions))
+    path_xyz, path_rgb = _sample_colored_trajectory(
+        positions,
+        waypoint_colors,
+        spacing=trajectory_spacing,
+    )
+
+    overlay_xyz: list[np.ndarray] = [path_xyz]
+    overlay_rgb: list[np.ndarray] = [path_rgb]
+    origin_xyz, origin_rgb = _axis_points(
+        np.zeros(3, dtype=np.float32),
+        np.eye(3, dtype=np.float32),
+        scale=frame_scale * 1.2,
+    )
+    overlay_xyz.append(origin_xyz)
+    overlay_rgb.append(origin_rgb)
+
+    if len(pose_actions):
+        frame_stride = max(1, int(np.ceil(len(pose_actions) / max(1, int(max_frames)))))
+        frame_indices = list(range(0, len(pose_actions), frame_stride))
+        if len(pose_actions) - 1 not in frame_indices:
+            frame_indices.append(len(pose_actions) - 1)
+        poses = pose9_to_homo_np(pose_actions[:, :9])
+        for frame_index in frame_indices:
+            scale = frame_scale * (1.35 if frame_index in (0, len(pose_actions) - 1) else 1.0)
+            frame_xyz, frame_rgb = _axis_points(
+                poses[frame_index, :3, 3],
+                poses[frame_index, :3, :3],
+                scale=scale,
+            )
+            overlay_xyz.append(frame_xyz)
+            overlay_rgb.append(frame_rgb)
+
+    trajectory_xyz = np.concatenate(overlay_xyz, axis=0).astype(np.float32, copy=False)
+    trajectory_rgb = np.concatenate(overlay_rgb, axis=0).astype(np.float32, copy=False)
+    max_points = max(1, int(max_points))
+    if len(trajectory_xyz) >= max_points:
+        indices = np.linspace(0, len(trajectory_xyz) - 1, max_points, dtype=np.int64)
+        trajectory_xyz = trajectory_xyz[indices]
+        trajectory_rgb = trajectory_rgb[indices]
+        scene_xyz = scene_xyz[:0]
+        scene_rgb = scene_rgb[:0]
+    else:
+        scene_budget = max_points - len(trajectory_xyz)
+        if len(scene_xyz) > scene_budget:
+            indices = np.linspace(0, len(scene_xyz) - 1, scene_budget, dtype=np.int64)
+            scene_xyz = scene_xyz[indices]
+            scene_rgb = scene_rgb[indices]
+
+    xyz = np.concatenate([scene_xyz, trajectory_xyz], axis=0)
+    rgb = np.concatenate([scene_rgb, trajectory_rgb], axis=0)
+    return np.concatenate([xyz, rgb], axis=1).astype(np.float32, copy=False)
+
+
 def _rgb_uint8(colors: np.ndarray) -> np.ndarray:
     colors = np.asarray(colors, dtype=np.float32)
     if colors.size == 0:
@@ -2497,27 +2772,12 @@ def _rgb_uint8(colors: np.ndarray) -> np.ndarray:
         colors = colors * 255.0
     return np.clip(colors, 0.0, 255.0).astype(np.uint8)
 
-def write_umi_debug_ply(path: Path, action_chunk: np.ndarray, point_cloud: np.ndarray) -> None:
+
+def _write_colored_point_cloud_ply(path: Path, xyzrgb: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    point_cloud = np.asarray(point_cloud, dtype=np.float32)
-    action_chunk = np.asarray(action_chunk, dtype=np.float32)
-    scene_points = point_cloud[:, :3]
-    scene_colors = _rgb_uint8(point_cloud[:, 3:6])
-
-    frame_points = []
-    frame_colors = []
-    poses = pose9_to_homo_np(action_chunk[:, :9])
-    for pose in poses:
-        pts, cols = _axis_points(pose[:3, 3], pose[:3, :3])
-        frame_points.append(pts)
-        frame_colors.append(cols)
-
-    if frame_points:
-        all_points = np.concatenate([scene_points, *frame_points], axis=0)
-        all_colors = np.concatenate([scene_colors, *frame_colors], axis=0)
-    else:
-        all_points = scene_points
-        all_colors = scene_colors
+    xyzrgb = np.asarray(xyzrgb, dtype=np.float32)
+    all_points = xyzrgb[:, :3]
+    all_colors = _rgb_uint8(xyzrgb[:, 3:6])
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("ply\n")
@@ -2530,11 +2790,97 @@ def write_umi_debug_ply(path: Path, action_chunk: np.ndarray, point_cloud: np.nd
         f.write("property uchar green\n")
         f.write("property uchar blue\n")
         f.write("end_header\n")
-        for point, color in zip(all_points, all_colors):
+        for point, color in zip(all_points, all_colors, strict=True):
             f.write(
                 f"{float(point[0]):.7f} {float(point[1]):.7f} {float(point[2]):.7f} "
                 f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
             )
+
+
+_STANDALONE_UMI_VISUALIZER: Any | None = None
+
+
+def _close_standalone_umi_visualizer() -> None:
+    global _STANDALONE_UMI_VISUALIZER
+    if _STANDALONE_UMI_VISUALIZER is not None:
+        _STANDALONE_UMI_VISUALIZER.close()
+        _STANDALONE_UMI_VISUALIZER = None
+
+
+def vis_umi_data(
+    action_chunk: Any,
+    point_cloud: Any,
+    *,
+    visualizer: Any | None = None,
+    save_path: str | Path | None = None,
+    max_points: int = 50000,
+) -> np.ndarray:
+    """Visualize a model-space UMI action chunk without touching Open3D here.
+
+    `visualizer` is expected to expose `update_colored`; the evaluator supplies
+    an isolated subprocess-backed viewer.  If neither `visualizer` nor
+    `save_path` is supplied, a module-level isolated viewer is created so the
+    function can be called directly from a debugger.  `save_path` remains
+    useful on a fully headless server and writes the exact same visualization.
+    """
+    global _STANDALONE_UMI_VISUALIZER
+    xyzrgb = build_umi_visualization_cloud(
+        action_chunk,
+        point_cloud,
+        max_points=max_points,
+    )
+    if save_path is not None:
+        _write_colored_point_cloud_ply(Path(save_path), xyzrgb)
+    if visualizer is None and save_path is None:
+        from lerobot.policies.smolvla.inference_diagnostics import ForegroundScoreVisualizer
+
+        if _STANDALONE_UMI_VISUALIZER is None:
+            _STANDALONE_UMI_VISUALIZER = ForegroundScoreVisualizer(
+                enabled=True,
+                max_points=max_points,
+                window_name=(
+                    "UMI model observation + predicted trajectory: "
+                    "blue/cyan=start, green=middle, red=end"
+                ),
+                print_every=1000000,
+            )
+            atexit.register(_close_standalone_umi_visualizer)
+        visualizer = _STANDALONE_UMI_VISUALIZER
+    if visualizer is not None:
+        visualizer.update_colored(xyzrgb)
+    return xyzrgb
+
+
+def write_umi_debug_ply(path: Path, action_chunk: np.ndarray, point_cloud: np.ndarray) -> None:
+    vis_umi_data(action_chunk, point_cloud, save_path=path)
+
+
+def _get_umi_trajectory_visualizer(infer: Any, max_points: int) -> Any:
+    visualizer = getattr(infer, "_umi_trajectory_visualizer", None)
+    if visualizer is None:
+        from lerobot.policies.smolvla.inference_diagnostics import ForegroundScoreVisualizer
+
+        visualizer = ForegroundScoreVisualizer(
+            enabled=True,
+            max_points=max_points,
+            window_name=(
+                "UMI model observation + predicted trajectory: "
+                "blue/cyan=start, green=middle, red=end"
+            ),
+            print_every=1000000,
+        )
+        infer._umi_trajectory_visualizer = visualizer
+    else:
+        visualizer.enable()
+    return visualizer
+
+
+def _close_umi_trajectory_visualizer(infer: Any) -> None:
+    visualizer = getattr(infer, "_umi_trajectory_visualizer", None)
+    if visualizer is not None:
+        visualizer.close()
+        delattr(infer, "_umi_trajectory_visualizer")
+
 
 def get_sim(env: Any):
     current = env
@@ -3269,6 +3615,16 @@ def run_episode(
     waypoint_gripper_tolerance = max(
         0.0, float(control.get("waypoint_gripper_tolerance", 0.004))
     )
+    rollback_chunks = max(1, int(control.get("rollback_chunks", 2)))
+    rollback_max_steps = max(1, int(control.get("rollback_max_steps", 50)))
+    rollback_position_tolerance = max(
+        0.0,
+        float(control.get("rollback_position_tolerance", waypoint_position_tolerance)),
+    )
+    rollback_rotation_tolerance = max(
+        0.0,
+        float(control.get("rollback_rotation_tolerance", waypoint_rotation_tolerance)),
+    )
     warmup_steps = max(0, int(control.get("warmup_steps", 0)))
     gripper_threshold = float(control.get("gripper_threshold", 0.5))
     gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
@@ -3387,6 +3743,16 @@ def run_episode(
     chunk_grasp_upward_displacements: list[float] = []
     chunk_transported_grasp_flags: list[bool] = []
     waypoint_hold_counts: list[int] = []
+    executed_chunk_start_controller_world_history: list[np.ndarray] = []
+    rollback_actions: list[np.ndarray] = []
+    rollback_target_controller_pose9: list[np.ndarray] = []
+    rollback_achieved_controller_pose9: list[np.ndarray] = []
+    rollback_position_errors: list[float] = []
+    rollback_rotation_errors: list[float] = []
+    rollback_chunk_counts: list[int] = []
+    rollback_request_count = 0
+    rollback_completed_count = 0
+    rollback_step_count = 0
 
     def update_grasp_transport_state(pose9_gripper: np.ndarray) -> bool:
         """Track whether an intermediate-width closure has subsequently lifted."""
@@ -3420,14 +3786,148 @@ def run_episode(
         render_camera = normalize_render_camera_name(str(cfg.get("render_camera", "agentview")))
         attach_mujoco_3d_viewer(env, render_camera=render_camera, key_callback=keyboard.viewer_key_callback)
         render_viewer3d(env, cfg, steps, force=True)
-    # if terminal_keys_enabled or str(cfg.get("render_mode", "offscreen")).lower() == "viewer3d":
-        # print("[eval] press 'n' to mark the current episode as failed and continue", flush=True)
+    if bool(cfg.get("keyboard_control_enabled", True)) or str(
+        cfg.get("render_mode", "offscreen")
+    ).lower() == "viewer3d":
+        print(
+            "[eval] controls: 'n' = fail/next episode, "
+            "'r' = rollback recent policy chunks, "
+            "'v' = visualize next predicted UMI trajectory",
+            flush=True,
+        )
+
+    def execute_manual_rollback() -> bool:
+        """Move the robot back to an earlier completed chunk start, then replan."""
+        nonlocal raw_obs, steps, done, manual_failure
+        nonlocal previous_issued_target_model_world
+        nonlocal grasp_anchor_position, grasp_max_upward_displacement
+        nonlocal rollback_request_count, rollback_completed_count, rollback_step_count
+
+        rollback_request_count += 1
+        available_chunks = len(executed_chunk_start_controller_world_history)
+        if available_chunks == 0:
+            rollback_chunk_counts.append(0)
+            print(
+                "[eval] rollback requested, but no executed chunk start pose is available; "
+                "replan from the current pose",
+                flush=True,
+            )
+            previous_issued_target_model_world = None
+            grasp_anchor_position = None
+            grasp_max_upward_displacement = 0.0
+            return False
+
+        chunk_count = min(rollback_chunks, available_chunks)
+        target_controller_world = np.asarray(
+            executed_chunk_start_controller_world_history[-chunk_count],
+            dtype=np.float32,
+        ).copy()
+        target_pose9 = matrix_to_pose9(target_controller_world)
+        rollback_action = np.concatenate(
+            [
+                world_pose_to_libero_absolute_action(target_controller_world),
+                np.zeros(1, dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        rollback_chunk_counts.append(int(chunk_count))
+        print(
+            f"[eval] rollback: returning to the start pose before the previous "
+            f"{chunk_count} completed policy chunk(s)",
+            flush=True,
+        )
+
+        reached = False
+        for _rollback_index in range(rollback_max_steps):
+            if steps >= max_steps or done:
+                break
+            if keyboard.poll():
+                manual_failure = True
+                break
+            try:
+                raw_obs, reward, done, _ = env.step(rollback_action)
+            except ValueError as exc:
+                if "terminated episode" in str(exc):
+                    done = True
+                    break
+                raise
+
+            steps += 1
+            rollback_step_count += 1
+            reward = float(reward)
+            rewards.append(reward)
+            rollback_actions.append(rollback_action.copy())
+            rollback_target_controller_pose9.append(target_pose9.copy())
+
+            step_object_positions, step_object_quaternions = capture_observable_object_poses(
+                raw_obs,
+                object_pose_names,
+            )
+            object_positions.append(step_object_positions)
+            object_quaternions.append(step_object_quaternions)
+            goal_predicate_values.append(capture_goal_predicates(env, raw_goal_predicates))
+            scene_joint_values.append(capture_scene_scalar_joints(env, scene_joint_records))
+            all_contacts, robot_contacts, all_contact_count, robot_contact_count = capture_contact_pairs(
+                env,
+                robot_contact_geoms,
+            )
+            contact_pair_strings.append(all_contacts)
+            robot_scene_contact_pair_strings.append(robot_contacts)
+            contact_counts.append(int(all_contact_count))
+            robot_scene_contact_counts.append(int(robot_contact_count))
+            render_viewer3d(env, cfg, steps)
+            if save_video:
+                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+
+            achieved_controller_world = current_controller_eef_world(env)
+            achieved_pose9 = matrix_to_pose9(achieved_controller_world)
+            rollback_achieved_controller_pose9.append(achieved_pose9)
+            position_error = float(
+                np.linalg.norm(
+                    achieved_controller_world[:3, 3] - target_controller_world[:3, 3]
+                )
+            )
+            rotation_error = rotation_error_radians(
+                achieved_controller_world[:3, :3],
+                target_controller_world[:3, :3],
+            )
+            rollback_position_errors.append(position_error)
+            rollback_rotation_errors.append(rotation_error)
+            if (
+                position_error <= rollback_position_tolerance
+                and rotation_error <= rollback_rotation_tolerance
+            ):
+                reached = True
+                break
+
+        previous_issued_target_model_world = None
+        grasp_anchor_position = None
+        grasp_max_upward_displacement = 0.0
+        if reached:
+            del executed_chunk_start_controller_world_history[-chunk_count:]
+            rollback_completed_count += 1
+            print(
+                f"[eval] rollback complete; "
+                f"{len(executed_chunk_start_controller_world_history)} earlier chunk start pose(s) remain",
+                flush=True,
+            )
+            return True
+
+        print(
+            "[eval] rollback stopped before reaching tolerance; replan from the current pose",
+            flush=True,
+        )
+        return False
 
     try:
         while steps < max_steps and not done and not success_ever:
             if keyboard.poll():
                 manual_failure = True
                 break
+            if keyboard.pop_rollback_request():
+                execute_manual_rollback()
+                if manual_failure or done:
+                    break
+                continue
 
             point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
                 env,
@@ -3492,12 +3992,44 @@ def run_episode(
                 chunk = chunk_batch[0].detach().cpu().numpy()
             else:
                 chunk = np.asarray(chunk_batch)[0]
+            chunk[:,3:9] = np.array([1,0,0,0,1,0])
             predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
+
+            one_shot_trajectory_vis = keyboard.pop_trajectory_visualization_request()
+            continuous_trajectory_vis = bool(
+                cfg.get("visualize_action_trajectory", False)
+            ) and (
+                model_call_count
+                % int(cfg.get("trajectory_vis_every_n_model_calls", 1))
+                == 0
+            )
+            if one_shot_trajectory_vis or continuous_trajectory_vis:
+                try:
+                    trajectory_visualizer = _get_umi_trajectory_visualizer(
+                        infer,
+                        int(cfg.get("trajectory_vis_max_points", 50000)),
+                    )
+                    vis_umi_data(
+                        chunk,
+                        model_observation["point_cloud"],
+                        visualizer=trajectory_visualizer,
+                        max_points=int(cfg.get("trajectory_vis_max_points", 50000)),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[warn] UMI trajectory visualization update failed: {exc!r}",
+                        flush=True,
+                    )
 
             if keyboard.poll():
                 manual_failure = True
                 break
+            if keyboard.pop_rollback_request():
+                execute_manual_rollback()
+                if manual_failure or done:
+                    break
+                continue
 
             start_idx = min(action_index, max(0, len(chunk) - 1))
             measured_gripper_width = float(eef_pose[-1])
@@ -3578,6 +4110,9 @@ def run_episode(
             normal_base_selected_count = max(0, normal_base_end_idx - start_idx)
             committed_selected_count = max(0, committed_end_idx - start_idx)
             executed_waypoints_this_chunk = 0
+            chunk_execution_start_steps = steps
+            chunk_start_controller_world = current_controller_eef_world(env).copy()
+            rollback_requested = False
             for selected_row_index, (row, action, model_world, controller_pose) in enumerate(zip(
                 selected_chunk,
                 actions,
@@ -3601,8 +4136,13 @@ def run_episode(
                         ):
                             break
                         adaptive_waypoints_executed += 1
-                if steps >= max_steps or done or success_ever or keyboard.poll():
-                    manual_failure = keyboard.poll()
+                if steps >= max_steps or done or success_ever:
+                    break
+                if keyboard.poll():
+                    manual_failure = True
+                    break
+                if keyboard.pop_rollback_request():
+                    rollback_requested = True
                     break
                 if inferred_stable_grasp and selected_row_index >= exec_action_steps:
                     grasp_extended_waypoints_executed += 1
@@ -3611,8 +4151,13 @@ def run_episode(
                 hold_count = 0
                 waypoint_gripper_direction = float(action[-1])
                 for _hold_index in range(waypoint_max_hold_steps):
-                    if steps >= max_steps or done or success_ever or keyboard.poll():
-                        manual_failure = keyboard.poll()
+                    if steps >= max_steps or done or success_ever:
+                        break
+                    if keyboard.poll():
+                        manual_failure = True
+                        break
+                    if keyboard.pop_rollback_request():
+                        rollback_requested = True
                         break
                     step_action = np.asarray(action, dtype=np.float32).copy()
                     if gripper_control_mode == "target_width":
@@ -3701,6 +4246,9 @@ def run_episode(
                     if keyboard.poll():
                         manual_failure = True
                         break
+                    if keyboard.pop_rollback_request():
+                        rollback_requested = True
+                        break
 
                     try:
                         success_ever = success_ever or bool(env.check_success())
@@ -3726,8 +4274,19 @@ def run_episode(
                     ):
                         break
                 waypoint_hold_counts.append(int(hold_count))
+                if manual_failure or rollback_requested or done or success_ever:
+                    break
             chunk_executed_waypoint_counts.append(int(executed_waypoints_this_chunk))
+            if steps > chunk_execution_start_steps:
+                executed_chunk_start_controller_world_history.append(
+                    np.asarray(chunk_start_controller_world, dtype=np.float32).copy()
+                )
 
+            if rollback_requested:
+                execute_manual_rollback()
+                if manual_failure or done:
+                    break
+                continue
             if manual_failure:
                 break
         manual_failure = manual_failure or keyboard.poll()
@@ -3800,6 +4359,14 @@ def run_episode(
         "waypoint_position_tolerance": float(waypoint_position_tolerance),
         "waypoint_rotation_tolerance": float(waypoint_rotation_tolerance),
         "waypoint_gripper_tolerance": float(waypoint_gripper_tolerance),
+        "rollback_chunks": int(rollback_chunks),
+        "rollback_max_steps": int(rollback_max_steps),
+        "rollback_position_tolerance": float(rollback_position_tolerance),
+        "rollback_rotation_tolerance": float(rollback_rotation_tolerance),
+        "rollback_request_count": int(rollback_request_count),
+        "rollback_completed_count": int(rollback_completed_count),
+        "rollback_step_count": int(rollback_step_count),
+        "rollback_history_remaining": int(len(executed_chunk_start_controller_world_history)),
         "waypoint_hold_mean": (
             float(np.mean(waypoint_hold_counts)) if waypoint_hold_counts else 0.0
         ),
@@ -3899,6 +4466,16 @@ def run_episode(
         "chunk_transported_grasp_flags": np.asarray(
             chunk_transported_grasp_flags, dtype=np.bool_
         ),
+        "rollback_actions": np.asarray(rollback_actions, dtype=np.float32),
+        "rollback_target_controller_pose9": np.asarray(
+            rollback_target_controller_pose9, dtype=np.float32
+        ),
+        "rollback_achieved_controller_pose9": np.asarray(
+            rollback_achieved_controller_pose9, dtype=np.float32
+        ),
+        "rollback_position_errors": np.asarray(rollback_position_errors, dtype=np.float32),
+        "rollback_rotation_errors": np.asarray(rollback_rotation_errors, dtype=np.float32),
+        "rollback_chunk_counts": np.asarray(rollback_chunk_counts, dtype=np.int16),
         "object_pose_names": object_pose_names,
         "initial_object_positions": initial_object_positions,
         "initial_object_quaternions": initial_object_quaternions,
@@ -4795,6 +5372,36 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["foreground_vis_max_points"] = int(
         cfg_get(cfg, args.foreground_vis_max_points, "foreground_vis_max_points", 50000)
     )
+    cfg["visualize_action_trajectory"] = bool(
+        cfg_get(
+            cfg,
+            args.visualize_action_trajectory,
+            "visualize_action_trajectory",
+            False,
+        )
+    )
+    cfg["trajectory_vis_max_points"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg,
+                args.trajectory_vis_max_points,
+                "trajectory_vis_max_points",
+                50000,
+            )
+        ),
+    )
+    cfg["trajectory_vis_every_n_model_calls"] = max(
+        1,
+        int(
+            cfg_get(
+                cfg,
+                args.trajectory_vis_every_n_model_calls,
+                "trajectory_vis_every_n_model_calls",
+                1,
+            )
+        ),
+    )
     cfg["add_gripper_cloud"] = bool(cfg_get(cfg, args.add_gripper_cloud, "add_gripper_cloud", True))
     if args.gripper_points is not None:
         cfg["gripper_points"] = int(args.gripper_points)
@@ -4964,6 +5571,36 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             )
         ),
     )
+    cfg["control"]["rollback_chunks"] = max(
+        1,
+        int(cfg_get(cfg["control"], args.rollback_chunks, "rollback_chunks", 2)),
+    )
+    cfg["control"]["rollback_max_steps"] = max(
+        1,
+        int(cfg_get(cfg["control"], args.rollback_max_steps, "rollback_max_steps", 50)),
+    )
+    cfg["control"]["rollback_position_tolerance"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.rollback_position_tolerance,
+                "rollback_position_tolerance",
+                cfg["control"]["waypoint_position_tolerance"],
+            )
+        ),
+    )
+    cfg["control"]["rollback_rotation_tolerance"] = max(
+        0.0,
+        float(
+            cfg_get(
+                cfg["control"],
+                args.rollback_rotation_tolerance,
+                "rollback_rotation_tolerance",
+                cfg["control"]["waypoint_rotation_tolerance"],
+            )
+        ),
+    )
     cfg["control"]["max_steps"] = int(cfg_get(cfg["control"], args.max_steps, "max_steps", 1000))
     cfg["use_suite_max_steps"] = bool(
         cfg_get(cfg, args.use_suite_max_steps, "use_suite_max_steps", False)
@@ -5121,6 +5758,11 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             raise ValueError("Parallel environment workers require --render-mode offscreen.")
         if bool(cfg.get("visualize_foreground", False)):
             raise ValueError("Parallel environment workers require --no-visualize-foreground.")
+        if bool(cfg.get("visualize_action_trajectory", False)):
+            raise ValueError(
+                "Online action-trajectory visualization requires serial evaluation: "
+                "--task-workers 1 --episode-workers-per-task 1."
+            )
     if cfg["episode_workers_per_task"] > 1 and cfg["task_worker_backend"] != "process":
         raise ValueError("--episode-workers-per-task > 1 requires --task-worker-backend process.")
     if cfg["isolated_policy_workers"] > 1 and cfg["episode_workers_per_task"] > 1:
@@ -5130,6 +5772,12 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         )
     if cfg["isolated_policy_workers"] > 1 and bool(cfg.get("visualize_foreground", False)):
         raise ValueError("Isolated policy workers require --no-visualize-foreground.")
+    if cfg["isolated_policy_workers"] > 1 and bool(
+        cfg.get("visualize_action_trajectory", False)
+    ):
+        raise ValueError(
+            "Online action-trajectory visualization requires --isolated-policy-workers 1."
+        )
 
     return cfg, suite_names, output_dir
 
@@ -5369,7 +6017,10 @@ def main() -> None:
         f"save_video={cfg['save_video']}, "
         f"render_mode={cfg.get('render_mode')}, "
         f"render_every_n_steps={cfg.get('render_every_n_steps')}, "
-        f"visualize_foreground={cfg.get('visualize_foreground')}"
+        f"visualize_foreground={cfg.get('visualize_foreground')}, "
+        f"visualize_action_trajectory={cfg.get('visualize_action_trajectory')}, "
+        f"trajectory_vis_every_n_model_calls="
+        f"{cfg.get('trajectory_vis_every_n_model_calls')}"
     )
 
     all_task_summaries: list[dict[str, Any]] = []
@@ -5502,6 +6153,7 @@ def main() -> None:
     finally:
         if scheduler is not None:
             scheduler.close()
+        _close_umi_trajectory_visualizer(infer)
         infer.close()
 
     write_eval_reports(output_dir, cfg, suite_names, all_task_summaries)

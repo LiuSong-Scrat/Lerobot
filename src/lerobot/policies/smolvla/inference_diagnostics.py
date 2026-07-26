@@ -469,6 +469,54 @@ class ForegroundScoreVisualizer:
         self._data_shm = None
         self._meta_shm = None
 
+    def update_colored(self, xyzrgb: torch.Tensor | np.ndarray, *, batch_index: int = 0) -> bool:
+        """Publish an explicitly colored point cloud through the isolated viewer.
+
+        This is also used by inference-time trajectory debugging.  Keeping the
+        Open3D window in the same standalone viewer process as foreground-score
+        visualization prevents MuJoCo EGL and Open3D GLX contexts from being
+        created in the policy / environment process.
+        """
+        if not self.enabled:
+            return False
+        points = _to_numpy(xyzrgb)
+        if points.ndim == 3:
+            points = points[batch_index]
+        if points.ndim != 2 or points.shape[-1] < 6:
+            raise ValueError(
+                "Colored point-cloud visualization expects an (N, >=6) xyzrgb array, "
+                f"got {points.shape}."
+            )
+
+        points = np.asarray(points[:, :6], dtype=np.float32)
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+        if len(points) == 0:
+            return False
+        if len(points) > self.max_points:
+            indices = np.linspace(0, len(points) - 1, self.max_points, dtype=np.int64)
+            points = points[indices]
+        colors = points[:, 3:6]
+        if colors.max(initial=0.0) > 1.0:
+            colors = colors / 255.0
+        colors = np.clip(colors, 0.0, 1.0)
+        if not self._ensure_process():
+            return False
+
+        assert self._data_array is not None and self._meta_array is not None
+        count = len(points)
+        self._meta_array[0] += 1  # odd: writer owns the shared frame
+        self._data_array[:count, :3] = points[:, :3]
+        self._data_array[:count, 3:6] = colors
+        self._meta_array[1] = count
+        self._meta_array[0] += 1  # even: complete frame is available
+        if self._process is not None and self._process.poll() is not None:
+            self._failed = True
+            self.enabled = False
+            return False
+        self._updates += 1
+        return True
+
     def update(
         self,
         xyzrgb: torch.Tensor | np.ndarray,
