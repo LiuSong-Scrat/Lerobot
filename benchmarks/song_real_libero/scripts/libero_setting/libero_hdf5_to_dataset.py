@@ -125,6 +125,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--replay-mode", choices=("states", "step"), default=None)
     parser.add_argument(
+        "--state-observation-offset",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help=(
+            "State index used to reconstruct source observation i in states replay mode. "
+            "Official LIBERO v1 files require 1 because create_dataset.py records obs[i] "
+            "after action[i] while retaining states[i]."
+        ),
+    )
+    parser.add_argument(
         "--restore-demo-model",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1047,9 +1058,25 @@ def collect_demo_episode(
 ) -> dict[str, Any]:
     if states.ndim != 2:
         raise ValueError(f"Expected demo states shape (T, D), got {states.shape}")
+    configured_state_observation_offset = int(cfg.get("state_observation_offset", 1))
+    if configured_state_observation_offset not in (0, 1):
+        raise ValueError(
+            "state_observation_offset must be 0 or 1, got "
+            f"{configured_state_observation_offset}."
+        )
+    state_observation_offset = (
+        configured_state_observation_offset if cfg["replay_mode"] == "states" else 0
+    )
+
     frame_count = len(states)
     if cfg["replay_mode"] == "step" and actions is not None:
         frame_count = min(frame_count, len(actions) + 1)
+    elif cfg["replay_mode"] == "states":
+        # Official LIBERO v1 create_dataset.py executes action[i] before
+        # recording obs[i], but stores states[i]. Consequently obs[i] is
+        # represented by states[i + 1]. The final source observation has no
+        # corresponding states[T], so snapshot replay intentionally drops it.
+        frame_count -= state_observation_offset
     if max_frames is not None and max_frames > 0:
         frame_count = min(frame_count, int(max_frames))
     if frame_count <= 1:
@@ -1096,7 +1123,8 @@ def collect_demo_episode(
                 raw_obs, _, _, _ = env.step(actions[frame_idx])
     else:
         for frame_idx in range(frame_count):
-            raw_obs = set_env_state_and_get_obs(env, states[frame_idx])
+            state_idx = frame_idx + state_observation_offset
+            raw_obs = set_env_state_and_get_obs(env, states[state_idx])
             if save_video:
                 append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
             if save_rgb_images and image_camera is not None:
@@ -1148,6 +1176,7 @@ def collect_demo_episode(
         "world_ee_poses": reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
+        "state_observation_offset": state_observation_offset,
     }
     if save_rgb_images:
         if len(image_frames) != len(episode_actions):
@@ -1166,6 +1195,7 @@ def make_episode_record(
     frames: int,
     model_sha256: str | None,
     source_fps: float | None,
+    state_observation_offset: int,
 ) -> dict[str, Any]:
     return {
         "suite": suite_name,
@@ -1180,6 +1210,7 @@ def make_episode_record(
         "model_sha256": model_sha256,
         "model_restoration_verified": model_sha256 is not None,
         "source_fps": source_fps,
+        "state_observation_offset": int(state_observation_offset),
     }
 
 
@@ -1239,6 +1270,7 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         frames=len(episode["actions"]),
         model_sha256=model_sha256,
         source_fps=source_fps,
+        state_observation_offset=int(episode["state_observation_offset"]),
     )
     artifact_dir = Path(job["tmp_path"])
     save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -1301,6 +1333,7 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
                 frames=len(episode["actions"]),
                 model_sha256=model_sha256,
                 source_fps=source_fps,
+                state_observation_offset=int(episode["state_observation_offset"]),
             )
             artifact_dir = Path(episode_job["tmp_path"])
             save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -1383,6 +1416,14 @@ def main() -> None:
     cfg["zarr_compression_level"] = int(cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3))
     cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 20))
     cfg["replay_mode"] = cfg_get(cfg, args.replay_mode, "replay_mode", "states")
+    cfg["state_observation_offset"] = int(
+        cfg_get(
+            cfg,
+            args.state_observation_offset,
+            "state_observation_offset",
+            1,
+        )
+    )
     cfg["restore_demo_model"] = bool(
         cfg_get(cfg, args.restore_demo_model, "restore_demo_model", True)
     )
@@ -1481,6 +1522,22 @@ def main() -> None:
             "demo_model_runtime_verification": bool(cfg["restore_demo_model"]),
         },
         "fps": int(cfg["fps"]),
+        "state_observation_alignment": {
+            "replay_mode": str(cfg["replay_mode"]),
+            "state_index_offset": int(cfg["state_observation_offset"]),
+            "mapping": (
+                "output[i] = render(states[i + state_index_offset])"
+                if str(cfg["replay_mode"]) == "states"
+                else "action replay"
+            ),
+            "official_libero_v1_default": "obs[i] ~= render(states[i + 1])",
+            "terminal_policy": (
+                "drop source obs[T-1] because states[T] is unavailable"
+                if str(cfg["replay_mode"]) == "states"
+                and int(cfg["state_observation_offset"]) == 1
+                else "not_applicable"
+            ),
+        },
         "demo_model_restoration": (
             "per_demo_model_file" if bool(cfg["restore_demo_model"]) else "disabled"
         ),
