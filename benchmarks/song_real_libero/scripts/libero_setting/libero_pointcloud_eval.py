@@ -454,6 +454,43 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Clean LIBERO eval: point-cloud observation -> action chunk -> absolute pose execution."
     )
+
+
+    ###################TrainDatasetTest##########
+    parser.add_argument(
+        "--dataset-domain-env",
+        "--align-env-to-training-data",
+        dest="dataset_domain_env",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Diagnostic mode: map episode N to source demo N, restore that demo's HDF5 "
+            "model_file, and initialize from the same state used by dataset conversion. "
+            "Disabled by default and not comparable to the standard LIBERO benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-domain-demo-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing the official LIBERO HDF5 demonstrations used for training. "
+            "Defaults to demo_root from the JSON config."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-domain-oracle-actions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Diagnostic mode: bypass policy inference, read the matched HDF5 demo's raw "
+            "OSC delta actions, and combine each one with its matched source state to "
+            "construct an absolute OSC setpoint while keeping controller.use_delta=False. Requires "
+            "--dataset-domain-env and is not a benchmark score."
+        ),
+    )
+
+
     parser.add_argument(
         "--settle-steps",
         type=int,
@@ -535,38 +572,6 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help="Evaluate only these LIBERO initial-state indices; repeat for multiple indices.",
-    )
-    parser.add_argument(
-        "--dataset-domain-env",
-        "--align-env-to-training-data",
-        dest="dataset_domain_env",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Diagnostic mode: map episode N to source demo N, restore that demo's HDF5 "
-            "model_file, and initialize from the same state used by dataset conversion. "
-            "Disabled by default and not comparable to the standard LIBERO benchmark."
-        ),
-    )
-    parser.add_argument(
-        "--dataset-domain-demo-root",
-        type=Path,
-        default=None,
-        help=(
-            "Root containing the official LIBERO HDF5 demonstrations used for training. "
-            "Defaults to demo_root from the JSON config."
-        ),
-    )
-    parser.add_argument(
-        "--dataset-domain-oracle-actions",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Diagnostic mode: bypass policy inference, read the matched HDF5 demo's raw "
-            "OSC delta actions, and combine each one with its matched source state to "
-            "construct an absolute OSC setpoint while keeping controller.use_delta=False. Requires "
-            "--dataset-domain-env and is not a benchmark score."
-        ),
     )
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
@@ -676,7 +681,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-max-hold-steps",
         type=int,
-        default=8,
+        default=None,
         help=(
             "Maximum controller steps spent tracking each predicted waypoint before advancing. "
             "One preserves the original one-waypoint-per-env-step behavior."
@@ -685,7 +690,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-position-tolerance",
         type=float,
-        default=0.002,
+        default=None,
         help="Position error in metres below which a held waypoint is considered reached.",
     )
     parser.add_argument(

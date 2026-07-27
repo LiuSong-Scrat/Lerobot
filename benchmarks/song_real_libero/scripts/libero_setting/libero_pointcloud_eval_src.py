@@ -558,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-domain-oracle-actions",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
             "Diagnostic mode: bypass policy inference and execute GT pose9+gripper chunks "
             "reconstructed from the matched source demo through the normal evaluation executor. "
