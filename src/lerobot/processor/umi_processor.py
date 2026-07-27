@@ -57,33 +57,84 @@ class UMIProcessor(ProcessorStep):
         observation = new_transition.get(TransitionKey.OBSERVATION)
         if observation is None or not isinstance(observation, dict):
             return new_transition
+        observation = observation.copy()
+        new_transition[TransitionKey.OBSERVATION] = observation
             
         # Extract data - observation keys have 'observation.' prefix stripped
         if 'observation.state' in observation:
-            state_np = observation['observation.state'].cpu().numpy()  # (batch_size, seq_len, 9)
+            state = observation['observation.state']
+            state_np = state.detach().cpu().numpy().copy()
         else:
             # No state data to process
             return new_transition
+        if state_np.shape[-1] < 9:
+            raise ValueError(
+                "UMI observation.state must contain at least a 9D pose, "
+                f"got shape {state_np.shape}."
+            )
+        state_had_sequence_dim = state_np.ndim == 3
+        if state_np.ndim == 2:
+            state_sequence = state_np[:, None, :]
+        elif state_np.ndim == 3:
+            state_sequence = state_np
+        else:
+            raise ValueError(
+                "UMI observation.state must have shape (B, D) or (B, S, D), "
+                f"got {state_np.shape}."
+            )
 
         # Get action from transition
         action = new_transition.get(TransitionKey.ACTION)
         if action is not None:
-            action_np = action.cpu().numpy()  # (batch_size, seq_len, D_action)
+            action_np = action.detach().cpu().numpy().copy()
+            if action_np.shape[-1] < 9:
+                raise ValueError(
+                    f"UMI action must contain at least a 9D pose, got shape {action_np.shape}."
+                )
+            action_had_sequence_dim = action_np.ndim == 3
+            if action_np.ndim == 2:
+                action_sequence = action_np[:, None, :]
+            elif action_np.ndim == 3:
+                action_sequence = action_np
+            else:
+                raise ValueError(
+                    "UMI action must have shape (B, D) or (B, S, D), "
+                    f"got {action_np.shape}."
+                )
         else:
-            action_np = None
+            action_sequence = None
+            action_had_sequence_dim = False
 
-        # Convert to egocentric coordinates
-        agent_pos = action_np
-        obs_pose9_eff_to_world = agent_pos
-        obs_pose9_data_eff_2_eff0 = self.from_world_to_umi_tra_pose9(obs_pose9_eff_to_world)
-        
-        # Update observation state
-        observation['observation.state'][..., :9] = torch.from_numpy(obs_pose9_data_eff_2_eff0[...,0,:]).unsqueeze(-2).to(observation['observation.state'].device)
+        # The egocentric origin must be the actually observed current EEF pose.
+        # Using action[0] as the origin was only accidentally valid while action
+        # and observation.state were duplicates. It would erase the displacement
+        # of a commanded absolute target.
+        origin_pose9 = state_sequence[:, 0, :9]
+        state_umi = self.from_world_to_umi_tra_pose9(
+            state_sequence[..., :9],
+            origin_pose9_eff_to_world=origin_pose9,
+        )
+        transformed_state = state_sequence.copy()
+        transformed_state[..., :9] = state_umi
+        if not state_had_sequence_dim:
+            transformed_state = transformed_state[:, 0]
+        observation['observation.state'] = torch.from_numpy(
+            transformed_state
+        ).to(device=state.device, dtype=state.dtype)
 
         # Update action if it exists (assuming action[..., :9] is the pose part)
-        if action_np is not None:
-            action_np[..., :9] = obs_pose9_data_eff_2_eff0
-            new_transition[TransitionKey.ACTION] = torch.from_numpy(action_np).to(action.device)
+        if action_sequence is not None:
+            action_umi = self.from_world_to_umi_tra_pose9(
+                action_sequence[..., :9],
+                origin_pose9_eff_to_world=origin_pose9,
+            )
+            transformed_action = action_sequence.copy()
+            transformed_action[..., :9] = action_umi
+            if not action_had_sequence_dim:
+                transformed_action = transformed_action[:, 0]
+            new_transition[TransitionKey.ACTION] = torch.from_numpy(
+                transformed_action
+            ).to(device=action.device, dtype=action.dtype)
 
         # self.vis_umi_data(obs_pose9_data_eff_2_eff0[0],point_cloud.squeeze(1)[0])
 
@@ -95,48 +146,48 @@ class UMIProcessor(ProcessorStep):
         """UMI processor doesn't change feature shapes or types, just coordinate systems."""
         return features
 
-    def from_world_to_umi_tra_pose9(self, obs_pose9_eff_to_world):
-        # obs_pose9_eff_to_world shape: (batch_size, seq_len, 9)
-        batch_size, seq_len = obs_pose9_eff_to_world.shape[:2]
+    def from_world_to_umi_tra_pose9(
+        self,
+        obs_pose9_eff_to_world,
+        *,
+        origin_pose9_eff_to_world=None,
+    ):
+        """Express a pose sequence relative to an explicit current EEF origin."""
 
-        # Convert each pose9 to homogeneous matrix
-        T_world_list = []
-        for i in range(batch_size):
-            for j in range(seq_len):
-                pose9 = obs_pose9_eff_to_world[i, j]
-                T_world = self.pose9_to_homo(torch.tensor(pose9).unsqueeze(0)).squeeze(0).cpu().numpy()
-                T_world_list.append(T_world)
+        poses = np.asarray(obs_pose9_eff_to_world)
+        if poses.ndim != 3 or poses.shape[-1] != 9:
+            raise ValueError(f"Expected pose sequence shape (B, S, 9), got {poses.shape}.")
+        batch_size, seq_len = poses.shape[:2]
 
-        T_world = np.array(T_world_list).reshape(batch_size, seq_len, 4, 4)  # (batch_size, seq_len, 4, 4)
+        pose_tensor = torch.as_tensor(poses)
+        T_eff_to_world = self.pose9_to_homo(pose_tensor).cpu().numpy()
 
-        # Get the transformation from eff0 to world
-        T_eff0_to_world = T_world[:, 0]  # (batch_size, 4, 4) - first timestep
+        if origin_pose9_eff_to_world is None:
+            origin_poses = poses[:, 0]
+        else:
+            origin_poses = np.asarray(origin_pose9_eff_to_world)
+            if origin_poses.ndim == 3 and origin_poses.shape[1] == 1:
+                origin_poses = origin_poses[:, 0]
+            if origin_poses.shape != (batch_size, 9):
+                raise ValueError(
+                    "UMI origin must have shape (B, 9), "
+                    f"got {origin_poses.shape} for batch size {batch_size}."
+                )
+        T_origin_to_world = self.pose9_to_homo(
+            torch.as_tensor(origin_poses)
+        ).cpu().numpy()
+        T_world_to_origin = self.fast_inverse_homogeneous(T_origin_to_world)
+        T_eff_to_origin = T_world_to_origin[:, None] @ T_eff_to_world
 
-        # Compute inverse transformations
-        T_world_inv = self.fast_inverse_homogeneous(T_world)  # (batch_size, seq_len, 4, 4)
-
-        # Compute transformations from eff0 to each eff
-        # T_eff0_to_eff = T_world_inv @ T_eff0_to_world for each batch
-        T_eff0_to_eff = np.zeros_like(T_world)
-        for i in range(batch_size):
-            T_eff0_to_world_i = T_eff0_to_world[i]  # (4, 4)
-            T_world_inv_i = T_world_inv[i]  # (seq_len, 4, 4)
-            T_eff0_to_eff[i] = T_world_inv_i @ T_eff0_to_world_i  # (seq_len, 4, 4)
-
-        # Compute transformations from each eff to eff0
-        T_eff_to_eff0 = self.fast_inverse_homogeneous(T_eff0_to_eff)  # (batch_size, seq_len, 4, 4)
-
-        # Convert back to trajectory format
-        obs_pose_eular_effi = []
-        for i in range(batch_size):
-            for j in range(seq_len):
-                T_effi_to_eff0 = T_eff_to_eff0[i, j]  # (4, 4)
-                trajectory = self.from_H_to_trajectory(T_effi_to_eff0)
-                obs_pose_eular_effi.append(trajectory)
-
-        obs_pose_eular_data = np.array(obs_pose_eular_effi).reshape(batch_size, seq_len, 6)
-        obs_pose9_data = self.traj6_to_pose9(obs_pose_eular_data)
-        return obs_pose9_data
+        rotation = T_eff_to_origin[..., :3, :3]
+        return np.concatenate(
+            [
+                T_eff_to_origin[..., :3, 3],
+                rotation[..., :, 0],
+                rotation[..., :, 1],
+            ],
+            axis=-1,
+        ).reshape(batch_size, seq_len, 9).astype(poses.dtype, copy=False)
 
     def create_frame(self, position, rot_matrix, scale=0.03):
         frame = o3d.geometry.TriangleMesh.create_coordinate_frame(

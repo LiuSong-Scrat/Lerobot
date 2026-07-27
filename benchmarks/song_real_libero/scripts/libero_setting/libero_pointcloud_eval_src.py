@@ -81,20 +81,18 @@ def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if not bool(cfg.get("dataset_domain_env", False)):
         return dict(FAIR_EVALUATION_PROTOCOL)
     state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
-    oracle_actions = bool(cfg.get("dataset_domain_oracle_actions", False))
-    initial_state_index = 0 if oracle_actions else state_offset
     return {
         **FAIR_EVALUATION_PROTOCOL,
         "name": "dataset_domain_source_demo_rollout",
-        "initial_state_source": f"source_demo_hdf5.states[{initial_state_index}]",
+        "initial_state_source": f"source_demo_hdf5.states[{state_offset}]",
         "fixture_reset_sequence": "source_demo_hdf5.model_file_per_episode",
         "environment_domain": "training_source_demo",
         "post_state_settling": "disabled_to_preserve_source_observation",
         "forced_initial_gripper_open": False,
         "pre_policy_warmup_steps": 0,
         "action_source": (
-            "source_demo_raw_delta_to_source_anchored_absolute_osc"
-            if oracle_actions
+            "source_demo_gt_pose9_gripper"
+            if bool(cfg.get("dataset_domain_oracle_actions", False))
             else "policy_flow_matching_sample"
         ),
         "benchmark_comparable": False,
@@ -562,10 +560,9 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Diagnostic mode: bypass policy inference, read the matched HDF5 demo's raw "
-            "OSC delta actions, and combine each one with its matched source state to "
-            "construct an absolute OSC setpoint while keeping controller.use_delta=False. Requires "
-            "--dataset-domain-env and is not a benchmark score."
+            "Diagnostic mode: bypass policy inference and execute GT pose9+gripper chunks "
+            "reconstructed from the matched source demo through the normal evaluation executor. "
+            "Requires --dataset-domain-env and is not a benchmark score."
         ),
     )
     parser.add_argument("--env-seed", type=int, default=None)
@@ -676,7 +673,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-max-hold-steps",
         type=int,
-        default=8,
+        default=None,
         help=(
             "Maximum controller steps spent tracking each predicted waypoint before advancing. "
             "One preserves the original one-waypoint-per-env-step behavior."
@@ -685,7 +682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waypoint-position-tolerance",
         type=float,
-        default=0.002,
+        default=None,
         help="Position error in metres below which a held waypoint is considered reached.",
     )
     parser.add_argument(
@@ -1175,85 +1172,6 @@ def world_pose_to_libero_absolute_action(target_world: np.ndarray) -> np.ndarray
     target_world = np.asarray(target_world, dtype=np.float32)
     rotvec = R.from_matrix(target_world[:3, :3]).as_rotvec().astype(np.float32)
     return np.concatenate([target_world[:3, 3], rotvec]).astype(np.float32)
-
-
-def libero_delta_action_to_absolute_action(
-    env: Any,
-    source_action: np.ndarray,
-    *,
-    force_controller_update: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert one source OSC delta command to an equivalent absolute command.
-
-    LIBERO demonstrations store normalized OSC deltas. A demonstrated state,
-    however, is the pose reached *after* contact dynamics and is not the OSC
-    setpoint encoded by the action that generated it. Replaying reached poses
-    as controller commands therefore changes the source action semantics.
-
-    This helper preserves an absolute-pose controller while reconstructing the
-    setpoint that robosuite's delta branch encodes at the supplied controller
-    state. No heuristic offset is added, and the source gripper command is
-    copied unchanged.
-    """
-
-    raw_action = np.asarray(source_action, dtype=np.float64).reshape(-1)
-    if raw_action.shape != (7,):
-        raise ValueError(f"Expected one LIBERO source action with shape (7,), got {raw_action.shape}.")
-    if not np.isfinite(raw_action).all():
-        raise ValueError("LIBERO source action contains non-finite values.")
-    if len(getattr(env, "robots", [])) != 1:
-        raise ValueError("Source-action absolute conversion currently requires one LIBERO robot.")
-
-    import robosuite.utils.transform_utils as T
-    from robosuite.utils.control_utils import set_goal_orientation, set_goal_position
-
-    controller = env.robots[0].controller
-    if bool(getattr(controller, "use_delta", True)):
-        raise RuntimeError(
-            "libero_delta_action_to_absolute_action requires controller.use_delta=False."
-        )
-    # Normal online conversion mirrors OperationalSpaceController.set_goal().
-    # Source-state reconstruction explicitly force-refreshes after setting each
-    # saved MuJoCo state so the absolute target is anchored to that source pose.
-    controller.update(force=bool(force_controller_update))
-    scaled_delta = np.asarray(controller.scale_action(raw_action[:6]), dtype=np.float64)
-    target_position = set_goal_position(
-        scaled_delta[:3],
-        np.asarray(controller.ee_pos, dtype=np.float64),
-        position_limit=controller.position_limits,
-    )
-    target_orientation = set_goal_orientation(
-        scaled_delta[3:],
-        np.asarray(controller.ee_ori_mat, dtype=np.float64),
-        orientation_limit=controller.orientation_limits,
-    )
-
-    target_controller_world = np.eye(4, dtype=np.float64)
-    target_controller_world[:3, :3] = np.asarray(target_orientation, dtype=np.float64)
-    target_controller_world[:3, 3] = np.asarray(target_position, dtype=np.float64)
-    absolute_action = np.concatenate(
-        [
-            np.asarray(target_position, dtype=np.float64),
-            # Use robosuite's own matrix -> quaternion -> axis-angle
-            # convention. SciPy projects a slightly non-orthogonal MuJoCo
-            # matrix onto SO(3); close to pi this changed one source target by
-            # about 0.02 in matrix space and was enough to break contact replay.
-            T.quat2axisangle(T.mat2quat(target_orientation)),
-            raw_action[6:7],
-        ]
-    )
-    return (
-        absolute_action.astype(np.float64),
-        target_controller_world.astype(np.float64),
-        scaled_delta.astype(np.float64),
-    )
-
-
-def refresh_arm_controller_state(env: Any) -> None:
-    """Refresh cached OSC kinematics after restoring a MuJoCo state."""
-
-    for robot in env.robots:
-        robot.controller.update(force=True)
 
 
 def current_controller_eef_world(env: Any) -> np.ndarray:
@@ -1936,9 +1854,6 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
     drop_keys = {
         "video_frames",
         "libero_actions",
-        "oracle_source_raw_actions",
-        "oracle_source_action_indices",
-        "oracle_scaled_deltas",
         "model_action_rows",
         "predicted_action_chunks",
         "oracle_chunk_source_indices",
@@ -1989,15 +1904,6 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
 def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | None:
     arrays = {
         "libero_actions": np.asarray(result.get("libero_actions", []), dtype=np.float32),
-        "oracle_source_raw_actions": np.asarray(
-            result.get("oracle_source_raw_actions", []), dtype=np.float32
-        ),
-        "oracle_source_action_indices": np.asarray(
-            result.get("oracle_source_action_indices", []), dtype=np.int64
-        ),
-        "oracle_scaled_deltas": np.asarray(
-            result.get("oracle_scaled_deltas", []), dtype=np.float32
-        ),
         "model_action_rows": np.asarray(result.get("model_action_rows", []), dtype=np.float32),
         "predicted_action_chunks": np.asarray(
             result.get("predicted_action_chunks", []), dtype=np.float32
@@ -3767,43 +3673,15 @@ def run_episode(
     init_state: np.ndarray,
     cfg: dict[str, Any],
     reset_env: bool = True,
-    oracle_raw_action_trajectory: np.ndarray | None = None,
-    oracle_absolute_action_trajectory: np.ndarray | None = None,
-    oracle_scaled_delta_trajectory: np.ndarray | None = None,
-    oracle_raw_action_indices: np.ndarray | None = None,
+    oracle_gt_world_trajectory: np.ndarray | None = None,
 ) -> dict[str, Any]:
     control = cfg["control"]
     dataset_domain_env = bool(cfg.get("dataset_domain_env", False))
-    oracle_actions_enabled = oracle_raw_action_trajectory is not None
+    oracle_actions_enabled = oracle_gt_world_trajectory is not None
     if bool(cfg.get("dataset_domain_oracle_actions", False)) != oracle_actions_enabled:
         raise ValueError(
-            "dataset_domain_oracle_actions and oracle_raw_action_trajectory must be enabled together."
+            "dataset_domain_oracle_actions and oracle_gt_world_trajectory must be enabled together."
         )
-    if oracle_actions_enabled:
-        assert oracle_raw_action_trajectory is not None
-        raw_oracle = np.asarray(oracle_raw_action_trajectory)
-        absolute_oracle = np.asarray(oracle_absolute_action_trajectory)
-        scaled_oracle = np.asarray(oracle_scaled_delta_trajectory)
-        raw_indices = np.asarray(oracle_raw_action_indices)
-        if raw_oracle.ndim != 2 or raw_oracle.shape[1] != 7:
-            raise ValueError(
-                f"Expected oracle raw actions with shape (T, 7), got {raw_oracle.shape}."
-            )
-        if absolute_oracle.shape != raw_oracle.shape:
-            raise ValueError(
-                "oracle_absolute_action_trajectory must match raw actions, "
-                f"got raw={raw_oracle.shape}, absolute={absolute_oracle.shape}."
-            )
-        if scaled_oracle.shape != (len(raw_oracle), 6):
-            raise ValueError(
-                "oracle_scaled_delta_trajectory must have shape (T, 6), "
-                f"got raw={raw_oracle.shape}, scaled={scaled_oracle.shape}."
-            )
-        if raw_indices.shape != (len(raw_oracle),):
-            raise ValueError(
-                "oracle_raw_action_indices must contain one source index per raw action, "
-                f"got actions={raw_oracle.shape}, indices={raw_indices.shape}."
-            )
     configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 1000)))
     max_steps = (
         int(LIBERO_STANDARD_MAX_STEPS[suite_name])
@@ -3926,10 +3804,7 @@ def run_episode(
             cfg=cfg,
         )
     synchronized_gripper_controller_actions: list[list[float]] = []
-    effective_synchronize_gripper_controller_state = bool(
-        control.get("synchronize_gripper_controller_state", True)
-    ) and not oracle_actions_enabled
-    if effective_synchronize_gripper_controller_state:
+    if bool(control.get("synchronize_gripper_controller_state", True)):
         synchronized_gripper_controller_actions = synchronize_gripper_controller_state(env)
         raw_obs = get_raw_obs(env, force_update=True)
 
@@ -3937,7 +3812,6 @@ def run_episode(
     # Absolute pose execution only.
     for robot in env.robots:
         robot.controller.use_delta = False
-    refresh_arm_controller_state(env)
 
 
     for _ in range(warmup_steps):
@@ -3984,9 +3858,6 @@ def run_episode(
 
     rewards: list[float] = []
     libero_actions: list[np.ndarray] = []
-    oracle_source_raw_actions: list[np.ndarray] = []
-    oracle_source_action_indices: list[int] = []
-    oracle_scaled_deltas: list[np.ndarray] = []
     model_action_rows: list[np.ndarray] = []
     # Keep every complete policy prediction for post-hoc diagnosis.  The
     # executed rows alone cannot reveal whether replanning truncated a
@@ -4056,7 +3927,7 @@ def run_episode(
     done = False
     model_call_count = 0
     policy_forward_call_count = 0
-    oracle_cursor = -1
+    oracle_cursor = 0
     oracle_chunk_source_indices: list[np.ndarray] = []
     steps = 0
     start_s = time.perf_counter()
@@ -4201,148 +4072,8 @@ def run_episode(
         )
         return False
 
-    def execute_raw_action_oracle() -> None:
-        nonlocal raw_obs, steps, done, success_ever, manual_failure, oracle_cursor
-        # A source demonstration action is already one policy-frequency control
-        # interval. Execute it exactly once. Holding or skipping rows would
-        # change the source controller integration and contact dynamics.
-        assert oracle_raw_action_trajectory is not None
-        assert oracle_absolute_action_trajectory is not None
-        assert oracle_scaled_delta_trajectory is not None
-        assert oracle_raw_action_indices is not None
-        raw_oracle = np.asarray(oracle_raw_action_trajectory, dtype=np.float64)
-        absolute_oracle = np.asarray(
-            oracle_absolute_action_trajectory, dtype=np.float64
-        )
-        scaled_oracle = np.asarray(
-            oracle_scaled_delta_trajectory, dtype=np.float64
-        )
-        raw_indices = np.asarray(oracle_raw_action_indices, dtype=np.int64)
-        oracle_chunk_source_indices.append(raw_indices.copy())
-        chunk_start_model_worlds.append(
-            pose9_to_homo_np(eef_pose9_gripper_from_obs(raw_obs)[:9]).astype(np.float32)
-        )
-        oracle_executed_count = 0
-        for (
-            source_action,
-            absolute_action,
-            scaled_delta,
-            source_action_index,
-        ) in zip(
-            raw_oracle,
-            absolute_oracle,
-            scaled_oracle,
-            raw_indices,
-            strict=True,
-        ):
-            if steps >= max_steps or done or success_ever:
-                break
-            if keyboard.poll():
-                manual_failure = True
-                break
-
-            current_model_world = pose9_to_homo_np(
-                eef_pose9_gripper_from_obs(raw_obs)[:9]
-            )
-            current_controller_world = current_controller_eef_world(env)
-            controller_to_model = (
-                fast_inverse_homogeneous(current_controller_world) @ current_model_world
-            )
-            target_controller_world = np.eye(4, dtype=np.float64)
-            target_controller_world[:3, :3] = R.from_rotvec(
-                absolute_action[3:6]
-            ).as_matrix()
-            target_controller_world[:3, 3] = absolute_action[:3]
-            target_model_world = target_controller_world @ controller_to_model
-
-            try:
-                raw_obs, reward, done, _ = env.step(absolute_action)
-            except ValueError as exc:
-                if "terminated episode" in str(exc):
-                    done = True
-                    break
-                raise
-
-            steps += 1
-            oracle_executed_count += 1
-            oracle_cursor = int(source_action_index)
-            reward = float(reward)
-            rewards.append(reward)
-            libero_actions.append(np.asarray(absolute_action, dtype=np.float32))
-            oracle_source_raw_actions.append(np.asarray(source_action, dtype=np.float32))
-            oracle_source_action_indices.append(int(source_action_index))
-            oracle_scaled_deltas.append(np.asarray(scaled_delta, dtype=np.float32))
-            target_controller_pose9.append(matrix_to_pose9(target_controller_world))
-            target_model_worlds.append(np.asarray(target_model_world, dtype=np.float32))
-            gripper_commands.append(float(source_action[-1]))
-            gripper_actual_widths.append(float(gripper_scalar(raw_obs)))
-            waypoint_hold_counts.append(1)
-
-            achieved_pose = eef_pose9_gripper_from_obs(raw_obs)
-            achieved_model_world = pose9_to_homo_np(achieved_pose[:9])
-            achieved_model_worlds.append(
-                np.asarray(achieved_model_world, dtype=np.float32)
-            )
-            tracking_position_errors.append(
-                float(
-                    np.linalg.norm(
-                        achieved_model_world[:3, 3] - target_model_world[:3, 3]
-                    )
-                )
-            )
-            tracking_rotation_errors.append(
-                rotation_error_radians(
-                    achieved_model_world[:3, :3],
-                    target_model_world[:3, :3],
-                )
-            )
-
-            step_object_positions, step_object_quaternions = capture_observable_object_poses(
-                raw_obs,
-                object_pose_names,
-            )
-            object_positions.append(step_object_positions)
-            object_quaternions.append(step_object_quaternions)
-            goal_predicate_values.append(
-                capture_goal_predicates(env, raw_goal_predicates)
-            )
-            scene_joint_values.append(
-                capture_scene_scalar_joints(env, scene_joint_records)
-            )
-            (
-                all_contacts,
-                robot_contacts,
-                all_contact_count,
-                robot_contact_count,
-            ) = capture_contact_pairs(env, robot_contact_geoms)
-            contact_pair_strings.append(all_contacts)
-            robot_scene_contact_pair_strings.append(robot_contacts)
-            contact_counts.append(int(all_contact_count))
-            robot_scene_contact_counts.append(int(robot_contact_count))
-            render_viewer3d(env, cfg, steps)
-            if save_video:
-                append_video_frames(
-                    video_frames,
-                    raw_obs,
-                    list(cfg["camera_names"]),
-                )
-
-            try:
-                success_ever = success_ever or bool(env.check_success())
-            except Exception:
-                success_ever = success_ever or bool(reward > 0.0)
-
-        chunk_executed_waypoint_counts.append(int(oracle_executed_count))
-
     try:
-        if oracle_actions_enabled:
-            execute_raw_action_oracle()
-        while (
-            not oracle_actions_enabled
-            and steps < max_steps
-            and not done
-            and not success_ever
-        ):
+        while steps < max_steps and not done and not success_ever:
             if keyboard.poll():
                 manual_failure = True
                 break
@@ -4398,24 +4129,35 @@ def run_episode(
             model_input_hashes.append(input_fingerprints["__all__"])
             if not first_model_input_component_hashes:
                 first_model_input_component_hashes = input_fingerprints
-            chunk_batch = infer.predict_action_chunk_obs(
-                model_observation,
-                task=task_language,
-                postprocess=True,
-                state_pose_mode="identity",
-                noise_seed=deterministic_policy_noise_seed(
-                    policy_noise_seed_base,
-                    suite_name=suite_name,
-                    task_id=int(task_id),
-                    episode_index=int(episode_index),
-                    model_call_index=int(model_call_count),
-                ),
-            )
-            policy_forward_call_count += 1
-            if hasattr(chunk_batch, "detach"):
-                chunk = chunk_batch[0].detach().cpu().numpy()
+            current_oracle_chunk_indices: np.ndarray | None = None
+            if oracle_actions_enabled:
+                assert oracle_gt_world_trajectory is not None
+                chunk, current_oracle_chunk_indices = make_dataset_domain_oracle_chunk(
+                    gt_world_trajectory=oracle_gt_world_trajectory,
+                    cursor=oracle_cursor,
+                    current_eef_pose9_gripper=eef_pose,
+                    chunk_size=int(getattr(infer.policy.config, "chunk_size", 50)),
+                )
+                oracle_chunk_source_indices.append(current_oracle_chunk_indices.copy())
             else:
-                chunk = np.asarray(chunk_batch)[0]
+                chunk_batch = infer.predict_action_chunk_obs(
+                    model_observation,
+                    task=task_language,
+                    postprocess=True,
+                    state_pose_mode="identity",
+                    noise_seed=deterministic_policy_noise_seed(
+                        policy_noise_seed_base,
+                        suite_name=suite_name,
+                        task_id=int(task_id),
+                        episode_index=int(episode_index),
+                        model_call_index=int(model_call_count),
+                    ),
+                )
+                policy_forward_call_count += 1
+                if hasattr(chunk_batch, "detach"):
+                    chunk = chunk_batch[0].detach().cpu().numpy()
+                else:
+                    chunk = np.asarray(chunk_batch)[0]
             predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
 
@@ -4513,6 +4255,14 @@ def run_episode(
                 )
             )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
+            selected_oracle_indices = (
+                None
+                if current_oracle_chunk_indices is None
+                else np.asarray(
+                    current_oracle_chunk_indices[start_idx:end_idx],
+                    dtype=np.int64,
+                )
+            )
             previous_predicted_width = float(
                 chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
             )
@@ -4533,6 +4283,7 @@ def run_episode(
             normal_base_selected_count = max(0, normal_base_end_idx - start_idx)
             committed_selected_count = max(0, committed_end_idx - start_idx)
             executed_waypoints_this_chunk = 0
+            last_executed_selected_row_index: int | None = None
             chunk_execution_start_steps = steps
             chunk_start_controller_world = current_controller_eef_world(env).copy()
             rollback_requested = False
@@ -4613,6 +4364,7 @@ def run_episode(
 
                     steps += 1
                     hold_count += 1
+                    last_executed_selected_row_index = int(selected_row_index)
                     step_object_positions, step_object_quaternions = capture_observable_object_poses(
                         raw_obs,
                         object_pose_names,
@@ -4699,6 +4451,13 @@ def run_episode(
                 waypoint_hold_counts.append(int(hold_count))
                 if manual_failure or rollback_requested or done or success_ever:
                     break
+            if (
+                selected_oracle_indices is not None
+                and last_executed_selected_row_index is not None
+            ):
+                oracle_cursor = int(
+                    selected_oracle_indices[last_executed_selected_row_index]
+                )
             chunk_executed_waypoint_counts.append(int(executed_waypoints_this_chunk))
             if steps > chunk_execution_start_steps:
                 executed_chunk_start_controller_world_history.append(
@@ -4742,8 +4501,6 @@ def run_episode(
             if success_ever
             else "env_done"
             if done
-            else "source_actions_exhausted"
-            if oracle_actions_enabled
             else "max_steps"
         ),
         "steps": int(steps),
@@ -4764,7 +4521,7 @@ def run_episode(
         "model_call_count": int(model_call_count),
         "policy_forward_call_count": int(policy_forward_call_count),
         "action_source": (
-            "source_demo_raw_delta_to_source_anchored_absolute_osc"
+            "source_demo_gt_pose9_gripper"
             if oracle_actions_enabled
             else "policy_flow_matching_sample"
         ),
@@ -4772,8 +4529,8 @@ def run_episode(
             int(oracle_cursor) if oracle_actions_enabled else None
         ),
         "oracle_trajectory_length": (
-            int(len(oracle_raw_action_trajectory))
-            if oracle_raw_action_trajectory is not None
+            int(len(oracle_gt_world_trajectory))
+            if oracle_gt_world_trajectory is not None
             else None
         ),
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
@@ -4784,7 +4541,7 @@ def run_episode(
         "gripper_delta_threshold": float(gripper_delta_threshold),
         "gripper_delta_alignment": gripper_delta_alignment,
         "synchronize_gripper_controller_state": bool(
-            effective_synchronize_gripper_controller_state
+            control.get("synchronize_gripper_controller_state", True)
         ),
         "initial_gripper_controller_actions": synchronized_gripper_controller_actions,
         "gripper_target_tolerance": float(gripper_target_tolerance),
@@ -4882,13 +4639,6 @@ def run_episode(
             float(np.max(chunk_boundary_rotation_errors)) if chunk_boundary_rotation_errors else 0.0
         ),
         "libero_actions": np.asarray(libero_actions, dtype=np.float32),
-        "oracle_source_raw_actions": np.asarray(
-            oracle_source_raw_actions, dtype=np.float32
-        ),
-        "oracle_source_action_indices": np.asarray(
-            oracle_source_action_indices, dtype=np.int64
-        ),
-        "oracle_scaled_deltas": np.asarray(oracle_scaled_deltas, dtype=np.float32),
         "model_action_rows": np.asarray(model_action_rows, dtype=np.float32),
         "predicted_action_chunks": np.asarray(predicted_action_chunks, dtype=np.float32),
         "oracle_chunk_source_indices": np.asarray(
@@ -5037,20 +4787,12 @@ def restore_dataset_domain_episode(
     demo_file = Path(task_source["demo_file"])
     demo_name = str(demo_names[episode_index])
     states, _actions, model_xml, source_fps = load_demo_group(demo_file, demo_name)
-    dataset_state_index = int(cfg.get("dataset_domain_state_observation_offset", 1))
-    if dataset_state_index not in (0, 1):
+    state_index = int(cfg.get("dataset_domain_state_observation_offset", 1))
+    if state_index not in (0, 1):
         raise ValueError(
             "dataset_domain_state_observation_offset must be 0 or 1, "
-            f"got {dataset_state_index}."
+            f"got {state_index}."
         )
-    # Exact source-action replay starts before actions[0]. Policy diagnostics
-    # still start from the first observation represented in the converted
-    # dataset, which is normally states[1] for official LIBERO v1 files.
-    state_index = (
-        0
-        if bool(cfg.get("dataset_domain_oracle_actions", False))
-        else dataset_state_index
-    )
     if states.ndim != 2 or state_index >= len(states):
         raise ValueError(
             f"Cannot initialize dataset-domain episode from {demo_file}:{demo_name}: "
@@ -5080,25 +4822,19 @@ def restore_dataset_domain_episode(
         "source_fps": None if source_fps is None else float(source_fps),
         "state_index": int(state_index),
         "state_mapping": f"initial_state = states[{state_index}]",
-        "dataset_observation_state_index": int(dataset_state_index),
         "source_state_count": int(len(states)),
     }
     return np.asarray(states[state_index]).copy(), metadata
 
 
-def load_dataset_domain_raw_action_trajectory(
+def reconstruct_dataset_domain_gt_world_trajectory(
     *,
     env: Any,
     task_source: dict[str, Any],
     episode_index: int,
     cfg: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Load source controls aligned with the restored dataset observation.
-
-    Exact source replay starts from ``states[0]`` and executes ``actions[0:]``.
-    This is intentionally distinct from a policy dataset-domain diagnostic,
-    whose first converted observation is normally rendered from ``states[1]``.
-    """
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Reconstruct the converted demo's pose9+gripper labels in simulator world."""
 
     if __package__ and __package__.startswith("benchmarks."):
         from .libero_hdf5_to_dataset import load_demo_group
@@ -5108,77 +4844,77 @@ def load_dataset_domain_raw_action_trajectory(
     demo_names = list(task_source["demo_names"])
     demo_name = str(demo_names[int(episode_index)])
     demo_file = Path(task_source["demo_file"])
-    states, actions, _model_xml, source_fps = load_demo_group(demo_file, demo_name)
-    dataset_state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
-    if actions.ndim != 2 or actions.shape[1] != 7:
+    states, _actions, _model_xml, _source_fps = load_demo_group(demo_file, demo_name)
+    state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
+    source_state_indices = np.arange(state_offset, len(states), dtype=np.int64)
+    if source_state_indices.size < 2:
         raise ValueError(
-            f"Expected source LIBERO actions with shape (T, 7), got "
-            f"{actions.shape} in {demo_file}:{demo_name}."
+            f"GT oracle needs at least two converted observations, but "
+            f"{demo_file}:{demo_name} provides states shape={states.shape} "
+            f"with offset={state_offset}."
         )
-    if dataset_state_offset < 0 or dataset_state_offset >= len(actions):
-        raise ValueError(
-            f"Cannot align source actions for states shape={states.shape}, "
-            f"actions shape={actions.shape}, state_offset={dataset_state_offset}."
-        )
-    source_action_indices = np.arange(0, len(actions), dtype=np.int64)
-    raw_trajectory = np.ascontiguousarray(
-        np.asarray(actions[source_action_indices], dtype=np.float64)
-    )
 
-    for robot in env.robots:
-        robot.controller.use_delta = False
-    absolute_actions: list[np.ndarray] = []
-    scaled_deltas: list[np.ndarray] = []
-    for source_action_index, source_action in zip(
-        source_action_indices,
-        raw_trajectory,
-        strict=True,
-    ):
-        # Anchor the desired setpoint to the source pose at which this command
-        # was issued. This is a coordinate conversion of the original command,
-        # not an added offset or task-specific contact heuristic.
-        env.set_init_state(states[int(source_action_index)])
-        absolute_action, _target_world, scaled_delta = (
-            libero_delta_action_to_absolute_action(
-                env,
-                source_action,
-                force_controller_update=True,
-            )
-        )
-        absolute_actions.append(absolute_action)
-        scaled_deltas.append(scaled_delta)
+    gt_world_poses: list[np.ndarray] = []
+    for state_index in source_state_indices:
+        raw_obs = env.set_init_state(states[int(state_index)])
+        gt_world_poses.append(eef_pose9_gripper_from_obs(raw_obs))
 
-    # Leave the simulator at the observation used to start evaluation. The
-    # episode runner sets this state again, but restoring it here prevents this
-    # loader from exposing the final source state to any caller.
-    env.set_init_state(states[0])
-    refresh_arm_controller_state(env)
-    absolute_trajectory = np.ascontiguousarray(
-        np.stack(absolute_actions), dtype=np.float64
+    # Leave the simulator at the exact first converted observation. run_episode
+    # sets it once more, but doing so here also makes this helper safe to inspect
+    # independently.
+    env.set_init_state(states[state_offset])
+    trajectory = np.ascontiguousarray(np.stack(gt_world_poses), dtype=np.float32)
+    return trajectory, {
+        "demo_file": str(demo_file),
+        "demo_name": demo_name,
+        "source_state_indices": source_state_indices.tolist(),
+        "trajectory_length": int(len(trajectory)),
+        "trajectory_format": "simulator_world_pose9_plus_physical_gripper_width",
+    }
+
+
+def make_dataset_domain_oracle_chunk(
+    *,
+    gt_world_trajectory: np.ndarray,
+    cursor: int,
+    current_eef_pose9_gripper: np.ndarray,
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Express upcoming absolute GT poses relative to the current actual EEF."""
+
+    trajectory = np.asarray(gt_world_trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[1] < 10:
+        raise ValueError(f"Expected GT trajectory shape (T, >=10), got {trajectory.shape}.")
+    if len(trajectory) == 0:
+        raise ValueError("GT trajectory is empty.")
+
+    start = int(np.clip(int(cursor), 0, len(trajectory) - 1))
+    resolved_chunk_size = max(1, int(chunk_size))
+    stop = min(len(trajectory), start + resolved_chunk_size)
+    source_indices = np.arange(start, stop, dtype=np.int64)
+    if len(source_indices) < resolved_chunk_size:
+        source_indices = np.concatenate(
+            [
+                source_indices,
+                np.full(
+                    resolved_chunk_size - len(source_indices),
+                    len(trajectory) - 1,
+                    dtype=np.int64,
+                ),
+            ]
+        )
+    targets = trajectory[source_indices]
+
+    current_world = pose9_to_homo_np(
+        np.asarray(current_eef_pose9_gripper, dtype=np.float32)[:9]
     )
-    scaled_delta_trajectory = np.ascontiguousarray(
-        np.stack(scaled_deltas), dtype=np.float64
-    )
-    return (
-        raw_trajectory,
-        absolute_trajectory,
-        scaled_delta_trajectory,
-        source_action_indices,
-        {
-            "demo_file": str(demo_file),
-            "demo_name": demo_name,
-            "source_fps": None if source_fps is None else float(source_fps),
-            "initial_state_index": 0,
-            "dataset_observation_state_index": int(dataset_state_offset),
-            "source_action_indices": source_action_indices.tolist(),
-            "trajectory_length": int(len(raw_trajectory)),
-            "trajectory_format": "libero_normalized_osc_delta_plus_gripper",
-            "execution_format": (
-                "source_state_anchored_absolute_osc_pose_plus_source_gripper"
-            ),
-            "controller_use_delta": False,
-        },
-    )
+    target_worlds = pose9_to_homo_np(targets[:, :9])
+    relative_targets = fast_inverse_homogeneous(current_world) @ target_worlds
+    chunk = np.concatenate(
+        [matrix_to_pose9(relative_targets), targets[:, 9:10]],
+        axis=-1,
+    ).astype(np.float32)
+    return chunk, source_indices
 
 
 def evaluate_task(
@@ -5311,10 +5047,7 @@ def evaluate_task(
         shared_layout_index = 0
         for episode_idx in resolved_episode_indices:
             environment_alignment: dict[str, Any] | None = None
-            oracle_raw_action_trajectory: np.ndarray | None = None
-            oracle_absolute_action_trajectory: np.ndarray | None = None
-            oracle_scaled_delta_trajectory: np.ndarray | None = None
-            oracle_raw_action_indices: np.ndarray | None = None
+            oracle_gt_world_trajectory: np.ndarray | None = None
             episode_dir = (
                 output_dir
                 / suite_name
@@ -5352,12 +5085,9 @@ def evaluate_task(
                     )
                     if bool(cfg.get("dataset_domain_oracle_actions", False)):
                         (
-                            oracle_raw_action_trajectory,
-                            oracle_absolute_action_trajectory,
-                            oracle_scaled_delta_trajectory,
-                            oracle_raw_action_indices,
+                            oracle_gt_world_trajectory,
                             oracle_metadata,
-                        ) = load_dataset_domain_raw_action_trajectory(
+                        ) = reconstruct_dataset_domain_gt_world_trajectory(
                             env=env,
                             task_source=task_source,
                             episode_index=int(episode_idx),
@@ -5406,10 +5136,7 @@ def evaluate_task(
                     init_state=episode_init_state,
                     cfg=cfg,
                     reset_env=False,
-                    oracle_raw_action_trajectory=oracle_raw_action_trajectory,
-                    oracle_absolute_action_trajectory=oracle_absolute_action_trajectory,
-                    oracle_scaled_delta_trajectory=oracle_scaled_delta_trajectory,
-                    oracle_raw_action_indices=oracle_raw_action_indices,
+                    oracle_gt_world_trajectory=oracle_gt_world_trajectory,
                 )
                 result["evaluation_protocol"] = evaluation_protocol_for_config(cfg)
                 result["environment_alignment"] = (

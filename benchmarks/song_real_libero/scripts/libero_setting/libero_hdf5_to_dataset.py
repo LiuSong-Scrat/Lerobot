@@ -60,7 +60,10 @@ from tqdm import tqdm
 
 POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
+ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
 POINT_CLOUD_CHANNELS = 6
+ACTION_LABEL_SEMANTICS = "source_raw_delta_to_source_state_anchored_absolute_osc_target"
+OBSERVATION_STATE_SEMANTICS = "achieved_eef_pose_at_reconstructed_observation"
 
 DATASET_FEATURES = {
     "action": {
@@ -325,6 +328,10 @@ def world_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
+def action_target_ee_pose_file(root: Path, episode_index: int) -> Path:
+    return root / ACTION_TARGET_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
+
+
 def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
     pc_dir = root / POINT_CLOUD_DIR_NAME
     pc_dir.mkdir(parents=True, exist_ok=True)
@@ -363,6 +370,30 @@ def write_worldflow_meta(root: Path) -> None:
         json.dump(meta, f, indent=2)
 
 
+def write_action_target_meta(root: Path) -> None:
+    pose_dir = root / ACTION_TARGET_EE_POSE_DIR_NAME
+    pose_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "key": "action.absolute_osc_target_pose",
+        "dtype": "float32",
+        "shape": [9],
+        "layout": "episode_npy",
+        "path_format": (
+            f"{ACTION_TARGET_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy"
+        ),
+        "coordinate_frame": "overview_camera",
+        "source": "raw LIBERO HDF5 normalized OSC_POSE delta action",
+        "source_state_anchor": "states[i]",
+        "action_index_mapping": "output[i] uses source actions[i]",
+        "conversion": (
+            "controller.set_goal(raw[:6]) with use_delta=True, including "
+            "controller orientation-goal history; no heuristic displacement or overshoot"
+        ),
+    }
+    with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
 def save_episode_point_clouds(
     root: Path,
     episode_index: int,
@@ -396,6 +427,22 @@ def save_episode_worldflow(root: Path, episode_index: int, reference_ee_poses: n
     np.save(path, reference_ee_poses)
 
 
+def save_episode_action_targets(
+    root: Path,
+    episode_index: int,
+    action_target_ee_poses: np.ndarray,
+) -> None:
+    action_target_ee_poses = np.ascontiguousarray(action_target_ee_poses, dtype=np.float32)
+    if action_target_ee_poses.ndim != 2 or action_target_ee_poses.shape[-1] != 9:
+        raise ValueError(
+            "Expected reference-frame absolute action targets shape (T, 9), "
+            f"got {action_target_ee_poses.shape}"
+        )
+    path = action_target_ee_pose_file(root, episode_index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, action_target_ee_poses)
+
+
 def save_episode_images_to_paths(
     dataset: LeRobotDataset,
     images: np.ndarray,
@@ -421,32 +468,57 @@ def homo_to_pose9(H: np.ndarray) -> np.ndarray:
     return np.concatenate([H[..., :3, 3], H[..., :3, 0], H[..., :3, 1]], axis=-1).astype(np.float32)
 
 
-def from_reference_to_umi_tra_pose9(obs_pose9_eff_to_reference: np.ndarray) -> np.ndarray:
-    reference_transforms = pose9_to_homo_np(obs_pose9_eff_to_reference)
-    eff0_to_reference = reference_transforms[0]
-    reference_to_eff = fast_inverse_homogeneous(reference_transforms)
-    eff0_to_eff = reference_to_eff @ eff0_to_reference
-    eff_to_eff0 = fast_inverse_homogeneous(eff0_to_eff)
-    return homo_to_pose9(eff_to_eff0)
+def from_reference_to_umi_tra_pose9(
+    pose9_eff_to_reference: np.ndarray,
+    *,
+    origin_pose9_eff_to_reference: np.ndarray | None = None,
+) -> np.ndarray:
+    """Express poses in one explicit episode-origin EEF frame.
+
+    Both achieved observation poses and commanded action targets must use the
+    same origin. In particular, an action target is not allowed to become its
+    own origin: doing that would erase the target displacement at frame zero.
+    """
+
+    reference_transforms = pose9_to_homo_np(pose9_eff_to_reference)
+    if reference_transforms.ndim != 3 or reference_transforms.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"Expected pose sequence with shape (T, 9), got {np.asarray(pose9_eff_to_reference).shape}"
+        )
+    if origin_pose9_eff_to_reference is None:
+        origin_pose9_eff_to_reference = np.asarray(pose9_eff_to_reference)[0]
+    origin_to_reference = pose9_to_homo_np(
+        np.asarray(origin_pose9_eff_to_reference, dtype=np.float32)
+    )
+    reference_to_origin = fast_inverse_homogeneous(origin_to_reference)
+    eff_to_origin = reference_to_origin @ reference_transforms
+    return homo_to_pose9(eff_to_origin)
 
 
 def make_episode_buffer(
     dataset: LeRobotDataset,
     task: str,
     actions: np.ndarray,
+    observation_states: np.ndarray,
     timestamps: np.ndarray,
     images: np.ndarray | None = None,
     image_key: str | None = None,
 ) -> dict[str, Any]:
     actions = np.ascontiguousarray(actions, dtype=np.float32)
+    observation_states = np.ascontiguousarray(observation_states, dtype=np.float32)
     timestamps = np.asarray(timestamps, dtype=np.float32).reshape(-1)
+    if observation_states.shape != actions.shape:
+        raise ValueError(
+            "observation.state must be frame-aligned with action and have the same "
+            f"shape, got state={observation_states.shape}, action={actions.shape}."
+        )
     episode_buffer = dataset.create_episode_buffer()
     episode_buffer["size"] = len(actions)
     episode_buffer["task"] = [task] * len(actions)
     episode_buffer["frame_index"] = np.arange(len(actions), dtype=np.int64)
     episode_buffer["timestamp"] = timestamps
     episode_buffer["action"] = actions
-    episode_buffer["observation.state"] = actions
+    episode_buffer["observation.state"] = observation_states
     if images is not None and image_key is not None:
         if len(images) != len(actions):
             raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
@@ -463,11 +535,17 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict[str, Any]) -> 
     episode_index = dataset.meta.total_episodes
     save_episode_point_clouds(dataset.root, episode_index, episode["point_clouds"])
     save_episode_worldflow(dataset.root, episode_index, episode["world_ee_poses"])
+    save_episode_action_targets(
+        dataset.root,
+        episode_index,
+        episode["action_target_ee_poses"],
+    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
             episode["task"],
             episode["actions"],
+            episode["observation_states"],
             episode["timestamps"],
         )
     )
@@ -495,7 +573,15 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
     else:
         np.save(artifact_dir / "point_clouds.npy", np.ascontiguousarray(episode["point_clouds"], dtype=np.float32))
     np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
+    np.save(
+        artifact_dir / "action_target_ee_poses.npy",
+        np.ascontiguousarray(episode["action_target_ee_poses"], dtype=np.float32),
+    )
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
+    np.save(
+        artifact_dir / "observation_states.npy",
+        np.ascontiguousarray(episode["observation_states"], dtype=np.float32),
+    )
     np.save(artifact_dir / "timestamps.npy", np.asarray(episode["timestamps"], dtype=np.float32))
     if "images" in episode:
         np.save(artifact_dir / "images.npy", np.ascontiguousarray(episode["images"], dtype=np.uint8))
@@ -511,8 +597,10 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
     required_files = (
         "record.json",
         "actions.npy",
+        "observation_states.npy",
         "timestamps.npy",
         "world_ee_poses.npy",
+        "action_target_ee_poses.npy",
     )
     missing = [name for name in required_files if not (artifact_dir / name).is_file()]
     if missing:
@@ -544,18 +632,48 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         )
 
     actions = np.load(artifact_dir / "actions.npy", mmap_mode="r")
+    observation_states = np.load(artifact_dir / "observation_states.npy", mmap_mode="r")
     timestamps = np.load(artifact_dir / "timestamps.npy", mmap_mode="r")
     world_ee_poses = np.load(artifact_dir / "world_ee_poses.npy", mmap_mode="r")
+    action_target_ee_poses = np.load(
+        artifact_dir / "action_target_ee_poses.npy", mmap_mode="r"
+    )
     frames = int(actions.shape[0])
     shape_errors = []
     if actions.ndim != 2 or actions.shape[1] != 10:
         shape_errors.append(f"actions shape={actions.shape}, expected (T, 10)")
+    if observation_states.shape != (frames, 10):
+        shape_errors.append(
+            f"observation_states shape={observation_states.shape}, expected ({frames}, 10)"
+        )
     if timestamps.shape != (frames,):
         shape_errors.append(f"timestamps shape={timestamps.shape}, expected ({frames},)")
     if world_ee_poses.shape != (frames, 9):
         shape_errors.append(f"world_ee_poses shape={world_ee_poses.shape}, expected ({frames}, 9)")
+    if action_target_ee_poses.shape != (frames, 9):
+        shape_errors.append(
+            "action_target_ee_poses shape="
+            f"{action_target_ee_poses.shape}, expected ({frames}, 9)"
+        )
     if int(record.get("frames", -1)) != frames:
         shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
+    if record.get("action_label_semantics") != ACTION_LABEL_SEMANTICS:
+        shape_errors.append(
+            "record action_label_semantics does not identify raw-delta absolute targets"
+        )
+    if record.get("observation_state_semantics") != OBSERVATION_STATE_SEMANTICS:
+        shape_errors.append(
+            "record observation_state_semantics does not identify achieved EEF poses"
+        )
+    finite_arrays = {
+        "actions": actions,
+        "observation_states": observation_states,
+        "world_ee_poses": world_ee_poses,
+        "action_target_ee_poses": action_target_ee_poses,
+    }
+    for name, array in finite_arrays.items():
+        if not np.isfinite(np.asarray(array)).all():
+            shape_errors.append(f"{name} contains non-finite values")
 
     expected_timestamps = np.arange(frames, dtype=np.float32) / float(episode_job["cfg"]["fps"])
     if timestamps.shape == expected_timestamps.shape and not np.array_equal(
@@ -718,7 +836,11 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
 
     point_clouds = np.asarray(episode["point_clouds"], dtype=np.float32)
     actions = np.asarray(episode["actions"], dtype=np.float32)
+    observation_states = np.asarray(episode["observation_states"], dtype=np.float32)
     reference_ee_poses = np.asarray(episode["world_ee_poses"], dtype=np.float32)
+    action_target_ee_poses = np.asarray(
+        episode["action_target_ee_poses"], dtype=np.float32
+    )
     candidate_indices = list(range(0, len(point_clouds), stride))
     if len(candidate_indices) > vis_count:
         pick = np.linspace(0, len(candidate_indices) - 1, vis_count).round().astype(int)
@@ -729,9 +851,21 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
     for frame_idx in frame_indices:
         write_ascii_ply_points(episode_dir / f"frame_{frame_idx:04d}_point_cloud_eff.ply", point_clouds[frame_idx])
         write_ascii_ply_frame(episode_dir / f"frame_{frame_idx:04d}_umi_action_frame.ply", actions[frame_idx, :9])
+        write_ascii_ply_frame(
+            episode_dir / f"frame_{frame_idx:04d}_umi_observation_state_frame.ply",
+            observation_states[frame_idx, :9],
+        )
 
     write_ascii_ply_lines(episode_dir / "umi_action_trajectory.ply", actions[:, :3])
+    write_ascii_ply_lines(
+        episode_dir / "umi_observation_state_trajectory.ply",
+        observation_states[:, :3],
+    )
     write_ascii_ply_lines(episode_dir / "reference_ee_trajectory.ply", reference_ee_poses[:, :3])
+    write_ascii_ply_lines(
+        episode_dir / "reference_action_target_trajectory.ply",
+        action_target_ee_poses[:, :3],
+    )
     preview = {
         **record,
         "frame_indices": [int(idx) for idx in frame_indices],
@@ -743,9 +877,14 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         "gripper_template": str(cfg.get("gripper_template", "reap")),
         "files": {
             "umi_action_trajectory": "umi_action_trajectory.ply",
+            "umi_observation_state_trajectory": "umi_observation_state_trajectory.ply",
             "reference_ee_trajectory": "reference_ee_trajectory.ply",
+            "reference_action_target_trajectory": "reference_action_target_trajectory.ply",
             "point_cloud_pattern": "frame_XXXX_point_cloud_eff.ply",
-            "frame_pattern": "frame_XXXX_umi_action_frame.ply",
+            "action_frame_pattern": "frame_XXXX_umi_action_frame.ply",
+            "observation_state_frame_pattern": (
+                "frame_XXXX_umi_observation_state_frame.ply"
+            ),
         },
     }
     with open(episode_dir / "preview.json", "w", encoding="utf-8") as f:
@@ -1046,6 +1185,74 @@ def set_env_state_and_get_obs(env: Any, state: np.ndarray) -> dict[str, Any]:
         return env.env._get_observations()
 
 
+def libero_delta_action_to_absolute_target_world(
+    env: Any,
+    source_action: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstruct the OSC setpoint encoded by one raw LIBERO delta action.
+
+    The returned pose is the controller goal, not the pose reached after one
+    environment step. Contact, interpolation and tracking error may make those
+    poses differ. This function mirrors robosuite's delta branch exactly and
+    deliberately adds no heuristic offset.
+    """
+
+    raw_action = np.asarray(source_action, dtype=np.float64).reshape(-1)
+    if raw_action.shape != (7,):
+        raise ValueError(
+            f"Expected one raw LIBERO action with shape (7,), got {raw_action.shape}."
+        )
+    if not np.isfinite(raw_action).all():
+        raise ValueError("Raw LIBERO action contains non-finite values.")
+    if len(getattr(env, "robots", [])) != 1:
+        raise ValueError("Absolute OSC target reconstruction requires one LIBERO robot.")
+
+    controller = env.robots[0].controller
+    if not bool(getattr(controller, "use_delta", False)):
+        raise RuntimeError(
+            "Raw LIBERO action conversion requires an OSC controller with use_delta=True."
+        )
+    if str(getattr(controller, "impedance_mode", "fixed")) != "fixed":
+        raise RuntimeError(
+            "Raw 7D LIBERO action conversion currently requires fixed OSC impedance mode."
+        )
+    scaled_delta = np.asarray(
+        controller.scale_action(raw_action[:6]), dtype=np.float64
+    )
+    # Calling the controller itself also preserves robosuite's orientation
+    # history: an all-zero rotation delta keeps the previous goal_ori instead
+    # of silently replacing it with the currently achieved orientation.
+    controller.update(force=True)
+    controller.set_goal(raw_action[:6])
+    target_position = np.asarray(controller.goal_pos, dtype=np.float64).copy()
+    target_orientation = np.asarray(controller.goal_ori, dtype=np.float64).copy()
+
+    target_to_world = np.eye(4, dtype=np.float64)
+    target_to_world[:3, :3] = np.asarray(target_orientation, dtype=np.float64)
+    target_to_world[:3, 3] = np.asarray(target_position, dtype=np.float64)
+    return target_to_world, scaled_delta
+
+
+def world_target_to_reference_pose9(
+    env: Any,
+    target_to_world: np.ndarray,
+    reference_camera: str,
+) -> np.ndarray:
+    """Express a controller-world target in the current observation camera."""
+
+    from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+
+    reference_to_world = np.asarray(
+        get_camera_extrinsic_matrix(env.sim, normalize_camera_name(reference_camera)),
+        dtype=np.float64,
+    )
+    world_to_reference = fast_inverse_homogeneous(reference_to_world)
+    target_to_reference = world_to_reference @ np.asarray(
+        target_to_world, dtype=np.float64
+    )
+    return homo_to_pose9(target_to_reference).astype(np.float32)
+
+
 def collect_demo_episode(
     *,
     env: Any,
@@ -1058,6 +1265,16 @@ def collect_demo_episode(
 ) -> dict[str, Any]:
     if states.ndim != 2:
         raise ValueError(f"Expected demo states shape (T, D), got {states.shape}")
+    if actions is None:
+        raise KeyError(
+            "Raw HDF5 actions are required: action labels must be reconstructed "
+            "from source OSC commands and may not fall back to achieved states."
+        )
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or actions.shape[1] != 7:
+        raise ValueError(f"Expected raw LIBERO actions shape (T, 7), got {actions.shape}")
+    if not np.isfinite(actions).all():
+        raise ValueError("Raw LIBERO actions contain non-finite values.")
     configured_state_observation_offset = int(cfg.get("state_observation_offset", 1))
     if configured_state_observation_offset not in (0, 1):
         raise ValueError(
@@ -1068,15 +1285,13 @@ def collect_demo_episode(
         configured_state_observation_offset if cfg["replay_mode"] == "states" else 0
     )
 
-    frame_count = len(states)
-    if cfg["replay_mode"] == "step" and actions is not None:
-        frame_count = min(frame_count, len(actions) + 1)
-    elif cfg["replay_mode"] == "states":
+    frame_count = min(len(states), len(actions))
+    if cfg["replay_mode"] == "states":
         # Official LIBERO v1 create_dataset.py executes action[i] before
         # recording obs[i], but stores states[i]. Consequently obs[i] is
         # represented by states[i + 1]. The final source observation has no
         # corresponding states[T], so snapshot replay intentionally drops it.
-        frame_count -= state_observation_offset
+        frame_count = min(frame_count, len(states) - state_observation_offset)
     if max_frames is not None and max_frames > 0:
         frame_count = min(frame_count, int(max_frames))
     if frame_count <= 1:
@@ -1088,64 +1303,87 @@ def collect_demo_episode(
     save_video = bool(cfg.get("save_video", False))
     point_clouds_reference = np.empty((frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32)
     reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
+    action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
     image_frames: list[np.ndarray] = []
     save_rgb_images = bool(cfg.get("save_rgb_images", True))
     image_camera = image_feature_camera(cfg) if save_rgb_images else None
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
+    reference_camera = pc_camera_names[0]
 
-    if cfg["replay_mode"] == "step" and actions is not None:
+    def collect_observation_frame(
+        frame_idx: int,
+        raw_obs: dict[str, Any],
+        target_to_world: np.ndarray,
+    ) -> None:
+        if save_video:
+            append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+        if save_rgb_images and image_camera is not None:
+            image = dataset_image_from_raw_obs(raw_obs, image_camera)
+            if image is None:
+                raise KeyError(
+                    f"Missing RGB image for camera {image_camera!r} in LIBERO observation."
+                )
+            image_frames.append(image)
+        point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
+            observation_to_camera_point_cloud(
+                env,
+                raw_obs,
+                pc_camera_names,
+                observation_height,
+                observation_width,
+                num_points,
+                seed=episode_seed + frame_idx,
+            )
+        )
+        point_clouds_reference[frame_idx] = point_cloud_reference
+        reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
+        action_target_reference_ee_poses[frame_idx] = (
+            world_target_to_reference_pose9(
+                env,
+                target_to_world,
+                reference_camera,
+            )
+        )
+        grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+
+    if cfg["replay_mode"] == "step":
         raw_obs = set_env_state_and_get_obs(env, states[0])
         for frame_idx in range(frame_count):
-            if save_video:
-                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
-            if save_rgb_images and image_camera is not None:
-                image = dataset_image_from_raw_obs(raw_obs, image_camera)
-                if image is None:
-                    raise KeyError(f"Missing RGB image for camera {image_camera!r} in LIBERO observation.")
-                image_frames.append(image)
-            point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
-                observation_to_camera_point_cloud(
+            target_to_world, _scaled_delta = (
+                libero_delta_action_to_absolute_target_world(
                     env,
-                    raw_obs,
-                    pc_camera_names,
-                    observation_height,
-                    observation_width,
-                    num_points,
-                    seed=episode_seed + frame_idx,
+                    actions[frame_idx],
                 )
             )
-            point_clouds_reference[frame_idx] = point_cloud_reference
-            reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
-            grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+            collect_observation_frame(frame_idx, raw_obs, target_to_world)
             if frame_idx < frame_count - 1:
                 raw_obs, _, _, _ = env.step(actions[frame_idx])
     else:
         for frame_idx in range(frame_count):
-            state_idx = frame_idx + state_observation_offset
-            raw_obs = set_env_state_and_get_obs(env, states[state_idx])
-            if save_video:
-                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
-            if save_rgb_images and image_camera is not None:
-                image = dataset_image_from_raw_obs(raw_obs, image_camera)
-                if image is None:
-                    raise KeyError(f"Missing RGB image for camera {image_camera!r} in LIBERO observation.")
-                image_frames.append(image)
-            point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
-                observation_to_camera_point_cloud(
+            # HDF5 supervision is indexed as obs[i] / actions[i]. The source
+            # command actions[i] was issued from states[i], while official
+            # LIBERO v1 obs[i] is reconstructed from states[i + 1]. Compute
+            # the target at the source state first, then restore the separate
+            # observation snapshot. Never anchor actions[i] at states[i + 1].
+            action_source_state_idx = frame_idx
+            observation_state_idx = frame_idx + state_observation_offset
+            source_obs = set_env_state_and_get_obs(
+                env, states[action_source_state_idx]
+            )
+            target_to_world, _scaled_delta = (
+                libero_delta_action_to_absolute_target_world(
                     env,
-                    raw_obs,
-                    pc_camera_names,
-                    observation_height,
-                    observation_width,
-                    num_points,
-                    seed=episode_seed + frame_idx,
+                    actions[frame_idx],
                 )
             )
-            point_clouds_reference[frame_idx] = point_cloud_reference
-            reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
-            grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+            raw_obs = (
+                source_obs
+                if observation_state_idx == action_source_state_idx
+                else set_env_state_and_get_obs(env, states[observation_state_idx])
+            )
+            collect_observation_frame(frame_idx, raw_obs, target_to_world)
 
     if cfg.get("add_gripper_cloud", True):
         point_clouds_reference = add_reference_gripper_clouds_to_episode(
@@ -1163,20 +1401,54 @@ def collect_demo_episode(
             gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         )
     point_clouds = reference_point_cloud_to_current_eff(point_clouds_reference, reference_ee_poses)
-    umi_poses = from_reference_to_umi_tra_pose9(reference_ee_poses)
-    episode_actions = np.concatenate([umi_poses, grippers], axis=-1).astype(np.float32)
+    episode_origin_pose = reference_ee_poses[0]
+    observation_umi_poses = from_reference_to_umi_tra_pose9(
+        reference_ee_poses,
+        origin_pose9_eff_to_reference=episode_origin_pose,
+    )
+    action_target_umi_poses = from_reference_to_umi_tra_pose9(
+        action_target_reference_ee_poses,
+        origin_pose9_eff_to_reference=episode_origin_pose,
+    )
+    observation_states = np.concatenate(
+        [observation_umi_poses, grippers], axis=-1
+    ).astype(np.float32)
+    # Keep the existing physical-width gripper representation. The corrected
+    # semantics in this conversion concern the 9D EEF pose target; replacing
+    # it with the raw binary LIBERO gripper command would silently change the
+    # policy's gripper action space.
+    episode_actions = np.concatenate(
+        [action_target_umi_poses, grippers], axis=-1
+    ).astype(np.float32)
     timestamps = np.arange(len(episode_actions), dtype=np.float32) / float(cfg["fps"])
+    target_residual_m = np.linalg.norm(
+        action_target_reference_ee_poses[:, :3] - reference_ee_poses[:, :3],
+        axis=-1,
+    )
 
     episode = {
         "task": task_language,
         "actions": episode_actions,
+        "observation_states": observation_states,
         "point_clouds": point_clouds,
         # Legacy key/path retained for the existing WorldFlow dataset wrapper.
         # Values are expressed in the fixed Overview-camera reference frame.
         "world_ee_poses": reference_ee_poses,
+        "action_target_ee_poses": action_target_reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
         "state_observation_offset": state_observation_offset,
+        "action_label_semantics": ACTION_LABEL_SEMANTICS,
+        "observation_state_semantics": OBSERVATION_STATE_SEMANTICS,
+        "action_source_index_mapping": "output[i] uses source actions[i]",
+        "action_source_state_mapping": "source actions[i] is anchored at states[i]",
+        "observation_state_mapping": (
+            f"output observation[i] is reconstructed from states[i + {state_observation_offset}]"
+            if cfg["replay_mode"] == "states"
+            else "output observation[i] is the pre-action replay state for actions[i]"
+        ),
+        "target_residual_translation_m_mean": float(target_residual_m.mean()),
+        "target_residual_translation_m_max": float(target_residual_m.max()),
     }
     if save_rgb_images:
         if len(image_frames) != len(episode_actions):
@@ -1196,6 +1468,7 @@ def make_episode_record(
     model_sha256: str | None,
     source_fps: float | None,
     state_observation_offset: int,
+    episode: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "suite": suite_name,
@@ -1211,6 +1484,28 @@ def make_episode_record(
         "model_restoration_verified": model_sha256 is not None,
         "source_fps": source_fps,
         "state_observation_offset": int(state_observation_offset),
+        "action_label_semantics": str(episode["action_label_semantics"]),
+        "observation_state_semantics": str(
+            episode["observation_state_semantics"]
+        ),
+        "action_source_index_mapping": str(
+            episode["action_source_index_mapping"]
+        ),
+        "action_source_state_mapping": str(
+            episode["action_source_state_mapping"]
+        ),
+        "observation_state_mapping": str(episode["observation_state_mapping"]),
+        "action_pose_coordinate_frame": "episode_origin_eef",
+        "observation_state_coordinate_frame": "episode_origin_eef",
+        "absolute_action_target_sidecar_coordinate_frame": "overview_camera",
+        "gripper_action_semantics": "achieved_physical_width_metres_unchanged",
+        "heuristic_action_target_offset": False,
+        "target_residual_translation_m_mean": float(
+            episode["target_residual_translation_m_mean"]
+        ),
+        "target_residual_translation_m_max": float(
+            episode["target_residual_translation_m_max"]
+        ),
     }
 
 
@@ -1271,6 +1566,7 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         model_sha256=model_sha256,
         source_fps=source_fps,
         state_observation_offset=int(episode["state_observation_offset"]),
+        episode=episode,
     )
     artifact_dir = Path(job["tmp_path"])
     save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -1334,6 +1630,7 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
                 model_sha256=model_sha256,
                 source_fps=source_fps,
                 state_observation_offset=int(episode["state_observation_offset"]),
+                episode=episode,
             )
             artifact_dir = Path(episode_job["tmp_path"])
             save_episode_artifact(artifact_dir, episode, record, cfg)
@@ -1355,6 +1652,7 @@ def save_collected_temp_episode(
     with open(artifact_dir / "record.json", "r", encoding="utf-8") as f:
         record = json.load(f)
     actions = np.load(artifact_dir / "actions.npy")
+    observation_states = np.load(artifact_dir / "observation_states.npy")
     timestamps = np.load(artifact_dir / "timestamps.npy")
     images_path = artifact_dir / "images.npy"
     images = np.load(images_path, mmap_mode="r") if images_path.exists() else None
@@ -1363,6 +1661,9 @@ def save_collected_temp_episode(
     point_cloud_storage = str(cfg.get("point_cloud_storage", "zarr"))
     final_point_cloud_path = point_cloud_storage_path(dataset.root, episode_index, point_cloud_storage)
     final_world_ee_pose_path = world_ee_pose_file(dataset.root, episode_index)
+    final_action_target_ee_pose_path = action_target_ee_pose_file(
+        dataset.root, episode_index
+    )
     artifact_point_cloud_path = artifact_dir / "point_clouds.npy"
     artifact_point_cloud_zarr_path = artifact_dir / "point_clouds.zarr"
     if point_cloud_storage == "zarr":
@@ -1381,11 +1682,16 @@ def save_collected_temp_episode(
     else:
         move_episode_array(artifact_point_cloud_path, final_point_cloud_path)
     move_episode_array(artifact_dir / "world_ee_poses.npy", final_world_ee_pose_path)
+    move_episode_array(
+        artifact_dir / "action_target_ee_poses.npy",
+        final_action_target_ee_pose_path,
+    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
             str(record["task_language"]),
             actions,
+            observation_states,
             timestamps,
             images=images,
             image_key=cfg.get("image_feature_key"),
@@ -1395,8 +1701,12 @@ def save_collected_temp_episode(
     if int(cfg.get("vis_count", 0) or 0) > 0:
         preview_episode = {
             "actions": actions,
+            "observation_states": observation_states,
             "point_clouds": open_episode_point_clouds(dataset.root / POINT_CLOUD_DIR_NAME, episode_index),
             "world_ee_poses": np.load(final_world_ee_pose_path, mmap_mode="r"),
+            "action_target_ee_poses": np.load(
+                final_action_target_ee_pose_path, mmap_mode="r"
+            ),
         }
         export_episode_preview(preview_episode, vis_dir, record, cfg)
     record["videos"] = move_episode_videos(artifact_dir, vis_dir, record, cfg)
@@ -1490,6 +1800,7 @@ def main() -> None:
     )
     write_point_cloud_meta(dataset.root, storage=str(cfg["point_cloud_storage"]))
     write_worldflow_meta(dataset.root)
+    write_action_target_meta(dataset.root)
 
     summary: dict[str, Any] = {
         "created_unix_s": time.time(),
@@ -1537,6 +1848,32 @@ def main() -> None:
                 and int(cfg["state_observation_offset"]) == 1
                 else "not_applicable"
             ),
+        },
+        "action_label_semantics": {
+            "pose_label": ACTION_LABEL_SEMANTICS,
+            "observation_state": OBSERVATION_STATE_SEMANTICS,
+            "source_action_mapping": "output[i] uses source HDF5 actions[i]",
+            "source_state_anchor": (
+                "actions[i] is converted at states[i], the state from which the "
+                "source OSC command was issued"
+            ),
+            "observation_mapping": (
+                f"output observation[i] = render(states[i + {int(cfg['state_observation_offset'])}])"
+                if str(cfg["replay_mode"]) == "states"
+                else "output observation[i] is captured immediately before actions[i]"
+            ),
+            "absolute_target_conversion": (
+                "robosuite controller.set_goal(raw[:6]) with use_delta=True, "
+                "including persistent orientation-goal semantics"
+            ),
+            "heuristic_target_offset": False,
+            "contact_semantics": (
+                "action remains the commanded OSC setpoint even when contact "
+                "prevents the achieved observation pose from reaching it"
+            ),
+            "stored_action_frame": "episode_origin_eef",
+            "absolute_target_audit_sidecar_frame": "overview_camera",
+            "gripper_label": "achieved physical width metres (unchanged)",
         },
         "demo_model_restoration": (
             "per_demo_model_file" if bool(cfg["restore_demo_model"]) else "disabled"

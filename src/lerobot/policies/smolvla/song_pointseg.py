@@ -475,7 +475,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     The current frame is always stored at temporal index 0.  With ``bidirectional=True``
     (the default), the remaining entries contain both past and future frames.  This
     wrapper leaves the policy action chunk untouched; temporal poses are read from the
-    episode's raw action column instead.
+    episode's achieved ``observation.state`` trajectory.  Legacy datasets where state
+    and action were duplicates can still fall back to the action column.
     """
 
     def __init__(
@@ -513,7 +514,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.include_base_item = bool(include_base_item)
         self.mmap_mode = mmap_mode
         self._point_cloud_cache: dict[int, np.ndarray] = {}
-        self._episode_action_cache: dict[int, Tensor] = {}
+        self._episode_motion_state_cache: dict[int, Tensor] = {}
         self._index_dataset = None
 
     def __getattr__(self, name: str):
@@ -522,7 +523,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_point_cloud_cache"] = {}
-        state["_episode_action_cache"] = {}
+        state["_episode_motion_state_cache"] = {}
         state["_index_dataset"] = None
         return state
 
@@ -548,17 +549,29 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             self._point_cloud_cache[episode_index] = point_clouds
         return point_clouds
 
-    def _episode_actions(self, episode_index: int) -> Tensor:
-        cached = self._episode_action_cache.get(episode_index)
+    def _episode_motion_states(self, episode_index: int) -> Tensor:
+        """Load achieved EEF poses used by the geometric motion prior."""
+
+        cached = self._episode_motion_state_cache.get(episode_index)
         if cached is not None:
             return cached
 
-        # Lightweight test/custom datasets can expose per-episode action arrays.
+        # Lightweight test/custom datasets can expose per-episode state arrays.
+        observation_states = getattr(self.dataset, "observation_states", None)
+        if observation_states is not None:
+            episode_states = torch.as_tensor(
+                observation_states[episode_index], dtype=torch.float32
+            )
+            self._episode_motion_state_cache[episode_index] = episode_states
+            return episode_states
+
+        # Backward-compatible fallback for old custom datasets where
+        # observation.state and action were intentionally identical.
         actions = getattr(self.dataset, "actions", None)
         if actions is not None:
-            episode_actions = torch.as_tensor(actions[episode_index], dtype=torch.float32)
-            self._episode_action_cache[episode_index] = episode_actions
-            return episode_actions
+            episode_states = torch.as_tensor(actions[episode_index], dtype=torch.float32)
+            self._episode_motion_state_cache[episode_index] = episode_states
+            return episode_states
 
         ensure_loaded = getattr(self.dataset, "_ensure_hf_dataset_loaded", None)
         if callable(ensure_loaded):
@@ -568,8 +581,9 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         episodes = getattr(meta, "episodes", None)
         if hf_dataset is None or episodes is None:
             raise RuntimeError(
-                "Bidirectional PointSeg supervision needs access to the raw per-frame action column. "
-                "Expected a LeRobotDataset or a dataset exposing per-episode `actions`."
+                "Bidirectional PointSeg supervision needs access to the raw per-frame "
+                "observation.state trajectory. Expected a LeRobotDataset or a dataset "
+                "exposing per-episode `observation_states`."
             )
 
         episode_record = None
@@ -589,17 +603,26 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             relative_indices = absolute_indices
         else:
             relative_indices = [absolute_to_relative[index] for index in absolute_indices]
+        state_column = "observation.state"
+        column_names = set(getattr(hf_dataset, "column_names", ()) or ())
+        if state_column not in column_names:
+            # Old generated datasets duplicated achieved poses into action.
+            # This fallback is intentionally schema-based; new datasets must
+            # never use commanded targets as observed motion.
+            state_column = "action"
         try:
-            values = hf_dataset["action"][relative_indices]
+            values = hf_dataset[state_column][relative_indices]
         except (KeyError, TypeError, IndexError):
-            values = hf_dataset[relative_indices]["action"]
-        episode_actions = torch.stack([torch.as_tensor(value) for value in values]).to(dtype=torch.float32)
-        self._episode_action_cache[episode_index] = episode_actions
-        return episode_actions
+            values = hf_dataset[relative_indices][state_column]
+        episode_states = torch.stack([torch.as_tensor(value) for value in values]).to(
+            dtype=torch.float32
+        )
+        self._episode_motion_state_cache[episode_index] = episode_states
+        return episode_states
 
     def _relative_temporal_poses(self, episode_index: int, frame_indices: list[int]) -> Tensor:
-        actions = self._episode_actions(episode_index)
-        poses = actions[frame_indices, :9].to(dtype=torch.float32)
+        motion_states = self._episode_motion_states(episode_index)
+        poses = motion_states[frame_indices, :9].to(dtype=torch.float32)
         rel = relative_poses_to_first(poses.unsqueeze(0)).squeeze(0)
         rel[0] = _identity_pose9(device=rel.device, dtype=rel.dtype)
         return rel
@@ -611,8 +634,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         approach/contact evidence without loading point clouds from the whole episode.
         Index 0 is always the current pose so downstream code can use it as the anchor.
         """
-        actions = self._episode_actions(episode_index)
-        episode_len = int(actions.shape[0])
+        motion_states = self._episode_motion_states(episode_index)
+        episode_len = int(motion_states.shape[0])
         if self.trajectory_samples == 0:
             sample_indices = torch.tensor([frame_index], dtype=torch.long)
         else:
@@ -623,7 +646,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
                 dtype=torch.float32,
             ).round().to(dtype=torch.long)
             sample_indices = torch.cat([torch.tensor([frame_index], dtype=torch.long), sample_indices])
-        poses = actions[sample_indices, :9].to(dtype=torch.float32)
+        poses = motion_states[sample_indices, :9].to(dtype=torch.float32)
         relative = relative_poses_to_first(poses.unsqueeze(0)).squeeze(0)
         relative[0] = _identity_pose9(device=relative.device, dtype=relative.dtype)
         return relative, sample_indices - int(frame_index)

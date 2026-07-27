@@ -287,6 +287,7 @@ def cache_samples(args: argparse.Namespace) -> None:
         "temporal_offsets": list(dataset.temporal_offsets),
         "temporal_mode": "bidirectional" if dataset.bidirectional else "future_only",
         "trajectory_mode": "sparse_full_episode",
+        "trajectory_pose_source": "observation.state (achieved EEF pose)",
         "trajectory_samples": dataset.trajectory_samples,
         "current_points": args.current_points,
         "future_points": args.future_points,

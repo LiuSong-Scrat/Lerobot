@@ -292,6 +292,43 @@ def test_temporal_point_cloud_dataset_shapes_and_episode_clamping(tmp_path):
     assert float(first_ep1["observation.point_cloud"][0, 0]) >= 10.0
 
 
+def test_temporal_point_cloud_motion_prior_uses_achieved_state_not_action_target(tmp_path):
+    point_cloud_dir = tmp_path / "point_clouds"
+    point_cloud_dir.mkdir()
+    np.save(
+        point_cloud_dir / "episode_000000.npy",
+        np.zeros((3, 4, 6), dtype=np.float32),
+    )
+    base = _FakeBaseDataset([3])
+    base.observation_states = [
+        torch.stack(
+            [
+                torch.cat([_pose_from_translation([x, 0.0, 0.0]), torch.zeros(1)])
+                for x in (0.0, 0.1, 0.2)
+            ]
+        )
+    ]
+    base.actions = [
+        torch.stack(
+            [
+                torch.cat([_pose_from_translation([x, 0.0, 0.0]), torch.zeros(1)])
+                for x in (0.0, 1.0, 2.0)
+            ]
+        )
+    ]
+    dataset = SongTemporalPointCloudDataset(
+        base,
+        point_cloud_dir=point_cloud_dir,
+        future_offsets=(1,),
+        current_points=4,
+        future_points=4,
+    )
+
+    relative = dataset._relative_temporal_poses(0, [0, 1])
+
+    assert torch.allclose(relative[1, :3], torch.tensor([0.1, 0.0, 0.0]), atol=1e-6)
+
+
 def test_full_episode_pose_trajectory_extends_target_evidence_without_changing_local_motion():
     current_xyz = torch.tensor([[[0.50, 0.0, 0.0], [0.80, 0.0, 0.0]]], dtype=torch.float32)
     current_pc = torch.cat([current_xyz, torch.zeros(1, 2, 3)], dim=-1)
