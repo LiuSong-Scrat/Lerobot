@@ -3,12 +3,14 @@
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.policies.smolvla.song_pointseg import (
     POINTSEG_CACHE_FIELDS,
     POINTSEG_CACHE_LABEL_FIELDS,
     POINTSEG_CACHE_VERSION,
+    POINTSEG_EVIDENCE_NAMES,
     ROLE_FOREGROUND,
     ROLE_IGNORE,
     PseudoLabelConfig,
@@ -18,6 +20,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegNet,
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
+    compute_pointseg_dataset_fingerprint,
     force_small_current_clouds_foreground,
     generate_pseudo_labels,
     generate_pseudo_labels_from_priors,
@@ -345,6 +348,7 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
         json.dump(
             {
                 "version": POINTSEG_CACHE_VERSION,
+                "evidence_channels": list(POINTSEG_EVIDENCE_NAMES),
                 "fields": list(POINTSEG_CACHE_FIELDS),
                 "shards": [{"path": "shard_000000", "length": num_samples}],
             },
@@ -362,6 +366,38 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
     assert tuple(sample["pointseg.role_scores"].shape) == (n_points, 3)
     assert sample["episode_index"].item() == 4
     assert sample["dataset_index"].item() == 1
+
+
+def test_cached_pointseg_dataset_rejects_wrong_evidence_semantics(tmp_path):
+    cache_dir = tmp_path / "bad_evidence_cache"
+    cache_dir.mkdir()
+    with open(cache_dir / "manifest.json", "w") as f:
+        json.dump(
+            {
+                "version": POINTSEG_CACHE_VERSION,
+                "evidence_channels": ["gripper", "condition_object", "target"],
+                "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+                "shards": [],
+            },
+            f,
+        )
+
+    with pytest.raises(ValueError, match="trajectory-evidence channels"):
+        SongPointSegCachedDataset(cache_dir)
+
+
+def test_cache_dataset_fingerprint_rejects_stale_point_index_metadata(tmp_path):
+    dataset_root = tmp_path / "dataset"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text('{"version": 1}')
+    fingerprint = compute_pointseg_dataset_fingerprint(dataset_root)
+    cache = SongPointSegCachedDataset.__new__(SongPointSegCachedDataset)
+    cache.manifest = {"dataset_fingerprint": fingerprint}
+
+    assert cache.validate_dataset_root(dataset_root)
+    (dataset_root / "meta" / "info.json").write_text('{"version": 2}')
+    with pytest.raises(ValueError, match="different dataset metadata"):
+        cache.validate_dataset_root(dataset_root)
 
 
 def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):
@@ -384,6 +420,7 @@ def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):
         json.dump(
             {
                 "version": POINTSEG_CACHE_VERSION,
+                "evidence_channels": list(POINTSEG_EVIDENCE_NAMES),
                 "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
                 "cache_mode": "indices",
                 "variable_num_points": True,

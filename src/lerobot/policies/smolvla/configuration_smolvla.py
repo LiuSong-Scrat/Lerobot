@@ -110,6 +110,10 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_loss_weight: float = 0.05
     worldflow_geo_loss_weight: float = 0.05
     worldflow_bridge_loss_weight: float = 0.05
+    # The Action Expert only follows the direct SE(3) trajectory head after
+    # that head becomes a sufficiently accurate trajectory teacher.
+    worldflow_bridge_confidence_tau: float = 0.05
+    worldflow_bridge_rotation_radius: float = 0.08
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
     worldflow_se3_head_enable: bool = False
@@ -188,10 +192,50 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        if self.worldflow_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError(
+                    "worldflow_enable=True requires ACTION normalization to be IDENTITY because the bridge "
+                    "interprets the first nine action dimensions as a metric pose9 transform."
+                )
+            if self.max_action_dim < 9:
+                raise ValueError("worldflow_enable=True requires max_action_dim >= 9 for pose9 actions.")
+            if self.worldflow_feature_dim <= 0:
+                raise ValueError("worldflow_feature_dim must be positive.")
+            if self.worldflow_grid_size <= 0:
+                raise ValueError("worldflow_grid_size must be positive.")
+            if self.worldflow_max_points < 4:
+                raise ValueError("worldflow_max_points must be at least 4.")
+            if self.worldflow_min_transport_points < 3:
+                raise ValueError(
+                    "worldflow_min_transport_points must be at least 3 for reliable co-motion evidence."
+                )
+            if self.worldflow_min_transport_points > self.worldflow_max_points:
+                raise ValueError("worldflow_min_transport_points cannot exceed worldflow_max_points.")
+            if not 0.0 <= self.worldflow_transport_score_threshold <= 1.0:
+                raise ValueError("worldflow_transport_score_threshold must be in [0, 1].")
+            if self.worldflow_bridge_confidence_tau <= 0:
+                raise ValueError("worldflow_bridge_confidence_tau must be positive.")
+            if self.worldflow_bridge_rotation_radius < 0:
+                raise ValueError("worldflow_bridge_rotation_radius must be non-negative.")
+            if self.worldflow_trans_weight < 0 or self.worldflow_rot_weight < 0:
+                raise ValueError("worldflow_trans_weight and worldflow_rot_weight must be non-negative.")
+            if any(
+                weight < 0
+                for weight in (
+                    self.worldflow_loss_weight,
+                    self.worldflow_geo_loss_weight,
+                    self.worldflow_bridge_loss_weight,
+                    self.worldflow_equiv_loss_weight,
+                )
+            ):
+                raise ValueError("WorldFlow loss weights must be non-negative.")
         if self.worldflow_se3_head_enable:
             warnings.warn(
                 "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "World-Ego now uses dense automatic ObjectFlow + weighted Kabsch, not a PCA canonical SE(3) head.",
+                "WorldFlow always predicts a direct SE(3) trajectory and uses analytic "
+                "World/Ego conjugation.",
                 stacklevel=2,
             )
         if self.se3_final_correction_enable:

@@ -23,9 +23,11 @@ from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
     POINTSEG_CACHE_LABEL_FIELDS,
     POINTSEG_CACHE_VERSION,
+    POINTSEG_EVIDENCE_NAMES,
     ROLE_NAMES,
     PseudoLabelConfig,
     SongTemporalPointCloudDataset,
+    compute_pointseg_dataset_fingerprint,
     generate_pseudo_labels,
     move_batch_to_device,
     parse_future_offsets,
@@ -293,7 +295,10 @@ def cache_samples(args: argparse.Namespace) -> None:
         "variable_num_points": True,
         "point_count_policy": "cap_without_repeat",
         "pseudo_label_policy": "soft_binary_trajectory_v1",
-        "evidence_channels": ["tool_comotion", "trajectory_approach", "near_contact"],
+        "evidence_channels": list(POINTSEG_EVIDENCE_NAMES),
+        "dataset_fingerprint": compute_pointseg_dataset_fingerprint(
+            Path(dataset.point_cloud_dir).parent
+        ),
         "storage_dtype": args.storage_dtype,
         "pseudo_label_config": asdict(pseudo_cfg),
         "args": _jsonable(vars(args)),

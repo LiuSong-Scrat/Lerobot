@@ -107,16 +107,44 @@ data/libero_setting/libero_4suite_lerobot_dataset/
   world_ee_poses/episode_000000.npy
 ```
 
-PointSeg cache v5 is index-only: each shard stores `point_indices`, pseudo labels, weights, class scores, foreground scores, and automatic `role_scores` with channels `gripper / condition-object / target`. It does not duplicate `observation.point_cloud`; training reconstructs the cached sample from the dataset's episode point cloud storage. Motion priors are recomputed online only when explicitly needed.
+PointSeg cache v7 is index-only: each shard stores `point_indices`, soft binary pseudo labels, weights, class scores, foreground scores, and trajectory-evidence `role_scores`. The three evidence channels have a fixed contract:
+
+```text
+0: tool_comotion
+1: trajectory_approach
+2: near_contact
+```
+
+These channels are soft trajectory evidence, not semantic labels such as gripper/object/target. The cache does not duplicate `observation.point_cloud`; training reconstructs the sampled points from the associated dataset episode. New manifests contain a dataset-metadata fingerprint in addition to the cache version and evidence-channel order. Strict training therefore rejects a cache made from another dataset conversion before stale point indices can silently supervise different geometry. Legacy v7 caches without this fingerprint still load with a warning, but should be rebuilt for WorldFlow training.
 
 When `--policy.pointseg_enable=true` and `--pointseg_sample_cache_dir` is omitted or points to a missing cache, training now computes the same motion-prior pseudo labels online once per DataLoader batch from current/future point clouds. This fallback uses CUDA by default when available; if CUDA is used, the training script forces DataLoader `num_workers=0` to avoid CUDA initialization inside forked worker processes. Set `SONG_POINTSEG_ONLINE=0` to disable this fallback, or set `SONG_POINTSEG_ONLINE_DEVICE=cpu` to keep multi-worker CPU loading. Tune `SONG_POINTSEG_ONLINE_CURRENT_POINTS`, `SONG_POINTSEG_ONLINE_FUTURE_POINTS`, and `SONG_POINTSEG_ONLINE_NN_CHUNK_SIZE` for debugging.
 
 World-Ego training uses two coupled branches when `--policy.worldflow_enable=true`:
 
 - Ego Body branch: the normal action flow-matching policy predicts executable UMI/body actions.
-- Dense ObjectFlow branch: automatic `role_scores` select non-gripper condition/target points, predict dense world-frame point displacement, fit a rigid spatial transform with weighted Kabsch, then bridge it to the body action by `B = H_i^{-1} S H_i`.
+- Direct WorldFlow branch: cache-v7 evidence selects balanced tool-co-motion and interaction point sets. Two LitePT encoders plus language and action-step position embeddings predict the complete body trajectory `B_k = H_t^-1 H_{t+k}` as SE(3) transforms.
+- World motion is derived analytically by conjugation, `S_k = H_t B_k H_t^-1 = H_{t+k} H_t^-1`; no point correspondence or point-flow estimate is required.
+- A confidence-gated, detached WorldFlow teacher can regularize the Action Expert only after its metric trajectory error becomes small. A random-SE(3) consistency loss regularizes coordinate-frame changes.
 
-This path uses no PCA/canonical frame, no manually specified segmentation, and no manually supervised point optical flow. Old PointSeg caches must be rebuilt because ObjectFlow requires cache v5 `role_scores`.
+This path uses no PCA/canonical frame, manually specified segmentation, or point optical-flow supervision. `worldflow_se3_head_enable` remains accepted only for old command-line compatibility; direct SE(3) prediction is selected by `worldflow_enable=true` and the former flag has no effect. WorldFlow remains disabled by default.
+
+The v0.4.1 fixed LIBERO dataset is compatible with this branch when its cache is generated from that exact dataset. Do not reuse a cache generated from a pre-fix dataset: cache point indices and episode/frame identities are dataset-relative, while v0.4.1 also restores each demo's `model_file` and the official `state[i+1] -> observation[i]` replay alignment.
+
+Recommended WorldFlow options:
+
+```bash
+--policy.worldflow_enable=true \
+--policy.worldflow_se3_head_enable=false \
+--policy.worldflow_loss_weight=0.05 \
+--policy.worldflow_geo_loss_weight=0.05 \
+--policy.worldflow_bridge_loss_weight=0.05 \
+--policy.worldflow_equiv_loss_weight=0.02 \
+--policy.worldflow_bridge_confidence_tau=0.05 \
+--policy.worldflow_bridge_rotation_radius=0.08 \
+--policy.worldflow_max_points=2048 \
+--policy.worldflow_min_transport_points=3 \
+--policy.worldflow_transport_score_threshold=0.05
+```
 
 ## Training
 

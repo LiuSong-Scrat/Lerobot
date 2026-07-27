@@ -243,6 +243,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         root = Path(root_value)
         self.point_cloud_dir = Path(point_cloud_dir) if point_cloud_dir is not None else root / "point_clouds"
         self.strict = strict
+        self.cache.validate_dataset_root(root, strict=self.strict)
         self.mmap_mode = mmap_mode
         self._point_cloud_cache: dict[int, np.ndarray] = {}
         if self.strict and len(self.cache) < len(self.dataset):
@@ -485,7 +486,7 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
             if bool(getattr(policy_cfg, "worldflow_enable", False)):
                 raise ValueError(
-                    f"{reason}; Dense ObjectFlow requires pointseg.role_scores. "
+                    f"{reason}; WorldFlow requires cache-v7 pointseg.role_scores trajectory evidence. "
                     "Provide a current PointSeg cache or enable SONG_POINTSEG_ONLINE=1."
                 )
             logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
@@ -495,7 +496,7 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         if not point_cloud_dir.is_dir():
             if bool(getattr(policy_cfg, "worldflow_enable", False)):
                 raise FileNotFoundError(
-                    f"{reason}; Dense ObjectFlow requires point clouds for online role_scores, "
+                    f"{reason}; WorldFlow requires point clouds for online cache-v7 trajectory evidence, "
                     f"but point cloud dir is missing: {point_cloud_dir}"
                 )
             logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
@@ -1438,15 +1439,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "loss_se3_equivariance",
                     "se3_action_trans_err",
                     "se3_action_rot_err_deg",
-                    "loss_worldflow_flow",
-                    "loss_worldflow_rigid",
+                    "loss_worldflow_body",
+                    "loss_worldflow_world",
                     "loss_worldflow_bridge",
                     "loss_worldflow_equiv",
+                    "worldflow_body_trans_err_m",
+                    "worldflow_world_trans_err_m",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
+                    "worldflow_bridge_confidence",
                     "worldflow_valid_ratio",
-                    "worldflow_object_point_ratio",
                     "worldflow_transport_point_ratio",
+                    "worldflow_interaction_point_ratio",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import warnings
@@ -27,6 +28,14 @@ ROLE_BACKGROUND = 0
 ROLE_FOREGROUND = 1
 ROLE_IGNORE = -100
 ROLE_NAMES = ("background", "foreground")
+POINTSEG_EVIDENCE_TOOL_COMOTION = 0
+POINTSEG_EVIDENCE_TRAJECTORY_APPROACH = 1
+POINTSEG_EVIDENCE_NEAR_CONTACT = 2
+POINTSEG_EVIDENCE_NAMES = (
+    "tool_comotion",
+    "trajectory_approach",
+    "near_contact",
+)
 ROLE_COLORS = np.array(
     [
         [128, 128, 128],
@@ -63,6 +72,43 @@ POINTSEG_CACHE_LABEL_FIELDS = (
 )
 
 _POINTOPS_KNN_FAILED = False
+
+
+def compute_pointseg_dataset_fingerprint(dataset_root: str | Path) -> dict[str, Any]:
+    """Fingerprint the immutable metadata that defines cache point-index semantics."""
+
+    root = Path(dataset_root)
+    candidates = (
+        "meta/info.json",
+        "meta/tasks.parquet",
+        "point_clouds/meta.json",
+        "world_ee_poses/meta.json",
+        "libero_collect_summary.json",
+        "real_hdf5_conversion_summary.json",
+    )
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    for relative_path in candidates:
+        path = root / relative_path
+        if not path.is_file():
+            continue
+        file_digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+        file_hash = file_digest.hexdigest()
+        files[relative_path] = file_hash
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_hash.encode("ascii"))
+        digest.update(b"\0")
+    if not files:
+        raise FileNotFoundError(f"Could not fingerprint dataset metadata under {root}.")
+    return {
+        "algorithm": "sha256",
+        "digest": digest.hexdigest(),
+        "files": files,
+    }
 
 
 def infer_litept_output_channels(backbone: nn.Module) -> int:
@@ -711,6 +757,12 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
                 f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}. "
                 "Rebuild the cache because motion-prior semantics changed."
             )
+        evidence_channels = tuple(self.manifest.get("evidence_channels", ()))
+        if evidence_channels != POINTSEG_EVIDENCE_NAMES:
+            raise ValueError(
+                "Song pointseg cache trajectory-evidence channels do not match the current cache-v7 "
+                f"semantics: expected {POINTSEG_EVIDENCE_NAMES}, got {evidence_channels}. Rebuild the cache."
+            )
 
         fields = tuple(self.manifest.get("fields", ()))
         self.cache_mode = str(
@@ -732,6 +784,33 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
         self.shard_lengths = [int(shard["length"]) for shard in self.shards]
         self._cumulative_lengths = np.cumsum(self.shard_lengths).tolist()
         self._array_cache: dict[int, dict[str, np.ndarray]] = {}
+
+    def validate_dataset_root(self, dataset_root: str | Path, *, strict: bool = True) -> bool:
+        """Verify that index-only cache entries refer to the intended dataset."""
+
+        expected = self.manifest.get("dataset_fingerprint")
+        if not isinstance(expected, dict) or not expected.get("digest"):
+            warnings.warn(
+                "Song pointseg cache has no dataset fingerprint. Episode/frame alignment will still be checked, "
+                "but stale point indices cannot be ruled out; rebuild the cache for strict v0.4.1 compatibility.",
+                stacklevel=2,
+            )
+            return False
+        actual = compute_pointseg_dataset_fingerprint(dataset_root)
+        if (
+            expected.get("algorithm") != actual["algorithm"]
+            or expected.get("digest") != actual["digest"]
+        ):
+            message = (
+                "Song pointseg cache was generated from different dataset metadata. "
+                f"Expected fingerprint {expected.get('digest')}, got {actual['digest']} for {dataset_root}. "
+                "Rebuild the cache from this exact dataset; point indices are not portable across conversions."
+            )
+            if strict:
+                raise ValueError(message)
+            warnings.warn(message, stacklevel=2)
+            return False
+        return True
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -1749,7 +1828,7 @@ def save_pointseg_npz(
         data["pseudo_labels"] = pseudo["labels"].detach().cpu().numpy()
         data["pseudo_weights"] = pseudo["weights"].detach().cpu().numpy()
         if "role_scores" in pseudo:
-            data["pseudo_role_scores_gripper_condition_target"] = pseudo["role_scores"].detach().cpu().numpy()
+            data["pseudo_trajectory_evidence"] = pseudo["role_scores"].detach().cpu().numpy()
         if "foreground_score" in pseudo:
             data["pseudo_foreground_score"] = pseudo["foreground_score"].detach().cpu().numpy()
     if metadata is not None:
