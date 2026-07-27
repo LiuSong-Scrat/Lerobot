@@ -1251,10 +1251,22 @@ def controller_target_to_model_target_world(
     roundtrip_error = float(
         np.max(np.abs(reconstructed_controller_world - target_controller_world))
     )
-    if roundtrip_error > 1e-8:
+    # source_model_world is reconstructed from float32 pose9 observations, while
+    # the OSC controller goal is read as float64. A mathematically exact rigid
+    # transform round trip therefore normally accumulates errors around 1e-8 to
+    # 1e-7. Keep a strict sanity check, but use a tolerance appropriate for this
+    # mixed-precision conversion instead of rejecting harmless round-off noise.
+    roundtrip_atol = 1e-6
+    if not np.allclose(
+        reconstructed_controller_world,
+        target_controller_world,
+        rtol=1e-7,
+        atol=roundtrip_atol,
+    ):
         raise RuntimeError(
             "Controller/model EEF target conversion failed its rigid-transform "
-            f"round trip: max error={roundtrip_error:.3e}."
+            f"round trip: max error={roundtrip_error:.3e}, "
+            f"atol={roundtrip_atol:.1e}."
         )
     return np.asarray(target_model_world, dtype=np.float64)
 
