@@ -31,6 +31,7 @@ if __package__ and __package__.startswith("benchmarks."):
     from .libero_pointcloud_utils import (
         add_reference_gripper_clouds_to_episode,
         ensure_libero_config,
+        eef_pose9_gripper_from_obs,
         fast_inverse_homogeneous,
         make_libero_env,
         normalize_camera_name,
@@ -46,6 +47,7 @@ else:
     from libero_setting.libero_pointcloud_utils import (
         add_reference_gripper_clouds_to_episode,
         ensure_libero_config,
+        eef_pose9_gripper_from_obs,
         fast_inverse_homogeneous,
         make_libero_env,
         normalize_camera_name,
@@ -62,7 +64,7 @@ POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
 POINT_CLOUD_CHANNELS = 6
-ACTION_LABEL_SEMANTICS = "source_raw_delta_to_source_state_anchored_absolute_osc_target"
+ACTION_LABEL_SEMANTICS = "source_raw_delta_to_source_state_anchored_absolute_model_eef_target"
 OBSERVATION_STATE_SEMANTICS = "achieved_eef_pose_at_reconstructed_observation"
 
 DATASET_FEATURES = {
@@ -387,7 +389,9 @@ def write_action_target_meta(root: Path) -> None:
         "action_index_mapping": "output[i] uses source actions[i]",
         "conversion": (
             "controller.set_goal(raw[:6]) with use_delta=True, including "
-            "controller orientation-goal history; no heuristic displacement or overshoot"
+            "controller orientation-goal history; map the controller-site goal "
+            "through the source-state controller-to-model EEF transform; no "
+            "heuristic displacement or overshoot"
         ),
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
@@ -1185,6 +1189,96 @@ def set_env_state_and_get_obs(env: Any, state: np.ndarray) -> dict[str, Any]:
         return env.env._get_observations()
 
 
+def current_controller_eef_world(env: Any) -> np.ndarray:
+    """Return the actual world pose of the EEF site controlled by OSC."""
+
+    if len(getattr(env, "robots", [])) != 1:
+        raise ValueError("EEF-frame conversion currently requires one LIBERO robot.")
+    controller = env.robots[0].controller
+    controller.update(force=True)
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = np.asarray(controller.ee_ori_mat, dtype=np.float64)
+    out[:3, 3] = np.asarray(controller.ee_pos, dtype=np.float64)
+    return out
+
+
+def current_controller_goal_world(env: Any) -> np.ndarray:
+    """Return the current absolute OSC goal without modifying controller state."""
+
+    if len(getattr(env, "robots", [])) != 1:
+        raise ValueError("OSC-goal extraction currently requires one LIBERO robot.")
+    controller = env.robots[0].controller
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = np.asarray(controller.goal_ori, dtype=np.float64)
+    out[:3, 3] = np.asarray(controller.goal_pos, dtype=np.float64)
+    return out
+
+
+def controller_target_to_model_target_world(
+    target_controller_world: np.ndarray,
+    source_model_world: np.ndarray,
+    source_controller_world: np.ndarray,
+) -> np.ndarray:
+    """Map an OSC-controller-site goal to the dataset/model EEF frame.
+
+    Evaluation applies the forward relation
+
+        target_controller_world = target_model_world @ model_to_controller
+
+    where ``model_to_controller`` is measured at the source state. Dataset
+    generation must therefore apply the exact inverse relation before storing
+    the target as a model-space action label.
+    """
+
+    target_controller_world = np.asarray(target_controller_world, dtype=np.float64)
+    source_model_world = np.asarray(source_model_world, dtype=np.float64)
+    source_controller_world = np.asarray(source_controller_world, dtype=np.float64)
+    for name, value in (
+        ("target_controller_world", target_controller_world),
+        ("source_model_world", source_model_world),
+        ("source_controller_world", source_controller_world),
+    ):
+        if value.shape != (4, 4) or not np.isfinite(value).all():
+            raise ValueError(f"{name} must be a finite 4x4 transform, got {value.shape}.")
+
+    model_to_controller = (
+        fast_inverse_homogeneous(source_model_world) @ source_controller_world
+    )
+    target_model_world = (
+        target_controller_world @ fast_inverse_homogeneous(model_to_controller)
+    )
+    reconstructed_controller_world = target_model_world @ model_to_controller
+    roundtrip_error = float(
+        np.max(np.abs(reconstructed_controller_world - target_controller_world))
+    )
+    if roundtrip_error > 1e-8:
+        raise RuntimeError(
+            "Controller/model EEF target conversion failed its rigid-transform "
+            f"round trip: max error={roundtrip_error:.3e}."
+        )
+    return np.asarray(target_model_world, dtype=np.float64)
+
+
+def reset_source_delta_controller_goal(env: Any) -> None:
+    """Initialize source-action goal history from the restored episode state."""
+
+    if len(getattr(env, "robots", [])) != 1:
+        raise ValueError("Controller reset currently requires one LIBERO robot.")
+    controller = env.robots[0].controller
+    if not bool(getattr(controller, "use_delta", False)):
+        raise RuntimeError(
+            "Raw LIBERO action conversion requires an OSC controller with use_delta=True."
+        )
+    controller.update(force=True)
+    reset_goal = getattr(controller, "reset_goal", None)
+    if callable(reset_goal):
+        reset_goal()
+    else:
+        # Compatibility with older robosuite controllers without reset_goal().
+        controller.goal_pos = np.asarray(controller.ee_pos, dtype=np.float64).copy()
+        controller.goal_ori = np.asarray(controller.ee_ori_mat, dtype=np.float64).copy()
+
+
 def libero_delta_action_to_absolute_target_world(
     env: Any,
     source_action: np.ndarray,
@@ -1238,7 +1332,7 @@ def world_target_to_reference_pose9(
     target_to_world: np.ndarray,
     reference_camera: str,
 ) -> np.ndarray:
-    """Express a controller-world target in the current observation camera."""
+    """Express a model-EEF world target in the fixed observation camera."""
 
     from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
 
@@ -1287,10 +1381,9 @@ def collect_demo_episode(
 
     frame_count = min(len(states), len(actions))
     if cfg["replay_mode"] == "states":
-        # Official LIBERO v1 create_dataset.py executes action[i] before
-        # recording obs[i], but stores states[i]. Consequently obs[i] is
-        # represented by states[i + 1]. The final source observation has no
-        # corresponding states[T], so snapshot replay intentionally drops it.
+        # Keep the caller-selected source-observation convention. Action i is
+        # always decoded at states[i], independently of the rendered observation
+        # offset used by the existing dataset pipeline.
         frame_count = min(frame_count, len(states) - state_observation_offset)
     if max_frames is not None and max_frames > 0:
         frame_count = min(frame_count, int(max_frames))
@@ -1301,7 +1394,9 @@ def collect_demo_episode(
     observation_height = int(cfg["observation_height"])
     observation_width = int(cfg["observation_width"])
     save_video = bool(cfg.get("save_video", False))
-    point_clouds_reference = np.empty((frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32)
+    point_clouds_reference = np.empty(
+        (frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32
+    )
     reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     grippers = np.empty((frame_count, 1), dtype=np.float32)
@@ -1315,8 +1410,9 @@ def collect_demo_episode(
     def collect_observation_frame(
         frame_idx: int,
         raw_obs: dict[str, Any],
-        target_to_world: np.ndarray,
-    ) -> None:
+    ) -> np.ndarray:
+        """Store one achieved observation and return its model-EEF world pose."""
+
         if save_video:
             append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
         if save_rgb_images and image_camera is not None:
@@ -1326,7 +1422,7 @@ def collect_demo_episode(
                     f"Missing RGB image for camera {image_camera!r} in LIBERO observation."
                 )
             image_frames.append(image)
-        point_cloud_reference, pose9_gripper_reference, _pose9_gripper_sim_world = (
+        point_cloud_reference, pose9_gripper_reference, pose9_gripper_sim_world = (
             observation_to_camera_point_cloud(
                 env,
                 raw_obs,
@@ -1339,51 +1435,82 @@ def collect_demo_episode(
         )
         point_clouds_reference[frame_idx] = point_cloud_reference
         reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
-        action_target_reference_ee_poses[frame_idx] = (
-            world_target_to_reference_pose9(
-                env,
-                target_to_world,
-                reference_camera,
-            )
-        )
         grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+        return pose9_to_homo_np(
+            np.asarray(pose9_gripper_sim_world, dtype=np.float32)[:9]
+        ).astype(np.float64)
+
+    def store_model_action_target(frame_idx: int, target_model_world: np.ndarray) -> None:
+        action_target_reference_ee_poses[frame_idx] = world_target_to_reference_pose9(
+            env,
+            target_model_world,
+            reference_camera,
+        )
+
+    # Explicitly initialize orientation-goal history at the restored episode
+    # state. This prevents a reused task environment from leaking the previous
+    # demonstration's final controller goal into the next demonstration.
+    initial_obs = set_env_state_and_get_obs(env, states[0])
+    reset_source_delta_controller_goal(env)
 
     if cfg["replay_mode"] == "step":
-        raw_obs = set_env_state_and_get_obs(env, states[0])
+        raw_obs = initial_obs
         for frame_idx in range(frame_count):
-            target_to_world, _scaled_delta = (
-                libero_delta_action_to_absolute_target_world(
-                    env,
-                    actions[frame_idx],
-                )
+            # Observation and model/controller frame relation are measured before
+            # issuing actions[i], matching the source command's anchor state.
+            source_model_world = collect_observation_frame(frame_idx, raw_obs)
+            source_controller_world = current_controller_eef_world(env)
+
+            # Execute the raw action exactly once. env.step() performs the
+            # controller.set_goal() call; reading goal_pos/goal_ori afterwards
+            # avoids the previous double-set_goal behavior in step replay.
+            next_obs, _, done, _ = env.step(actions[frame_idx])
+            target_controller_world = current_controller_goal_world(env)
+            target_model_world = controller_target_to_model_target_world(
+                target_controller_world,
+                source_model_world,
+                source_controller_world,
             )
-            collect_observation_frame(frame_idx, raw_obs, target_to_world)
-            if frame_idx < frame_count - 1:
-                raw_obs, _, _, _ = env.step(actions[frame_idx])
+            store_model_action_target(frame_idx, target_model_world)
+            raw_obs = next_obs
+            if bool(done) and frame_idx + 1 < frame_count:
+                raise RuntimeError(
+                    f"Source action replay terminated at frame {frame_idx} before "
+                    f"the expected {frame_count} converted frames."
+                )
     else:
         for frame_idx in range(frame_count):
-            # HDF5 supervision is indexed as obs[i] / actions[i]. The source
-            # command actions[i] was issued from states[i], while official
-            # LIBERO v1 obs[i] is reconstructed from states[i + 1]. Compute
-            # the target at the source state first, then restore the separate
-            # observation snapshot. Never anchor actions[i] at states[i + 1].
+            # actions[i] was issued from states[i]. Decode the controller target
+            # there, map it back into the model/data EEF frame, and only then
+            # restore the independently configured observation snapshot.
             action_source_state_idx = frame_idx
             observation_state_idx = frame_idx + state_observation_offset
             source_obs = set_env_state_and_get_obs(
                 env, states[action_source_state_idx]
             )
-            target_to_world, _scaled_delta = (
+            source_model_world = pose9_to_homo_np(
+                np.asarray(eef_pose9_gripper_from_obs(source_obs), dtype=np.float32)[:9]
+            ).astype(np.float64)
+            source_controller_world = current_controller_eef_world(env)
+            target_controller_world, _scaled_delta = (
                 libero_delta_action_to_absolute_target_world(
                     env,
                     actions[frame_idx],
                 )
             )
+            target_model_world = controller_target_to_model_target_world(
+                target_controller_world,
+                source_model_world,
+                source_controller_world,
+            )
+
             raw_obs = (
                 source_obs
                 if observation_state_idx == action_source_state_idx
                 else set_env_state_and_get_obs(env, states[observation_state_idx])
             )
-            collect_observation_frame(frame_idx, raw_obs, target_to_world)
+            collect_observation_frame(frame_idx, raw_obs)
+            store_model_action_target(frame_idx, target_model_world)
 
     if cfg.get("add_gripper_cloud", True):
         point_clouds_reference = add_reference_gripper_clouds_to_episode(
@@ -1400,7 +1527,9 @@ def collect_demo_episode(
             widths_are_normalized=False,
             gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         )
-    point_clouds = reference_point_cloud_to_current_eff(point_clouds_reference, reference_ee_poses)
+    point_clouds = reference_point_cloud_to_current_eff(
+        point_clouds_reference, reference_ee_poses
+    )
     episode_origin_pose = reference_ee_poses[0]
     observation_umi_poses = from_reference_to_umi_tra_pose9(
         reference_ee_poses,
@@ -1413,10 +1542,9 @@ def collect_demo_episode(
     observation_states = np.concatenate(
         [observation_umi_poses, grippers], axis=-1
     ).astype(np.float32)
-    # Keep the existing physical-width gripper representation. The corrected
-    # semantics in this conversion concern the 9D EEF pose target; replacing
-    # it with the raw binary LIBERO gripper command would silently change the
-    # policy's gripper action space.
+    # Preserve the existing physical-width gripper action space. Only the 9D
+    # arm pose is changed from achieved-state semantics to commanded-target
+    # semantics in the same model EEF frame used by observations and evaluation.
     episode_actions = np.concatenate(
         [action_target_umi_poses, grippers], axis=-1
     ).astype(np.float32)
@@ -1442,6 +1570,10 @@ def collect_demo_episode(
         "observation_state_semantics": OBSERVATION_STATE_SEMANTICS,
         "action_source_index_mapping": "output[i] uses source actions[i]",
         "action_source_state_mapping": "source actions[i] is anchored at states[i]",
+        "action_target_eef_mapping": (
+            "source controller goal mapped through the source-state "
+            "controller-to-model EEF transform"
+        ),
         "observation_state_mapping": (
             f"output observation[i] is reconstructed from states[i + {state_observation_offset}]"
             if cfg["replay_mode"] == "states"
@@ -1452,7 +1584,10 @@ def collect_demo_episode(
     }
     if save_rgb_images:
         if len(image_frames) != len(episode_actions):
-            raise ValueError(f"Collected {len(image_frames)} RGB frames for {len(episode_actions)} actions.")
+            raise ValueError(
+                f"Collected {len(image_frames)} RGB frames for "
+                f"{len(episode_actions)} actions."
+            )
         episode["images"] = np.asarray(image_frames, dtype=np.uint8)
     return episode
 
@@ -1494,6 +1629,7 @@ def make_episode_record(
         "action_source_state_mapping": str(
             episode["action_source_state_mapping"]
         ),
+        "action_target_eef_mapping": str(episode["action_target_eef_mapping"]),
         "observation_state_mapping": str(episode["observation_state_mapping"]),
         "action_pose_coordinate_frame": "episode_origin_eef",
         "observation_state_coordinate_frame": "episode_origin_eef",
@@ -1863,8 +1999,9 @@ def main() -> None:
                 else "output observation[i] is captured immediately before actions[i]"
             ),
             "absolute_target_conversion": (
-                "robosuite controller.set_goal(raw[:6]) with use_delta=True, "
-                "including persistent orientation-goal semantics"
+                "robosuite controller.set_goal(raw[:6]) with use_delta=True; "
+                "the resulting controller-site target is mapped into the "
+                "model/data EEF frame measured at source states[i]"
             ),
             "heuristic_target_offset": False,
             "contact_semantics": (
