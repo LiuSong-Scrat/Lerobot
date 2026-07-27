@@ -71,7 +71,33 @@ FAIR_EVALUATION_PROTOCOL = {
     "action_sample_selection": "none",
     "initial_state_source": "task_suite.get_task_init_states",
     "fixture_reset_sequence": "seeded_serial_episode_index",
+    "benchmark_comparable": True,
 }
+
+
+def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Describe whether this is a standard benchmark or a source-demo domain diagnostic."""
+
+    if not bool(cfg.get("dataset_domain_env", False)):
+        return dict(FAIR_EVALUATION_PROTOCOL)
+    state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
+    return {
+        **FAIR_EVALUATION_PROTOCOL,
+        "name": "dataset_domain_source_demo_rollout",
+        "initial_state_source": f"source_demo_hdf5.states[{state_offset}]",
+        "fixture_reset_sequence": "source_demo_hdf5.model_file_per_episode",
+        "environment_domain": "training_source_demo",
+        "post_state_settling": "disabled_to_preserve_source_observation",
+        "forced_initial_gripper_open": False,
+        "pre_policy_warmup_steps": 0,
+        "action_source": (
+            "source_demo_gt_pose9_gripper"
+            if bool(cfg.get("dataset_domain_oracle_actions", False))
+            else "policy_flow_matching_sample"
+        ),
+        "benchmark_comparable": False,
+        "diagnostic_only": True,
+    }
 
 
 def acquire_evaluation_run_lock(output_dir: Path) -> None:
@@ -508,6 +534,37 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Evaluate only these LIBERO initial-state indices; repeat for multiple indices.",
     )
+    parser.add_argument(
+        "--dataset-domain-env",
+        "--align-env-to-training-data",
+        dest="dataset_domain_env",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Diagnostic mode: map episode N to source demo N, restore that demo's HDF5 "
+            "model_file, and initialize from the same state used by dataset conversion. "
+            "Disabled by default and not comparable to the standard LIBERO benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-domain-demo-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing the official LIBERO HDF5 demonstrations used for training. "
+            "Defaults to demo_root from the JSON config."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-domain-oracle-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Diagnostic mode: bypass policy inference and execute GT pose9+gripper chunks "
+            "reconstructed from the matched source demo through the normal evaluation executor. "
+            "Requires --dataset-domain-env and is not a benchmark score."
+        ),
+    )
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
@@ -831,12 +888,26 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: Path) -> dict[str, Any]:
     return load_json_config(
         path,
-        path_keys=("policy_path", "policy_repo_id", "libero_config_path", "demo_root", "output_dir", "vis_dir"),
+        path_keys=(
+            "policy_path",
+            "policy_repo_id",
+            "libero_config_path",
+            "demo_root",
+            "dataset_domain_demo_root",
+            "output_dir",
+            "vis_dir",
+        ),
     )
 
 
 def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) -> Any:
     return cli_value if cli_value is not None else cfg.get(key, default)
+
+
+def configured_demo_root(cfg: dict[str, Any]) -> Any:
+    if bool(cfg.get("dataset_domain_env", False)):
+        return cfg.get("dataset_domain_demo_root") or cfg.get("demo_root")
+    return cfg.get("demo_root")
 
 
 def json_safe(value: Any) -> Any:
@@ -1608,7 +1679,24 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "render_mode": str(cfg.get("render_mode", "offscreen")),
         "evaluation_identity": cfg.get("evaluation_identity", {}),
         "env_seed": int(cfg.get("env_seed", 0)),
-        "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
+        "evaluation_protocol": evaluation_protocol_for_config(cfg),
+        "environment_domain": {
+            "dataset_domain_env": bool(cfg.get("dataset_domain_env", False)),
+            "dataset_domain_oracle_actions": bool(
+                cfg.get("dataset_domain_oracle_actions", False)
+            ),
+            "benchmark_comparable": not bool(cfg.get("dataset_domain_env", False)),
+            "demo_root": (
+                str(cfg.get("dataset_domain_demo_root"))
+                if bool(cfg.get("dataset_domain_env", False))
+                else None
+            ),
+            "state_observation_offset": (
+                int(cfg.get("dataset_domain_state_observation_offset", 1))
+                if bool(cfg.get("dataset_domain_env", False))
+                else None
+            ),
+        },
         "use_suite_max_steps": bool(cfg.get("use_suite_max_steps", False)),
         "suite_max_steps": {
             suite_name: (
@@ -1631,13 +1719,52 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "torch_determinism": cfg.get("torch_determinism", {}),
         },
         "initialization": {
-            "settle_steps": int(cfg["settle_steps"]),
-            "settle_min_seconds": float(cfg["settle_min_seconds"]),
-            "settle_stable_seconds": float(cfg["settle_stable_seconds"]),
-            "settle_max_seconds": float(cfg["settle_max_seconds"]),
-            "settle_require_stable": bool(cfg["settle_require_stable"]),
-            "settle_keep_robot_fixed": bool(cfg["settle_keep_robot_fixed"]),
-            "initial_gripper_open": bool(cfg["initial_gripper_open"]),
+            "mode": (
+                "source_demo_exact_observation"
+                if bool(cfg.get("dataset_domain_env", False))
+                else "standard_libero_settled"
+            ),
+            "settling_applied": not bool(cfg.get("dataset_domain_env", False)),
+            "settle_steps": (
+                0
+                if bool(cfg.get("dataset_domain_env", False))
+                else int(cfg["settle_steps"])
+            ),
+            "settle_min_seconds": (
+                0.0
+                if bool(cfg.get("dataset_domain_env", False))
+                else float(cfg["settle_min_seconds"])
+            ),
+            "settle_stable_seconds": (
+                0.0
+                if bool(cfg.get("dataset_domain_env", False))
+                else float(cfg["settle_stable_seconds"])
+            ),
+            "settle_max_seconds": (
+                0.0
+                if bool(cfg.get("dataset_domain_env", False))
+                else float(cfg["settle_max_seconds"])
+            ),
+            "settle_require_stable": (
+                False
+                if bool(cfg.get("dataset_domain_env", False))
+                else bool(cfg["settle_require_stable"])
+            ),
+            "settle_keep_robot_fixed": (
+                False
+                if bool(cfg.get("dataset_domain_env", False))
+                else bool(cfg["settle_keep_robot_fixed"])
+            ),
+            "initial_gripper_open": (
+                False
+                if bool(cfg.get("dataset_domain_env", False))
+                else bool(cfg["initial_gripper_open"])
+            ),
+            "warmup_steps": (
+                0
+                if bool(cfg.get("dataset_domain_env", False))
+                else int(cfg["control"].get("warmup_steps", 0))
+            ),
         },
         "observation": {
             "num_points": int(cfg["num_points"]),
@@ -1729,6 +1856,7 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "libero_actions",
         "model_action_rows",
         "predicted_action_chunks",
+        "oracle_chunk_source_indices",
         "target_controller_pose9",
         "target_model_worlds",
         "achieved_model_worlds",
@@ -1779,6 +1907,9 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         "model_action_rows": np.asarray(result.get("model_action_rows", []), dtype=np.float32),
         "predicted_action_chunks": np.asarray(
             result.get("predicted_action_chunks", []), dtype=np.float32
+        ),
+        "oracle_chunk_source_indices": np.asarray(
+            result.get("oracle_chunk_source_indices", []), dtype=np.int64
         ),
         "target_controller_pose9": np.asarray(result.get("target_controller_pose9", []), dtype=np.float32),
         "target_model_worlds": np.asarray(result.get("target_model_worlds", []), dtype=np.float32),
@@ -2477,7 +2608,7 @@ def _process_task_worker_entry(
     shard_index: int,
     episode_indices: list[int],
     task_spec: dict[str, str],
-    task_init_states: np.ndarray,
+    task_init_states: np.ndarray | None,
     cfg: dict[str, Any],
     output_dir: Path,
     request_queue: Any,
@@ -2490,7 +2621,7 @@ def _process_task_worker_entry(
 ) -> None:
     """Own one MuJoCo task environment in a process that never loads the policy."""
     try:
-        ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+        ensure_libero_config(cfg.get("libero_config_path"), configured_demo_root(cfg))
         suite = _SingleTaskSuiteProxy(task_id, task_spec)
         infer = ProcessInferenceProxy(
             worker_id=worker_id,
@@ -3542,8 +3673,15 @@ def run_episode(
     init_state: np.ndarray,
     cfg: dict[str, Any],
     reset_env: bool = True,
+    oracle_gt_world_trajectory: np.ndarray | None = None,
 ) -> dict[str, Any]:
     control = cfg["control"]
+    dataset_domain_env = bool(cfg.get("dataset_domain_env", False))
+    oracle_actions_enabled = oracle_gt_world_trajectory is not None
+    if bool(cfg.get("dataset_domain_oracle_actions", False)) != oracle_actions_enabled:
+        raise ValueError(
+            "dataset_domain_oracle_actions and oracle_gt_world_trajectory must be enabled together."
+        )
     configured_max_steps = int(control.get("max_steps", getattr(env, "horizon", 1000)))
     max_steps = (
         int(LIBERO_STANDARD_MAX_STEPS[suite_name])
@@ -3628,7 +3766,8 @@ def run_episode(
         0.0,
         float(control.get("rollback_rotation_tolerance", waypoint_rotation_tolerance)),
     )
-    warmup_steps = max(0, int(control.get("warmup_steps", 0)))
+    configured_warmup_steps = max(0, int(control.get("warmup_steps", 0)))
+    warmup_steps = 0 if dataset_domain_env else configured_warmup_steps
     gripper_threshold = float(control.get("gripper_threshold", 0.5))
     gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
     gripper_control_mode = str(control.get("gripper_control_mode", "delta_width"))
@@ -3644,20 +3783,26 @@ def run_episode(
         raw_obs = get_raw_obs(env, force_update=True)
     raw_obs = env.set_init_state(init_state)
 
-    raw_obs = settle_scene_after_reset(
-        env,
-        steps=int(cfg["settle_steps"]),
-        min_seconds=float(cfg["settle_min_seconds"]),
-        stable_seconds=float(cfg["settle_stable_seconds"]),
-        max_seconds=float(cfg["settle_max_seconds"]),
-        linear_velocity_threshold=float(cfg["settle_linear_velocity_threshold"]),
-        angular_velocity_threshold=float(cfg["settle_angular_velocity_threshold"]),
-        other_dof_velocity_threshold=float(cfg["settle_other_dof_velocity_threshold"]),
-        require_stable=bool(cfg["settle_require_stable"]),
-        keep_robot_fixed=bool(cfg["settle_keep_robot_fixed"]),
-        open_gripper=bool(cfg["initial_gripper_open"]),
-        cfg=cfg,
-    )
+    if dataset_domain_env:
+        # This state is the exact simulator snapshot rendered into the first
+        # converted training observation. Advancing physics or forcing the
+        # fingers open here would immediately move evaluation out of that domain.
+        raw_obs = get_raw_obs(env, force_update=True)
+    else:
+        raw_obs = settle_scene_after_reset(
+            env,
+            steps=int(cfg["settle_steps"]),
+            min_seconds=float(cfg["settle_min_seconds"]),
+            stable_seconds=float(cfg["settle_stable_seconds"]),
+            max_seconds=float(cfg["settle_max_seconds"]),
+            linear_velocity_threshold=float(cfg["settle_linear_velocity_threshold"]),
+            angular_velocity_threshold=float(cfg["settle_angular_velocity_threshold"]),
+            other_dof_velocity_threshold=float(cfg["settle_other_dof_velocity_threshold"]),
+            require_stable=bool(cfg["settle_require_stable"]),
+            keep_robot_fixed=bool(cfg["settle_keep_robot_fixed"]),
+            open_gripper=bool(cfg["initial_gripper_open"]),
+            cfg=cfg,
+        )
     synchronized_gripper_controller_actions: list[list[float]] = []
     if bool(control.get("synchronize_gripper_controller_state", True)):
         synchronized_gripper_controller_actions = synchronize_gripper_controller_state(env)
@@ -3781,6 +3926,9 @@ def run_episode(
     success_ever = False
     done = False
     model_call_count = 0
+    policy_forward_call_count = 0
+    oracle_cursor = 0
+    oracle_chunk_source_indices: list[np.ndarray] = []
     steps = 0
     start_s = time.perf_counter()
 
@@ -3981,23 +4129,35 @@ def run_episode(
             model_input_hashes.append(input_fingerprints["__all__"])
             if not first_model_input_component_hashes:
                 first_model_input_component_hashes = input_fingerprints
-            chunk_batch = infer.predict_action_chunk_obs(
-                model_observation,
-                task=task_language,
-                postprocess=True,
-                state_pose_mode="identity",
-                noise_seed=deterministic_policy_noise_seed(
-                    policy_noise_seed_base,
-                    suite_name=suite_name,
-                    task_id=int(task_id),
-                    episode_index=int(episode_index),
-                    model_call_index=int(model_call_count),
-                ),
-            )
-            if hasattr(chunk_batch, "detach"):
-                chunk = chunk_batch[0].detach().cpu().numpy()
+            current_oracle_chunk_indices: np.ndarray | None = None
+            if oracle_actions_enabled:
+                assert oracle_gt_world_trajectory is not None
+                chunk, current_oracle_chunk_indices = make_dataset_domain_oracle_chunk(
+                    gt_world_trajectory=oracle_gt_world_trajectory,
+                    cursor=oracle_cursor,
+                    current_eef_pose9_gripper=eef_pose,
+                    chunk_size=int(getattr(infer.policy.config, "chunk_size", 50)),
+                )
+                oracle_chunk_source_indices.append(current_oracle_chunk_indices.copy())
             else:
-                chunk = np.asarray(chunk_batch)[0]
+                chunk_batch = infer.predict_action_chunk_obs(
+                    model_observation,
+                    task=task_language,
+                    postprocess=True,
+                    state_pose_mode="identity",
+                    noise_seed=deterministic_policy_noise_seed(
+                        policy_noise_seed_base,
+                        suite_name=suite_name,
+                        task_id=int(task_id),
+                        episode_index=int(episode_index),
+                        model_call_index=int(model_call_count),
+                    ),
+                )
+                policy_forward_call_count += 1
+                if hasattr(chunk_batch, "detach"):
+                    chunk = chunk_batch[0].detach().cpu().numpy()
+                else:
+                    chunk = np.asarray(chunk_batch)[0]
             predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
 
@@ -4095,6 +4255,14 @@ def run_episode(
                 )
             )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
+            selected_oracle_indices = (
+                None
+                if current_oracle_chunk_indices is None
+                else np.asarray(
+                    current_oracle_chunk_indices[start_idx:end_idx],
+                    dtype=np.int64,
+                )
+            )
             previous_predicted_width = float(
                 chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
             )
@@ -4115,6 +4283,7 @@ def run_episode(
             normal_base_selected_count = max(0, normal_base_end_idx - start_idx)
             committed_selected_count = max(0, committed_end_idx - start_idx)
             executed_waypoints_this_chunk = 0
+            last_executed_selected_row_index: int | None = None
             chunk_execution_start_steps = steps
             chunk_start_controller_world = current_controller_eef_world(env).copy()
             rollback_requested = False
@@ -4195,6 +4364,7 @@ def run_episode(
 
                     steps += 1
                     hold_count += 1
+                    last_executed_selected_row_index = int(selected_row_index)
                     step_object_positions, step_object_quaternions = capture_observable_object_poses(
                         raw_obs,
                         object_pose_names,
@@ -4281,6 +4451,13 @@ def run_episode(
                 waypoint_hold_counts.append(int(hold_count))
                 if manual_failure or rollback_requested or done or success_ever:
                     break
+            if (
+                selected_oracle_indices is not None
+                and last_executed_selected_row_index is not None
+            ):
+                oracle_cursor = int(
+                    selected_oracle_indices[last_executed_selected_row_index]
+                )
             chunk_executed_waypoint_counts.append(int(executed_waypoints_this_chunk))
             if steps > chunk_execution_start_steps:
                 executed_chunk_start_controller_world_history.append(
@@ -4303,7 +4480,17 @@ def run_episode(
 
     final_eef_pose = eef_pose9_gripper_from_obs(raw_obs)
     return {
-        "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
+        "evaluation_protocol": evaluation_protocol_for_config(cfg),
+        "initialization_mode": (
+            "source_demo_exact_observation"
+            if dataset_domain_env
+            else "standard_libero_settled"
+        ),
+        "settling_applied": not dataset_domain_env,
+        "forced_initial_gripper_open_applied": (
+            bool(cfg["initial_gripper_open"]) and not dataset_domain_env
+        ),
+        "warmup_steps_applied": int(warmup_steps),
         "success": bool(success_ever),
         "done": bool(done),
         "manual_failure": bool(manual_failure),
@@ -4332,6 +4519,20 @@ def run_episode(
         ),
         "release_event_extended_model_calls": int(release_event_extended_model_calls),
         "model_call_count": int(model_call_count),
+        "policy_forward_call_count": int(policy_forward_call_count),
+        "action_source": (
+            "source_demo_gt_pose9_gripper"
+            if oracle_actions_enabled
+            else "policy_flow_matching_sample"
+        ),
+        "oracle_final_source_cursor": (
+            int(oracle_cursor) if oracle_actions_enabled else None
+        ),
+        "oracle_trajectory_length": (
+            int(len(oracle_gt_world_trajectory))
+            if oracle_gt_world_trajectory is not None
+            else None
+        ),
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
         "max_reward": float(np.max(rewards)) if rewards else 0.0,
         "wall_s": float(time.perf_counter() - start_s),
@@ -4440,6 +4641,9 @@ def run_episode(
         "libero_actions": np.asarray(libero_actions, dtype=np.float32),
         "model_action_rows": np.asarray(model_action_rows, dtype=np.float32),
         "predicted_action_chunks": np.asarray(predicted_action_chunks, dtype=np.float32),
+        "oracle_chunk_source_indices": np.asarray(
+            oracle_chunk_source_indices, dtype=np.int64
+        ),
         "target_model_worlds": np.asarray(target_model_worlds, dtype=np.float32),
         "target_controller_pose9": np.asarray(target_controller_pose9, dtype=np.float32),
         "achieved_model_worlds": np.asarray(achieved_model_worlds, dtype=np.float32),
@@ -4499,6 +4703,220 @@ def run_episode(
     }
 
 
+def resolve_dataset_domain_task_source(
+    *,
+    suite: Any,
+    suite_name: str,
+    task_id: int,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact source HDF5 demos used by dataset conversion for one task."""
+
+    if __package__ and __package__.startswith("benchmarks."):
+        from .libero_hdf5_to_dataset import (
+            find_demo_file,
+            iter_demo_group_names,
+            normalized_name,
+        )
+    else:
+        from libero_setting.libero_hdf5_to_dataset import (
+            find_demo_file,
+            iter_demo_group_names,
+            normalized_name,
+        )
+
+    demo_root_value = cfg.get("dataset_domain_demo_root")
+    if not demo_root_value:
+        raise ValueError(
+            "--dataset-domain-env requires --dataset-domain-demo-root or demo_root in the config."
+        )
+    demo_root = Path(demo_root_value).expanduser().resolve()
+    if not demo_root.is_dir():
+        raise FileNotFoundError(f"Dataset-domain demo root does not exist: {demo_root}")
+
+    task = suite.get_task(int(task_id))
+    source_cfg = dict(cfg)
+    source_cfg["suite"] = str(suite_name)
+    # Evaluation must never silently download a different source dataset.
+    source_cfg["download_demos"] = False
+    demo_file = find_demo_file(task, demo_root, None, source_cfg)
+    candidate_key = normalized_name(demo_file.stem)
+    expected_task_keys = {
+        normalized_name(str(getattr(task, "name", ""))),
+        normalized_name(Path(str(getattr(task, "bddl_file", ""))).stem),
+    }
+    expected_task_keys.discard("")
+    if not any(task_key in candidate_key for task_key in expected_task_keys):
+        expected = ", ".join(sorted(expected_task_keys))
+        raise FileNotFoundError(
+            "Dataset-domain evaluation refused an ambiguous demonstration match: "
+            f"suite={suite_name!r}, task_id={task_id}, expected task key in "
+            f"{{{expected}}}, but the best candidate was {demo_file}. "
+            "Ensure --dataset-domain-demo-root contains the HDF5 file for this exact task."
+        )
+    demo_names = iter_demo_group_names(demo_file)
+    if not demo_names:
+        raise RuntimeError(f"No demonstrations with states were found in {demo_file}.")
+    return {
+        "demo_root": str(demo_root),
+        "demo_file": str(demo_file),
+        "demo_names": demo_names,
+    }
+
+
+def restore_dataset_domain_episode(
+    *,
+    env: Any,
+    task_source: dict[str, Any],
+    episode_index: int,
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Restore one demo's MuJoCo model and return its converted first observation state."""
+
+    if __package__ and __package__.startswith("benchmarks."):
+        from .libero_hdf5_to_dataset import load_demo_group, restore_demo_model
+    else:
+        from libero_setting.libero_hdf5_to_dataset import load_demo_group, restore_demo_model
+
+    demo_names = list(task_source["demo_names"])
+    if episode_index < 0 or episode_index >= len(demo_names):
+        raise IndexError(
+            f"Dataset-domain episode {episode_index} is unavailable; "
+            f"source file provides {len(demo_names)} demo(s)."
+        )
+    demo_file = Path(task_source["demo_file"])
+    demo_name = str(demo_names[episode_index])
+    states, _actions, model_xml, source_fps = load_demo_group(demo_file, demo_name)
+    state_index = int(cfg.get("dataset_domain_state_observation_offset", 1))
+    if state_index not in (0, 1):
+        raise ValueError(
+            "dataset_domain_state_observation_offset must be 0 or 1, "
+            f"got {state_index}."
+        )
+    if states.ndim != 2 or state_index >= len(states):
+        raise ValueError(
+            f"Cannot initialize dataset-domain episode from {demo_file}:{demo_name}: "
+            f"states shape={states.shape}, requested state index={state_index}."
+        )
+
+    eval_control_freq = float(cfg["control"]["control_freq"])
+    if source_fps is not None and not np.isclose(float(source_fps), eval_control_freq):
+        raise ValueError(
+            "Dataset-domain evaluation requires source and evaluation control frequencies "
+            f"to match, but {demo_file}:{demo_name} was collected at {source_fps:g} Hz "
+            f"and evaluation is configured for {eval_control_freq:g} Hz."
+        )
+
+    model_sha256 = restore_demo_model(env, model_xml, required=True)
+    # reset_from_xml_string replaces the MuJoCo model while the outer env
+    # object keeps the same identity. Do not reuse joint-address metadata from
+    # the previous demo model.
+    _GRIPPER_JOINT_CACHE.pop(id(env), None)
+    metadata = {
+        "enabled": True,
+        "benchmark_comparable": False,
+        "demo_file": str(demo_file),
+        "demo_name": demo_name,
+        "demo_episode_index": int(episode_index),
+        "model_sha256": model_sha256,
+        "source_fps": None if source_fps is None else float(source_fps),
+        "state_index": int(state_index),
+        "state_mapping": f"initial_state = states[{state_index}]",
+        "source_state_count": int(len(states)),
+    }
+    return np.asarray(states[state_index]).copy(), metadata
+
+
+def reconstruct_dataset_domain_gt_world_trajectory(
+    *,
+    env: Any,
+    task_source: dict[str, Any],
+    episode_index: int,
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Reconstruct the converted demo's pose9+gripper labels in simulator world."""
+
+    if __package__ and __package__.startswith("benchmarks."):
+        from .libero_hdf5_to_dataset import load_demo_group
+    else:
+        from libero_setting.libero_hdf5_to_dataset import load_demo_group
+
+    demo_names = list(task_source["demo_names"])
+    demo_name = str(demo_names[int(episode_index)])
+    demo_file = Path(task_source["demo_file"])
+    states, _actions, _model_xml, _source_fps = load_demo_group(demo_file, demo_name)
+    state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
+    source_state_indices = np.arange(state_offset, len(states), dtype=np.int64)
+    if source_state_indices.size < 2:
+        raise ValueError(
+            f"GT oracle needs at least two converted observations, but "
+            f"{demo_file}:{demo_name} provides states shape={states.shape} "
+            f"with offset={state_offset}."
+        )
+
+    gt_world_poses: list[np.ndarray] = []
+    for state_index in source_state_indices:
+        raw_obs = env.set_init_state(states[int(state_index)])
+        gt_world_poses.append(eef_pose9_gripper_from_obs(raw_obs))
+
+    # Leave the simulator at the exact first converted observation. run_episode
+    # sets it once more, but doing so here also makes this helper safe to inspect
+    # independently.
+    env.set_init_state(states[state_offset])
+    trajectory = np.ascontiguousarray(np.stack(gt_world_poses), dtype=np.float32)
+    return trajectory, {
+        "demo_file": str(demo_file),
+        "demo_name": demo_name,
+        "source_state_indices": source_state_indices.tolist(),
+        "trajectory_length": int(len(trajectory)),
+        "trajectory_format": "simulator_world_pose9_plus_physical_gripper_width",
+    }
+
+
+def make_dataset_domain_oracle_chunk(
+    *,
+    gt_world_trajectory: np.ndarray,
+    cursor: int,
+    current_eef_pose9_gripper: np.ndarray,
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Express upcoming absolute GT poses relative to the current actual EEF."""
+
+    trajectory = np.asarray(gt_world_trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[1] < 10:
+        raise ValueError(f"Expected GT trajectory shape (T, >=10), got {trajectory.shape}.")
+    if len(trajectory) == 0:
+        raise ValueError("GT trajectory is empty.")
+
+    start = int(np.clip(int(cursor), 0, len(trajectory) - 1))
+    resolved_chunk_size = max(1, int(chunk_size))
+    stop = min(len(trajectory), start + resolved_chunk_size)
+    source_indices = np.arange(start, stop, dtype=np.int64)
+    if len(source_indices) < resolved_chunk_size:
+        source_indices = np.concatenate(
+            [
+                source_indices,
+                np.full(
+                    resolved_chunk_size - len(source_indices),
+                    len(trajectory) - 1,
+                    dtype=np.int64,
+                ),
+            ]
+        )
+    targets = trajectory[source_indices]
+
+    current_world = pose9_to_homo_np(
+        np.asarray(current_eef_pose9_gripper, dtype=np.float32)[:9]
+    )
+    target_worlds = pose9_to_homo_np(targets[:, :9])
+    relative_targets = fast_inverse_homogeneous(current_world) @ target_worlds
+    chunk = np.concatenate(
+        [matrix_to_pose9(relative_targets), targets[:, 9:10]],
+        axis=-1,
+    ).astype(np.float32)
+    return chunk, source_indices
+
+
 def evaluate_task(
     *,
     infer: Any,
@@ -4512,11 +4930,29 @@ def evaluate_task(
     on_environment_ready: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate all or one deterministic episode shard for a task."""
-    init_states = (
-        get_task_init_states(suite, int(task_id))
-        if task_init_states is None
-        else np.asarray(task_init_states)
+    dataset_domain_env = bool(cfg.get("dataset_domain_env", False))
+    task_source = (
+        resolve_dataset_domain_task_source(
+            suite=suite,
+            suite_name=suite_name,
+            task_id=int(task_id),
+            cfg=cfg,
+        )
+        if dataset_domain_env
+        else None
     )
+    init_states = None
+    if not dataset_domain_env:
+        init_states = (
+            get_task_init_states(suite, int(task_id))
+            if task_init_states is None
+            else np.asarray(task_init_states)
+        )
+        available_episode_count = int(len(init_states))
+    else:
+        assert task_source is not None
+        available_episode_count = int(len(task_source["demo_names"]))
+
     if episode_indices is None:
         configured_episode_ids = cfg.get("episode_ids")
         if configured_episode_ids is None:
@@ -4530,29 +4966,39 @@ def evaluate_task(
     invalid_episode_indices = [
         episode_index
         for episode_index in resolved_episode_indices
-        if episode_index < 0 or episode_index >= len(init_states)
+        if episode_index < 0 or episode_index >= available_episode_count
     ]
     if invalid_episode_indices:
+        source_name = "source HDF5 demos" if dataset_domain_env else "task init states"
         raise ValueError(
             f"Invalid episode indices for task {task_id}: {invalid_episode_indices}; "
-            f"task provides {len(init_states)} initial states."
+            f"{source_name} provide {available_episode_count} episode(s)."
         )
-    # LIBERO hard reset randomizes model-level bodies that are not represented
-    # by the flattened init_state. Preserve the canonical serial reset index so
-    # targeted runs and episode shards see the same fixture layout as episode N
-    # in a normal 0..N evaluation.
+
+    # Standard LIBERO evaluation advances the seeded hard-reset sequence because
+    # flattened init states omit model-level fixture placement. Dataset-domain
+    # mode instead restores the exact per-demo XML, so no reset-RNG warmup is used.
     resolved_episode_indices = sorted(resolved_episode_indices)
-    full_official_indices = list(range(len(init_states)))
-    if resolved_episode_indices != full_official_indices:
-        print(
-            f"[info] suite={suite_name} task={task_id} uses official fixed init-state "
-            f"subset {resolved_episode_indices}; a full OpenVLA-style LIBERO score uses "
-            f"all {len(full_official_indices)} indices.",
-            flush=True,
-        )
+    full_episode_indices = list(range(available_episode_count))
+    if resolved_episode_indices != full_episode_indices:
+        if dataset_domain_env:
+            print(
+                f"[info] suite={suite_name} task={task_id} uses training-source demo "
+                f"subset {resolved_episode_indices}; this is a dataset-domain diagnostic, "
+                f"not a standard LIBERO benchmark score.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[info] suite={suite_name} task={task_id} uses official fixed init-state "
+                f"subset {resolved_episode_indices}; a full OpenVLA-style LIBERO score uses "
+                f"all {len(full_episode_indices)} indices.",
+                flush=True,
+            )
     task_results: list[dict[str, Any]] = []
-    task_name = f"task_{int(task_id):03d}"
-    task_language = f"{suite_name}:{int(task_id)}"
+    task_definition = suite.get_task(int(task_id))
+    task_name = str(getattr(task_definition, "name", f"task_{int(task_id):03d}"))
+    task_language = str(getattr(task_definition, "language", f"{suite_name}:{int(task_id)}"))
 
     def _make_task_env() -> tuple[Any, Any]:
         # LIBERO / robosuite model construction and EGL context setup enter
@@ -4600,6 +5046,8 @@ def evaluate_task(
         # sequence without consuming one extra random fixture placement.
         shared_layout_index = 0
         for episode_idx in resolved_episode_indices:
+            environment_alignment: dict[str, Any] | None = None
+            oracle_gt_world_trajectory: np.ndarray | None = None
             episode_dir = (
                 output_dir
                 / suite_name
@@ -4627,27 +5075,57 @@ def evaluate_task(
                     task_language = str(getattr(task, "language", task_language))
 
                 assert env is not None
-                if bool(cfg.get("recreate_env_per_episode", False)):
-                    reset_warmup_count = int(episode_idx)
-                else:
-                    if int(episode_idx) < shared_layout_index:
-                        raise RuntimeError(
-                            "Episode reset sequence cannot move backwards: "
-                            f"current={shared_layout_index}, requested={episode_idx}."
+                if dataset_domain_env:
+                    assert task_source is not None
+                    episode_init_state, environment_alignment = restore_dataset_domain_episode(
+                        env=env,
+                        task_source=task_source,
+                        episode_index=int(episode_idx),
+                        cfg=cfg,
+                    )
+                    if bool(cfg.get("dataset_domain_oracle_actions", False)):
+                        (
+                            oracle_gt_world_trajectory,
+                            oracle_metadata,
+                        ) = reconstruct_dataset_domain_gt_world_trajectory(
+                            env=env,
+                            task_source=task_source,
+                            episode_index=int(episode_idx),
+                            cfg=cfg,
                         )
-                    reset_warmup_count = int(episode_idx) - shared_layout_index
-                for _ in range(reset_warmup_count):
-                    env.reset()
-                if reset_warmup_count:
+                        environment_alignment["oracle_actions"] = oracle_metadata
+                    reset_warmup_count = 0
                     print(
-                        "[eval] advanced LIBERO hard-reset RNG sequence: "
+                        "[eval] dataset-domain environment restored: "
                         f"suite={suite_name} task={task_id} episode={episode_idx} "
-                        f"skipped_resets={reset_warmup_count}",
+                        f"demo={environment_alignment['demo_name']} "
+                        f"state_index={environment_alignment['state_index']}",
                         flush=True,
                     )
+                else:
+                    assert init_states is not None
+                    episode_init_state = init_states[episode_idx]
+                    if bool(cfg.get("recreate_env_per_episode", False)):
+                        reset_warmup_count = int(episode_idx)
+                    else:
+                        if int(episode_idx) < shared_layout_index:
+                            raise RuntimeError(
+                                "Episode reset sequence cannot move backwards: "
+                                f"current={shared_layout_index}, requested={episode_idx}."
+                            )
+                        reset_warmup_count = int(episode_idx) - shared_layout_index
+                    for _ in range(reset_warmup_count):
+                        env.reset()
+                    if reset_warmup_count:
+                        print(
+                            "[eval] advanced LIBERO hard-reset RNG sequence: "
+                            f"suite={suite_name} task={task_id} episode={episode_idx} "
+                            f"skipped_resets={reset_warmup_count}",
+                            flush=True,
+                        )
 
-                if not bool(cfg.get("recreate_env_per_episode", False)):
-                    shared_layout_index = int(episode_idx)
+                    if not bool(cfg.get("recreate_env_per_episode", False)):
+                        shared_layout_index = int(episode_idx)
                 result = run_episode(
                     infer=infer,
                     env=env,
@@ -4655,11 +5133,24 @@ def evaluate_task(
                     task_id=int(task_id),
                     episode_index=int(episode_idx),
                     task_language=task_language,
-                    init_state=init_states[episode_idx],
+                    init_state=episode_init_state,
                     cfg=cfg,
                     reset_env=False,
+                    oracle_gt_world_trajectory=oracle_gt_world_trajectory,
                 )
-                result["hard_reset_sequence_index"] = int(episode_idx)
+                result["evaluation_protocol"] = evaluation_protocol_for_config(cfg)
+                result["environment_alignment"] = (
+                    environment_alignment
+                    if environment_alignment is not None
+                    else {
+                        "enabled": False,
+                        "benchmark_comparable": True,
+                        "initial_state_source": "task_suite.get_task_init_states",
+                    }
+                )
+                result["hard_reset_sequence_index"] = (
+                    None if dataset_domain_env else int(episode_idx)
+                )
                 result["hard_reset_warmup_count"] = int(reset_warmup_count)
 
                 action_npz = save_episode_actions(result, episode_dir)
@@ -4698,7 +5189,8 @@ def evaluate_task(
                 )
             except Exception as exc:
                 failure = {
-                    "evaluation_protocol": dict(FAIR_EVALUATION_PROTOCOL),
+                    "evaluation_protocol": evaluation_protocol_for_config(cfg),
+                    "environment_alignment": environment_alignment,
                     "episode_index": int(episode_idx),
                     "success": False,
                     "steps": 0,
@@ -4894,7 +5386,7 @@ def evaluate_suite_process_parallel(
     suite_name: str,
     task_ids: list[int],
     task_specs_by_id: dict[int, dict[str, str]],
-    task_init_states_by_id: dict[int, np.ndarray],
+    task_init_states_by_id: dict[int, np.ndarray | None],
     cfg: dict[str, Any],
     output_dir: Path,
     worker_count: int,
@@ -5175,7 +5667,7 @@ def _isolated_policy_worker_entry(
         else:
             from smolvla_model_inference import SmolVLA_ModelInference as WorkerInference
 
-        ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+        ensure_libero_config(cfg.get("libero_config_path"), configured_demo_root(cfg))
         configure_torch_determinism(bool(cfg.get("deterministic_torch", True)))
 
         from libero.libero import benchmark
@@ -5374,6 +5866,60 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["evaluation_identity"]["eval_config_path"] = str(config_path)
     cfg["evaluation_identity"]["eval_config_sha256"] = _sha256_file(config_path)
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
+    cfg["dataset_domain_env"] = bool(
+        cfg_get(cfg, args.dataset_domain_env, "dataset_domain_env", False)
+    )
+    cfg["dataset_domain_oracle_actions"] = bool(
+        cfg_get(
+            cfg,
+            args.dataset_domain_oracle_actions,
+            "dataset_domain_oracle_actions",
+            False,
+        )
+    )
+    dataset_domain_demo_root = cfg_get(
+        cfg,
+        args.dataset_domain_demo_root,
+        "dataset_domain_demo_root",
+        cfg.get("demo_root"),
+    )
+    cfg["dataset_domain_demo_root"] = (
+        str(Path(dataset_domain_demo_root).expanduser().resolve())
+        if dataset_domain_demo_root
+        else None
+    )
+    cfg["dataset_domain_state_observation_offset"] = int(
+        cfg.get(
+            "dataset_domain_state_observation_offset",
+            cfg.get("state_observation_offset", 1),
+        )
+    )
+    if cfg["dataset_domain_state_observation_offset"] not in (0, 1):
+        raise ValueError(
+            "state_observation_offset must be 0 or 1 for dataset-domain evaluation, "
+            f"got {cfg['dataset_domain_state_observation_offset']}."
+        )
+    if cfg["dataset_domain_env"] and not cfg["dataset_domain_demo_root"]:
+        raise ValueError(
+            "--dataset-domain-env requires --dataset-domain-demo-root or demo_root in the config."
+        )
+    if cfg["dataset_domain_oracle_actions"] and not cfg["dataset_domain_env"]:
+        raise ValueError(
+            "--dataset-domain-oracle-actions requires --dataset-domain-env."
+        )
+    cfg["evaluation_identity"]["environment_domain"] = {
+        "dataset_domain_env": bool(cfg["dataset_domain_env"]),
+        "dataset_domain_oracle_actions": bool(
+            cfg["dataset_domain_oracle_actions"]
+        ),
+        "demo_root": cfg["dataset_domain_demo_root"] if cfg["dataset_domain_env"] else None,
+        "state_observation_offset": (
+            int(cfg["dataset_domain_state_observation_offset"])
+            if cfg["dataset_domain_env"]
+            else None
+        ),
+        "benchmark_comparable": not bool(cfg["dataset_domain_env"]),
+    }
     cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 4096))
@@ -5927,7 +6473,7 @@ def main() -> None:
             output_dir=output_dir,
         )
         return
-    ensure_libero_config(cfg.get("libero_config_path"), cfg.get("demo_root"))
+    ensure_libero_config(cfg.get("libero_config_path"), configured_demo_root(cfg))
 
     from libero.libero import benchmark
     selected_episode_count = (
@@ -6030,6 +6576,9 @@ def main() -> None:
         f"policy_noise_seed={cfg['policy_noise_seed']}, "
         f"deterministic_torch={cfg['deterministic_torch']}, "
         f"env_seed={cfg['env_seed']}, "
+        f"dataset_domain_env={cfg['dataset_domain_env']}, "
+        f"dataset_domain_oracle_actions={cfg['dataset_domain_oracle_actions']}, "
+        f"benchmark_comparable={not cfg['dataset_domain_env']}, "
         f"use_suite_max_steps={cfg['use_suite_max_steps']}, "
         f"episode_horizons={episode_horizons}, "
         f"save_video={cfg['save_video']}, "
@@ -6094,10 +6643,20 @@ def main() -> None:
                     int(task_id): serialize_libero_task(suite.get_task(int(task_id)))
                     for task_id in task_ids
                 }
-                task_init_states_by_id = {
-                    int(task_id): init_states_as_numpy(get_task_init_states(suite, int(task_id)))
-                    for task_id in task_ids
-                }
+                task_init_states_by_id: dict[int, np.ndarray | None]
+                if bool(cfg.get("dataset_domain_env", False)):
+                    # Dataset-domain workers resolve source demos themselves.
+                    # Avoid loading unrelated standard benchmark init states.
+                    task_init_states_by_id = {
+                        int(task_id): None for task_id in task_ids
+                    }
+                else:
+                    task_init_states_by_id = {
+                        int(task_id): init_states_as_numpy(
+                            get_task_init_states(suite, int(task_id))
+                        )
+                        for task_id in task_ids
+                    }
                 print(
                     f"[parallel] suite={suite_name}: starting up to {environment_worker_count} "
                     f"MuJoCo processes ({worker_count} tasks x {episode_worker_count} episode shards) "

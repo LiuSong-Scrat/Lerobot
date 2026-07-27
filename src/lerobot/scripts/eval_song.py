@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -95,11 +96,140 @@ EVAL_METRIC_KEYS = (
 )
 
 
-def _make_eval_dataset(cfg: TrainPipelineConfig):
+@dataclass
+class SongEvalPipelineConfig(TrainPipelineConfig):
+    """Read-only evaluation options that do not belong to the training config."""
+
+    libero_dataset_domain_action_mse: bool = False
+    libero_suite: str | None = None
+    libero_task_id: int | None = None
+
+
+class EvalFrameSubset(torch.utils.data.Dataset):
+    """Frame subset that preserves access to LeRobot metadata and wrapper attributes."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset, indices: list[int]) -> None:
+        self.dataset = dataset
+        self.indices = [int(index) for index in indices]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.dataset, name)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> Any:
+        return self.dataset[self.indices[index]]
+
+
+def _resolve_libero_dataset_domain_selection(
+    cfg: SongEvalPipelineConfig,
+) -> dict[str, Any] | None:
+    """Resolve one LIBERO suite/task to the exact episodes stored in the training dataset."""
+
+    if not cfg.libero_dataset_domain_action_mse:
+        if cfg.libero_suite is not None or cfg.libero_task_id is not None:
+            raise ValueError(
+                "--libero_suite/--libero_task_id require "
+                "--libero_dataset_domain_action_mse=true."
+            )
+        return None
+    if cfg.libero_suite is None or cfg.libero_task_id is None:
+        raise ValueError(
+            "--libero_dataset_domain_action_mse=true requires both "
+            "--libero_suite and --libero_task_id."
+        )
+    if cfg.dataset.streaming:
+        raise ValueError("LIBERO dataset-domain action MSE does not support streaming datasets.")
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    try:
+        from libero.libero import benchmark
+    except Exception as exc:
+        raise RuntimeError(
+            "LIBERO must be importable to resolve --libero_suite and --libero_task_id."
+        ) from exc
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    suite_name = str(cfg.libero_suite)
+    if suite_name not in benchmark_dict:
+        raise ValueError(
+            f"Unknown LIBERO suite {suite_name!r}; available suites are "
+            f"{sorted(benchmark_dict)}."
+        )
+    suite = benchmark_dict[suite_name]()
+    task_id = int(cfg.libero_task_id)
+    if task_id < 0 or task_id >= len(suite.tasks):
+        raise ValueError(
+            f"Invalid task id {task_id} for {suite_name}; expected 0..{len(suite.tasks) - 1}."
+        )
+    task = suite.get_task(task_id)
+    task_language = str(task.language)
+
+    metadata = LeRobotDatasetMetadata(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        revision=cfg.dataset.revision,
+    )
+    matching_episode_indices = [
+        int(episode["episode_index"])
+        for episode in metadata.episodes
+        if task_language in list(episode["tasks"])
+    ]
+    if cfg.dataset.episodes is not None:
+        requested = {int(index) for index in cfg.dataset.episodes}
+        matching_episode_indices = [
+            index for index in matching_episode_indices if index in requested
+        ]
+    if not matching_episode_indices:
+        available_tasks = sorted(str(task_name) for task_name in metadata.tasks.index)
+        preview = available_tasks[:20]
+        raise ValueError(
+            f"No episodes for {suite_name} task {task_id} ({task_language!r}) were found "
+            f"in dataset {cfg.dataset.repo_id!r}. Available task labels include: {preview}"
+        )
+
+    frame_indices: list[int] = []
+    for episode_index in matching_episode_indices:
+        episode = metadata.episodes[episode_index]
+        frame_indices.extend(
+            range(
+                int(episode["dataset_from_index"]),
+                int(episode["dataset_to_index"]),
+            )
+        )
+    return {
+        "mode": "libero_training_dataset_action_mse",
+        "suite": suite_name,
+        "task_id": task_id,
+        "task_name": str(task.name),
+        "task_language": task_language,
+        "episode_indices": matching_episode_indices,
+        "frame_indices": frame_indices,
+        "episode_count": len(matching_episode_indices),
+        "frame_count": len(frame_indices),
+        "environment_source": "converted_training_dataset",
+        "benchmark_rollout": False,
+    }
+
+
+def _make_eval_dataset(
+    cfg: SongEvalPipelineConfig,
+    dataset_domain_selection: dict[str, Any] | None,
+):
+    # Build the complete dataset first. Applying the frame subset after the
+    # PointSeg/cache wrappers preserves their global dataset-index alignment.
+    requested_episodes = cfg.dataset.episodes
+    if dataset_domain_selection is not None:
+        cfg.dataset.episodes = None
     dataset = make_dataset(cfg)
     dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
     dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
     dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
+    if dataset_domain_selection is not None:
+        dataset = EvalFrameSubset(dataset, dataset_domain_selection["frame_indices"])
+        cfg.dataset.episodes = requested_episodes
     return dataset
 
 
@@ -125,8 +255,9 @@ def _make_eval_preprocessor(cfg: TrainPipelineConfig, policy, dataset, device: t
     return preprocessor
 
 
-def _make_eval_dataloader(cfg: TrainPipelineConfig, dataset, device: torch.device):
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+def _make_eval_dataloader(cfg: SongEvalPipelineConfig, dataset, device: torch.device):
+    dataset_domain_action_mse = bool(cfg.libero_dataset_domain_action_mse)
+    if hasattr(cfg.policy, "drop_n_last_frames") and not dataset_domain_action_mse:
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
@@ -150,7 +281,7 @@ def _make_eval_dataloader(cfg: TrainPipelineConfig, dataset, device: torch.devic
         dataset,
         num_workers=dataloader_num_workers,
         batch_size=cfg.batch_size,
-        shuffle=sampler is None and not cfg.dataset.streaming,
+        shuffle=sampler is None and not cfg.dataset.streaming and not dataset_domain_action_mse,
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
@@ -209,7 +340,7 @@ def _format_metrics(metrics: dict[str, float]) -> str:
 
 
 @parser.wrap()
-def evaluate(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None) -> dict[str, Any]:
+def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None) -> dict[str, Any]:
     # TrainPipelineConfig normally rejects an output directory containing prior
     # artifacts. Evaluation only replaces eval_metrics.json and never writes a
     # checkpoint, so reusing an evaluation directory is safe and convenient.
@@ -246,13 +377,22 @@ def evaluate(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None) -
     device = accelerator.device
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+    dataset_domain_selection = _resolve_libero_dataset_domain_selection(cfg)
 
     if is_main_process:
         logging.info("Creating evaluation dataset")
-        dataset = _make_eval_dataset(cfg)
+        if dataset_domain_selection is not None:
+            logging.info(
+                "LIBERO dataset-domain action MSE: suite=%s task=%s episodes=%s frames=%s",
+                dataset_domain_selection["suite"],
+                dataset_domain_selection["task_id"],
+                dataset_domain_selection["episode_count"],
+                dataset_domain_selection["frame_count"],
+            )
+        dataset = _make_eval_dataset(cfg, dataset_domain_selection)
     accelerator.wait_for_everyone()
     if not is_main_process:
-        dataset = _make_eval_dataset(cfg)
+        dataset = _make_eval_dataset(cfg, dataset_domain_selection)
 
     if is_main_process:
         logging.info("Loading evaluation policy")
@@ -352,6 +492,13 @@ def evaluate(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None) -
         key: running_sums[key] / running_counts[key] for key in EVAL_METRIC_KEYS if running_counts[key] > 0
     }
     evaluated_samples = int(running_counts.get("loss_action", 0.0))
+    dataset_domain_report = None
+    if dataset_domain_selection is not None:
+        dataset_domain_report = {
+            key: value
+            for key, value in dataset_domain_selection.items()
+            if key != "frame_indices"
+        }
     summary = {
         "checkpoint": str(cfg.policy.pretrained_path),
         "dataset": str(cfg.dataset.repo_id),
@@ -362,6 +509,14 @@ def evaluate(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None) -
         "num_processes": int(accelerator.num_processes),
         "seed": cfg.seed,
         "metrics": summary_metrics,
+        "dataset_domain_selection": dataset_domain_report,
+        "metric_semantics": {
+            "loss_action": (
+                "The checkpoint's native flow-matching action velocity MSE, "
+                "computed by policy(batch) with the same preprocessing, action chunks, "
+                "padding masks, and PointSeg cache path as training."
+            )
+        },
     }
 
     gradients_created = [
