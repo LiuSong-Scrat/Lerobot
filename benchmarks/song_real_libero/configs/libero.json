@@ -42,7 +42,7 @@
   "control": {
     "gripper_threshold": 0.075,
     "gripper_control_mode": "delta_width",
-    "gripper_delta_threshold": 0.004,
+    "gripper_delta_threshold": 0.002,
     "gripper_delta_alignment": "current_minus_previous",
     "synchronize_gripper_controller_state": true,
     "gripper_target_tolerance": 0.004,

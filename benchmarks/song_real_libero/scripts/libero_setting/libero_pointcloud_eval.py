@@ -462,7 +462,7 @@ def parse_args() -> argparse.Namespace:
         "--align-env-to-training-data",
         dest="dataset_domain_env",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Diagnostic mode: map episode N to source demo N, restore that demo's HDF5 "
             "model_file, and initialize from the same state used by dataset conversion. "
