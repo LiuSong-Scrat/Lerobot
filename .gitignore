@@ -180,3 +180,14 @@ outputs/
 
 # hdf5
 *.hdf5
+
+# Local benchmark datasets, conversions, and machine-specific scripts.
+/WEP_VLA_V042_MERGE_REVIEW.md
+/benchmarks/open_x_embodiment/
+/benchmarks/xuan_calvin/
+/benchmarks/xuan_libero_plus/
+/benchmarks/xuan_metaworld/
+/benchmarks/xuan_robotwin/
+/benchmarks/song_real_libero/scripts/libero_setting/libero_hdf5_to_dataset\ copy.py
+/benchmarks/song_real_libero/scripts/libero_setting/run_libero_4suite_eval.sh
+/benchmarks/虚拟环境.md

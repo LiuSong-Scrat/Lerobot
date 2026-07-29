@@ -1369,7 +1369,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy.train()
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
+        # Keep enough precision for late-stage runs where the action loss is below 1e-3.
+        "loss": AverageMeter("loss", ":.6f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
@@ -1459,7 +1460,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 for key in debug_keys:
                     value = output_dict.get(key)
                     if value is not None:
-                        debug_items.append(f"{key}:{float(value):.4g}")
+                        value = float(value)
+                        if key.startswith("loss"):
+                            debug_items.append(f"{key}:{value:.6f}")
+                        else:
+                            debug_items.append(f"{key}:{value:.4g}")
                 if debug_items:
                     logging.info(" ".join(debug_items))
             if wandb_logger:
@@ -1480,20 +1485,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
-            with torch.no_grad(), accelerator.autocast():
-                save_joint_pointseg_visualization(
-                    policy,
-                    batch,
-                    step=step,
-                    output_dir=cfg.output_dir,
-                    tag="train",
-                    max_items=2,
-                )
-                try:
-                    ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
-                except Exception:
-                    logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
-
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
@@ -1510,6 +1501,39 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+
+            # Persist the checkpoint before optional native visualization/OOD code.
+            # A process-level crash in Open3D/spconv must not lose the trained step.
+            with torch.no_grad(), accelerator.autocast():
+                save_joint_pointseg_visualization(
+                    policy,
+                    batch,
+                    step=step,
+                    output_dir=cfg.output_dir,
+                    tag="train",
+                    max_items=2,
+                )
+                disable_checkpoint_ood = os.environ.get("SONG_DISABLE_CHECKPOINT_OOD", "0").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if disable_checkpoint_ood:
+                    logging.info("Checkpoint OOD inference disabled at step %s.", step)
+                else:
+                    try:
+                        ood_case_inference(
+                            policy,
+                            preprocessor,
+                            postprocessor,
+                            batch,
+                            step,
+                            output_dir=cfg.output_dir,
+                            ood_num_points=50000,
+                        )
+                    except Exception:
+                        logging.exception("OOD case inference failed at step %s; continuing training.", step)
 
             accelerator.wait_for_everyone()
 
