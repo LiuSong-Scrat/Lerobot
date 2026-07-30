@@ -14,7 +14,8 @@ EEF 相对动作轨迹。
 
 项目同时支持真实机器人 HDF5 与 LIBERO 官方 demonstration。两个数据域共享以下核心契约：
 
-- 固定 overview 相机是观测参考系；真实数据不依赖相机到机器人世界的外参。
+- 固定 overview 相机直接作为观测参考系；头戴相机使用同步 6-DoF 轨迹，可归一化到 episode
+  第一帧相机系，也可对齐到共享 tracking/base 中的 canonical 固定相机。
 - 点云在加入虚拟夹爪后转换到当前 EEF 坐标系，再作为模型输入。
 - 动作采用 `xyz + rotation-6D + gripper` 的 10 维表示。
 - PointSeg 的监督来自机械臂轨迹先验，不使用人工分割、人工光流、手工目标点或 PCA。
@@ -37,7 +38,7 @@ EEF 相对动作轨迹。
 | PointSeg | 开启 | 使用 cache v7 软运动先验监督 |
 | LitePT | 开启 | XYZ 作为 coord，同时 XYZRGB 作为 feat |
 | Point–Action fusion | 开启 | 最终 LitePT token 与 action token 联合双向 self-attention |
-| WorldFlow | **关闭** | 当前 cache 通道语义尚未与旧 WorldFlow 角色解释完全统一 |
+| WorldFlow | **默认关闭** | 已重构为独立 LitePT/PointAction flow-matching 辅助分支，需单独重训验证 |
 | 独立 SE(3) flow 动作头 | **关闭** | 实验分支，不是当前稳定结果路径 |
 | PCA / canonical frame | 不使用 | 已从当前方案中排除 |
 | 人工分割 / 人工点流 | 不使用 | 所有前景监督由轨迹自动产生 |
@@ -119,8 +120,10 @@ EEF 相对动作轨迹。
 ### 2.2 当前没有声称解决的问题
 
 - 当前 LitePT 把绝对 XYZ 同时输入 coord 和 feat，仍可能对坐标平移、相机重定位和离群点敏感。
-- 当前真实与 LIBERO 数据都把 overview 相机视为固定参考。相机随头部运动时，必须实时获得
-  EEF 与相机在同一坐标系中的位姿，否则点云和机器人状态会失配。
+- 固定 overview 相机仍可直接使用原路径；头戴相机必须为每个 RGB-D 帧提供同步的 full-SE(3)
+  `T_tracking_camera` 轨迹，并在真实数据转换时对齐到 episode 第一帧或共享 canonical
+  相机定义的模型 `world`。`overhead` 只作为相机/数据键名称。L515/D435I 原始 IMU 只有加速度和
+  角速度，不能直接替代 6-DoF VIO/SLAM 位姿。
 - 运动先验是软前景证据，不等价于实例分割或精确场景流。
 - 低 flow-matching loss 不保证接触任务成功；闭环误差、控制器语义、数据对齐和动作执行频率
   都可能成为主要瓶颈。
@@ -233,6 +236,136 @@ R=[\mathbf{b}_1,\mathbf{b}_2,\mathbf{b}_3].
 - 状态：当前 EEF 在自身坐标系中接近单位位姿；
 - 动作：相对于当前实际 EEF 的未来命令目标；
 - 推理输出：同样的 EEF-relative 目标，再由执行器还原为控制器目标。
+
+### 4.4 L515 / D435I 移动 overview 相机：对齐到 model world
+
+完整独立操作手册见
+[`scripts/real_setting/README_CAMERA_MOTION.md`](scripts/real_setting/README_CAMERA_MOTION.md)。
+
+头跟随手运动时，相机系中的末端位姿可能近似不变。若直接把它当作固定相机 state，真实运动会被
+相机运动抵消，动作标签退化为接近零。`overhead` 只标识 overview 相机通道；稳定参考坐标叫
+`world`。默认 `episode_first` 将它定义为 episode 第一帧 overview 相机：
+
+```text
+T_T_Ct  : 第 t 帧相机到 VIO/SLAM tracking frame 的变换
+T_W_Ct = inverse(T_T_C0) @ T_T_Ct
+p_W    = T_W_Ct @ p_Ct
+T_W_Et = T_W_Ct @ T_Ct_Et
+```
+
+点云和 EEF 位姿必须一起变换。只移动点云而不移动 EEF 会制造坐标系错误。二者一起变换后，
+最终送入模型的当前 EEF 系点云保持物理等价；真正被修复的是 `world_ee_poses`、state/action
+轨迹及依赖该轨迹生成的运动先验。VIO/SLAM 的 tracking frame 只是外部定位坐标，不能称为
+模型 world。
+
+#### 采集与现场调试
+
+```bash
+python benchmarks/song_real_libero/scripts/real_setting/record_bestman_rgbd.py \
+  --camera L515 \
+  --output /path/to/raw_sequence \
+  --storage compressed \
+  --record-imu \
+  --debug-visualization \
+  --debug-rgbd-odometry \
+  --debug-save-every 30
+```
+
+调试窗口同时显示 RGB、深度有效率与尺度分位数、深度边缘在 RGB 上的重合情况、点云 XZ/XY
+投影、采集 FPS、gyro/accel 与 RGB 的时间差，以及动态鲁棒 RGB-D world-anchor 的 fitness、
+RMSE、累计平移与旋转。按 `S` 保存 dashboard，按 `R` 把下一帧设为新的 world 参考帧。自动截图位于
+`<raw_sequence>/debug/`，原始多速率 IMU 位于 `imu.jsonl`，每条 `frames.jsonl` 记录还带有
+最近邻 IMU 样本。`metadata.json` 同时保存实际选择的 gyro/accel rate、motion intrinsics、
+motion sensor 到 color camera 的 librealsense 外参和设备/固件信息，便于后续 VIO 标定审计。
+
+`--debug-rgbd-odometry` 使用固定首帧 world 锚、多帧静态背景一致性、RGB+几何配准和 Tukey
+鲁棒核，能够抑制局部移动的人手与物体；它仍只用于质量检查，不会写成训练用 camera pose。
+L515/D435I 的 gyro/accel 不能通过简单双积分可靠恢复平移。正式数据必须由同步
+RGB-D-Inertial SLAM/VIO 或外部 6-DoF tracking 提供每帧
+`T_tracking_camera`。tracking frame 的任意全局原点会在首帧归一化中消去，不会成为模型输入。
+
+正式采集无需同步运行上述重调试。`--camera-trajectory-mode rgbd_odometry` 会先保持原速采集，
+关闭相机后再估计轨迹；`--camera-trajectory-mode external` 则严格接入完整外部 SLAM/VIO
+轨迹。添加 `--visualize-aligned-point-cloud` 后会动态播放所有首帧对齐点云，并显示固定大型
+XYZ 原点轴、当前相机轴和相机轨迹。固定相机默认使用 `--camera-trajectory-mode static`，
+为每帧写入单位位姿，数值行为与旧数据一致。完整参数与实测 FPS 见独立操作手册。
+
+固定相机漂移检查可直接执行：
+
+```bash
+python benchmarks/song_real_libero/scripts/real_setting/record_bestman_rgbd.py \
+  --camera L515 \
+  --output /path/to/stationary_check \
+  --num-frames 120 \
+  --warmup-frames 30 \
+  --stationary-pose-check \
+  --record-imu
+```
+
+D435I 只需改为 `--camera D435I`；无显示服务器增加 `--debug-headless`。逐帧诊断位姿和
+PASS/FAIL 报告分别保存在 `debug/rgbd_odometry.jsonl` 与
+`debug/stationary_pose_report.json`。
+
+#### 将 VIO/SLAM 轨迹写入 HDF5
+
+相机轨迹 JSONL 必须按 `record_index` 与 RGB-D 帧显式匹配，不能猜测时间偏移。每行示例：
+
+```json
+{"record_index": 17, "timestamp_ms": 1234.5, "camera_to_tracking": [[1,0,0,0.02],[0,1,0,0],[0,0,1,0.01],[0,0,0,1]], "tracking_source": "vio", "valid": true}
+```
+
+构造 HDF5 时保持原始点云与手部位姿均在当前相机系：
+
+```bash
+python benchmarks/song_real_libero/scripts/real_setting/build_humanhand_hdf5_dataset.py \
+  --input /path/to/raw_sequence \
+  --jsonl /path/to/handpose_wilor.jsonl \
+  --camera-pose-jsonl /path/to/camera_pose.jsonl \
+  --require-camera-pose \
+  --camera-pose-max-sync-error-ms 20 \
+  --camera-reference-mode episode_first \
+  --pose-frame camera \
+  --segments 0:200 \
+  --no-interactive
+```
+
+输出字段为 `observations/camera_tracking_pose/<camera>`，矩阵语义固定为
+`T_tracking<-camera`、平移单位
+meter。一个 segment 中只要缺失任意一帧位姿就会报错，避免部分轨迹被静默当作固定相机。
+当 RGB-D 与 pose 同时带时间戳时，默认还会检查两者绝对时间差不超过 20 ms，并把逐帧误差写入
+`observations/camera_tracking_pose_sync_error_ms`。
+
+#### 转换为 LeRobot dataset 并验收
+
+```bash
+python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py \
+  --input-dir /path/to/hdf5_raw \
+  --output-root /path/to/lerobot_dataset \
+  --repo-id real_head_camera_dataset \
+  --camera overhead \
+  --camera-motion-compensation required \
+  --camera-reference-mode auto \
+  --camera-motion-debug \
+  --camera-motion-debug-episodes 2 \
+  --vis-count 2
+```
+
+`auto` 模式在存在相机轨迹时补偿，缺失时保持原固定相机行为；正式头戴数据应使用 `required`。
+审计文件包括：
+
+- `world_ee_poses/episode_xxxxxx.npy`：`T_world<-ee`；
+- `camera_motion/episode_xxxxxx.npy`：`T_world<-current_camera`；
+- `visualizations/episode_xxxxxx/camera_motion/overlay_raw_as_if_camera_fixed.ply`；
+- `.../overlay_aligned_to_world.ply`；
+- `.../trajectories_camera_blue_raw_ee_red_aligned_ee_green.ply`；
+- `.../trajectory.csv` 和 `README.txt`。
+
+正确结果应满足：静态背景在 aligned overlay 中明显比 raw overlay 更锐利；当头跟随手时，红色
+原始 camera-relative EEF 轨迹可能接近静止，但绿色首帧参考系 EEF 轨迹应恢复真实运动。
+
+若要让所有 episode 和旧固定 overview 相机严格共用一个 world，使用
+`--camera-reference-mode canonical` 并提供同一持久 tracking/base 坐标中的
+`T_tracking<-canonical_camera`。每次重置原点的 odometry 无法单独提供这种跨 episode 对齐。
 
 ---
 
@@ -482,36 +615,46 @@ x_{k+1}=x_k+\Delta t\,v_\theta(x_k,t_k,c),\qquad \Delta t=0.1.
 
 ### 8.1 当前实现
 
-`worldflow_enable=true` 时，额外 Dense ObjectFlow 分支：
+`worldflow_enable=true` 时启用一个与 Ego 分支不共享参数的辅助模型：
 
-1. 向量化 top-k / gather 选择最多 2,048 个点；
-2. 先在 Ego 点云中选点，再转换到固定 overview/world 参考系；
-3. MLP 对每点一次输出 `chunk_size × 3` 的位移；
-4. batched weighted Kabsch 通过一次 SVD 拟合每个时刻的刚体变换；
-5. 使用 SE(3) 共轭关系把空间变换联系到 body action；
-6. 计算 dense flow、rigid、bridge 与 equivariance 辅助损失。
+1. PointSeg 按预测前景分数选出 Ego/body-frame 的 XYZRGB 前景点；WorldFlow 不读取分数值、
+   pseudo label 或 `role_scores`；
+2. 用当前末端 world 位姿 \(C=T_{W\leftarrow E_0}\) 将前景点解析地转换到 world frame；
+3. 独立的 LitePT 编码 world 点云，独立 PointAction adapter 让 noisy spatial-action token
+   进入点云 token 内部交互；
+4. 独立语言 embedding、动作/时间投影与双向 Action Expert 通过 flow matching 预测
+   \(G_t=A_tC^{-1}\) 的 pose9 表示；
+5. 用 \(C^{-1}\hat G_tC\leftrightarrow\hat B_t\) 将 World spatial transform 与 Ego body-frame
+   动作连接；
+6. 对随机坐标变换 \(S\) 同步增强点云、flow noise 和监督标签，并约束
+   \(\hat G'_t=S\hat G_tS^{-1}\)。
 
-该分支不使用 PCA，不要求真实点流标签，Kabsch 结果默认不反向传播。它当前是训练辅助分支，
-不会直接替代默认 flow-matching 推理输出。
+损失由 `flow + SE(3) endpoint geometry + World–Ego bridge + conjugation equivariance` 组成。
+当前实现不预测点流、不运行 Kabsch、不使用 PCA，也不需要人为角色定义。
 
-### 8.2 当前为什么必须默认关闭
+WorldFlow 只在训练 `forward` 中计算辅助损失；`sample_actions`、`predict_action_chunk` 和在线
+推理均不调用该分支，因此 rollout 仍完全由原 Ego SmolVLA flow-matching 路径生成。
 
-最新版 PointSeg cache 的三个通道是：
+第一版完整结构的关键开关为：
 
-```text
-tool_comotion / trajectory_approach / near_contact
+```bash
+--policy.worldflow_enable=true
+--policy.worldflow_action_expert_layers=-1
+--policy.worldflow_max_points=0
+--policy.worldflow_loss_weight=0.05
+--policy.worldflow_geo_loss_weight=0.05
+--policy.worldflow_bridge_loss_weight=0.05
+--policy.worldflow_equiv_loss_weight=0.02
+--policy.se3_enable=false
 ```
 
-但 WorldFlow 的旧选点和聚合逻辑仍按：
+`worldflow_action_expert_layers=-1` 表示与 Ego Action Expert 使用相同层数；`worldflow_max_points=0`
+表示保留完整预测前景。减小层数或设置正的点数上限只用于显存/速度消融，不是默认完整结构。
 
-```text
-gripper / condition-manipulated-object / target
-```
+### 8.2 为什么仍默认关闭
 
-解释同一张量，并会抑制通道 0。两组通道语义并不等价。这会使 WorldFlow 以错误角色解释软证据，
-属于功能性风险，而不是单纯超参数问题。
-
-在重新定义角色映射、迁移 cache manifest、补充单元测试并重新训练前，论文主结果和稳定训练必须：
+新 WorldFlow 已消除旧版 evidence/role 语义错配，但模型结构和旧 WorldFlow checkpoint 不兼容，
+必须从新分支随机初始化并重新训练。论文主结果在完成独立消融前仍使用：
 
 ```bash
 --policy.worldflow_enable=false
@@ -566,8 +709,8 @@ fixture 的 XML 布局。flattened simulator state 主要保存动态状态，�
 |---|---|
 | `observation.state` | 重建观测时的实际 EEF pose + 实际夹爪宽度 |
 | `action` | 控制器绝对 target pose + 对应物理夹爪宽度 |
-| `world_ee_poses/` | 实际 EEF 在固定 overview 相机参考系中的 pose |
-| `action_target_ee_poses/` | 命令目标在固定 overview 相机参考系中的 pose |
+| `world_ee_poses/` | 实际 EEF 在模型 world（固定 overview 相机参考系）中的 pose |
+| `action_target_ee_poses/` | 命令目标在模型 world 中的 pose |
 
 实际 state 与 action 在接触、跟踪误差或控制延迟下本来就不同。这是正确数据，不应再次对齐为同值。
 
@@ -667,7 +810,8 @@ timestamp:   timestamp_ms
 
 1. 读取相机系 XYZRGB；
 2. 在同一相机系添加虚拟夹爪；
-3. 把 overhead 相机系视为固定 reference/world；
+3. 固定相机直接以 overhead 为 reference；移动相机按配置对齐到 episode 第一帧或 canonical
+   overview 相机；
 4. 将合并点云转换到当前 EEF；
 5. 从人手示范 pose 构造 state/action；
 6. 保存 RGB、时间戳和 sidecar pose。
@@ -1247,7 +1391,7 @@ python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
 | adapter 版真实 dataset，点云和 frame 未变化 | 条件兼容 | 核对 image key、点顺序、episode mapping；不确定时重建 cache |
 | cache v7 + 完全相同 dataset | 是 | 使用 strict 检查 |
 | v0.2 / v0.3 checkpoint | 条件兼容 | 以 checkpoint config 构造模型，不能强行开启新 fusion |
-| 当前 checkpoint + `worldflow_enable=true` | 不建议 | evidence channel 语义未对齐 |
+| 旧 WorldFlow checkpoint + 当前 `worldflow_enable=true` | 否 | 新分支不再是 Dense ObjectFlow；需重新训练 WorldFlow 参数 |
 | point-only checkpoint + PLY | 是 | 不需要 RGB adapter |
 | adapter checkpoint + 只有 PLY | 否 | 还需同步 RGB、task、EEF pose |
 
@@ -1419,7 +1563,7 @@ sha256sum /path/to/checkpoint/model.safetensors
 2. dataset 是否由逐 demo `model_file`、offset 1、controller target 版本生成？
 3. cache 是否由这份 dataset 重新生成？
 4. checkpoint 内 adapter、PointSeg、Point–Action fusion 开关是什么？
-5. WorldFlow 是否仍关闭；若开启，evidence channel 是否已正式迁移？
+5. WorldFlow 是否仍关闭；若开启，是否使用独立 LitePT/PointAction 分支并从头训练其参数？
 6. 训练与推理的 RGB key、点云坐标系和 EEF pose 是否一致？
 7. 比较 loss 时是否固定了样本、noise、\(t\) 和 processor？
 8. rollout 失败前，oracle action 能否通过同一执行器？

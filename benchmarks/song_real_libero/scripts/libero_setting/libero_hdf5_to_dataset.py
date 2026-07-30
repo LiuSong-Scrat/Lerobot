@@ -64,7 +64,9 @@ POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
 POINT_CLOUD_CHANNELS = 6
-ACTION_LABEL_SEMANTICS = "source_raw_delta_to_source_state_anchored_absolute_model_eef_target"
+ACTION_LABEL_SEMANTICS = (
+    "source_raw_delta_to_source_state_anchored_absolute_model_eef_target"
+)
 OBSERVATION_STATE_SEMANTICS = "achieved_eef_pose_at_reconstructed_observation"
 
 DATASET_FEATURES = {
@@ -87,14 +89,18 @@ def image_feature_key(camera: str) -> str:
 
 def image_feature_camera(cfg: dict[str, Any]) -> str:
     value = cfg.get("image_camera")
-    return str(value) if value is not None else pointcloud_camera_names_from_config(cfg)[0]
+    return (
+        str(value) if value is not None else pointcloud_camera_names_from_config(cfg)[0]
+    )
 
 
 def ensure_image_camera_rendered(cfg: dict[str, Any]) -> None:
     if not bool(cfg.get("save_rgb_images", True)):
         return
     image_camera = normalize_camera_name(image_feature_camera(cfg))
-    camera_names = [normalize_camera_name(name) for name in list(cfg.get("camera_names") or [])]
+    camera_names = [
+        normalize_camera_name(name) for name in list(cfg.get("camera_names") or [])
+    ]
     pointcloud_cameras = pointcloud_camera_names_from_config(cfg)
     if image_camera not in camera_names and image_camera not in pointcloud_cameras:
         camera_names.append(image_camera)
@@ -106,17 +112,25 @@ def dataset_features_with_image(cfg: dict[str, Any]) -> dict[str, Any]:
     if bool(cfg.get("save_rgb_images", True)):
         features[image_feature_key(image_feature_camera(cfg))] = {
             "dtype": "image",
-            "shape": (int(cfg.get("observation_height", 128)), int(cfg.get("observation_width", 128)), 3),
+            "shape": (
+                int(cfg.get("observation_height", 128)),
+                int(cfg.get("observation_width", 128)),
+                3,
+            ),
             "names": ["height", "width", "channels"],
         }
     return features
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert LIBERO demonstrations into the Song point-cloud LeRobot format.")
+    parser = argparse.ArgumentParser(
+        description="Convert LIBERO demonstrations into the Song point-cloud LeRobot format."
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--suite", action="append", default=None)
-    parser.add_argument("--all-tasks", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--all-tasks", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--task-id", type=int, action="append", default=None)
     parser.add_argument("--demo-root", type=Path, default=None)
     parser.add_argument("--demo-file", type=Path, action="append", default=None)
@@ -155,24 +169,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Require the output dataset FPS to match the source LIBERO control frequency.",
     )
-    parser.add_argument("--download-demos", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--download-use-huggingface", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--download-demos", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--download-use-huggingface",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--vis-dir", type=Path, default=None)
     parser.add_argument("--vis-count", type=int, default=None)
     parser.add_argument("--vis-stride", type=int, default=None)
-    parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--save-rgb-images", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--save-video", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--save-rgb-images", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--image-camera", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--tmp-dir", type=Path, default=None)
-    parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--overwrite", action=argparse.BooleanOptionalAction, default=None
+    )
     return parser.parse_args()
 
 
 def load_config(path: Path) -> dict[str, Any]:
     return load_json_config(
         path,
-        path_keys=("dataset_output_root", "libero_config_path", "demo_root", "vis_dir", "output_dir"),
+        path_keys=(
+            "dataset_output_root",
+            "libero_config_path",
+            "demo_root",
+            "vis_dir",
+            "output_dir",
+        ),
     )
 
 
@@ -181,7 +213,11 @@ def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) 
 
 
 def resolve_suite_names(cli_suites: list[str] | None, cfg: dict[str, Any]) -> list[str]:
-    suites = cli_suites if cli_suites is not None else cfg.get("suites", cfg.get("suite", "libero_object"))
+    suites = (
+        cli_suites
+        if cli_suites is not None
+        else cfg.get("suites", cfg.get("suite", "libero_object"))
+    )
     if isinstance(suites, str):
         suites = [suites]
     suites = [str(suite) for suite in suites]
@@ -212,7 +248,9 @@ def resolve_task_ids_for_suite(
     resolved = [int(task_id) for task_id in task_ids]
     invalid = [task_id for task_id in resolved if task_id < 0 or task_id >= task_count]
     if invalid:
-        raise ValueError(f"Invalid task id(s) for {suite_name}: {invalid}; valid range is [0, {task_count - 1}]")
+        raise ValueError(
+            f"Invalid task id(s) for {suite_name}: {invalid}; valid range is [0, {task_count - 1}]"
+        )
     return resolved
 
 
@@ -235,8 +273,12 @@ def image_from_raw_obs(raw_obs: dict[str, Any], image_key: str) -> np.ndarray | 
     return image
 
 
-def dataset_image_from_raw_obs(raw_obs: dict[str, Any], camera_name: str) -> np.ndarray | None:
-    image_key = camera_name if str(camera_name).endswith("_image") else f"{camera_name}_image"
+def dataset_image_from_raw_obs(
+    raw_obs: dict[str, Any], camera_name: str
+) -> np.ndarray | None:
+    image_key = (
+        camera_name if str(camera_name).endswith("_image") else f"{camera_name}_image"
+    )
     image = image_from_raw_obs(raw_obs, image_key)
     if image is None:
         return None
@@ -245,7 +287,11 @@ def dataset_image_from_raw_obs(raw_obs: dict[str, Any], camera_name: str) -> np.
     return image.copy()
 
 
-def append_video_frames(video_frames: dict[str, list[np.ndarray]], raw_obs: dict[str, Any], camera_names: list[str]) -> None:
+def append_video_frames(
+    video_frames: dict[str, list[np.ndarray]],
+    raw_obs: dict[str, Any],
+    camera_names: list[str],
+) -> None:
     for image_key in camera_image_keys(camera_names):
         image = image_from_raw_obs(raw_obs, image_key)
         if image is not None:
@@ -286,7 +332,12 @@ def write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
         writer.release()
 
 
-def export_episode_videos(episode: dict[str, Any], video_dir: Path, record: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
+def export_episode_videos(
+    episode: dict[str, Any],
+    video_dir: Path,
+    record: dict[str, Any],
+    cfg: dict[str, Any],
+) -> list[str]:
     if not cfg.get("save_video", False):
         return []
     video_frames = episode.get("video_frames") or {}
@@ -295,7 +346,9 @@ def export_episode_videos(episode: dict[str, Any], video_dir: Path, record: dict
 
     video_dir_name = record.get("video_dir_name")
     if video_dir_name is None:
-        video_dir_name = f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+        video_dir_name = (
+            f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+        )
 
     episode_dir = video_dir / video_dir_name
 
@@ -313,7 +366,10 @@ def normalized_name(value: str) -> str:
 
 
 def natural_key(path: Path):
-    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.as_posix())]
+    return [
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", path.as_posix())
+    ]
 
 
 def point_cloud_file(root: Path, episode_index: int) -> Path:
@@ -347,7 +403,8 @@ def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
         "storage_format": storage,
         "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
         "coordinate_frame": "current_eff",
-        "source_reference_frame": "overview_camera",
+        "source_reference_frame": "world",
+        "world_definition": "fixed_overview_camera",
     }
     if storage == "zarr":
         meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
@@ -364,9 +421,9 @@ def write_worldflow_meta(root: Path) -> None:
         "shape": [9],
         "layout": "episode_npy",
         "path_format": f"{WORLD_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy",
-        "coordinate_frame": "overview_camera",
-        "legacy_directory_name": True,
-        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
+        "coordinate_frame": "world",
+        "world_definition": "fixed_overview_camera",
+        "sim_extrinsic_usage": "simulator_world_eef_to_model_world_overview_camera",
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -383,7 +440,8 @@ def write_action_target_meta(root: Path) -> None:
         "path_format": (
             f"{ACTION_TARGET_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy"
         ),
-        "coordinate_frame": "overview_camera",
+        "coordinate_frame": "world",
+        "world_definition": "fixed_overview_camera",
         "source": "raw LIBERO HDF5 normalized OSC_POSE delta action",
         "source_state_anchor": "states[i]",
         "action_index_mapping": "output[i] uses source actions[i]",
@@ -408,7 +466,9 @@ def save_episode_point_clouds(
 ) -> None:
     point_clouds = np.ascontiguousarray(point_clouds, dtype=np.float32)
     if point_clouds.ndim != 3 or point_clouds.shape[-1] != POINT_CLOUD_CHANNELS:
-        raise ValueError(f"Expected point clouds shape (T, N, 6), got {point_clouds.shape}")
+        raise ValueError(
+            f"Expected point clouds shape (T, N, 6), got {point_clouds.shape}"
+        )
     if storage == "zarr":
         save_episode_point_clouds_zarr(
             root / POINT_CLOUD_DIR_NAME,
@@ -422,10 +482,14 @@ def save_episode_point_clouds(
         np.save(path, point_clouds)
 
 
-def save_episode_worldflow(root: Path, episode_index: int, reference_ee_poses: np.ndarray) -> None:
+def save_episode_worldflow(
+    root: Path, episode_index: int, reference_ee_poses: np.ndarray
+) -> None:
     reference_ee_poses = np.ascontiguousarray(reference_ee_poses, dtype=np.float32)
     if reference_ee_poses.ndim != 2 or reference_ee_poses.shape[-1] != 9:
-        raise ValueError(f"Expected reference-frame ee poses shape (T, 9), got {reference_ee_poses.shape}")
+        raise ValueError(
+            f"Expected reference-frame ee poses shape (T, 9), got {reference_ee_poses.shape}"
+        )
     path = world_ee_pose_file(root, episode_index)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, reference_ee_poses)
@@ -436,7 +500,9 @@ def save_episode_action_targets(
     episode_index: int,
     action_target_ee_poses: np.ndarray,
 ) -> None:
-    action_target_ee_poses = np.ascontiguousarray(action_target_ee_poses, dtype=np.float32)
+    action_target_ee_poses = np.ascontiguousarray(
+        action_target_ee_poses, dtype=np.float32
+    )
     if action_target_ee_poses.ndim != 2 or action_target_ee_poses.shape[-1] != 9:
         raise ValueError(
             "Expected reference-frame absolute action targets shape (T, 9), "
@@ -469,7 +535,9 @@ def save_episode_images_to_paths(
 
 def homo_to_pose9(H: np.ndarray) -> np.ndarray:
     H = np.asarray(H, dtype=np.float32)
-    return np.concatenate([H[..., :3, 3], H[..., :3, 0], H[..., :3, 1]], axis=-1).astype(np.float32)
+    return np.concatenate(
+        [H[..., :3, 3], H[..., :3, 0], H[..., :3, 1]], axis=-1
+    ).astype(np.float32)
 
 
 def from_reference_to_umi_tra_pose9(
@@ -525,7 +593,9 @@ def make_episode_buffer(
     episode_buffer["observation.state"] = observation_states
     if images is not None and image_key is not None:
         if len(images) != len(actions):
-            raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
+            raise ValueError(
+                f"Image frame count {len(images)} does not match actions {len(actions)}."
+            )
         episode_buffer[image_key] = save_episode_images_to_paths(
             dataset,
             images,
@@ -564,7 +634,12 @@ def move_episode_array(src: Path, dst: Path) -> None:
     shutil.move(str(src), str(dst))
 
 
-def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: dict[str, Any], cfg: dict[str, Any]) -> None:
+def save_episode_artifact(
+    artifact_dir: Path,
+    episode: dict[str, Any],
+    record: dict[str, Any],
+    cfg: dict[str, Any],
+) -> None:
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -575,20 +650,35 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
             compression_level=int(cfg.get("zarr_compression_level", 3)),
         )
     else:
-        np.save(artifact_dir / "point_clouds.npy", np.ascontiguousarray(episode["point_clouds"], dtype=np.float32))
-    np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
+        np.save(
+            artifact_dir / "point_clouds.npy",
+            np.ascontiguousarray(episode["point_clouds"], dtype=np.float32),
+        )
+    np.save(
+        artifact_dir / "world_ee_poses.npy",
+        np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32),
+    )
     np.save(
         artifact_dir / "action_target_ee_poses.npy",
         np.ascontiguousarray(episode["action_target_ee_poses"], dtype=np.float32),
     )
-    np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
+    np.save(
+        artifact_dir / "actions.npy",
+        np.ascontiguousarray(episode["actions"], dtype=np.float32),
+    )
     np.save(
         artifact_dir / "observation_states.npy",
         np.ascontiguousarray(episode["observation_states"], dtype=np.float32),
     )
-    np.save(artifact_dir / "timestamps.npy", np.asarray(episode["timestamps"], dtype=np.float32))
+    np.save(
+        artifact_dir / "timestamps.npy",
+        np.asarray(episode["timestamps"], dtype=np.float32),
+    )
     if "images" in episode:
-        np.save(artifact_dir / "images.npy", np.ascontiguousarray(episode["images"], dtype=np.uint8))
+        np.save(
+            artifact_dir / "images.npy",
+            np.ascontiguousarray(episode["images"], dtype=np.uint8),
+        )
     with open(artifact_dir / "record.json", "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False)
     if cfg.get("save_video", False):
@@ -608,7 +698,9 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
     )
     missing = [name for name in required_files if not (artifact_dir / name).is_file()]
     if missing:
-        raise FileNotFoundError(f"Incomplete worker artifact {artifact_dir}: missing {missing}")
+        raise FileNotFoundError(
+            f"Incomplete worker artifact {artifact_dir}: missing {missing}"
+        )
 
     with open(artifact_dir / "record.json", "r", encoding="utf-8") as f:
         record = json.load(f)
@@ -618,9 +710,10 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
             identity_errors.append(
                 f"{key}: expected {episode_job.get(key)!r}, got {record.get(key)!r}"
             )
-    if Path(record["demo_file"]).expanduser().resolve() != Path(
-        episode_job["demo_file"]
-    ).expanduser().resolve():
+    if (
+        Path(record["demo_file"]).expanduser().resolve()
+        != Path(episode_job["demo_file"]).expanduser().resolve()
+    ):
         identity_errors.append(
             f"demo_file: expected {episode_job['demo_file']!r}, got {record['demo_file']!r}"
         )
@@ -651,16 +744,22 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
             f"observation_states shape={observation_states.shape}, expected ({frames}, 10)"
         )
     if timestamps.shape != (frames,):
-        shape_errors.append(f"timestamps shape={timestamps.shape}, expected ({frames},)")
+        shape_errors.append(
+            f"timestamps shape={timestamps.shape}, expected ({frames},)"
+        )
     if world_ee_poses.shape != (frames, 9):
-        shape_errors.append(f"world_ee_poses shape={world_ee_poses.shape}, expected ({frames}, 9)")
+        shape_errors.append(
+            f"world_ee_poses shape={world_ee_poses.shape}, expected ({frames}, 9)"
+        )
     if action_target_ee_poses.shape != (frames, 9):
         shape_errors.append(
             "action_target_ee_poses shape="
             f"{action_target_ee_poses.shape}, expected ({frames}, 9)"
         )
     if int(record.get("frames", -1)) != frames:
-        shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
+        shape_errors.append(
+            f"record frames={record.get('frames')}, actions frames={frames}"
+        )
     if record.get("action_label_semantics") != ACTION_LABEL_SEMANTICS:
         shape_errors.append(
             "record action_label_semantics does not identify raw-delta absolute targets"
@@ -679,7 +778,9 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         if not np.isfinite(np.asarray(array)).all():
             shape_errors.append(f"{name} contains non-finite values")
 
-    expected_timestamps = np.arange(frames, dtype=np.float32) / float(episode_job["cfg"]["fps"])
+    expected_timestamps = np.arange(frames, dtype=np.float32) / float(
+        episode_job["cfg"]["fps"]
+    )
     if timestamps.shape == expected_timestamps.shape and not np.array_equal(
         np.asarray(timestamps), expected_timestamps
     ):
@@ -719,9 +820,13 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
                 3,
             )
             if images.shape != expected_image_shape:
-                shape_errors.append(f"images shape={images.shape}, expected {expected_image_shape}")
+                shape_errors.append(
+                    f"images shape={images.shape}, expected {expected_image_shape}"
+                )
     elif images_path.exists():
-        shape_errors.append("unexpected RGB image artifact while save_rgb_images is disabled")
+        shape_errors.append(
+            "unexpected RGB image artifact while save_rgb_images is disabled"
+        )
 
     if shape_errors:
         raise RuntimeError(
@@ -730,13 +835,17 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         )
 
 
-def move_episode_videos(artifact_dir: Path, vis_dir: Path, record: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
+def move_episode_videos(
+    artifact_dir: Path, vis_dir: Path, record: dict[str, Any], cfg: dict[str, Any]
+) -> list[str]:
     if not cfg.get("save_video", False):
         return []
     source_dir = artifact_dir / "videos"
     if not source_dir.exists():
         return []
-    dest_dir = vis_dir / f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+    dest_dir = (
+        vis_dir / f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+    )
     dest_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for source_path in sorted(source_dir.iterdir(), key=lambda path: path.name):
@@ -775,10 +884,14 @@ def write_ascii_ply_points(path: Path, xyzrgb: np.ndarray) -> None:
         f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
         f.write("end_header\n")
         for xyz, rgb in zip(xyzrgb[:, :3], colors):
-            f.write(f"{xyz[0]:.7f} {xyz[1]:.7f} {xyz[2]:.7f} {int(rgb[0])} {int(rgb[1])} {int(rgb[2])}\n")
+            f.write(
+                f"{xyz[0]:.7f} {xyz[1]:.7f} {xyz[2]:.7f} {int(rgb[0])} {int(rgb[1])} {int(rgb[2])}\n"
+            )
 
 
-def write_ascii_ply_lines(path: Path, points: np.ndarray, colors: np.ndarray | None = None) -> None:
+def write_ascii_ply_lines(
+    path: Path, points: np.ndarray, colors: np.ndarray | None = None
+) -> None:
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Expected line points shape (N, 3), got {points.shape}")
@@ -830,12 +943,16 @@ def make_frame_points(pose9: np.ndarray, scale: float = 0.04) -> np.ndarray:
     return np.concatenate([origin[None], endpoints], axis=0)
 
 
-def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[str, Any], cfg: dict[str, Any]) -> None:
+def export_episode_preview(
+    episode: dict[str, Any], vis_dir: Path, record: dict[str, Any], cfg: dict[str, Any]
+) -> None:
     vis_count = int(cfg.get("vis_count", 0) or 0)
     if vis_count <= 0:
         return
     stride = max(1, int(cfg.get("vis_stride", 1) or 1))
-    episode_dir = vis_dir / f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+    episode_dir = (
+        vis_dir / f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
+    )
     episode_dir.mkdir(parents=True, exist_ok=True)
 
     point_clouds = np.asarray(episode["point_clouds"], dtype=np.float32)
@@ -853,8 +970,14 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         frame_indices = candidate_indices
 
     for frame_idx in frame_indices:
-        write_ascii_ply_points(episode_dir / f"frame_{frame_idx:04d}_point_cloud_eff.ply", point_clouds[frame_idx])
-        write_ascii_ply_frame(episode_dir / f"frame_{frame_idx:04d}_umi_action_frame.ply", actions[frame_idx, :9])
+        write_ascii_ply_points(
+            episode_dir / f"frame_{frame_idx:04d}_point_cloud_eff.ply",
+            point_clouds[frame_idx],
+        )
+        write_ascii_ply_frame(
+            episode_dir / f"frame_{frame_idx:04d}_umi_action_frame.ply",
+            actions[frame_idx, :9],
+        )
         write_ascii_ply_frame(
             episode_dir / f"frame_{frame_idx:04d}_umi_observation_state_frame.ply",
             observation_states[frame_idx, :9],
@@ -865,7 +988,9 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         episode_dir / "umi_observation_state_trajectory.ply",
         observation_states[:, :3],
     )
-    write_ascii_ply_lines(episode_dir / "reference_ee_trajectory.ply", reference_ee_poses[:, :3])
+    write_ascii_ply_lines(
+        episode_dir / "reference_ee_trajectory.ply", reference_ee_poses[:, :3]
+    )
     write_ascii_ply_lines(
         episode_dir / "reference_action_target_trajectory.ply",
         action_target_ee_poses[:, :3],
@@ -918,9 +1043,10 @@ def maybe_download_demos(cfg: dict[str, Any], demo_root: Path) -> None:
         return
     dataset_name = downloadable_suite_name(str(cfg["suite"]))
     if dataset_name is None:
-        raise ValueError(f"Do not know which LIBERO demo package to download for suite {cfg['suite']!r}.")
+        raise ValueError(
+            f"Do not know which LIBERO demo package to download for suite {cfg['suite']!r}."
+        )
     from libero.libero.utils.download_utils import libero_dataset_download
-
 
     print(f"No local demos found. Downloading {dataset_name} demos to {demo_root} ...")
     libero_dataset_download(
@@ -931,7 +1057,9 @@ def maybe_download_demos(cfg: dict[str, Any], demo_root: Path) -> None:
     )
 
 
-def find_demo_file(task: Any, demo_root: Path, explicit_files: list[Path] | None, cfg: dict[str, Any]) -> Path:
+def find_demo_file(
+    task: Any, demo_root: Path, explicit_files: list[Path] | None, cfg: dict[str, Any]
+) -> Path:
     if explicit_files:
         if len(explicit_files) == 1:
             path = explicit_files[0].expanduser().resolve()
@@ -945,10 +1073,15 @@ def find_demo_file(task: Any, demo_root: Path, explicit_files: list[Path] | None
                 return path
         raise FileNotFoundError(f"No explicit --demo-file matches task {task.name!r}.")
 
-    candidates = sorted(list(demo_root.rglob("*.hdf5")) + list(demo_root.rglob("*.h5")), key=natural_key)
+    candidates = sorted(
+        list(demo_root.rglob("*.hdf5")) + list(demo_root.rglob("*.h5")), key=natural_key
+    )
     if not candidates:
         maybe_download_demos(cfg, demo_root)
-        candidates = sorted(list(demo_root.rglob("*.hdf5")) + list(demo_root.rglob("*.h5")), key=natural_key)
+        candidates = sorted(
+            list(demo_root.rglob("*.hdf5")) + list(demo_root.rglob("*.h5")),
+            key=natural_key,
+        )
     if not candidates:
         download_hint = (
             f"No .hdf5/.h5 demo files found under {demo_root}.\n"
@@ -983,13 +1116,18 @@ def iter_demo_groups(demo_file: Path):
         root = h5_file["data"] if "data" in h5_file else h5_file
         names = sorted(
             [name for name in root.keys() if isinstance(root[name], h5py.Group)],
-            key=lambda value: [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", value)],
+            key=lambda value: [
+                int(part) if part.isdigit() else part
+                for part in re.split(r"(\d+)", value)
+            ],
         )
         for name in names:
             group = root[name]
             if "states" not in group:
                 continue
-            yield name, group["states"][:], group["actions"][:] if "actions" in group else None
+            yield name, group["states"][:], (
+                group["actions"][:] if "actions" in group else None
+            )
 
 
 def iter_demo_group_names(demo_file: Path) -> list[str]:
@@ -1001,7 +1139,10 @@ def iter_demo_group_names(demo_file: Path) -> list[str]:
                 for name in root.keys()
                 if isinstance(root[name], h5py.Group) and "states" in root[name]
             ],
-            key=lambda value: [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", value)],
+            key=lambda value: [
+                int(part) if part.isdigit() else part
+                for part in re.split(r"(\d+)", value)
+            ],
         )
 
 
@@ -1035,7 +1176,9 @@ def load_demo_group(
             raise KeyError(f"Demo group {demo_name!r} not found in {demo_file}")
         group = root[demo_name]
         if "states" not in group:
-            raise KeyError(f"Demo group {demo_name!r} in {demo_file} is missing 'states'.")
+            raise KeyError(
+                f"Demo group {demo_name!r} in {demo_file} is missing 'states'."
+            )
         states = group["states"][:]
         actions = group["actions"][:] if "actions" in group else None
         model_value = group.attrs.get("model_file")
@@ -1063,7 +1206,9 @@ def postprocess_demo_model_xml(model_xml: str) -> str:
         elif "chiliocosm/assets/" in normalized:
             replacement = libero_assets / normalized.split("chiliocosm/assets/", 1)[1]
         elif "/libero/libero/assets/" in normalized:
-            replacement = libero_assets / normalized.split("/libero/libero/assets/", 1)[1]
+            replacement = (
+                libero_assets / normalized.split("/libero/libero/assets/", 1)[1]
+            )
         elif "/libero/assets/" in normalized:
             replacement = libero_assets / normalized.split("/libero/assets/", 1)[1]
         elif "/robosuite/" in normalized:
@@ -1080,7 +1225,9 @@ def postprocess_demo_model_xml(model_xml: str) -> str:
 
     if unresolved:
         preview = "\n  ".join(unresolved[:10])
-        suffix = f"\n  ... and {len(unresolved) - 10} more" if len(unresolved) > 10 else ""
+        suffix = (
+            f"\n  ... and {len(unresolved) - 10} more" if len(unresolved) > 10 else ""
+        )
         raise FileNotFoundError(
             "Could not resolve asset paths from the demonstration model XML:\n  "
             f"{preview}{suffix}"
@@ -1097,7 +1244,9 @@ def ensure_demo_model_assets_ready() -> None:
         raise FileNotFoundError(f"LIBERO asset directory is unavailable: {assets_path}")
 
 
-def verify_restored_demo_model(env: Any, model_xml: str, *, atol: float = 1e-10) -> None:
+def verify_restored_demo_model(
+    env: Any, model_xml: str, *, atol: float = 1e-10
+) -> None:
     """Fail fast if a worker is not using the model belonging to its current demo."""
     root = ET.fromstring(model_xml)
     model = env.sim.model
@@ -1119,8 +1268,12 @@ def verify_restored_demo_model(env: Any, model_xml: str, *, atol: float = 1e-10)
                 mismatches.append(f"body {name!r} position error={error:.3e}")
 
         if "quat" in body.attrib:
-            expected_quat = np.fromstring(body.attrib["quat"], sep=" ", dtype=np.float64)
-            expected_quat /= max(float(np.linalg.norm(expected_quat)), np.finfo(np.float64).eps)
+            expected_quat = np.fromstring(
+                body.attrib["quat"], sep=" ", dtype=np.float64
+            )
+            expected_quat /= max(
+                float(np.linalg.norm(expected_quat)), np.finfo(np.float64).eps
+            )
             actual_quat = np.asarray(model.body_quat[body_id], dtype=np.float64)
             # q and -q represent the same rotation.
             error = min(
@@ -1132,14 +1285,18 @@ def verify_restored_demo_model(env: Any, model_xml: str, *, atol: float = 1e-10)
 
     if mismatches:
         preview = "\n  ".join(mismatches[:10])
-        suffix = f"\n  ... and {len(mismatches) - 10} more" if len(mismatches) > 10 else ""
+        suffix = (
+            f"\n  ... and {len(mismatches) - 10} more" if len(mismatches) > 10 else ""
+        )
         raise RuntimeError(
             "The restored MuJoCo model does not match the current demonstration XML:\n  "
             f"{preview}{suffix}"
         )
 
 
-def restore_demo_model(env: Any, model_xml: str | None, *, required: bool) -> str | None:
+def restore_demo_model(
+    env: Any, model_xml: str | None, *, required: bool
+) -> str | None:
     """Restore model-level scene state omitted by MuJoCo flattened states."""
     if model_xml is None:
         if required:
@@ -1239,13 +1396,15 @@ def controller_target_to_model_target_world(
         ("source_controller_world", source_controller_world),
     ):
         if value.shape != (4, 4) or not np.isfinite(value).all():
-            raise ValueError(f"{name} must be a finite 4x4 transform, got {value.shape}.")
+            raise ValueError(
+                f"{name} must be a finite 4x4 transform, got {value.shape}."
+            )
 
     model_to_controller = (
         fast_inverse_homogeneous(source_model_world) @ source_controller_world
     )
-    target_model_world = (
-        target_controller_world @ fast_inverse_homogeneous(model_to_controller)
+    target_model_world = target_controller_world @ fast_inverse_homogeneous(
+        model_to_controller
     )
     reconstructed_controller_world = target_model_world @ model_to_controller
     roundtrip_error = float(
@@ -1311,7 +1470,9 @@ def libero_delta_action_to_absolute_target_world(
     if not np.isfinite(raw_action).all():
         raise ValueError("Raw LIBERO action contains non-finite values.")
     if len(getattr(env, "robots", [])) != 1:
-        raise ValueError("Absolute OSC target reconstruction requires one LIBERO robot.")
+        raise ValueError(
+            "Absolute OSC target reconstruction requires one LIBERO robot."
+        )
 
     controller = env.robots[0].controller
     if not bool(getattr(controller, "use_delta", False)):
@@ -1322,9 +1483,7 @@ def libero_delta_action_to_absolute_target_world(
         raise RuntimeError(
             "Raw 7D LIBERO action conversion currently requires fixed OSC impedance mode."
         )
-    scaled_delta = np.asarray(
-        controller.scale_action(raw_action[:6]), dtype=np.float64
-    )
+    scaled_delta = np.asarray(controller.scale_action(raw_action[:6]), dtype=np.float64)
     # Calling the controller itself also preserves robosuite's orientation
     # history: an all-zero rotation delta keeps the previous goal_ori instead
     # of silently replacing it with the currently achieved orientation.
@@ -1378,7 +1537,9 @@ def collect_demo_episode(
         )
     actions = np.asarray(actions)
     if actions.ndim != 2 or actions.shape[1] != 7:
-        raise ValueError(f"Expected raw LIBERO actions shape (T, 7), got {actions.shape}")
+        raise ValueError(
+            f"Expected raw LIBERO actions shape (T, 7), got {actions.shape}"
+        )
     if not np.isfinite(actions).all():
         raise ValueError("Raw LIBERO actions contain non-finite values.")
     configured_state_observation_offset = int(cfg.get("state_observation_offset", 1))
@@ -1452,7 +1613,9 @@ def collect_demo_episode(
             np.asarray(pose9_gripper_sim_world, dtype=np.float32)[:9]
         ).astype(np.float64)
 
-    def store_model_action_target(frame_idx: int, target_model_world: np.ndarray) -> None:
+    def store_model_action_target(
+        frame_idx: int, target_model_world: np.ndarray
+    ) -> None:
         action_target_reference_ee_poses[frame_idx] = world_target_to_reference_pose9(
             env,
             target_model_world,
@@ -1497,9 +1660,7 @@ def collect_demo_episode(
             # restore the independently configured observation snapshot.
             action_source_state_idx = frame_idx
             observation_state_idx = frame_idx + state_observation_offset
-            source_obs = set_env_state_and_get_obs(
-                env, states[action_source_state_idx]
-            )
+            source_obs = set_env_state_and_get_obs(env, states[action_source_state_idx])
             source_model_world = pose9_to_homo_np(
                 np.asarray(eef_pose9_gripper_from_obs(source_obs), dtype=np.float32)[:9]
             ).astype(np.float64)
@@ -1632,20 +1793,14 @@ def make_episode_record(
         "source_fps": source_fps,
         "state_observation_offset": int(state_observation_offset),
         "action_label_semantics": str(episode["action_label_semantics"]),
-        "observation_state_semantics": str(
-            episode["observation_state_semantics"]
-        ),
-        "action_source_index_mapping": str(
-            episode["action_source_index_mapping"]
-        ),
-        "action_source_state_mapping": str(
-            episode["action_source_state_mapping"]
-        ),
+        "observation_state_semantics": str(episode["observation_state_semantics"]),
+        "action_source_index_mapping": str(episode["action_source_index_mapping"]),
+        "action_source_state_mapping": str(episode["action_source_state_mapping"]),
         "action_target_eef_mapping": str(episode["action_target_eef_mapping"]),
         "observation_state_mapping": str(episode["observation_state_mapping"]),
         "action_pose_coordinate_frame": "episode_origin_eef",
         "observation_state_coordinate_frame": "episode_origin_eef",
-        "absolute_action_target_sidecar_coordinate_frame": "overview_camera",
+        "absolute_action_target_sidecar_coordinate_frame": "world",
         "gripper_action_semantics": "achieved_physical_width_metres_unchanged",
         "heuristic_action_target_offset": False,
         "target_residual_translation_m_mean": float(
@@ -1746,7 +1901,9 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
         for episode_job in job["episodes"]:
             demo_file = Path(episode_job["demo_file"])
             demo_name = str(episode_job["demo_name"])
-            states, actions, model_xml, source_fps = load_demo_group(demo_file, demo_name)
+            states, actions, model_xml, source_fps = load_demo_group(
+                demo_file, demo_name
+            )
             validate_source_fps(
                 demo_file=demo_file,
                 demo_name=demo_name,
@@ -1782,7 +1939,12 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
             )
             artifact_dir = Path(episode_job["tmp_path"])
             save_episode_artifact(artifact_dir, episode, record, cfg)
-            results.append({"job_index": int(episode_job["job_index"]), "tmp_path": str(artifact_dir)})
+            results.append(
+                {
+                    "job_index": int(episode_job["job_index"]),
+                    "tmp_path": str(artifact_dir),
+                }
+            )
     finally:
         env.close()
 
@@ -1807,7 +1969,9 @@ def save_collected_temp_episode(
     episode_index = int(dataset.meta.total_episodes)
 
     point_cloud_storage = str(cfg.get("point_cloud_storage", "zarr"))
-    final_point_cloud_path = point_cloud_storage_path(dataset.root, episode_index, point_cloud_storage)
+    final_point_cloud_path = point_cloud_storage_path(
+        dataset.root, episode_index, point_cloud_storage
+    )
     final_world_ee_pose_path = world_ee_pose_file(dataset.root, episode_index)
     final_action_target_ee_pose_path = action_target_ee_pose_file(
         dataset.root, episode_index
@@ -1826,7 +1990,9 @@ def save_collected_temp_episode(
             )
             artifact_point_cloud_path.unlink(missing_ok=True)
         else:
-            raise FileNotFoundError(f"Missing point cloud artifact under {artifact_dir}")
+            raise FileNotFoundError(
+                f"Missing point cloud artifact under {artifact_dir}"
+            )
     else:
         move_episode_array(artifact_point_cloud_path, final_point_cloud_path)
     move_episode_array(artifact_dir / "world_ee_poses.npy", final_world_ee_pose_path)
@@ -1850,7 +2016,9 @@ def save_collected_temp_episode(
         preview_episode = {
             "actions": actions,
             "observation_states": observation_states,
-            "point_clouds": open_episode_point_clouds(dataset.root / POINT_CLOUD_DIR_NAME, episode_index),
+            "point_clouds": open_episode_point_clouds(
+                dataset.root / POINT_CLOUD_DIR_NAME, episode_index
+            ),
             "world_ee_poses": np.load(final_world_ee_pose_path, mmap_mode="r"),
             "action_target_ee_poses": np.load(
                 final_action_target_ee_pose_path, mmap_mode="r"
@@ -1870,8 +2038,12 @@ def main() -> None:
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 10000))
-    cfg["point_cloud_storage"] = str(cfg_get(cfg, args.point_cloud_storage, "point_cloud_storage", "zarr"))
-    cfg["zarr_compression_level"] = int(cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3))
+    cfg["point_cloud_storage"] = str(
+        cfg_get(cfg, args.point_cloud_storage, "point_cloud_storage", "zarr")
+    )
+    cfg["zarr_compression_level"] = int(
+        cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3)
+    )
     cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 20))
     cfg["replay_mode"] = cfg_get(cfg, args.replay_mode, "replay_mode", "states")
     cfg["state_observation_offset"] = int(
@@ -1893,13 +2065,21 @@ def main() -> None:
             True,
         )
     )
-    cfg["download_demos"] = bool(cfg_get(cfg, args.download_demos, "download_demos", True))
-    cfg["download_use_huggingface"] = bool(cfg_get(cfg, args.download_use_huggingface, "download_use_huggingface", True))
-    cfg["overwrite_dataset"] = bool(cfg_get(cfg, args.overwrite, "overwrite_dataset", True))
+    cfg["download_demos"] = bool(
+        cfg_get(cfg, args.download_demos, "download_demos", True)
+    )
+    cfg["download_use_huggingface"] = bool(
+        cfg_get(cfg, args.download_use_huggingface, "download_use_huggingface", True)
+    )
+    cfg["overwrite_dataset"] = bool(
+        cfg_get(cfg, args.overwrite, "overwrite_dataset", True)
+    )
     cfg["vis_count"] = int(cfg_get(cfg, args.vis_count, "vis_count", 0) or 0)
     cfg["vis_stride"] = int(cfg_get(cfg, args.vis_stride, "vis_stride", 1) or 1)
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", False))
-    cfg["save_rgb_images"] = bool(cfg_get(cfg, args.save_rgb_images, "save_rgb_images", True))
+    cfg["save_rgb_images"] = bool(
+        cfg_get(cfg, args.save_rgb_images, "save_rgb_images", True)
+    )
     image_camera_value = cfg_get(cfg, args.image_camera, "image_camera")
     if image_camera_value is not None:
         cfg["image_camera"] = str(image_camera_value)
@@ -1907,21 +2087,38 @@ def main() -> None:
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
-    ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
+    ensure_libero_config(
+        cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root")
+    )
     if cfg["restore_demo_model"]:
         ensure_demo_model_assets_ready()
 
-    output_root = Path(
-        cfg_get(cfg, args.output_root, "dataset_output_root", LIBERO_DATA_ROOT / "libero_lerobot_dataset")
-    ).expanduser().resolve()
+    output_root = (
+        Path(
+            cfg_get(
+                cfg,
+                args.output_root,
+                "dataset_output_root",
+                LIBERO_DATA_ROOT / "libero_lerobot_dataset",
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
     repo_id = cfg_get(cfg, args.repo_id, "dataset_repo_id", "song_libero_pointcloud")
     demo_root = get_libero_dataset_root(args.demo_root, cfg)
     cfg["demo_root"] = str(demo_root)
     cfg["image_feature_key"] = (
-        image_feature_key(image_feature_camera(cfg)) if bool(cfg.get("save_rgb_images", True)) else None
+        image_feature_key(image_feature_camera(cfg))
+        if bool(cfg.get("save_rgb_images", True))
+        else None
     )
     vis_dir_value = cfg_get(cfg, args.vis_dir, "vis_dir")
-    vis_dir = Path(vis_dir_value).expanduser().resolve() if vis_dir_value else output_root / "visualizations"
+    vis_dir = (
+        Path(vis_dir_value).expanduser().resolve()
+        if vis_dir_value
+        else output_root / "visualizations"
+    )
     tmp_dir = (
         args.tmp_dir.expanduser().resolve()
         if args.tmp_dir is not None
@@ -1957,11 +2154,16 @@ def main() -> None:
         "output_root": str(output_root),
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
-        "reference_frame": "overview_camera",
+        "reference_frame": "world",
+        "world_definition": "fixed_overview_camera",
         "reference_camera": pointcloud_camera_names_from_config(cfg)[0],
-        "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
+        "sim_extrinsic_usage": "simulator_world_eef_to_model_world_overview_camera",
         "render_camera_names": render_camera_names_from_config(cfg),
-        "image_camera": image_feature_camera(cfg) if bool(cfg.get("save_rgb_images", True)) else None,
+        "image_camera": (
+            image_feature_camera(cfg)
+            if bool(cfg.get("save_rgb_images", True))
+            else None
+        ),
         "image_feature_key": cfg.get("image_feature_key"),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
@@ -1972,7 +2174,9 @@ def main() -> None:
         "num_workers": int(cfg["num_workers"]),
         "parallel_collection_protocol": {
             "execution_mode": (
-                "spawn_process_pool" if int(cfg["num_workers"]) > 1 else "in_process_serial"
+                "spawn_process_pool"
+                if int(cfg["num_workers"]) > 1
+                else "in_process_serial"
             ),
             "worker_scope": "one isolated environment per task",
             "worker_output": "unique temporary directory per episode job",
@@ -2062,10 +2266,15 @@ def main() -> None:
                     "task_id": task_id,
                     "demo_file": str(demo_file),
                     "demo_name": demo_name,
-                    "episode_seed": suite_index * 10_000_000 + task_id * 100000 + converted_for_task * 1000,
+                    "episode_seed": suite_index * 10_000_000
+                    + task_id * 100000
+                    + converted_for_task * 1000,
                     "max_frames": max_frames,
                     "cfg": suite_cfg,
-                    "tmp_path": str(tmp_dir / f"episode_job_{job_index:06d}_{suite_name}_task_{task_id:03d}"),
+                    "tmp_path": str(
+                        tmp_dir
+                        / f"episode_job_{job_index:06d}_{suite_name}_task_{task_id:03d}"
+                    ),
                 }
                 episode_jobs.append(episode_job)
                 task_episode_jobs.append(episode_job)
@@ -2091,9 +2300,13 @@ def main() -> None:
     def register_result(result: dict[str, Any]) -> None:
         result_index = int(result["job_index"])
         if result_index not in expected_jobs:
-            raise RuntimeError(f"Worker returned unknown episode job index {result_index}.")
+            raise RuntimeError(
+                f"Worker returned unknown episode job index {result_index}."
+            )
         if result_index in results:
-            raise RuntimeError(f"Worker returned duplicate episode job index {result_index}.")
+            raise RuntimeError(
+                f"Worker returned duplicate episode job index {result_index}."
+            )
         expected_job = expected_jobs[result_index]
         actual_path = Path(result["tmp_path"]).expanduser().resolve()
         expected_path = Path(expected_job["tmp_path"]).expanduser().resolve()
@@ -2118,14 +2331,23 @@ def main() -> None:
             max_workers=int(cfg["num_workers"]),
             mp_context=mp.get_context("spawn"),
         ) as executor:
-            futures = [executor.submit(collect_task_worker, task_job) for task_job in task_jobs]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO tasks", unit="task"):
+            futures = [
+                executor.submit(collect_task_worker, task_job) for task_job in task_jobs
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Collecting LIBERO tasks",
+                unit="task",
+            ):
                 for result in future.result():
                     register_result(result)
 
     missing_results = sorted(set(expected_jobs) - set(results))
     if missing_results:
-        raise RuntimeError(f"Collection finished with missing episode job(s): {missing_results}")
+        raise RuntimeError(
+            f"Collection finished with missing episode job(s): {missing_results}"
+        )
 
     for episode_job in episode_jobs:
         temp_path = results[int(episode_job["job_index"])]

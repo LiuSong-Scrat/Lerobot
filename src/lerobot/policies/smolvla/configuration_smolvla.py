@@ -103,7 +103,11 @@ class SmolVLAConfig(PreTrainedConfig):
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
 
-    # World-frame trajectory auxiliary supervision.
+    # Independent world-frame trajectory auxiliary branch. PointSeg first
+    # selects the foreground XYZRGB cloud in the Ego/body frame. The branch
+    # analytically maps that cloud with the current world EEF pose, encodes it
+    # with its own LitePT + PointAction modules, and flow-matches the spatial
+    # transform A_t C^{-1}. It is never called by the policy inference path.
     worldflow_enable: bool = False
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
@@ -114,7 +118,18 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_rot_weight: float = 1.0
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
-    worldflow_max_points: int = 2048
+    # 0 keeps the complete predicted foreground. A positive value is an
+    # optional memory cap applied after PointSeg foreground selection.
+    worldflow_max_points: int = 0
+    # -1 mirrors the Ego Action Expert depth. A positive value can be used for
+    # an explicitly shallower auxiliary expert.
+    worldflow_action_expert_layers: int = -1
+    worldflow_action_expert_dropout: float = 0.0
+    worldflow_augmentation_trans_scale: float = 0.20
+    worldflow_augmentation_rot_scale: float = 0.75
+    # Legacy Dense-ObjectFlow options retained only so old command lines and
+    # configs remain parseable. The independent branch does not consume role
+    # scores, predict point flow, or run Kabsch.
     worldflow_min_transport_points: int = 3
     worldflow_transport_score_threshold: float = 0.05
 
@@ -191,9 +206,23 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.worldflow_se3_head_enable:
             warnings.warn(
                 "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "World-Ego now uses dense automatic ObjectFlow + weighted Kabsch, not a PCA canonical SE(3) head.",
+                "WorldFlow directly flow-matches an SE(3) spatial transform with an independent "
+                "LitePT/PointAction/action-expert branch.",
                 stacklevel=2,
             )
+        if self.worldflow_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError(
+                    "worldflow_enable=True requires ACTION normalization to be IDENTITY because "
+                    "the World-Ego bridge interprets Ego pose9 predictions as physical SE(3) transforms."
+                )
+            if self.worldflow_feature_dim <= 0:
+                raise ValueError("worldflow_feature_dim must be positive.")
+            if self.worldflow_action_expert_layers == 0 or self.worldflow_action_expert_layers < -1:
+                raise ValueError("worldflow_action_expert_layers must be -1 or a positive integer.")
+            if self.worldflow_max_points < 0:
+                raise ValueError("worldflow_max_points must be non-negative.")
         if self.se3_final_correction_enable:
             warnings.warn(
                 "se3_final_correction_enable is kept only for CLI compatibility and is ignored. "

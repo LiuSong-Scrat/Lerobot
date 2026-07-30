@@ -1,63 +1,81 @@
-# LIBERO SETTTING
-  ## LeroboDatasetFromHDF5 ####################### (Download) Hdf5-->Add Gripper-->Zarr-->Dataset
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python \
-      benchmarks/song_real_libero/scripts/libero_setting/libero_hdf5_to_dataset.py \
-      --config benchmarks/song_real_libero/configs/libero.json \
-      --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_demos \
-      --suite libero_spatial \
-      --suite libero_object \
-      --all-tasks \
-      --episodes 2 \
-      --num-workers 10 \
-      --point-cloud-storage zarr \
-      --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset \
-      --repo-id song_libero_4suite_pointcloud \
-      --save-video \
-      --vis-count 2 
-  ## PriorCache ###########################   MultiGPU  --nproc_per_node=4
-  torchrun --standalone --nproc_per_node=1   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_dataset   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_cache   --batch-size=24   --num-workers=14   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=4   --overwrite
 
-  ## TrainCode ###########################   MultiGPU CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu --num_processes 4 python benchmarks/song_real_libero/scripts/train_song_benchmark.py
-    export SONG_POINTSEG_REQUIRE_POINTOPS=1 
-    python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
-      --policy.type=smolvla \
-      --policy.push_to_hub=false \
-      --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/temp_dataset \
-      --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_4suite_lerobot_cache \
-      --policy.vlm_model_name=/home/liusong/SmolVLM2-500M-Video-Instruct \
-      --policy.load_vlm_weights=false \
-      --batch_size=8 \
-      --steps=500000 \
-      --log_freq=1 \
-      --output_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh \
-      --job_name=song_libero_pointseg_fresh \
-      --policy.device=cuda \
-      --wandb.enable=true \
-      --wandb.disable_artifact=true \
-      --save_freq=5000 \
-      --eval_freq=5000 \
-      --num_workers=0 \
-      --policy.pointseg_enable=true \
-      --policy.pointseg_backbone_type=litept \
-      --policy.pointseg_grid_size=0.01 \
-      --policy.pointseg_feature_dim=64 \
-      --policy.pointseg_aux_loss_weight=0.002 \
-      --policy.pointseg_foreground_ratio=0.08 \
-      --policy.pointseg_background_ratio=0.08 \
-      --policy.pointseg_min_foreground_points=500 \
-      --policy.pointseg_min_background_points=0 \
-      --policy.worldflow_enable=false \
-      --policy.worldflow_se3_head_enable=false \
-      --policy.se3_enable=false \
-      --policy.se3_final_correction_enable=false
+# LOCAL SERVER
 
-  ## BenchmarkEval ###########################  
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  python   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model  --suite libero_spatial  --all-tasks   --episodes 10  --action-index 0   --exec-action-steps 12   --save-video --render-mode offscreen   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/10w_eval_spatial_temp
-
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=0 python   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model   --suite libero_spatial --suite  libero_goal    --all-tasks   --episodes 10  --action-index 0   --exec-action-steps 12   --save-video --render-mode offscreen   --output-dir /home/liusong/ProgramFiles/Huggingface/lerobot/song_real_libero/outputs/eval_temp
-
-
-
+## Libero Benchmark
+## 1.准备WEP-VLA Lerobot格式Benchmark数据集
+见 README_SCAI.md
+## BenchmarkEval ###########################  
+  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --suite libero_10 \
+  --task-id 3 \
+  --task-id 4 \
+  --task-id 6 \
+  --task-id 9 \
+  --episodes 10 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 1 \
+  --task-workers 4 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 20 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --initial-gripper-open \
+  --settle-keep-robot-fixed \
+  --synchronize-gripper-controller-state \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/10k_dataset_fixed_v1_new_long_thresh2_chunk24
+  
+  
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --suite libero_goal \
+  --task-id 3 \
+  --task-id 5 \
+  --task-id 9 \
+  --episodes 10 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 1 \
+  --task-workers 3 \
+  --episode-workers-per-task 2 \
+  --inference-batch-size 20 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --initial-gripper-open \
+  --settle-keep-robot-fixed \
+  --synchronize-gripper-controller-state \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/10k_eval_new_goal_dataset_fixed_v1_thresh2_chunk24
 
 
 

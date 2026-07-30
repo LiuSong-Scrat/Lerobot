@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import os
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,13 +18,21 @@ from scipy.spatial.transform import Rotation as R
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import REAL_DATA_ROOT
+    from .camera_motion_utils import (
+        matrix_from_json_record,
+        validate_transform_sequence,
+    )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import REAL_DATA_ROOT
+    from real_setting.camera_motion_utils import (
+        matrix_from_json_record,
+        validate_transform_sequence,
+    )
 
 
 HANDPOSE_ROOT = Path("/home/liusong/ProgramFiles/HandPoseExtraction")
-DEFAULT_POINTS_NUM = 640*480
+DEFAULT_POINTS_NUM = 640 * 480
 _VIDEO_CAPTURE_CACHE = {}
 _SEGMENT_WORKER_CONTEXT = None
 
@@ -85,8 +93,61 @@ def main() -> None:
             "and offline WiLoR gripper predictions."
         )
     )
-    parser.add_argument("--input", required=True, help="RGB-D directory produced by record_bestman_rgbd.py.")
-    parser.add_argument("--jsonl", default=None, help="WiLoR JSONL. Defaults to <input>/handpose_wilor.jsonl.")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="RGB-D directory produced by record_bestman_rgbd.py.",
+    )
+    parser.add_argument(
+        "--jsonl",
+        default=None,
+        help="WiLoR JSONL. Defaults to <input>/handpose_wilor.jsonl.",
+    )
+    parser.add_argument(
+        "--camera-pose-jsonl",
+        default=None,
+        help=(
+            "Optional full-6DoF VIO/SLAM camera poses, one JSON object per frame. Records are matched by "
+            "record_index and must contain T_tracking_camera as camera_to_tracking/transform_matrix, or "
+            "translation_m + quaternion_xyzw."
+        ),
+    )
+    parser.add_argument(
+        "--require-camera-pose",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reject every exported segment that lacks a valid full-SE(3) camera pose for any frame.",
+    )
+    parser.add_argument(
+        "--camera-pose-max-sync-error-ms",
+        type=float,
+        default=20.0,
+        help=(
+            "Maximum absolute camera-pose/RGB-D timestamp difference when both timestamps are present. "
+            "Set 0 to disable this validation; record_index matching remains mandatory."
+        ),
+    )
+    parser.add_argument(
+        "--camera-reference-mode",
+        choices=("episode_first", "canonical"),
+        default="episode_first",
+        help=(
+            "How later conversion defines model world. episode_first uses each segment's "
+            "first camera frame; canonical uses one fixed camera pose in a persistent "
+            "tracking/base frame."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-camera-to-tracking-matrix",
+        nargs=16,
+        type=float,
+        default=None,
+        metavar="M",
+        help=(
+            "Row-major T_tracking<-canonicalCamera in meters, stored in HDF5 for "
+            "cross-episode canonical fixed-view alignment."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=str(REAL_DATA_ROOT / "hdf5_raw"),
@@ -94,7 +155,11 @@ def main() -> None:
     )
     parser.add_argument("--task", default="humanhand_offline")
     parser.add_argument("--camera-names", default="overhead,hand")
-    parser.add_argument("--run-inference", action="store_true", help="Run HandPoseExtraction offline WiLoR first.")
+    parser.add_argument(
+        "--run-inference",
+        action="store_true",
+        help="Run HandPoseExtraction offline WiLoR first.",
+    )
     parser.add_argument("--handpose-root", default=str(HANDPOSE_ROOT))
     parser.add_argument("--wilor-repo", default=str(HANDPOSE_ROOT / "external/WiLoR"))
     parser.add_argument("--checkpoint", default="pretrained_models/wilor_final.ckpt")
@@ -102,12 +167,28 @@ def main() -> None:
     parser.add_argument("--detector", default="pretrained_models/detector.pt")
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--force-handedness", choices=("left", "right"), default=None)
-    parser.add_argument("--fusion-mode", choices=("model-depth", "keypoint-depth"), default="model-depth")
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("model-depth", "keypoint-depth"),
+        default="model-depth",
+    )
     parser.add_argument("--gripper-x-offset-cm", type=float, default=1.5)
     parser.add_argument("--gripper-z-offset-cm", type=float, default=3.5)
-    parser.add_argument("--reuse-jsonl", action="store_true", help="Do not run inference even if --run-inference is set.")
-    parser.add_argument("--show-inference", action="store_true", help="Show OpenCV preview while running offline WiLoR.")
-    parser.add_argument("--no-inference-progress", action="store_true", help="Do not show progress while running offline WiLoR.")
+    parser.add_argument(
+        "--reuse-jsonl",
+        action="store_true",
+        help="Do not run inference even if --run-inference is set.",
+    )
+    parser.add_argument(
+        "--show-inference",
+        action="store_true",
+        help="Show OpenCV preview while running offline WiLoR.",
+    )
+    parser.add_argument(
+        "--no-inference-progress",
+        action="store_true",
+        help="Do not show progress while running offline WiLoR.",
+    )
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument(
         "--segments",
@@ -168,6 +249,10 @@ def main() -> None:
     parser.add_argument("--allow-missing-gripper", action="store_true")
     parser.add_argument("--window-name", default="HumanHand offline slicer")
     args = parser.parse_args()
+    if args.camera_pose_max_sync_error_ms < 0.0:
+        raise ValueError("--camera-pose-max-sync-error-ms must be non-negative.")
+    if args.camera_reference_mode == "canonical" and args.canonical_camera_to_tracking_matrix is None:
+        raise ValueError("--camera-reference-mode=canonical requires --canonical-camera-to-tracking-matrix.")
     if args.transform_to_world:
         args.pose_frame = "world"
         if args.camera_to_world_preset is None and args.camera_to_world_matrix is None:
@@ -182,6 +267,12 @@ def main() -> None:
         run_offline_wilor(args, input_dir, jsonl_path)
 
     frame_records = load_frame_records(input_dir)
+    if args.camera_pose_jsonl:
+        frame_records = attach_external_camera_poses(
+            frame_records,
+            Path(args.camera_pose_jsonl).expanduser().resolve(),
+            max_sync_error_ms=args.camera_pose_max_sync_error_ms,
+        )
     metadata = load_metadata(input_dir)
     payloads = load_payloads(jsonl_path)
     samples = align_samples(frame_records, payloads)
@@ -340,6 +431,69 @@ def load_frame_records(input_dir: Path) -> list[dict]:
     return records
 
 
+def attach_external_camera_poses(
+    frame_records: list[dict],
+    jsonl_path: Path,
+    *,
+    max_sync_error_ms: float | None = None,
+) -> list[dict]:
+    """Attach canonical T_tracking_camera matrices to RGB-D frame records."""
+
+    if not jsonl_path.is_file():
+        raise FileNotFoundError(jsonl_path)
+    pose_by_index: dict[int, dict] = {}
+    for line_number, line in enumerate(jsonl_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        raw_index = record.get("record_index", record.get("index"))
+        if raw_index is None:
+            raise KeyError(f"{jsonl_path}:{line_number} has no record_index.")
+        index = int(raw_index)
+        if index in pose_by_index:
+            raise ValueError(f"Duplicate camera pose for record_index={index} in {jsonl_path}.")
+        matrix = matrix_from_json_record(record)
+        pose_by_index[index] = {
+            "camera_to_tracking": matrix.tolist(),
+            "camera_pose_source": str(record.get("tracking_source", record.get("source", "external_vio"))),
+            "camera_pose_timestamp_ms": record.get("timestamp_ms"),
+            "camera_pose_valid": bool(record.get("valid", True)),
+        }
+
+    output = []
+    matched = 0
+    for frame in frame_records:
+        enriched = dict(frame)
+        index = int(frame.get("index", -1))
+        if index in pose_by_index:
+            pose_record = dict(pose_by_index[index])
+            rgb_timestamp_ms = frame.get("timestamp_ms")
+            pose_timestamp_ms = pose_record.get("camera_pose_timestamp_ms")
+            if rgb_timestamp_ms is not None and pose_timestamp_ms is not None:
+                sync_error_ms = float(pose_timestamp_ms) - float(rgb_timestamp_ms)
+                if (
+                    max_sync_error_ms is not None
+                    and float(max_sync_error_ms) > 0.0
+                    and abs(sync_error_ms) > float(max_sync_error_ms)
+                ):
+                    raise ValueError(
+                        f"Camera pose record_index={index} is out of sync with RGB-D by "
+                        f"{sync_error_ms:+.3f} ms (limit={float(max_sync_error_ms):.3f} ms)."
+                    )
+                pose_record["camera_pose_sync_error_ms"] = sync_error_ms
+            enriched.update(pose_record)
+            matched += 1
+        output.append(enriched)
+    if matched == 0:
+        raise RuntimeError(
+            f"No record_index values in {jsonl_path} matched the RGB-D frames. "
+            "Timestamp-only matching is intentionally not guessed."
+        )
+    print(f"Attached {matched}/{len(frame_records)} external full-SE(3) camera poses from {jsonl_path}.")
+    return output
+
+
 def load_payloads(jsonl_path: Path) -> list[dict]:
     if not jsonl_path.exists():
         raise FileNotFoundError(jsonl_path)
@@ -436,12 +590,12 @@ def run_interactive_slicer(
             break
         if key in (83, 2555904, 65363, ord("d"), ord("D")):
             index = min(index + 1, len(samples) - 1)
-        elif key in (81, 2424832,65361, ord("a"), ord("A")):
+        elif key in (81, 2424832, 65361, ord("a"), ord("A")):
             index = max(index - 1, 0)
-        elif key in (82, 2490368,65362, ord("w"), ord("W")):
+        elif key in (82, 2490368, 65362, ord("w"), ord("W")):
             start_record_index = int(frame_record.get("index", index))
             print(f"Segment start = frame {start_record_index}")
-        elif key in (84, 2621440,65364, ord("s"), ord("S")):
+        elif key in (84, 2621440, 65364, ord("s"), ord("S")):
             end_record_index = int(frame_record.get("index", index))
             if start_record_index is None:
                 print("Set a start frame first with Up/W.")
@@ -503,7 +657,10 @@ def save_static_segments_hdf5(
             for segment, path in zip(segments, output_paths)
         ]
 
-    print(f"Saving {len(segments)} static segments with {worker_count} worker processes.", flush=True)
+    print(
+        f"Saving {len(segments)} static segments with {worker_count} worker processes.",
+        flush=True,
+    )
     result_paths: list[Path | None] = [None] * len(segments)
     start_s = time.time()
     with ProcessPoolExecutor(
@@ -617,6 +774,9 @@ def save_segment_hdf5(
     keypoints_3d_m = []
     source_indices = []
     timestamps_ms = []
+    camera_to_tracking_poses: list[np.ndarray | None] = []
+    camera_pose_sources: list[str] = []
+    camera_pose_sync_errors_ms: list[float] = []
 
     start_s = time.time()
     total_frames = len(selected)
@@ -646,6 +806,16 @@ def save_segment_hdf5(
         keypoints_3d_m.append(joints)
         source_indices.append(int(frame_record.get("index", len(source_indices))))
         timestamps_ms.append(float(payload.get("timestamp_ms") or frame_record.get("timestamp_ms") or np.nan))
+        raw_camera_pose = frame_record.get("camera_to_tracking", frame_record.get("camera_to_world"))
+        camera_pose_valid = bool(frame_record.get("camera_pose_valid", raw_camera_pose is not None))
+        camera_pose_sync_errors_ms.append(float(frame_record.get("camera_pose_sync_error_ms", np.nan)))
+        if raw_camera_pose is None or not camera_pose_valid:
+            camera_to_tracking_poses.append(None)
+        else:
+            camera_to_tracking_poses.append(
+                validate_transform_sequence(np.asarray(raw_camera_pose, dtype=np.float64).reshape(4, 4))[0]
+            )
+            camera_pose_sources.append(str(frame_record.get("camera_pose_source", "recorded_pose")))
         if progress_enabled and (frame_offset == 1 or frame_offset == total_frames or frame_offset % 25 == 0):
             print_progress(
                 f"Preparing segment {segment.start}:{segment.end}",
@@ -657,17 +827,46 @@ def save_segment_hdf5(
         sys.stderr.write("\n")
         sys.stderr.flush()
 
+    available_camera_pose_count = sum(pose is not None for pose in camera_to_tracking_poses)
+    if 0 < available_camera_pose_count < len(camera_to_tracking_poses):
+        missing_indices = [
+            source_indices[index] for index, pose in enumerate(camera_to_tracking_poses) if pose is None
+        ]
+        raise RuntimeError(
+            "Camera poses are only partially available inside the selected segment. "
+            f"Missing/invalid record_index values: {missing_indices[:20]}"
+            f"{'...' if len(missing_indices) > 20 else ''}. "
+            "A partial trajectory must not be silently treated as a fixed camera."
+        )
+    has_camera_poses = available_camera_pose_count == len(camera_to_tracking_poses)
+    if args.require_camera_pose and not has_camera_poses:
+        raise RuntimeError(
+            f"Segment {segment.start}:{segment.end} has no full-SE(3) camera trajectory, "
+            "but --require-camera-pose was requested."
+        )
+    camera_pose_source = (
+        camera_pose_sources[0]
+        if camera_pose_sources and len(set(camera_pose_sources)) == 1
+        else ("mixed" if camera_pose_sources else "none")
+    )
+
     path = output_path if output_path is not None else next_episode_path(output_dir)
     with h5py.File(path, "x", rdcc_nbytes=2 * 1024**2) as root:
         root.attrs["sim"] = False
         root.attrs["task"] = args.task
         root.attrs["source_rgbd_dir"] = str(input_dir)
-        root.attrs["source_jsonl"] = str(Path(args.jsonl).resolve() if args.jsonl else input_dir / "handpose_wilor.jsonl")
+        root.attrs["source_jsonl"] = str(
+            Path(args.jsonl).resolve() if args.jsonl else input_dir / "handpose_wilor.jsonl"
+        )
         root.attrs["segment_start_record_index"] = segment.start
         root.attrs["segment_end_record_index"] = segment.end
         root.attrs["pose_frame"] = args.pose_frame
         if args.pose_frame == "camera":
-            root.attrs["reference_frame"] = "overhead_camera"
+            # This is still raw per-frame camera data. The converter defines
+            # model world from the first overview-camera frame after applying
+            # the optional camera-to-tracking trajectory.
+            root.attrs["reference_frame"] = "current_camera"
+            root.attrs["overview_camera_storage_name"] = camera_names[0]
             root.attrs["uses_camera_extrinsic"] = False
         else:
             # Legacy export mode only. The current training/conversion pipeline
@@ -681,6 +880,14 @@ def save_segment_hdf5(
         root.attrs["max_points"] = int(args.max_points)
         root.attrs["camera_names"] = json.dumps(camera_names, ensure_ascii=False)
         root.attrs["camera_datasets_hardlinked"] = len(camera_names) > 1
+        root.attrs["camera_tracking_pose_available"] = bool(has_camera_poses)
+        root.attrs["camera_pose_source"] = camera_pose_source
+        root.attrs["camera_reference_mode"] = str(args.camera_reference_mode)
+        if args.canonical_camera_to_tracking_matrix is not None:
+            canonical_camera_to_tracking = validate_transform_sequence(
+                np.asarray(args.canonical_camera_to_tracking_matrix, dtype=np.float64).reshape(4, 4)
+            )[0]
+            root.attrs["canonical_camera_to_tracking"] = canonical_camera_to_tracking
 
         obs = root.create_group("observations")
         image_grp = obs.create_group("images")
@@ -701,6 +908,34 @@ def save_segment_hdf5(
         for name in camera_names[1:]:
             image_grp[name] = first_image
             cloud_grp[name] = first_cloud
+        if has_camera_poses:
+            camera_pose_grp = obs.create_group("camera_tracking_pose")
+            first_camera_pose = camera_pose_grp.create_dataset(
+                first_camera,
+                data=np.asarray(camera_to_tracking_poses, dtype=np.float64),
+            )
+            first_camera_pose.attrs["transform_direction"] = "camera_to_tracking"
+            first_camera_pose.attrs["notation"] = "T_tracking<-camera"
+            first_camera_pose.attrs["translation_unit"] = "meter"
+            first_camera_pose.attrs["pose_format"] = "matrix"
+            first_camera_pose.attrs["tracking_source"] = camera_pose_source
+            first_camera_pose.attrs["camera_reference_mode"] = str(args.camera_reference_mode)
+            if args.canonical_camera_to_tracking_matrix is not None:
+                first_camera_pose.attrs["canonical_camera_to_tracking"] = np.asarray(
+                    args.canonical_camera_to_tracking_matrix,
+                    dtype=np.float64,
+                ).reshape(4, 4)
+            finite_sync_errors = np.asarray(camera_pose_sync_errors_ms, dtype=np.float64)
+            finite_sync_errors = finite_sync_errors[np.isfinite(finite_sync_errors)]
+            first_camera_pose.attrs["max_abs_sync_error_ms"] = (
+                float(np.max(np.abs(finite_sync_errors))) if len(finite_sync_errors) else np.nan
+            )
+            for name in camera_names[1:]:
+                camera_pose_grp[name] = first_camera_pose
+            obs.create_dataset(
+                "camera_tracking_pose_sync_error_ms",
+                data=np.asarray(camera_pose_sync_errors_ms, dtype=np.float64),
+            )
 
         obs.create_dataset("qpos", data=np.asarray(qpos, dtype=np.float64))
         obs.create_dataset("pose_eular", data=np.asarray(pose_eular, dtype=np.float64))
@@ -856,9 +1091,11 @@ def gripper_state_from_hand(
         position,
         rotation,
         x_offset_delta_m=float(requested_x_offset_m) - float(gripper.get("tcp_offset_x_m", 0.0)),
-        z_offset_delta_m=None
-        if requested_z_offset_m is None
-        else float(requested_z_offset_m) - float(gripper.get("tcp_offset_z_m", requested_z_offset_m)),
+        z_offset_delta_m=(
+            None
+            if requested_z_offset_m is None
+            else float(requested_z_offset_m) - float(gripper.get("tcp_offset_z_m", requested_z_offset_m))
+        ),
     )
     opening = float(gripper.get("opening_width_m", 0.0))
     if should_transform_to_output_frame(pose_frame):
@@ -940,7 +1177,10 @@ def make_cloud_rgb(
             sample = np.linspace(0, valid_flat.size - 1, int(max_points), dtype=np.int64)
             selected_flat = valid_flat[sample]
         else:
-            repeat = np.resize(np.arange(valid_flat.size, dtype=np.int64), int(max_points) - valid_flat.size)
+            repeat = np.resize(
+                np.arange(valid_flat.size, dtype=np.int64),
+                int(max_points) - valid_flat.size,
+            )
             selected_flat = np.concatenate([valid_flat, valid_flat[repeat]])
     else:
         selected_flat = valid_flat
@@ -985,15 +1225,19 @@ def resize_image(color_bgr: np.ndarray, width: int, height: int) -> np.ndarray:
         return np.asarray(resized, dtype=np.uint8)[:, :, ::-1].copy()
 
 
-
-
 def draw_payload_preview(cv2, image: np.ndarray, payload: dict, intrinsics: CameraIntrinsics) -> None:
     for hand in payload.get("hands", []):
         pts = np.asarray(hand.get("keypoints_2d_px", []), dtype=np.float64)
         if pts.shape == (21, 2):
             for a, b in HAND_EDGES:
                 if np.all(np.isfinite(pts[[a, b]])):
-                    cv2.line(image, tuple(np.round(pts[a]).astype(int)), tuple(np.round(pts[b]).astype(int)), (0, 220, 180), 2)
+                    cv2.line(
+                        image,
+                        tuple(np.round(pts[a]).astype(int)),
+                        tuple(np.round(pts[b]).astype(int)),
+                        (0, 220, 180),
+                        2,
+                    )
             for idx, point in enumerate(pts):
                 if np.all(np.isfinite(point)):
                     color = (40, 220, 40) if idx in (4, 8) else (0, 180, 255)
@@ -1021,7 +1265,16 @@ def draw_gripper(cv2, image: np.ndarray, gripper: dict, intrinsics: CameraIntrin
         if end_px is None:
             continue
         cv2.arrowedLine(image, origin, end_px, color, 3, tipLength=0.05)
-        cv2.putText(image, label, (end_px[0] + 4, end_px[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            label,
+            (end_px[0] + 4, end_px[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def project_one(point_xyz: np.ndarray, intrinsics: CameraIntrinsics) -> tuple[int, int] | None:
@@ -1051,8 +1304,26 @@ def draw_overlay(
     ]
     x, y = 12, 24
     for line in lines:
-        cv2.putText(image, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(image, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            line,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            line,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
         y += 24
 
 

@@ -489,21 +489,11 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
             logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
             return dataset
         if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
-            if bool(getattr(policy_cfg, "worldflow_enable", False)):
-                raise ValueError(
-                    f"{reason}; Dense ObjectFlow requires pointseg.role_scores. "
-                    "Provide a current PointSeg cache or enable SONG_POINTSEG_ONLINE=1."
-                )
             logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
             return dataset
         root = Path(getattr(dataset, "root", dataset.meta.root))
         point_cloud_dir = root / "point_clouds"
         if not point_cloud_dir.is_dir():
-            if bool(getattr(policy_cfg, "worldflow_enable", False)):
-                raise FileNotFoundError(
-                    f"{reason}; Dense ObjectFlow requires point clouds for online role_scores, "
-                    f"but point cloud dir is missing: {point_cloud_dir}"
-                )
             logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
             return dataset
         mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
@@ -1466,14 +1456,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "se3_action_trans_err",
                     "se3_action_rot_err_deg",
                     "loss_worldflow_flow",
-                    "loss_worldflow_rigid",
+                    "loss_worldflow_geo",
                     "loss_worldflow_bridge",
                     "loss_worldflow_equiv",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
-                    "worldflow_object_point_ratio",
-                    "worldflow_transport_point_ratio",
+                    "worldflow_foreground_points",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
