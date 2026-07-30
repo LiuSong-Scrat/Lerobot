@@ -3,7 +3,111 @@
 
 ## Libero Benchmark
 ## 1.准备WEP-VLA Lerobot格式Benchmark数据集
-见 README_SCAI.md
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+MUJOCO_EGL_DEVICE_ID=0 \
+python benchmarks/song_real_libero/scripts/libero_setting/libero_hdf5_to_dataset.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --demo-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/libero_demos \
+  --suite libero_spatial \
+  --task-id 5 \
+  --episodes 10 \
+  --num-workers 10 \
+  --num-points 10000 \
+  --point-cloud-storage zarr \
+  --fps 20 \
+  --replay-mode states \
+  --state-observation-offset 1 \
+  --restore-demo-model \
+  --require-source-fps-match \
+  --save-rgb-images \
+  --image-camera agentview \
+  --no-download-demos \
+  --save-video \
+  --vis-count 2 \
+  --overwrite \
+  --vis-dir /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_dataset/visualizations \
+  --output-root /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_dataset/ \
+  --repo-id song_libero_4suite_pointcloud
+
+torchrun --standalone --nproc_per_node=4   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py   --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_dataset/   --output-dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_cache   --batch-size=24   --num-workers=4   --shard-size=4096  --storage-dtype=float16   --nn-chunk-size=1024   --vis-count=4  --overwrite
+
+
+#export CUDA_VISIBLE_DEVICES=1
+ulimit -n 65535
+export SONG_POINTSEG_REQUIRE_POINTOPS=1 
+python  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+    --policy.type=smolvla \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_dataset/  \
+    --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_cache \
+    --policy.vla_adapter_enable=true \
+    --policy.vla_adapter_freeze_vlm=true \
+    --policy.vlm_model_name=/home/liusong/hf_models/SmolVLM2-500M-Video-Instruct \
+    --policy.vlm_weights_path=/home/liusong/hf_models/smolvla_base \
+    --policy.load_vlm_weights=true \
+    --batch_size=2 \
+    --steps=80000 \
+    --log_freq=1 \
+    --output_dir=benchmarks/song_real_libero/outputs/wep_vla_v050_doubleflow \
+    --job_name=wep_vla_v050_doubleflow  \
+    --policy.device=cuda \
+    --wandb.enable=true \
+    --wandb.disable_artifact=true \
+    --save_freq=200 \
+    --eval_freq=200 \
+    --num_workers=8 \
+    --policy.pointseg_enable=true \
+    --policy.pointseg_backbone_type=litept \
+    --policy.pointseg_grid_size=0.01 \
+    --policy.pointseg_feature_dim=64 \
+    --policy.pointseg_aux_loss_weight=0.0005 \
+    --policy.pointseg_foreground_ratio=0.025 \
+    --policy.pointseg_background_ratio=0.025 \
+    --policy.pointseg_min_foreground_points=2500 \
+    --policy.pointseg_min_background_points=0  \
+    --policy.pointseg_use_temporal_priors_as_input=false  \
+    --policy.pointseg_use_pseudo_selection=false \
+    --policy.worldflow_enable=true \
+    --policy.worldflow_feature_dim=64 \
+    --policy.worldflow_grid_size=0.01 \
+    --policy.worldflow_max_points=0 \
+    --policy.point_action_fusion_enable=true \
+    --policy.point_action_fusion_heads=4 \
+    --policy.worldflow_loss_weight=1.0 \
+    --policy.worldflow_geo_loss_weight=0.05 \
+    --policy.worldflow_bridge_loss_weight=0.05 \
+    --policy.worldflow_equiv_loss_weight=0.02 \
+    --policy.worldflow_trans_weight=1.0 \
+    --policy.worldflow_rot_weight=1.0 \
+    --policy.worldflow_augmentation_trans_scale=0.20 \
+    --policy.worldflow_augmentation_rot_scale=0.75 \
+    --policy.worldflow_se3_head_enable=false \
+    --policy.se3_enable=false \
+    --policy.se3_final_correction_enable=false
+
+#### doubleflow
+--policy.worldflow_enable=true
+--policy.worldflow_max_points=0
+--policy.worldflow_loss_weight=0.05
+--policy.worldflow_geo_loss_weight=0.05
+--policy.worldflow_bridge_loss_weight=0.05
+--policy.worldflow_equiv_loss_weight=0.02
+--policy.se3_enable=false
+
+#### auxiliary
+--policy.worldflow_enable=true \
+--policy.worldflow_action_expert_layers=-1 \
+--policy.worldflow_max_points=0 \
+--policy.worldflow_loss_weight=0.05 \
+--policy.worldflow_geo_loss_weight=0.05 \
+--policy.worldflow_bridge_loss_weight=0.05 \
+--policy.worldflow_equiv_loss_weight=0.02 \
+--policy.worldflow_se3_head_enable=false \
+--policy.se3_enable=false \
+--policy.se3_final_correction_enable=false
+
+
 ## BenchmarkEval ###########################  
   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \

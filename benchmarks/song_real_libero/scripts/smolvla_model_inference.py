@@ -484,7 +484,12 @@ class SmolVLA_ModelInference:
                 if policy_device.type == "cuda":
                     torch.cuda.manual_seed_all(int(forward_seed))
                 noise = self._make_seeded_action_noise(model_batch, noise_seed)
-                action_chunk = self.policy.predict_action_chunk(model_batch, noise=noise)
+                worldflow_noise = self._make_seeded_worldflow_noise(model_batch, noise_seed)
+                action_chunk = self.policy.predict_action_chunk(
+                    model_batch,
+                    noise=noise,
+                    worldflow_noise=worldflow_noise,
+                )
         self._update_foreground_visualization()
         if postprocess:
             action_chunk = self.postprocessor(action_chunk)
@@ -535,6 +540,44 @@ class SmolVLA_ModelInference:
                 else:
                     sample = model.sample_noise(shape, device)
             samples.append(sample)
+        return torch.cat(samples, dim=0)
+
+    def _make_seeded_worldflow_noise(
+        self,
+        model_batch: dict[str, Any],
+        noise_seed: int | list[int] | tuple[int, ...] | None,
+    ) -> torch.Tensor | None:
+        """Build batch-order-independent SE(3) noise for the World chunk."""
+        model = self.policy.model
+        if noise_seed is None or not model.config.worldflow_enable:
+            return None
+        state = self.policy.prepare_state(model_batch)
+        batch_size = int(state.shape[0])
+        seeds = (
+            [int(noise_seed)] * batch_size
+            if isinstance(noise_seed, int)
+            else [int(seed) for seed in noise_seed]
+        )
+        if len(seeds) != batch_size:
+            raise ValueError(
+                f"noise_seed has {len(seeds)} entries for inference batch size {batch_size}."
+            )
+        device = state.device
+        cuda_devices = (
+            [device.index if device.index is not None else torch.cuda.current_device()]
+            if device.type == "cuda"
+            else []
+        )
+        samples = []
+        for seed in seeds:
+            # A disjoint deterministic stream avoids coupling World SE(3)
+            # noise to the Ego Euclidean action noise.
+            world_seed = (int(seed) ^ 0x5EED5EED5EED5EED) & ((1 << 63) - 1)
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(world_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(world_seed)
+                samples.append(model.sample_worldflow_noise(1, device))
         return torch.cat(samples, dim=0)
 
     @torch.inference_mode()
@@ -680,6 +723,34 @@ class SmolVLA_ModelInference:
             batch_size=batch_size,
         )
         state_tensor = self._match_batch_size(state_tensor, batch_size, "observation.state")
+        worldflow_current_pose = None
+        if self.policy.config.worldflow_enable:
+            worldflow_value = observation.get("worldflow.current_ee_pose")
+            if worldflow_value is None:
+                if state is None:
+                    raise ValueError(
+                        "WorldFlow inference requires 'worldflow.current_ee_pose' or a raw current pose9 state."
+                    )
+                worldflow_current_pose = self._prepare_state_tensor(
+                    state,
+                    state_pose_mode="raw",
+                    batch_size=batch_size,
+                )[..., :9]
+            else:
+                worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
+                if worldflow_current_pose.ndim == 1:
+                    worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
+                if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
+                    raise ValueError(
+                        "worldflow.current_ee_pose must have shape (9,) or (B,9), "
+                        f"got {tuple(worldflow_current_pose.shape)}."
+                    )
+                worldflow_current_pose = worldflow_current_pose[..., :9]
+            worldflow_current_pose = self._match_batch_size(
+                worldflow_current_pose,
+                batch_size,
+                "worldflow.current_ee_pose",
+            )
         language = self._tokenize_task(task, batch_size)
 
         batch = {
@@ -688,6 +759,8 @@ class SmolVLA_ModelInference:
             OBS_LANGUAGE_TOKENS: language["input_ids"].to(self.device),
             OBS_LANGUAGE_ATTENTION_MASK: language["attention_mask"].to(self.device, dtype=torch.bool),
         }
+        if worldflow_current_pose is not None:
+            batch["worldflow.current_ee_pose"] = worldflow_current_pose.to(self.device)
         if self.policy.config.vla_adapter_enable:
             batch.update(self._prepare_rgb_observation_batch(observation, batch_size))
         return batch

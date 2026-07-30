@@ -542,6 +542,33 @@ class SmolVLA_ModelInference:
 
         state_tensor = self._prepare_state_tensor(state, state_pose_mode=state_pose_mode)
         state_tensor = self._match_batch_size(state_tensor, batch_size, "observation.state")
+        worldflow_current_pose = None
+        if self.policy.config.worldflow_enable:
+            worldflow_value = observation.get("worldflow.current_ee_pose")
+            if worldflow_value is None:
+                if state is None:
+                    raise ValueError(
+                        "WorldFlow inference requires 'worldflow.current_ee_pose' or a raw current pose9 state."
+                    )
+                worldflow_current_pose = self._prepare_state_tensor(
+                    state,
+                    state_pose_mode="raw",
+                )[..., :9]
+            else:
+                worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
+                if worldflow_current_pose.ndim == 1:
+                    worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
+                if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
+                    raise ValueError(
+                        "worldflow.current_ee_pose must have shape (9,) or (B,9), "
+                        f"got {tuple(worldflow_current_pose.shape)}."
+                    )
+                worldflow_current_pose = worldflow_current_pose[..., :9]
+            worldflow_current_pose = self._match_batch_size(
+                worldflow_current_pose,
+                batch_size,
+                "worldflow.current_ee_pose",
+            )
         language = self._tokenize_task(task, batch_size)
 
         batch = {
@@ -550,6 +577,8 @@ class SmolVLA_ModelInference:
             OBS_LANGUAGE_TOKENS: language["input_ids"].to(self.device),
             OBS_LANGUAGE_ATTENTION_MASK: language["attention_mask"].to(self.device, dtype=torch.bool),
         }
+        if worldflow_current_pose is not None:
+            batch["worldflow.current_ee_pose"] = worldflow_current_pose.to(self.device)
         if self.policy.config.vla_adapter_enable:
             batch.update(self._prepare_rgb_observation_batch(observation, batch_size))
         return batch

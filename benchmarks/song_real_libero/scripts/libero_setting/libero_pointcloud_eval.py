@@ -4385,6 +4385,10 @@ def run_episode(
             model_observation = {
                 "point_cloud": point_cloud,
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
+                # Ego policy state remains identity (UMI/body frame), while
+                # the joint World branch needs the analytic body-to-world
+                # carrier used to transform the same selected foreground.
+                "worldflow.current_ee_pose": np.asarray(eef_pose[:9], dtype=np.float32),
             }
             chunk_start_model_world = pose9_to_homo_np(np.asarray(eef_pose[:9], dtype=np.float32))
             chunk_start_model_worlds.append(np.asarray(chunk_start_model_world, dtype=np.float32))

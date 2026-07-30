@@ -103,11 +103,13 @@ class SmolVLAConfig(PreTrainedConfig):
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
 
-    # Independent world-frame trajectory auxiliary branch. PointSeg first
-    # selects the foreground XYZRGB cloud in the Ego/body frame. The branch
-    # analytically maps that cloud with the current world EEF pose, encodes it
-    # with its own LitePT + PointAction modules, and flow-matches the spatial
-    # transform A_t C^{-1}. It is never called by the policy inference path.
+    # Joint World–Ego trajectory branch. PointSeg selects foreground XYZRGB in
+    # the Ego/body frame, then the current EEF pose analytically maps those
+    # exact points into World. World owns an independent LitePT + PointAction
+    # front-end, but both streams share the official Action Expert. One
+    # attention-pooled global scene token per stream forms the causal-prefix
+    # scene block; all World/Ego action tokens form one bidirectional block.
+    # The branch is active in training and inference.
     worldflow_enable: bool = False
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
@@ -121,8 +123,8 @@ class SmolVLAConfig(PreTrainedConfig):
     # 0 keeps the complete predicted foreground. A positive value is an
     # optional memory cap applied after PointSeg foreground selection.
     worldflow_max_points: int = 0
-    # -1 mirrors the Ego Action Expert depth. A positive value can be used for
-    # an explicitly shallower auxiliary expert.
+    # Legacy v0.5 CLI fields. v0.5.1+ shares the Ego Action Expert, so these
+    # values are parsed for old commands but do not instantiate another expert.
     worldflow_action_expert_layers: int = -1
     worldflow_action_expert_dropout: float = 0.0
     worldflow_augmentation_trans_scale: float = 0.20
@@ -206,8 +208,8 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.worldflow_se3_head_enable:
             warnings.warn(
                 "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "WorldFlow directly flow-matches an SE(3) spatial transform with an independent "
-                "LitePT/PointAction/action-expert branch.",
+                "WorldFlow directly flow-matches an SE(3) spatial transform through its "
+                "LitePT/PointAction front-end and the shared World–Ego Action Expert.",
                 stacklevel=2,
             )
         if self.worldflow_enable:
@@ -219,10 +221,26 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.worldflow_feature_dim <= 0:
                 raise ValueError("worldflow_feature_dim must be positive.")
-            if self.worldflow_action_expert_layers == 0 or self.worldflow_action_expert_layers < -1:
-                raise ValueError("worldflow_action_expert_layers must be -1 or a positive integer.")
+            if not self.point_action_fusion_enable:
+                raise ValueError(
+                    "worldflow_enable=True requires point_action_fusion_enable=True so both "
+                    "coordinate streams provide point-fused action tokens to the shared expert."
+                )
             if self.worldflow_max_points < 0:
                 raise ValueError("worldflow_max_points must be non-negative.")
+            if self.se3_enable:
+                raise ValueError(
+                    "worldflow_enable and se3_enable cannot be combined: the joint World–Ego "
+                    "branch currently shares the standard flow-matching Action Expert output."
+                )
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError("worldflow_enable=True is not compatible with RTC.")
+            if self.worldflow_action_expert_layers != -1 or self.worldflow_action_expert_dropout != 0.0:
+                warnings.warn(
+                    "worldflow_action_expert_layers/dropout are legacy v0.5 options and are ignored "
+                    "because World and Ego now share one Action Expert.",
+                    stacklevel=2,
+                )
         if self.se3_final_correction_enable:
             warnings.warn(
                 "se3_final_correction_enable is kept only for CLI compatibility and is ignored. "

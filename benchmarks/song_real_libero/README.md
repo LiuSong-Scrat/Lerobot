@@ -2,7 +2,7 @@
 
 > 项目主文档与快速回顾手册
 >
-> 文档基线：`wep_vla_v0.4.2`，commit `9fb900c`，2026-07-28
+> 文档基线：`wep_vla_v0.5.0_auxiliary` 上的 World–Ego v2，2026-07-30
 > 如果后续代码行为与本文冲突，以当前代码和 checkpoint 内的 `config.json` 为准，并同步更新本节基线。
 
 ## 摘要
@@ -38,7 +38,7 @@ EEF 相对动作轨迹。
 | PointSeg | 开启 | 使用 cache v7 软运动先验监督 |
 | LitePT | 开启 | XYZ 作为 coord，同时 XYZRGB 作为 feat |
 | Point–Action fusion | 开启 | 最终 LitePT token 与 action token 联合双向 self-attention |
-| WorldFlow | **默认关闭** | 已重构为独立 LitePT/PointAction flow-matching 辅助分支，需单独重训验证 |
+| WorldFlow | **默认关闭** | v2 为独立点云前端 + 共享 Action Expert，训练与推理均参与，需单独重训验证 |
 | 独立 SE(3) flow 动作头 | **关闭** | 实验分支，不是当前稳定结果路径 |
 | PCA / canonical frame | 不使用 | 已从当前方案中排除 |
 | 人工分割 / 人工点流 | 不使用 | 所有前景监督由轨迹自动产生 |
@@ -72,7 +72,8 @@ EEF 相对动作轨迹。
 | VLM/Expert attention mode | `cross_attn` |
 | self-attention 插入间隔 | 每 2 层 |
 | PointSeg / LitePT feature dim | 64 |
-| 前景 LitePT token 上限 | 256 |
+| LitePT `n_tokens` 构造值 | 256（当前不强制截断） |
+| World/Ego shared-expert scene tokens | 每分支 1 个 `global_feat` |
 | Point–Action attention heads | 4 |
 | robot state prefix | 默认关闭 |
 
@@ -609,37 +610,118 @@ x_{k+1}=x_k+\Delta t\,v_\theta(x_k,t_k,c),\qquad \Delta t=0.1.
 因此动作生成本身具有随机性。要严格比较两个入口、两次推理或 modality ablation，必须固定
 相同 noise seed，并使用相同 batch 构成和数值执行路径。
 
+启用 World–Ego v2 时，LIBERO 推理包装器会从同一个 sample seed 派生一条独立的 World
+SE(3) noise stream，保证每个样本的两组初始噪声都不依赖动态 batch 中的请求顺序。
+
 ---
 
 ## 8. WorldFlow 与 SE(3) 实验分支
 
-### 8.1 当前实现
+### 8.1 World–Ego v2 当前实现
 
-`worldflow_enable=true` 时启用一个与 Ego 分支不共享参数的辅助模型：
+`worldflow_enable=true` 不再创建第二套 Action Expert，而是创建一套独立 World 点云前端，并让
+World 与 Ego 在官方 SmolVLA Action Expert 中彼此学习。数据路径为：
 
-1. PointSeg 按预测前景分数选出 Ego/body-frame 的 XYZRGB 前景点；WorldFlow 不读取分数值、
-   pseudo label 或 `role_scores`；
-2. 用当前末端 world 位姿 \(C=T_{W\leftarrow E_0}\) 将前景点解析地转换到 world frame；
-3. 独立的 LitePT 编码 world 点云，独立 PointAction adapter 让 noisy spatial-action token
-   进入点云 token 内部交互；
-4. 独立语言 embedding、动作/时间投影与双向 Action Expert 通过 flow matching 预测
-   \(G_t=A_tC^{-1}\) 的 pose9 表示；
-5. 用 \(C^{-1}\hat G_tC\leftrightarrow\hat B_t\) 将 World spatial transform 与 Ego body-frame
-   动作连接；
-6. 对随机坐标变换 \(S\) 同步增强点云、flow noise 和监督标签，并约束
-   \(\hat G'_t=S\hat G_tS^{-1}\)。
+1. PointSeg 按模型预测选出 Ego/body-frame XYZRGB 前景点；
+2. World 分支只接收这些 XYZRGB 点，不接收前景概率、pseudo label、role score 或真实点流；
+3. 用当前末端 world 位姿 \(C=T_{W\leftarrow E_0}\) 将同一批前景点解析地变换到 World；
+4. Ego 与 World 各自使用独立 LitePT、动作/时间投影和 PointAction adapter；
+5. 两个前端分别输出一个 `global_feat` scene token 与已经融合完整点特征的 `action tokens`；
+6. 两个 scene token 和两组 action token 进入同一个官方 Action Expert，分别预测 Ego body action velocity
+   与 World spatial-transform velocity；
+7. 训练和 rollout 推理均同时维护、去噪两组 action chunk，最终只向控制器返回 Ego chunk。
 
-损失由 `flow + SE(3) endpoint geometry + World–Ego bridge + conjugation equivariance` 组成。
-当前实现不预测点流、不运行 Kabsch、不使用 PCA，也不需要人为角色定义。
+World 分支的独立边界止于 PointAction 输出。共享专家之前没有通过加权求和或 gate 混合两个
+分支，也没有另建简化 MLP expert。
 
-WorldFlow 只在训练 `forward` 中计算辅助损失；`sample_actions`、`predict_action_chunk` 和在线
-推理均不调用该分支，因此 rollout 仍完全由原 Ego SmolVLA flow-matching 路径生成。
+### 8.2 联合 token 与 attention 语义
 
-第一版完整结构的关键开关为：
+Action Expert 的逻辑序列为：
+
+```text
+VLM prefix
+  └─ RGB / language / point summary
+
+shared-expert suffix
+  ├─ scene block: [Ego global scene token, World global scene token]
+  └─ action block: [Ego action_0..T-1, World action_0..T-1]
+```
+
+- Ego/World 分别用 LitePT 注意力池化后的 `global_feat` 构造一个 scene token；
+- 完整 LitePT 点 token 不直接进入共享 Action Expert，只在各自 PointAction 内与动作交互；
+- Ego/World scene token 加入不同的可学习 branch-type embedding；
+- Ego/World action token也加入不同的 branch-type embedding，不能只靠序列位置猜测坐标来源；
+- 两组 scene token 位于同一个双向 block，可相互交换几何上下文；
+- 两个完整 action chunk 位于同一个双向 block，所以任意 Ego action step 与任意 World action
+  step 都可双向通信；
+- scene block 不能读取后面的 action block；
+- action block 可以读取全部 VLM prefix、全部 scene token 与两组全部有效 action token；
+- padded scene/action token 同时受 key/query mask 排除；
+- SmolVLA 原有 RoPE position id 仍在 VLM/Expert attention 内生效，PointAction 内仍保留动作
+  step position embedding。
+
+每个分支的信息路径都保持为原始模型的两级结构：
+
+```text
+完整 LitePT 点 token ── PointAction ── point-fused action token
+          └──────── attention pooling ── 单个 global scene token
+```
+
+所以共享专家始终只接收两个场景级 token，不需要对点 token 额外采样或重汇聚。点级几何细节
+通过 PointAction 写入动作 token，`global_feat` 则提供场景级上下文。该路径不使用前景概率、
+role、PCA 或手工目标点。
+
+这里的“causal”是 block 间的 prefix-causal，而不是 action chunk 内的自回归 causal。模型一次
+生成整个 chunk，因此两组 action token 内部和彼此之间保持双向。
+
+### 8.3 几何目标与损失
+
+设当前末端位姿为 \(C=T_{W\leftarrow E_0}\)，未来绝对末端位姿为
+\(A_t=T_{W\leftarrow E_t}\)。两个分支的目标分别是：
+
+\[
+B_t=C^{-1}A_t,\qquad G_t=A_tC^{-1}.
+\]
+
+二者通过 SE(3) 共轭关系严格连接：
+
+\[
+B_t=C^{-1}G_tC.
+\]
+
+World 分支对 \(G_t\) 做 pose9 flow matching，同时计算 endpoint SE(3) 几何损失；bridge loss
+比较 \(C^{-1}\hat G_tC\) 与共享专家输出的 Ego endpoint。随机坐标增广 \(S\) 同步作用于 World
+点云、World flow noise 和监督标签：
+
+\[
+G'_t=SG_tS^{-1},\qquad \hat G'_t\approx S\hat G_tS^{-1}.
+\]
+
+总辅助损失仍由 `flow + SE(3) endpoint geometry + World–Ego bridge + conjugation
+equivariance` 组成。该实现不预测点流、不运行 Kabsch、不使用 PCA，也不引入人工角色监督。
+
+### 8.4 推理路径与 current pose 契约
+
+推理不再绕过 World 分支。每次 policy call：
+
+1. Ego flow 从原来的动作噪声初始化；
+2. World flow 从合法 SE(3) 噪声初始化；
+3. PointSeg 选择 Ego 前景，再用当前 \(C\) 得到 World 前景；
+4. 每个 Euler step 重新生成两组 point-fused action token，经过共享专家得到两组 velocity；
+5. 两个状态都积分到下一步，最终只返回 Ego action。
+
+因此开启 WorldFlow 的 checkpoint 在在线推理时必须提供
+`worldflow.current_ee_pose: (B,9)`。它只是解析坐标变换载体，不作为 Ego robot-state prefix：
+
+- `libero_pointcloud_eval.py` 从当前 simulator EEF pose 自动加入；
+- 两份 `smolvla_model_inference.py` 优先读取显式字段；真实机器人 `single_inference` 可从原始
+  `pose_eular`/state 自动构造；
+- 普通 Ego `observation.state` 仍按 UMI 契约置为 identity，不会因此改回绝对位姿策略。
+
+关键开关为：
 
 ```bash
 --policy.worldflow_enable=true
---policy.worldflow_action_expert_layers=-1
 --policy.worldflow_max_points=0
 --policy.worldflow_loss_weight=0.05
 --policy.worldflow_geo_loss_weight=0.05
@@ -648,20 +730,23 @@ WorldFlow 只在训练 `forward` 中计算辅助损失；`sample_actions`、`pre
 --policy.se3_enable=false
 ```
 
-`worldflow_action_expert_layers=-1` 表示与 Ego Action Expert 使用相同层数；`worldflow_max_points=0`
-表示保留完整预测前景。减小层数或设置正的点数上限只用于显存/速度消融，不是默认完整结构。
+`worldflow_max_points=0` 表示保留完整预测前景；正值只作为显存上限，不是额外前景筛选。
+`worldflow_action_expert_layers` 和 `worldflow_action_expert_dropout` 只为兼容 v0.5 命令保留，
+v2 中被忽略，因为只存在一套共享 Action Expert。WorldFlow 与 `se3_enable`、RTC 不能同时开启。
 
-### 8.2 为什么仍默认关闭
+### 8.5 为什么仍默认关闭
 
-新 WorldFlow 已消除旧版 evidence/role 语义错配，但模型结构和旧 WorldFlow checkpoint 不兼容，
-必须从新分支随机初始化并重新训练。论文主结果在完成独立消融前仍使用：
+v2 改变了 suffix 长度、共享专家的信息流和推理调用链，与 v0.5 auxiliary checkpoint 以及更早
+Dense ObjectFlow checkpoint 都不具备功能等价性。旧 checkpoint 即使以非严格方式加载，也会
+缺少 scene projection、branch-type embedding 和 World output projection，不能视为可用 v2
+模型，必须重新训练。完成独立消融前仍默认：
 
 ```bash
 --policy.worldflow_enable=false
 --policy.worldflow_se3_head_enable=false
 ```
 
-### 8.3 其他 SE(3) 参数
+### 8.6 其他 SE(3) 参数
 
 - `se3_enable=true`：独立的实验性 SE(3)-twist flow 动作生成路径，不等于 WorldFlow。
 - `worldflow_se3_head_enable`：历史兼容参数，当前忽略。
@@ -1391,7 +1476,7 @@ python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
 | adapter 版真实 dataset，点云和 frame 未变化 | 条件兼容 | 核对 image key、点顺序、episode mapping；不确定时重建 cache |
 | cache v7 + 完全相同 dataset | 是 | 使用 strict 检查 |
 | v0.2 / v0.3 checkpoint | 条件兼容 | 以 checkpoint config 构造模型，不能强行开启新 fusion |
-| 旧 WorldFlow checkpoint + 当前 `worldflow_enable=true` | 否 | 新分支不再是 Dense ObjectFlow；需重新训练 WorldFlow 参数 |
+| v0.5 auxiliary / 更早 WorldFlow checkpoint + 当前 `worldflow_enable=true` | 否 | v2 改为共享专家和双分支推理；需重新训练 |
 | point-only checkpoint + PLY | 是 | 不需要 RGB adapter |
 | adapter checkpoint + 只有 PLY | 否 | 还需同步 RGB、task、EEF pose |
 
@@ -1563,7 +1648,7 @@ sha256sum /path/to/checkpoint/model.safetensors
 2. dataset 是否由逐 demo `model_file`、offset 1、controller target 版本生成？
 3. cache 是否由这份 dataset 重新生成？
 4. checkpoint 内 adapter、PointSeg、Point–Action fusion 开关是什么？
-5. WorldFlow 是否仍关闭；若开启，是否使用独立 LitePT/PointAction 分支并从头训练其参数？
+5. WorldFlow 是否仍关闭；若开启，是否为 v2 独立 LitePT/PointAction 前端 + 共享专家并从头训练？
 6. 训练与推理的 RGB key、点云坐标系和 EEF pose 是否一致？
 7. 比较 loss 时是否固定了样本、noise、\(t\) 和 processor？
 8. rollout 失败前，oracle action 能否通过同一执行器？
