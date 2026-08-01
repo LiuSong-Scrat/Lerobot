@@ -6,11 +6,19 @@ import torch
 from torch import nn
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+
+def test_action_chunk_start_offset_shifts_dataset_action_indices():
+    cfg = SmolVLAConfig(chunk_size=4, n_action_steps=4, action_chunk_start_offset=1)
+
+    assert cfg.action_delta_indices == [1, 2, 3, 4]
 from lerobot.policies.smolvla.modeling_smolvla import (
+    SmolVLAPolicy,
     VLAFlowMatching,
     WorldFlowActionBranch,
     make_att_2d_masks,
     matrix_to_pose9,
+    pose9_to_matrix,
     se3_exp,
     se3_log,
     so3_exp,
@@ -35,6 +43,199 @@ def test_se3_relative_update_recovers_target():
     b = se3_exp(torch.randn(8, 6) * 0.2)
     recovered = se3_exp(se3_log(a @ torch.linalg.inv(b))) @ b
     assert torch.allclose(recovered, a, atol=3e-4, rtol=3e-4)
+
+
+def test_worldflow_noise_respects_physical_translation_and_rotation_scales():
+    torch.manual_seed(13)
+    cfg = SmolVLAConfig(
+        chunk_size=256,
+        n_action_steps=16,
+        worldflow_noise_trans_scale=0.07,
+        worldflow_noise_rot_scale=0.11,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    pose9_noise = model.sample_worldflow_noise(batch_size=128, device=torch.device("cpu"))
+    sampled_twist = se3_log(pose9_to_matrix(pose9_noise))
+
+    assert torch.allclose(
+        sampled_twist[..., :3].std(),
+        torch.tensor(cfg.worldflow_noise_trans_scale),
+        atol=3e-3,
+        rtol=0.04,
+    )
+    assert torch.allclose(
+        sampled_twist[..., 3:6].std(),
+        torch.tensor(cfg.worldflow_noise_rot_scale),
+        atol=3e-3,
+        rtol=0.04,
+    )
+
+
+def test_ego_pose9_noise_is_valid_se3_and_respects_physical_scales():
+    torch.manual_seed(17)
+    cfg = SmolVLAConfig(
+        chunk_size=256,
+        n_action_steps=16,
+        pose9_action_noise_enable=True,
+        pose9_action_noise_trans_scale=0.08,
+        pose9_action_noise_rot_scale=0.14,
+        pose9_action_noise_gripper_scale=0.03,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    noise = model.sample_pose9_action_noise((128, cfg.chunk_size, 10), torch.device("cpu"))
+    transform = pose9_to_matrix(noise[..., :9])
+    sampled_twist = se3_log(transform)
+
+    assert torch.allclose(
+        sampled_twist[..., :3].std(),
+        torch.tensor(cfg.pose9_action_noise_trans_scale),
+        atol=3e-3,
+        rtol=0.04,
+    )
+    assert torch.allclose(
+        sampled_twist[..., 3:6].std(),
+        torch.tensor(cfg.pose9_action_noise_rot_scale),
+        atol=3e-3,
+        rtol=0.04,
+    )
+    assert torch.allclose(
+        noise[..., 9].std(),
+        torch.tensor(cfg.pose9_action_noise_gripper_scale),
+        atol=2e-3,
+        rtol=0.04,
+    )
+    rotation = transform[..., :3, :3]
+    identity = torch.eye(3).expand_as(rotation)
+    assert torch.allclose(rotation.transpose(-1, -2) @ rotation, identity, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(torch.linalg.det(rotation), torch.ones_like(rotation[..., 0, 0]), atol=2e-5)
+
+
+def test_zero_pose9_and_worldflow_noise_scales_produce_identity_priors():
+    cfg = SmolVLAConfig(
+        chunk_size=8,
+        n_action_steps=8,
+        pose9_action_noise_enable=True,
+        pose9_action_noise_trans_scale=0.0,
+        pose9_action_noise_rot_scale=0.0,
+        pose9_action_noise_gripper_scale=0.0,
+        worldflow_enable=True,
+        worldflow_noise_trans_scale=0.0,
+        worldflow_noise_rot_scale=0.0,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    ego_noise = model.sample_pose9_action_noise((3, cfg.chunk_size, 10), torch.device("cpu"))
+    world_noise = model.sample_worldflow_noise(batch_size=3, device=torch.device("cpu"))
+    identity = torch.eye(4).expand(3, cfg.chunk_size, 4, 4)
+
+    assert torch.equal(pose9_to_matrix(ego_noise[..., :9]), identity)
+    assert torch.count_nonzero(ego_noise[..., 9]) == 0
+    assert torch.equal(pose9_to_matrix(world_noise), identity)
+
+
+def test_integration_grid_time_sampling_matches_inference_euler_steps():
+    cfg = SmolVLAConfig(
+        num_steps=10,
+        flow_time_sampling="integration_grid",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    torch.manual_seed(7)
+    sampled = model.sample_time(2048, torch.device("cpu"))
+
+    scaled = sampled * cfg.num_steps
+    assert torch.allclose(scaled, scaled.round())
+    assert sampled.min().item() == 0.0
+    assert torch.allclose(sampled.max(), torch.tensor(0.9))
+    assert set(scaled.to(dtype=torch.int64).tolist()) == set(range(cfg.num_steps))
+
+
+def test_integration_grid_time_sampling_can_emphasize_exact_zero():
+    cfg = SmolVLAConfig(
+        num_steps=10,
+        flow_time_sampling="integration_grid",
+        flow_time_zero_probability=0.5,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    torch.manual_seed(7)
+    sampled = model.sample_time(20_000, torch.device("cpu"))
+
+    scaled = sampled * cfg.num_steps
+    zero_ratio = (sampled == 0).to(dtype=torch.float32).mean()
+    assert torch.allclose(scaled, scaled.round())
+    assert torch.allclose(sampled.max(), torch.tensor(0.9))
+    assert torch.allclose(zero_ratio, torch.tensor(0.5), atol=0.015)
+    assert set(scaled.to(dtype=torch.int64).tolist()) == set(range(cfg.num_steps))
+
+
+def test_pose9_action_loss_weights_preserve_scale_and_prioritize_physical_groups():
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            action_loss_translation_weight=3.0,
+            action_loss_rotation_weight=1.0,
+            action_loss_gripper_weight=3.0,
+        )
+    )
+    weights = SmolVLAPolicy._action_loss_dimension_weights(
+        policy,
+        10,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert torch.allclose(weights.mean(), torch.tensor(1.0))
+    assert weights[:3].min() > weights[3:9].max()
+    assert torch.allclose(weights[9], weights[0])
+
+
+def test_standard_action_metrics_use_physical_endpoint_error_and_padding_mask():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    identity = torch.eye(4).expand(1, 2, 4, 4).clone()
+    actions = torch.cat(
+        [matrix_to_pose9(identity), torch.zeros(1, 2, 1)],
+        dim=-1,
+    )
+    x_t = actions.clone()
+    u_t = torch.zeros_like(actions)
+    pred_velocity = torch.zeros_like(actions)
+    pred_velocity[0, 0, 0] = 0.01
+    pred_velocity[0, 0, 9] = 0.02
+    # This much larger error must be ignored because the second step is padded.
+    pred_velocity[0, 1, 0] = 1.0
+    pred_velocity[0, 1, 9] = 1.0
+
+    model._record_standard_action_metrics(
+        actions=actions,
+        x_t=x_t,
+        u_t=u_t,
+        pred_velocity=pred_velocity,
+        time=torch.zeros(1),
+        actions_is_pad=torch.tensor([[False, True]]),
+    )
+
+    assert torch.allclose(model.last_action_metrics["action_endpoint_trans_err"], torch.tensor(0.01))
+    assert torch.allclose(
+        model.last_action_metrics["action_endpoint_gripper_err"],
+        torch.tensor(0.02),
+    )
+    assert torch.allclose(
+        model.last_action_metrics["action_endpoint_rot_err_deg"],
+        torch.tensor(0.0),
+    )
 
 
 class _TinySceneEncoder(nn.Module):

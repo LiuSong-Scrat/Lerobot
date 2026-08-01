@@ -1,5 +1,5 @@
 {
-  "policy_path": "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/last/pretrained_model",
+  "policy_path": "/tmp/temp/training/task5_causal_offset1_from_det4k_003000/checkpoints/001000/pretrained_model",
   "policy_repo_id": "/home/liusong/scp_receive/smolvla",
   "vlm_model": "/home/liusong/SmolVLM2-500M-Video-Instruct",
   "output_dir": "outputs/libero_setting/eval",
@@ -7,8 +7,8 @@
   "dataset_repo_id": "song_libero_pointcloud",
   "libero_config_path": "data/libero_setting/libero_config",
   "demo_root": "data/libero_setting/libero_demos",
-  "suite": "libero_goal",
-  "task_ids": [3,5],
+  "suite": "libero_spatial",
+  "task_ids": [5],
   "episodes": 10,
   "fps": 20,
   "device": "cuda",

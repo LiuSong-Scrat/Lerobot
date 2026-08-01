@@ -516,6 +516,17 @@ def make_policy(
     else:
         # Make a fresh policy.
         policy = policy_cls(**kwargs)
+        if getattr(cfg, "load_action_expert_weights", False):
+            initializer = getattr(policy, "initialize_action_expert_from_pretrained", None)
+            if initializer is None:
+                raise TypeError(
+                    f"Policy type {cfg.type!r} requested load_action_expert_weights=True "
+                    "but does not implement Action Expert initialization."
+                )
+            source = getattr(cfg, "action_expert_weights_path", None) or getattr(
+                cfg, "vlm_weights_path", None
+            )
+            initializer(source)
 
     policy.to(cfg.device)
     assert isinstance(policy, torch.nn.Module)

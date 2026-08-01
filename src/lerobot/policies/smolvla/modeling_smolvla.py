@@ -68,7 +68,10 @@ from typing_extensions import Unpack
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.policies.smolvla.smolvlm_with_expert import (
+    SmolVLMWithExpertModel,
+    load_pretrained_action_expert_weights,
+)
 from lerobot.policies.smolvla.song_pointseg import (
     MOTION_PRIOR_DIM,
     ROLE_FOREGROUND,
@@ -597,6 +600,26 @@ class SmolVLAPolicy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
+    def initialize_action_expert_from_pretrained(
+        self,
+        source: str | None = None,
+    ) -> dict[str, int | str]:
+        """Initialize only a freshly constructed policy's Action Expert."""
+
+        resolved_source = source or self.config.action_expert_weights_path or self.config.vlm_weights_path
+        if resolved_source is None:
+            raise ValueError(
+                "No Action Expert checkpoint source was supplied. Set "
+                "action_expert_weights_path or vlm_weights_path."
+            )
+        report = load_pretrained_action_expert_weights(
+            self.model,
+            str(resolved_source),
+            load_action_projections=self.config.load_action_expert_projection_weights,
+        )
+        self.action_expert_initialization_report = report
+        return report
+
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
         self.rtc_processor = None
@@ -786,6 +809,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for key, value in self.model.last_se3_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
+        for key, value in self.model.last_action_metrics.items():
+            if torch.is_tensor(value):
+                loss_dict[key] = value.detach().item()
         worldflow_aux = self.model.compute_worldflow_aux_loss()
         for key, value in self.model.last_worldflow_metrics.items():
             if torch.is_tensor(value):
@@ -794,6 +820,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Remove padding
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
+        losses = losses * self._action_loss_dimension_weights(
+            original_action_dim,
+            device=losses.device,
+            dtype=losses.dtype,
+        )
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         valid_action_counts = torch.full(
@@ -834,6 +865,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 loss = loss + worldflow_aux["per_sample_loss"].mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def _action_loss_dimension_weights(
+        self,
+        action_dim: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Return mean-one weights for pose9 + gripper flow-matching dimensions."""
+
+        weights = torch.ones(action_dim, device=device, dtype=dtype)
+        if action_dim < 10:
+            return weights
+        weights[:3] = float(self.config.action_loss_translation_weight)
+        weights[3:9] = float(self.config.action_loss_rotation_weight)
+        weights[9] = float(self.config.action_loss_gripper_weight)
+        return weights * (float(action_dim) / weights.sum().clamp_min(torch.finfo(dtype).eps))
 
     def prepare_point_clouds(self, batch):
         """Extract point cloud features from the batch.
@@ -2107,6 +2155,7 @@ class VLAFlowMatching(nn.Module):
         self.last_pointseg_visualization: dict[str, Tensor] | None = None
         self.last_worldflow_metrics: dict[str, Tensor] = {}
         self.last_se3_metrics: dict[str, Tensor] = {}
+        self.last_action_metrics: dict[str, Tensor] = {}
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -2190,13 +2239,56 @@ class VLAFlowMatching(nn.Module):
             device=device,
             dtype=torch.float32,
         )
+        twist[..., :3] = twist[..., :3] * float(self.config.worldflow_noise_trans_scale)
+        twist[..., 3:6] = twist[..., 3:6] * float(self.config.worldflow_noise_rot_scale)
         return matrix_to_pose9(se3_exp(twist))
 
+    def sample_pose9_action_noise(self, shape: tuple[int, ...], device: torch.device) -> Tensor:
+        """Sample valid SE(3) pose9 + gripper noise for the standard Ego flow."""
+
+        if len(shape) != 3 or shape[-1] < 10:
+            raise ValueError(f"Expected Ego action noise shape [B,T,D>=10], got {shape}.")
+        twist = torch.randn(*shape[:2], 6, device=device, dtype=torch.float32)
+        twist[..., :3] *= float(self.config.pose9_action_noise_trans_scale)
+        twist[..., 3:6] *= float(self.config.pose9_action_noise_rot_scale)
+        gripper = torch.randn(*shape[:2], 1, device=device, dtype=torch.float32)
+        gripper *= float(self.config.pose9_action_noise_gripper_scale)
+        noise = torch.cat([matrix_to_pose9(se3_exp(twist)), gripper], dim=-1)
+        if shape[-1] > 10:
+            noise = pad_vector(noise, shape[-1])
+        return noise
+
     def sample_time(self, bsize, device):
+        mode = self.config.flow_time_sampling
+        if mode == "integration_grid":
+            num_steps = int(self.config.num_steps)
+            zero_probability = float(self.config.flow_time_zero_probability)
+            if num_steps == 1:
+                return torch.zeros(int(bsize), device=device, dtype=torch.float32)
+            if zero_probability > 0:
+                choose_zero = torch.rand(int(bsize), device=device) < zero_probability
+                step = torch.randint(
+                    low=1,
+                    high=num_steps,
+                    size=(int(bsize),),
+                    device=device,
+                )
+                step = torch.where(choose_zero, torch.zeros_like(step), step)
+                return step.to(dtype=torch.float32) / float(num_steps)
+            step = torch.randint(
+                low=0,
+                high=num_steps,
+                size=(int(bsize),),
+                device=device,
+            )
+            return step.to(dtype=torch.float32) / float(num_steps)
+        if mode == "uniform":
+            return torch.rand(int(bsize), device=device, dtype=torch.float32) * 0.999
+        if mode != "beta":
+            raise ValueError(f"Unsupported flow_time_sampling={mode!r}.")
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
-        return time
+        return time_beta * 0.999 + 0.001
 
     def sample_se3_action_noise(self, actions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if actions.shape[-1] < 10:
@@ -2233,6 +2325,52 @@ class VLAFlowMatching(nn.Module):
             point_mask=self.last_point_action_mask,
             actions_is_pad=actions_is_pad,
         )
+
+    def _record_standard_action_metrics(
+        self,
+        *,
+        actions: Tensor,
+        x_t: Tensor,
+        u_t: Tensor,
+        pred_velocity: Tensor,
+        time: Tensor,
+        actions_is_pad: Tensor | None,
+    ) -> None:
+        """Record physically interpretable diagnostics for pose9 flow matching."""
+
+        self.last_action_metrics = {}
+        if min(actions.shape[-1], x_t.shape[-1], pred_velocity.shape[-1]) < 10:
+            return
+        valid = None
+        if torch.is_tensor(actions_is_pad):
+            valid = ~actions_is_pad.to(device=actions.device, dtype=torch.bool)
+
+        flow_error = (pred_velocity - u_t).square()
+        endpoint = x_t + (1.0 - time[:, None, None]) * pred_velocity
+        endpoint_pose = pose9_to_matrix(endpoint[..., :9])
+        target_pose = pose9_to_matrix(actions[..., :9])
+
+        self.last_action_metrics = {
+            "loss_action_translation": self._masked_scalar_mean(flow_error[..., :3].mean(-1), valid)
+            .detach(),
+            "loss_action_rotation6d": self._masked_scalar_mean(flow_error[..., 3:9].mean(-1), valid)
+            .detach(),
+            "loss_action_gripper": self._masked_scalar_mean(flow_error[..., 9], valid).detach(),
+            "action_endpoint_trans_err": self._masked_scalar_mean(
+                torch.linalg.norm(endpoint_pose[..., :3, 3] - target_pose[..., :3, 3], dim=-1),
+                valid,
+            ).detach(),
+            "action_endpoint_rot_err_deg": torch.rad2deg(
+                self._masked_scalar_mean(
+                    _rotation_geodesic(endpoint_pose[..., :3, :3], target_pose[..., :3, :3]),
+                    valid,
+                )
+            ).detach(),
+            "action_endpoint_gripper_err": self._masked_scalar_mean(
+                (endpoint[..., 9] - actions[..., 9]).abs(),
+                valid,
+            ).detach(),
+        }
 
     def _se3_predict_from_suffix(
         self,
@@ -2815,6 +2953,12 @@ class VLAFlowMatching(nn.Module):
             device=point_cloud_world.device,
             dtype=torch.float32,
         )
+        noise_twist[..., :3] = (
+            noise_twist[..., :3] * float(self.config.worldflow_noise_trans_scale)
+        )
+        noise_twist[..., 3:6] = (
+            noise_twist[..., 3:6] * float(self.config.worldflow_noise_rot_scale)
+        )
         noise_spatial = se3_exp(noise_twist)
         noise_pose9 = matrix_to_pose9(noise_spatial)
         time_expanded = time[:, None, None]
@@ -3148,6 +3292,7 @@ class VLAFlowMatching(nn.Module):
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         self.last_worldflow_aux = None
         self.last_worldflow_metrics = {}
+        self.last_action_metrics = {}
         if self.config.se3_enable:
             return self.forward_se3(
                 pc_feats,
@@ -3163,7 +3308,10 @@ class VLAFlowMatching(nn.Module):
                 image_masks=image_masks,
             )
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            if self.config.pose9_action_noise_enable:
+                noise = self.sample_pose9_action_noise(tuple(actions.shape), actions.device)
+            else:
+                noise = self.sample_noise(actions.shape, actions.device)
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
@@ -3251,6 +3399,14 @@ class VLAFlowMatching(nn.Module):
                 pred_aug_velocity=pred_aug_velocity,
                 augmentation_transform=augmentation_transform,
             )
+            self._record_standard_action_metrics(
+                actions=actions,
+                x_t=x_t,
+                u_t=u_t,
+                pred_velocity=v_t,
+                time=time,
+                actions_is_pad=actions_is_pad,
+            )
             return F.mse_loss(u_t, v_t, reduction="none")
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -3275,6 +3431,14 @@ class VLAFlowMatching(nn.Module):
             self.last_body_pose9_prediction = endpoint[..., :9]
         else:
             self.last_body_pose9_prediction = None
+        self._record_standard_action_metrics(
+            actions=actions,
+            x_t=x_t,
+            u_t=u_t,
+            pred_velocity=v_t,
+            time=time,
+            actions_is_pad=actions_is_pad,
+        )
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
@@ -3310,7 +3474,10 @@ class VLAFlowMatching(nn.Module):
 
         if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
+            if self.config.pose9_action_noise_enable:
+                noise = self.sample_pose9_action_noise(actions_shape, device)
+            else:
+                noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             pc_feats,

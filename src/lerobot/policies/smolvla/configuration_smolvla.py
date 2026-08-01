@@ -32,6 +32,11 @@ class SmolVLAConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 32 #50
     n_action_steps: int = 16 #50
+    # Some recorder formats store observation[i] after action[i] has already
+    # been applied.  Their first causal control target is therefore
+    # action[i + 1].  Shift action chunk lookup at the dataset boundary rather
+    # than training a stale token and compensating with action_index at runtime.
+    action_chunk_start_offset: int = 0
 
     # Shorter state and action vectors will be padded
     max_state_dim: int = 10
@@ -68,6 +73,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # Number of denoising steps during flow matching inference.
     # Recommended values: 8-10 (fast), 20-30 (balanced), 50+ (high-quality)
     num_steps: int = 10
+    # The official large-data recipe samples continuous times from
+    # Beta(1.5, 1). For small-data fitting, ``integration_grid`` instead
+    # trains exactly the Euler times used by sample_actions:
+    # {0, 1/num_steps, ..., (num_steps-1)/num_steps}.
+    flow_time_sampling: str = "beta"
+    # Optional small-data emphasis on the first Euler evaluation. At t=0 the
+    # noisy action contains no ground-truth trajectory information, so this is
+    # the only grid point that must infer the whole chunk from observations.
+    # Zero preserves uniform integration-grid sampling.
+    flow_time_zero_probability: float = 0.0
 
     # Attention utils
     use_cache: bool = True
@@ -103,6 +118,22 @@ class SmolVLAConfig(PreTrainedConfig):
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
 
+    # Relative importance of the physical pose9 + gripper action groups in the
+    # standard flow-matching objective. Values are normalized to preserve the
+    # overall loss scale. Defaults reproduce the original per-dimension MSE.
+    action_loss_translation_weight: float = 1.0
+    action_loss_rotation_weight: float = 1.0
+    action_loss_gripper_weight: float = 1.0
+    # Standard SmolVLA assumes normalized Euclidean action channels. Song's
+    # identity-normalized pose9 instead contains a 6D rotation representation,
+    # so zero-centred Gaussian vectors are not valid rotation states. This
+    # option samples a valid SE(3) pose9 in both training and inference while
+    # retaining the standard Euclidean flow-matching objective.
+    pose9_action_noise_enable: bool = False
+    pose9_action_noise_trans_scale: float = 0.15
+    pose9_action_noise_rot_scale: float = 0.35
+    pose9_action_noise_gripper_scale: float = 0.05
+
     # Joint World–Ego trajectory branch. PointSeg selects foreground XYZRGB in
     # the Ego/body frame, then the current EEF pose analytically maps those
     # exact points into World. World owns an independent LitePT + PointAction
@@ -127,6 +158,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # values are parsed for old commands but do not instantiate another expert.
     worldflow_action_expert_layers: int = -1
     worldflow_action_expert_dropout: float = 0.0
+    # WorldFlow denoises an SE(3) spatial transform. Unit Gaussian twists
+    # correspond to metre-scale translations and roughly 90 degree rotations,
+    # which is far outside a tabletop robot's action distribution. Keep the
+    # noise on the same physical scale as the reachable trajectory.
+    worldflow_noise_trans_scale: float = 0.15
+    worldflow_noise_rot_scale: float = 0.20
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -163,6 +200,17 @@ class SmolVLAConfig(PreTrainedConfig):
     # source of the architecture and processor when a policy checkpoint is used.
     vlm_weights_path: str | None = None
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    # One-shot initialization used only when make_policy creates a fresh
+    # `--policy.type=smolvla` model. Full checkpoints loaded through
+    # `--policy.path` already contain these tensors and are never overwritten.
+    load_action_expert_weights: bool = False
+    # Defaults to vlm_weights_path when omitted. The source must be a complete
+    # SmolVLA policy checkpoint, not a raw SmolVLM repository.
+    action_expert_weights_path: str | None = None
+    # The official 32 action channels need not share semantics with Song's
+    # physical pose9 + gripper channels. Keep the task-specific projections
+    # random by default while reusing the transformer and timestep MLP.
+    load_action_expert_projection_weights: bool = False
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 
@@ -195,6 +243,22 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if int(self.action_chunk_start_offset) < 0:
+            raise ValueError("action_chunk_start_offset must be non-negative.")
+        if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
+            raise ValueError(
+                "flow_time_sampling must be one of beta, uniform, integration_grid; "
+                f"got {self.flow_time_sampling!r}."
+            )
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive.")
+        if not 0.0 <= float(self.flow_time_zero_probability) < 1.0:
+            raise ValueError("flow_time_zero_probability must be in [0, 1).")
+        if self.flow_time_zero_probability > 0 and self.flow_time_sampling != "integration_grid":
+            raise ValueError(
+                "flow_time_zero_probability is only supported with "
+                "flow_time_sampling='integration_grid'."
+            )
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
@@ -205,6 +269,28 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+        for name in (
+            "action_loss_translation_weight",
+            "action_loss_rotation_weight",
+            "action_loss_gripper_weight",
+        ):
+            if float(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.pose9_action_noise_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError(
+                    "pose9_action_noise_enable=True requires ACTION normalization to be IDENTITY."
+                )
+            if self.max_action_dim < 10:
+                raise ValueError("pose9_action_noise_enable=True requires max_action_dim >= 10.")
+            for name in (
+                "pose9_action_noise_trans_scale",
+                "pose9_action_noise_rot_scale",
+                "pose9_action_noise_gripper_scale",
+            ):
+                if float(getattr(self, name)) < 0:
+                    raise ValueError(f"{name} must be non-negative.")
         if self.worldflow_se3_head_enable:
             warnings.warn(
                 "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
@@ -228,6 +314,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.worldflow_max_points < 0:
                 raise ValueError("worldflow_max_points must be non-negative.")
+            if self.worldflow_noise_trans_scale < 0:
+                raise ValueError("worldflow_noise_trans_scale must be non-negative.")
+            if self.worldflow_noise_rot_scale < 0:
+                raise ValueError("worldflow_noise_rot_scale must be non-negative.")
             if self.se3_enable:
                 raise ValueError(
                     "worldflow_enable and se3_enable cannot be combined: the joint World–Ego "
@@ -254,6 +344,19 @@ class SmolVLAConfig(PreTrainedConfig):
                 stacklevel=2,
             )
             self.load_vlm_weights = True
+        if self.load_action_expert_weights:
+            action_expert_source = self.action_expert_weights_path or self.vlm_weights_path
+            if action_expert_source is None or str(action_expert_source).strip().lower() in {
+                "",
+                "0",
+                "false",
+                "none",
+                "off",
+            }:
+                raise ValueError(
+                    "load_action_expert_weights=True requires action_expert_weights_path "
+                    "or vlm_weights_path pointing to a complete SmolVLA policy checkpoint."
+                )
         if self.vla_adapter_enable and self.vla_adapter_freeze_vlm:
             if not self.train_expert_only:
                 warnings.warn(
@@ -296,7 +399,8 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        start = int(self.action_chunk_start_offset)
+        return list(range(start, start + self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

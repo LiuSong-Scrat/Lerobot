@@ -448,16 +448,22 @@ class SmolVLA_ModelInference:
         postprocess: bool = True,
         state_pose_mode: str = "identity",
         noise_seed: int | list[int] | tuple[int, ...] | None = None,
+        noise_mode: str = "sample",
     ) -> torch.Tensor:
+        noise_mode = str(noise_mode).strip().lower()
+        if noise_mode not in {"sample", "zero"}:
+            raise ValueError(f"noise_mode must be 'sample' or 'zero', got {noise_mode!r}.")
         model_batch = self.build_model_batch(
             observation,
             task=task,
             state_pose_mode=state_pose_mode,
         )
-        if noise_seed is None:
+        if noise_seed is None and noise_mode == "sample":
             action_chunk = self.policy.predict_action_chunk(model_batch)
         else:
-            if isinstance(noise_seed, int):
+            if noise_seed is None:
+                forward_seeds = [0]
+            elif isinstance(noise_seed, int):
                 forward_seeds = [int(noise_seed)]
             else:
                 forward_seeds = [int(seed) for seed in noise_seed]
@@ -483,8 +489,12 @@ class SmolVLA_ModelInference:
                 torch.manual_seed(int(forward_seed))
                 if policy_device.type == "cuda":
                     torch.cuda.manual_seed_all(int(forward_seed))
-                noise = self._make_seeded_action_noise(model_batch, noise_seed)
-                worldflow_noise = self._make_seeded_worldflow_noise(model_batch, noise_seed)
+                if noise_mode == "zero":
+                    noise = self._make_zero_action_noise(model_batch)
+                    worldflow_noise = self._make_identity_worldflow_noise(model_batch)
+                else:
+                    noise = self._make_seeded_action_noise(model_batch, noise_seed)
+                    worldflow_noise = self._make_seeded_worldflow_noise(model_batch, noise_seed)
                 action_chunk = self.policy.predict_action_chunk(
                     model_batch,
                     noise=noise,
@@ -494,6 +504,43 @@ class SmolVLA_ModelInference:
         if postprocess:
             action_chunk = self.postprocessor(action_chunk)
         return action_chunk.detach().cpu()
+
+    def _make_zero_action_noise(self, model_batch: dict[str, Any]) -> torch.Tensor:
+        """Return a deterministic valid origin for the configured Ego flow."""
+
+        state = self.policy.prepare_state(model_batch)
+        model = self.policy.model
+        noise = torch.zeros(
+            state.shape[0],
+            model.config.chunk_size,
+            model.config.max_action_dim,
+            device=state.device,
+            dtype=torch.float32,
+        )
+        if bool(model.config.se3_enable or model.config.pose9_action_noise_enable):
+            if noise.shape[-1] < 9:
+                raise ValueError("Pose9 action noise requires max_action_dim >= 9.")
+            noise[..., 3] = 1.0
+            noise[..., 7] = 1.0
+        return noise
+
+    def _make_identity_worldflow_noise(self, model_batch: dict[str, Any]) -> torch.Tensor | None:
+        """Return identity SE(3) pose9 noise for deterministic World-flow diagnostics."""
+
+        model = self.policy.model
+        if not model.config.worldflow_enable:
+            return None
+        state = self.policy.prepare_state(model_batch)
+        identity = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            device=state.device,
+            dtype=torch.float32,
+        )
+        return identity.view(1, 1, 9).expand(
+            state.shape[0],
+            model.config.chunk_size,
+            9,
+        ).clone()
 
     def _make_seeded_action_noise(
         self,
@@ -537,6 +584,13 @@ class SmolVLA_ModelInference:
                 if model.config.se3_enable:
                     dummy = torch.zeros(shape, dtype=torch.float32, device=device)
                     sample = model.sample_se3_action_noise(dummy)[2]
+                elif model.config.pose9_action_noise_enable:
+                    # Mirror VLAFlowMatching.sample_actions exactly.  Falling
+                    # back to legacy Euclidean Gaussian noise here changes the
+                    # inference distribution whenever a deterministic seed is
+                    # requested, and is especially destructive for a zero-scale
+                    # identity SE(3) checkpoint.
+                    sample = model.sample_pose9_action_noise(shape, device)
                 else:
                     sample = model.sample_noise(shape, device)
             samples.append(sample)

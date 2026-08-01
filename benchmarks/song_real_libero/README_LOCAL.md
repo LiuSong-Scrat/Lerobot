@@ -37,7 +37,7 @@ torchrun --standalone --nproc_per_node=4   benchmarks/song_real_libero/scripts/s
 ulimit -n 65535
 export SONG_POINTSEG_REQUIRE_POINTOPS=1 
 python  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
-    --policy.type=smolvla \
+    --policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/wep_vla_v050_doubleflow/checkpoints/015000/pretrained_model \
     --policy.push_to_hub=false \
     --dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_dataset/  \
     --pointseg_sample_cache_dir=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/libero_setting/wepvla_v5_libero_4suite_data/libero_4suite_lerobot_cache \
@@ -46,16 +46,16 @@ python  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
     --policy.vlm_model_name=/home/liusong/hf_models/SmolVLM2-500M-Video-Instruct \
     --policy.vlm_weights_path=/home/liusong/hf_models/smolvla_base \
     --policy.load_vlm_weights=true \
-    --batch_size=2 \
+    --batch_size=5 \
     --steps=80000 \
     --log_freq=1 \
-    --output_dir=benchmarks/song_real_libero/outputs/wep_vla_v050_doubleflow \
+    --output_dir=benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh_post/checkpoints/wep_vla_v050_doubleflow_after_15k \
     --job_name=wep_vla_v050_doubleflow  \
     --policy.device=cuda \
     --wandb.enable=true \
     --wandb.disable_artifact=true \
-    --save_freq=200 \
-    --eval_freq=200 \
+    --save_freq=5000 \
+    --eval_freq=5000 \
     --num_workers=8 \
     --policy.pointseg_enable=true \
     --policy.pointseg_backbone_type=litept \
@@ -106,6 +106,10 @@ python  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 --policy.worldflow_se3_head_enable=false \
 --policy.se3_enable=false \
 --policy.se3_final_correction_enable=false
+
+
+
+
 
 
 ## BenchmarkEval ###########################  

@@ -129,8 +129,10 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
     """Inject fixed-reference EEF poses for WorldFlow supervision.
 
-    ``world_ee_poses`` is a compatibility path; camera-reference datasets store
-    overhead-camera-frame poses there and treat that fixed frame as model world.
+    The current pose is the achieved observation pose. Future World targets use
+    ``action_target_ee_poses`` when present so they describe the same controller
+    targets as the Ego action chunk. Legacy datasets without that sidecar fall
+    back to achieved future poses.
     """
 
     def __init__(
@@ -144,13 +146,22 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         self.dataset = dataset
         self.root = Path(root)
         self.pose_dir = self.root / "world_ee_poses"
+        command_target_dir = self.root / "action_target_ee_poses"
+        self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
         self.mmap_mode = mmap_mode
         self._pose_cache: dict[int, np.ndarray] = {}
+        self._target_pose_cache: dict[int, np.ndarray] = {}
 
         if not self.pose_dir.is_dir():
             raise FileNotFoundError(
                 f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
+            )
+        if self.target_pose_dir == self.pose_dir:
+            logging.warning(
+                "WorldFlow command-target sidecar is absent at %s; falling back to achieved future poses. "
+                "The World--Ego bridge is exactly label-consistent only when action_target_ee_poses is present.",
+                command_target_dir,
             )
 
     def __getattr__(self, name):
@@ -159,6 +170,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_pose_cache"] = {}
+        state["_target_pose_cache"] = {}
         return state
 
     def __len__(self):
@@ -172,26 +184,55 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_poses(self, episode_index: int) -> np.ndarray:
-        poses = self._pose_cache.get(episode_index)
+    def _load_episode_poses(
+        self,
+        episode_index: int,
+        *,
+        directory: Path,
+        cache: dict[int, np.ndarray],
+        description: str,
+    ) -> np.ndarray:
+        poses = cache.get(episode_index)
         if poses is None:
-            path = self.pose_dir / f"episode_{episode_index:06d}.npy"
+            path = directory / f"episode_{episode_index:06d}.npy"
             if not path.exists():
-                raise FileNotFoundError(f"WorldFlow reference-frame ee pose memmap file is missing: {path}")
+                raise FileNotFoundError(f"WorldFlow {description} pose memmap file is missing: {path}")
             poses = np.load(path, mmap_mode=self.mmap_mode)
             if poses.ndim != 2 or poses.shape[-1] != 9:
-                raise ValueError(f"Expected reference-frame ee poses shape (T,9), got {poses.shape}.")
-            self._pose_cache[episode_index] = poses
+                raise ValueError(f"Expected WorldFlow {description} poses shape (T,9), got {poses.shape}.")
+            cache[episode_index] = poses
         return poses
+
+    def _episode_poses(self, episode_index: int) -> np.ndarray:
+        return self._load_episode_poses(
+            episode_index,
+            directory=self.pose_dir,
+            cache=self._pose_cache,
+            description="achieved current",
+        )
+
+    def _episode_target_poses(self, episode_index: int) -> np.ndarray:
+        return self._load_episode_poses(
+            episode_index,
+            directory=self.target_pose_dir,
+            cache=self._target_pose_cache,
+            description="command target",
+        )
 
     def __getitem__(self, idx):
         item = dict(self.dataset[idx])
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         poses = self._episode_poses(episode_index)
+        target_poses = self._episode_target_poses(episode_index)
         episode_len = int(len(poses))
         if episode_len <= 0:
             raise ValueError(f"Worldflow episode {episode_index} is empty.")
+        if len(target_poses) != episode_len:
+            raise ValueError(
+                f"WorldFlow episode {episode_index} achieved/target lengths differ: "
+                f"{episode_len} != {len(target_poses)}."
+            )
 
         current_index = min(max(frame_index, 0), episode_len - 1)
         current_pose = np.array(poses[current_index], dtype=np.float32, copy=True)
@@ -207,7 +248,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         frame_indices = frame_index + np.arange(chunk_size, dtype=np.int64)
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
         item["worldflow.ee_poses"] = torch.from_numpy(
-            np.array(poses[clamped_indices], dtype=np.float32, copy=True)
+            np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
         )
         item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
         return item
@@ -1421,6 +1462,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if output_dict:
                 debug_keys = (
                     "loss_action",
+                    "loss_action_translation",
+                    "loss_action_rotation6d",
+                    "loss_action_gripper",
+                    "action_endpoint_trans_err",
+                    "action_endpoint_rot_err_deg",
+                    "action_endpoint_gripper_err",
                     "loss_pointseg_aux",
                     "loss_se3_twist",
                     "loss_se3_endpoint",

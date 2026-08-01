@@ -1,5 +1,5 @@
-# Example: MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py --config benchmarks/song_real_libero/configs/libero.json
 #!/usr/bin/env python
+# Example: python benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py --config benchmarks/song_real_libero/configs/libero.json
 """Minimal LIBERO point-cloud evaluation with absolute-pose chunk execution.
 
 Kept pipeline:
@@ -12,13 +12,48 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
+import os
+
+
+def _configure_default_mujoco_gl_backend() -> None:
+    """Select a self-contained offscreen backend before importing any GL users.
+
+    Explicit caller settings always win.  With no related environment variables,
+    LIBERO evaluation defaults to EGL and pins GLVND to NVIDIA when the standard
+    vendor manifest is installed.  Per-suite launchers continue to select the
+    concrete EGL device through ``MUJOCO_EGL_DEVICE_ID`` in each child process.
+    """
+
+    mujoco_gl = os.environ.get("MUJOCO_GL")
+    pyopengl_platform = os.environ.get("PYOPENGL_PLATFORM")
+    if mujoco_gl is None and pyopengl_platform is None:
+        mujoco_gl = pyopengl_platform = "egl"
+        os.environ["MUJOCO_GL"] = mujoco_gl
+        os.environ["PYOPENGL_PLATFORM"] = pyopengl_platform
+    elif mujoco_gl is None and pyopengl_platform in {"egl", "osmesa"}:
+        mujoco_gl = pyopengl_platform
+        os.environ["MUJOCO_GL"] = mujoco_gl
+    elif pyopengl_platform is None and mujoco_gl in {"egl", "osmesa"}:
+        pyopengl_platform = mujoco_gl
+        os.environ["PYOPENGL_PLATFORM"] = pyopengl_platform
+
+    if mujoco_gl == "egl" and pyopengl_platform == "egl":
+        nvidia_egl_vendor = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        if os.path.isfile(nvidia_egl_vendor):
+            os.environ.setdefault(
+                "__EGL_VENDOR_LIBRARY_FILENAMES",
+                nvidia_egl_vendor,
+            )
+
+
+_configure_default_mujoco_gl_backend()
+
 import argparse
 import atexit
 import hashlib
 import importlib.metadata
 import json
 import multiprocessing as mp
-import os
 import queue
 import re
 import select
@@ -576,6 +611,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
+    parser.add_argument(
+        "--point-cloud-seed-base",
+        type=int,
+        default=None,
+        help=(
+            "Base added to the model-call point-cloud sampling seed. Leave at 0 for normal "
+            "evaluation; use the converter's episode_seed only for exact dataset-domain diagnostics."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
 
     parser.add_argument("--observation-height", type=int, default=None)
@@ -749,6 +793,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--policy-noise-mode",
+        choices=("sample", "zero"),
+        default=None,
+        help=(
+            "Initial flow state: 'sample' keeps normal seeded sampling; 'zero' uses zero Ego "
+            "noise and identity World SE(3) noise as a deterministic diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--deterministic-torch",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -810,9 +863,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
-        "--visualize-foreground",
+        "--save-first-model-input",
         action=argparse.BooleanOptionalAction,
         default=None,
+        help=(
+            "Save the first post-conversion point cloud and EEF pose in actions.npz. "
+            "This is a diagnostic for dataset/evaluator observation parity."
+        ),
+    )
+    parser.add_argument(
+        "--visualize-foreground",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Continuously show PointSeg foreground probability in a non-blocking Open3D window.",
     )
     parser.add_argument("--foreground-vis-max-points", type=int, default=None)
@@ -1921,6 +1983,7 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "action_index": int(cfg["control"]["action_index"]),
             "control_freq": float(cfg["control"].get("control_freq", cfg.get("control_freq", 5))),
             "policy_noise_seed": int(cfg["policy_noise_seed"]),
+            "policy_noise_mode": str(cfg["policy_noise_mode"]),
         },
         "overall": aggregate_task_results(tasks),
         "suite_reports": suite_reports,
@@ -1972,6 +2035,8 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "contact_counts",
         "robot_scene_contact_counts",
         "waypoint_hold_counts",
+        "first_model_point_cloud",
+        "first_model_eef_pose",
         "release_event_predicted_width_changes",
         "chunk_executed_waypoint_counts",
         "chunk_release_event_end_counts",
@@ -2092,6 +2157,12 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         ),
         "waypoint_hold_counts": np.asarray(
             result.get("waypoint_hold_counts", []), dtype=np.int16
+        ),
+        "first_model_point_cloud": np.asarray(
+            result.get("first_model_point_cloud", []), dtype=np.float32
+        ),
+        "first_model_eef_pose": np.asarray(
+            result.get("first_model_eef_pose", []), dtype=np.float32
         ),
     }
     if arrays["libero_actions"].size == 0:
@@ -2260,12 +2331,26 @@ def capture_contact_pairs(env: Any, robot_geoms: set[str]) -> tuple[str, str, in
     robot_sorted = sorted(robot_scene_pairs)
     return "; ".join(all_sorted), "; ".join(robot_sorted), len(all_sorted), len(robot_sorted)
 
+
+def match_packed_dataset_point_cloud_precision(point_cloud: np.ndarray) -> np.ndarray:
+    """Match the XYZ precision used by the converter's packed Zarr format.
+
+    Current LIBERO datasets store XYZ as float16 and expose it to the policy as
+    float32 after decoding.  Reproducing that round trip online is important for
+    hard voxelization: sub-millimetre differences can otherwise move points
+    across a LitePT voxel boundary even for an exactly reconstructed frame.
+    """
+
+    cloud = np.ascontiguousarray(np.asarray(point_cloud, dtype=np.float32)).copy()
+    cloud[..., :3] = cloud[..., :3].astype(np.float16).astype(np.float32)
+    return cloud
+
 def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[str, Any], seed: int) -> tuple[np.ndarray, np.ndarray, float]:
     """Build the exact online UMI observation used for model inference.
 
     Returns:
       pc_eff:      xyzrgb in the current model EEF frame, with optional local gripper cloud.
-      world_pose9: model EEF pose in world frame from LIBERO raw_obs.
+      world_pose9: model EEF pose in the fixed overview-camera frame used by training.
       gripper:     physical gripper width scalar saved/trained in the dataset.
 
     This mirrors the non-instant LIBERO evaluator: first back-project to world,
@@ -2282,7 +2367,11 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
         int(cfg["num_points"]),
         seed=int(seed),
     )
-    world_pose9 = np.asarray(pose9_gripper[:9], dtype=np.float32)
+    world_pose9 = eef_pose_in_reference_camera(
+        env,
+        pose9_gripper,
+        pointcloud_camera_names_from_config(cfg)[0],
+    )[:9]
     gripper = float(pose9_gripper[-1])
     if bool(cfg.get("add_gripper_cloud", True)):
         gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
@@ -2298,7 +2387,40 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
             drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
             shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
         )
+    pc_eff = match_packed_dataset_point_cloud_precision(pc_eff)
     return np.ascontiguousarray(pc_eff, dtype=np.float32), world_pose9, gripper
+
+
+def eef_pose_in_reference_camera(
+    env: Any,
+    eef_pose_world: np.ndarray,
+    reference_camera: str,
+) -> np.ndarray:
+    """Express a simulator-world EEF pose in the model's overview-camera frame.
+
+    Dataset conversion stores ``world_ee_poses`` in the first point-cloud
+    camera frame.  WorldFlow inference must use that identical frame; passing
+    the raw MuJoCo world pose silently changes both translation and orientation
+    token distributions even though the Ego point cloud remains valid.
+    """
+
+    try:
+        from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+    except Exception as exc:  # pragma: no cover - optional LIBERO dependency path
+        raise RuntimeError("robosuite camera utilities are required for WorldFlow evaluation.") from exc
+
+    pose = np.asarray(eef_pose_world, dtype=np.float32).reshape(-1)
+    if pose.size < 9:
+        raise ValueError(f"Expected EEF pose9, got shape {np.asarray(eef_pose_world).shape}.")
+    camera_to_world = get_camera_extrinsic_matrix(
+        env.sim,
+        _normalized_camera_name(reference_camera),
+    ).astype(np.float32)
+    eef_to_camera = fast_inverse_homogeneous(camera_to_world) @ pose9_to_homo_np(pose[:9])
+    pose_camera = matrix_to_pose9(eef_to_camera)
+    if pose.size > 9:
+        pose_camera = np.concatenate([pose_camera, pose[9:]], axis=0)
+    return np.asarray(pose_camera, dtype=np.float32)
 
 
 def _normalized_camera_name(camera_name: Any) -> str:
@@ -4009,6 +4131,8 @@ def run_episode(
     tracking_rotation_errors: list[float] = []
     model_input_hashes: list[str] = []
     first_model_input_component_hashes: dict[str, str] = {}
+    first_model_point_cloud: np.ndarray | None = None
+    first_model_eef_pose: np.ndarray | None = None
     chunk_start_model_worlds: list[np.ndarray] = []
     chunk_previous_target_model_worlds: list[np.ndarray] = []
     chunk_boundary_position_errors: list[float] = []
@@ -4364,7 +4488,7 @@ def run_episode(
                 int(cfg["observation_height"]),
                 int(cfg["observation_width"]),
                 int(cfg["num_points"]),
-                seed=steps,
+                seed=int(cfg.get("point_cloud_seed_base", 0)) + steps,
             )
             if bool(cfg.get("add_gripper_cloud", True)):
                 point_cloud = add_world_gripper_cloud_to_point_cloud(
@@ -4375,20 +4499,29 @@ def run_episode(
                     gripper_points=int(cfg.get("gripper_points", 500)),
                     gripper_len=float(cfg.get("gripper_len", 0.06)),
                     gripper_template=str(cfg.get("gripper_template", "reap")),
-                    seed=steps,
+                    seed=int(cfg.get("point_cloud_seed_base", 0)) + steps,
                     drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
                     shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
                 )
+            point_cloud = match_packed_dataset_point_cloud_precision(point_cloud)
+            if bool(cfg.get("save_first_model_input", False)) and first_model_point_cloud is None:
+                first_model_point_cloud = np.asarray(point_cloud, dtype=np.float32).copy()
+                first_model_eef_pose = np.asarray(eef_pose, dtype=np.float32).copy()
 
             transported_grasp = update_grasp_transport_state(eef_pose)
+            worldflow_eef_pose = eef_pose_in_reference_camera(
+                env,
+                eef_pose,
+                pc_camera_names[0],
+            )
 
             model_observation = {
                 "point_cloud": point_cloud,
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
                 # Ego policy state remains identity (UMI/body frame), while
-                # the joint World branch needs the analytic body-to-world
-                # carrier used to transform the same selected foreground.
-                "worldflow.current_ee_pose": np.asarray(eef_pose[:9], dtype=np.float32),
+                # the joint World branch needs the analytic body-to-overview-
+                # camera carrier used by dataset ``world_ee_poses``.
+                "worldflow.current_ee_pose": np.asarray(worldflow_eef_pose[:9], dtype=np.float32),
             }
             chunk_start_model_world = pose9_to_homo_np(np.asarray(eef_pose[:9], dtype=np.float32))
             chunk_start_model_worlds.append(np.asarray(chunk_start_model_world, dtype=np.float32))
@@ -4412,6 +4545,7 @@ def run_episode(
                 task=task_language,
                 postprocess=True,
                 state_pose_mode="identity",
+                noise_mode=str(cfg.get("policy_noise_mode", "sample")),
                 noise_seed=deterministic_policy_noise_seed(
                     policy_noise_seed_base,
                     suite_name=suite_name,
@@ -4523,7 +4657,9 @@ def run_episode(
             )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
             previous_predicted_width = float(
-                chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
+                chunk[start_idx - 1, -1]
+                if start_idx > 0
+                else measured_gripper_width
             )
             actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
                 env=env,
@@ -4958,6 +5094,16 @@ def run_episode(
         "contact_counts": np.asarray(contact_counts, dtype=np.int32),
         "robot_scene_contact_counts": np.asarray(robot_scene_contact_counts, dtype=np.int32),
         "waypoint_hold_counts": np.asarray(waypoint_hold_counts, dtype=np.int16),
+        "first_model_point_cloud": (
+            np.asarray(first_model_point_cloud, dtype=np.float32)
+            if first_model_point_cloud is not None
+            else np.empty((0, 6), dtype=np.float32)
+        ),
+        "first_model_eef_pose": (
+            np.asarray(first_model_eef_pose, dtype=np.float32)
+            if first_model_eef_pose is not None
+            else np.empty((0,), dtype=np.float32)
+        ),
         "video_frames": video_frames,
     }
 
@@ -5110,9 +5256,17 @@ def load_dataset_domain_raw_action_trajectory(
     """
 
     if __package__ and __package__.startswith("benchmarks."):
-        from .libero_hdf5_to_dataset import load_demo_group
+        from .libero_hdf5_to_dataset import (
+            libero_delta_action_to_absolute_target_world,
+            load_demo_group,
+            reset_source_delta_controller_goal,
+        )
     else:
-        from libero_setting.libero_hdf5_to_dataset import load_demo_group
+        from libero_setting.libero_hdf5_to_dataset import (
+            libero_delta_action_to_absolute_target_world,
+            load_demo_group,
+            reset_source_delta_controller_goal,
+        )
 
     demo_names = list(task_source["demo_names"])
     demo_name = str(demo_names[int(episode_index)])
@@ -5134,8 +5288,17 @@ def load_dataset_domain_raw_action_trajectory(
         np.asarray(actions[source_action_indices], dtype=np.float64)
     )
 
+    # Reconstruct the exact source controller goals before switching the
+    # evaluator to absolute-pose mode.  In robosuite's delta OSC controller,
+    # position deltas are anchored to the achieved EEF position, but rotation
+    # deltas are accumulated from the persistent ``goal_ori``.  Recomputing
+    # every orientation target independently from ``ee_ori_mat`` loses that
+    # history and produces an absolute trajectory different from both the
+    # source demo and the converted dataset labels.
     for robot in env.robots:
-        robot.controller.use_delta = False
+        robot.controller.use_delta = True
+    env.set_init_state(states[0])
+    reset_source_delta_controller_goal(env)
     absolute_actions: list[np.ndarray] = []
     scaled_deltas: list[np.ndarray] = []
     for source_action_index, source_action in zip(
@@ -5147,12 +5310,15 @@ def load_dataset_domain_raw_action_trajectory(
         # was issued. This is a coordinate conversion of the original command,
         # not an added offset or task-specific contact heuristic.
         env.set_init_state(states[int(source_action_index)])
-        absolute_action, _target_world, scaled_delta = (
-            libero_delta_action_to_absolute_action(
-                env,
-                source_action,
-                force_controller_update=True,
-            )
+        target_world, scaled_delta = libero_delta_action_to_absolute_target_world(
+            env,
+            source_action,
+        )
+        absolute_action = np.concatenate(
+            [
+                world_pose_to_libero_absolute_action(target_world),
+                np.asarray(source_action[6:7], dtype=np.float64),
+            ]
         )
         absolute_actions.append(absolute_action)
         scaled_deltas.append(scaled_delta)
@@ -5160,6 +5326,8 @@ def load_dataset_domain_raw_action_trajectory(
     # Leave the simulator at the observation used to start evaluation. The
     # episode runner sets this state again, but restoring it here prevents this
     # loader from exposing the final source state to any caller.
+    for robot in env.robots:
+        robot.controller.use_delta = False
     env.set_init_state(states[0])
     refresh_arm_controller_state(env)
     absolute_trajectory = np.ascontiguousarray(
@@ -5183,7 +5351,7 @@ def load_dataset_domain_raw_action_trajectory(
             "trajectory_length": int(len(raw_trajectory)),
             "trajectory_format": "libero_normalized_osc_delta_plus_gripper",
             "execution_format": (
-                "source_state_anchored_absolute_osc_pose_plus_source_gripper"
+                "source_state_anchored_absolute_osc_pose_with_persistent_goal_ori_plus_source_gripper"
             ),
             "controller_use_delta": False,
         },
@@ -6212,6 +6380,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["render_every_n_steps"] = int(cfg_get(cfg, args.render_every_n_steps, "render_every_n_steps", 1))
     cfg["render_gpu_device_id"] = int(cfg_get(cfg, args.render_gpu_device_id, "render_gpu_device_id", -1))
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", True))
+    cfg["save_first_model_input"] = bool(
+        cfg_get(cfg, args.save_first_model_input, "save_first_model_input", False)
+    )
     cfg["visualize_foreground"] = bool(
         cfg_get(cfg, args.visualize_foreground, "visualize_foreground", False)
     )
@@ -6249,6 +6420,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         ),
     )
     cfg["add_gripper_cloud"] = bool(cfg_get(cfg, args.add_gripper_cloud, "add_gripper_cloud", True))
+    cfg["point_cloud_seed_base"] = int(
+        cfg_get(cfg, args.point_cloud_seed_base, "point_cloud_seed_base", 0)
+    )
     if args.gripper_points is not None:
         cfg["gripper_points"] = int(args.gripper_points)
     cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
@@ -6453,6 +6627,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     )
     cfg["control"]["warmup_steps"] = int(cfg_get(cfg["control"], args.warmup_steps, "warmup_steps", 0))
     cfg["policy_noise_seed"] = int(cfg_get(cfg, args.policy_noise_seed, "policy_noise_seed", 0))
+    cfg["policy_noise_mode"] = str(
+        cfg_get(cfg, args.policy_noise_mode, "policy_noise_mode", "sample")
+    )
     cfg["deterministic_torch"] = bool(
         cfg_get(cfg, args.deterministic_torch, "deterministic_torch", True)
     )
