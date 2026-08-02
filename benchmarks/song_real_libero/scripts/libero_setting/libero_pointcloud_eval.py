@@ -802,6 +802,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ablate-worldflow-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Diagnostic only: keep the joint World-Ego suffix layout unchanged but mask all "
+            "World scene/action tokens. Compare against the same checkpoint and noise seed to "
+            "measure whether WorldFlow causally affects closed-loop actions."
+        ),
+    )
+    parser.add_argument(
         "--deterministic-torch",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1866,6 +1876,7 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "recreate_env_per_episode": bool(cfg["recreate_env_per_episode"]),
             "deterministic_torch": bool(cfg["deterministic_torch"]),
             "torch_determinism": cfg.get("torch_determinism", {}),
+            "ablate_worldflow_tokens": bool(cfg.get("ablate_worldflow_tokens", False)),
         },
         "initialization": {
             "mode": (
@@ -6129,6 +6140,10 @@ def _isolated_policy_worker_entry(
             visualize_foreground=False,
             foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
         )
+        if bool(cfg.get("ablate_worldflow_tokens", False)):
+            if not bool(infer.policy.config.worldflow_enable):
+                raise ValueError("--ablate-worldflow-tokens requires a WorldFlow checkpoint.")
+            infer.policy.model.inference_ablation_modalities = frozenset({"world"})
         suite = benchmark.get_benchmark_dict()[suite_name]()
         summaries: list[dict[str, Any]] = []
         for task_id in task_ids:
@@ -6371,6 +6386,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         "benchmark_comparable": not bool(cfg["dataset_domain_env"]),
     }
     cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
+    cfg["ablate_worldflow_tokens"] = bool(
+        cfg_get(cfg, args.ablate_worldflow_tokens, "ablate_worldflow_tokens", False)
+    )
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 4096))
     cfg["observation_height"] = int(cfg_get(cfg, args.observation_height, "observation_height", 128))
@@ -7003,6 +7021,10 @@ def main() -> None:
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
     )
+    if cfg["ablate_worldflow_tokens"]:
+        if not bool(infer.policy.config.worldflow_enable):
+            raise ValueError("--ablate-worldflow-tokens requires a WorldFlow checkpoint.")
+        infer.policy.model.inference_ablation_modalities = frozenset({"world"})
 
     print(
         "[info] clean absolute-pose eval: "
@@ -7033,6 +7055,7 @@ def main() -> None:
         f"gripper_delta_threshold={cfg['control']['gripper_delta_threshold']}, "
         f"gripper_target_tolerance={cfg['control']['gripper_target_tolerance']}, "
         f"policy_noise_seed={cfg['policy_noise_seed']}, "
+        f"ablate_worldflow_tokens={cfg['ablate_worldflow_tokens']}, "
         f"deterministic_torch={cfg['deterministic_torch']}, "
         f"env_seed={cfg['env_seed']}, "
         f"dataset_domain_env={cfg['dataset_domain_env']}, "

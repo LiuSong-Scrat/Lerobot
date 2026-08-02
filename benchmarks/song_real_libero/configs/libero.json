@@ -1,5 +1,5 @@
 {
-  "policy_path": "/tmp/temp/training/task5_causal_offset1_from_det4k_003000/checkpoints/001000/pretrained_model",
+  "policy_path": "/tmp/temp/training/task5_fullse3_endpoint_tinyprior_from_win_000500/checkpoints/000250/pretrained_model",
   "policy_repo_id": "/home/liusong/scp_receive/smolvla",
   "vlm_model": "/home/liusong/SmolVLM2-500M-Video-Instruct",
   "output_dir": "outputs/libero_setting/eval",

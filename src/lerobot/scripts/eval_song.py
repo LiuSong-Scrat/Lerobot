@@ -88,6 +88,8 @@ EVAL_METRIC_KEYS = (
     "worldflow_rot_err_deg",
     "worldflow_valid_ratio",
     "worldflow_foreground_points",
+    "worldflow_noise_conjugacy_error",
+    "worldflow_path_conjugacy_error",
     "pointseg_foreground_ratio",
     "pointseg_operation_prob_mean",
     "pointseg_selection_score_mean",
@@ -474,7 +476,9 @@ def _flow_time_sweep_metrics(
     model = getattr(policy, "model", None)
     if model is None:
         raise AttributeError("Flow-time sweep requires policy.model.")
-    if bool(getattr(policy.config, "pose9_action_noise_enable", False)):
+    if bool(getattr(policy.config, "se3_enable", False)):
+        _noise_transform, _gripper_noise, fixed_noise = model.sample_se3_action_noise(action)
+    elif bool(getattr(policy.config, "pose9_action_noise_enable", False)):
         fixed_noise = model.sample_pose9_action_noise(tuple(action.shape), action.device)
     else:
         fixed_noise = model.sample_noise(action.shape, action.device)
@@ -563,6 +567,8 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     if is_main_process:
         logging.info("Loading evaluation policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta, rename_map=cfg.rename_map)
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
     ensure_ddp_parameters_initialized(policy, accelerator)
     preprocessor = _make_eval_preprocessor(cfg, policy, dataset, device)
     dataloader = _make_eval_dataloader(cfg, dataset, device)

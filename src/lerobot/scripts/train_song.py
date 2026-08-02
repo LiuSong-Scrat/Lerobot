@@ -1257,6 +1257,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -1492,6 +1494,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
                     "worldflow_foreground_points",
+                    "worldflow_noise_conjugacy_error",
+                    "worldflow_path_conjugacy_error",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

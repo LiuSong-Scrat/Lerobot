@@ -2,8 +2,21 @@
 
 > 项目主文档与快速回顾手册
 >
-> 文档基线：`wep_vla_v0.5.0_auxiliary` 上的 World–Ego v2，2026-07-30
+> 文档基线：`wep_vla_v0.5.0_double_flow`，2026-08-02
 > 如果后续代码行为与本文冲突，以当前代码和 checkpoint 内的 `config.json` 为准，并同步更新本节基线。
+
+> [!IMPORTANT]
+> **动作时序与随机流是 checkpoint 语义，不能只在评测命令中临时补偿。**
+>
+> - 修复后的 LIBERO post-action 数据必须训练为 `action_chunk_start_offset=1`；这表示预测
+>   token 0 已对应 dataset `action[i+1]`，正式在线推理仍执行 `action_index=0`。禁止再跳一次到
+>   `action_index=1`。
+> - `pose9_action_noise_enable=true` 但三个 noise scale 全为 0，只是“单位位姿起点的确定性
+>   flow”，不是随机扩散；多步 Euler 积分仍存在。
+> - 随机双流必须设置 `worldflow_noise_coupling=conjugate_ego`，使初始噪声满足
+>   `G0 = C B0 C^-1`。`independent` 仅用于复现旧实验。
+> - 数据、cache、checkpoint、offset、noise prior 和评测 action index 必须作为一套不可拆分的
+>   实验契约记录。
 
 ## 摘要
 
@@ -19,7 +32,8 @@ EEF 相对动作轨迹。
 - 点云在加入虚拟夹爪后转换到当前 EEF 坐标系，再作为模型输入。
 - 动作采用 `xyz + rotation-6D + gripper` 的 10 维表示。
 - PointSeg 的监督来自机械臂轨迹先验，不使用人工分割、人工光流、手工目标点或 PCA。
-- 默认稳定模型不启用 WorldFlow 和额外 SE(3) 动作分支。
+- 面向完整四套件的默认训练仍关闭 WorldFlow/SE(3)；但完整 SE(3)+WorldFlow 已有
+  LIBERO Spatial task 5 官方 10/10 的受控单任务 checkpoint，见 8.8。
 
 本文既是实现说明，也是后续开发时快速恢复上下文的唯一主入口。历史实验审计可继续参考
 [LIBERO_EVALUATION_AUDIT.md](LIBERO_EVALUATION_AUDIT.md)，VLM adapter 的旧版专项说明见
@@ -38,8 +52,8 @@ EEF 相对动作轨迹。
 | PointSeg | 开启 | 使用 cache v7 软运动先验监督 |
 | LitePT | 开启 | XYZ 作为 coord，同时 XYZRGB 作为 feat |
 | Point–Action fusion | 开启 | 最终 LitePT token 与 action token 联合双向 self-attention |
-| WorldFlow | **默认关闭** | v2 为独立点云前端 + 共享 Action Expert，训练与推理均参与，需单独重训验证 |
-| 独立 SE(3) flow 动作头 | **关闭** | 实验分支，不是当前稳定结果路径 |
+| WorldFlow | 实验性开启 | 双流版为独立点云前端 + 共享 Action Expert，训练与推理均参与；已有单任务闭环证据，完整四套件仍需消融 |
+| 完整 SE(3) flow | 默认关闭 | `pose9_endpoint` warm-start 已通过 task5 10/10；直接随机 twist 头仍不建议小数据使用 |
 | PCA / canonical frame | 不使用 | 已从当前方案中排除 |
 | 人工分割 / 人工点流 | 不使用 | 所有前景监督由轨迹自动产生 |
 
@@ -578,17 +592,17 @@ action chunk 强制改成 causal attention。
 
 ### 7.4 Flow matching 动作生成
 
-训练时：
+训练时的通用 rectified-flow 形式为：
 
 \[
-\epsilon \sim \mathcal{N}(0, 0.1^2I),\qquad
-t\sim\operatorname{Beta}(1.5,1)
+x_t=(1-t)x_0+t a,\qquad
+u_t=a-x_0.
 \]
 
-\[
-x_t=(1-t)\epsilon+t a,\qquad
-u_t=a-\epsilon.
-\]
+其中 `x0` 和 `t` 由 checkpoint 配置决定：v0.4.2 兼容模式使用所有 channel 独立
+`Normal(0, 0.1)` 与 `Beta(1.5,1)`；当前随机 pose9 模式先在 se(3) 按米/弧度采样并映射成
+合法 SE(3) 起点，也可用 `integration_grid` 让训练时刻与 10 步 Euler 推理网格一致。具体区别见
+8.7。
 
 模型以 \(x_t,t\) 和 prefix 为条件预测速度 \(v_\theta(x_t,t,c)\)，优化：
 
@@ -610,8 +624,10 @@ x_{k+1}=x_k+\Delta t\,v_\theta(x_k,t_k,c),\qquad \Delta t=0.1.
 因此动作生成本身具有随机性。要严格比较两个入口、两次推理或 modality ablation，必须固定
 相同 noise seed，并使用相同 batch 构成和数值执行路径。
 
-启用 World–Ego v2 时，LIBERO 推理包装器会从同一个 sample seed 派生一条独立的 World
-SE(3) noise stream，保证每个样本的两组初始噪声都不依赖动态 batch 中的请求顺序。
+启用 World–Ego v2 时，`independent` 兼容模式从同一 sample seed 派生独立 World SE(3)
+noise；推荐的 `conjugate_ego` 模式不再独立采样，而是从已经固定 seed 的 Ego prior 和当前 EEF
+pose 解析得到 World prior。两种方式都不依赖动态 batch 请求顺序，但只有后者描述同一个物理随机
+变换。
 
 ---
 
@@ -689,26 +705,38 @@ B_t=C^{-1}A_t,\qquad G_t=A_tC^{-1}.
 B_t=C^{-1}G_tC.
 \]
 
-World 分支对 \(G_t\) 做 pose9 flow matching，同时计算 endpoint SE(3) 几何损失；bridge loss
-比较 \(C^{-1}\hat G_tC\) 与共享专家输出的 Ego endpoint。随机坐标增广 \(S\) 同步作用于 World
-点云、World flow noise 和监督标签：
+关闭 `se3_enable` 时，World 分支对 \(G_t\) 做 pose9 Euclidean flow matching；开启
+`se3_enable` 时，Ego 和 World 都改为 SE(3) 流形上的左平凡化 twist flow。两种模式都计算
+endpoint SE(3) 几何损失；bridge loss 比较 \(C^{-1}\hat G_tC\) 与共享专家输出的 Ego endpoint。
+随机坐标增广 \(S\) 同步作用于 World 点云、World flow 起点和监督标签：
 
 \[
 G'_t=SG_tS^{-1},\qquad \hat G'_t\approx S\hat G_tS^{-1}.
 \]
 
 总辅助损失仍由 `flow + SE(3) endpoint geometry + World–Ego bridge + conjugation
-equivariance` 组成。该实现不预测点流、不运行 Kabsch、不使用 PCA，也不引入人工角色监督。
+equivariance` 组成。完整 SE(3) 模式中的流路径为：
+
+\[
+H(t)=\operatorname{Exp}\!\left(t\operatorname{Log}(H_1H_0^{-1})\right)H_0,
+\qquad
+\xi(t)=\frac{\operatorname{Log}(H_1H(t)^{-1})}{1-t}.
+\]
+
+训练预测单位流时间下的 6D twist \(\xi\)，推理每一步执行
+`H <- Exp(dt * xi) H`；旋转在训练插值和推理积分过程中都保持为合法 SO(3)。该实现不预测点流、
+不运行 Kabsch、不使用 PCA，也不引入人工角色监督。
 
 ### 8.4 推理路径与 current pose 契约
 
 推理不再绕过 World 分支。每次 policy call：
 
 1. Ego flow 从原来的动作噪声初始化；
-2. World flow 从合法 SE(3) 噪声初始化；
+2. World flow 从合法 SE(3) 噪声初始化；`conjugate_ego` 时该噪声由 Ego 起点解析共轭得到；
 3. PointSeg 选择 Ego 前景，再用当前 \(C\) 得到 World 前景；
-4. 每个 Euler step 重新生成两组 point-fused action token，经过共享专家得到两组 velocity；
-5. 两个状态都积分到下一步，最终只返回 Ego action。
+4. 每个积分 step 重新生成两组 point-fused action token，经过共享专家得到两组 velocity；
+5. 普通模式对两组 pose9 做 Euclidean Euler 积分；完整 SE(3) 模式分别对 Ego/World twist 做
+   `Exp(dt*xi)` 群积分；最终只返回 Ego action。
 
 因此开启 WorldFlow 的 checkpoint 在在线推理时必须提供
 `worldflow.current_ee_pose: (B,9)`。它只是解析坐标变换载体，不作为 Ego robot-state prefix：
@@ -732,7 +760,10 @@ equivariance` 组成。该实现不预测点流、不运行 Kabsch、不使用 P
 
 `worldflow_max_points=0` 表示保留完整预测前景；正值只作为显存上限，不是额外前景筛选。
 `worldflow_action_expert_layers` 和 `worldflow_action_expert_dropout` 只为兼容 v0.5 命令保留，
-v2 中被忽略，因为只存在一套共享 Action Expert。WorldFlow 与 `se3_enable`、RTC 不能同时开启。
+v2 中被忽略，因为只存在一套共享 Action Expert。WorldFlow 可以和 `se3_enable` 同时开启，但二者
+都仍不能和 RTC 同时开启。完整四套件尚未完成同规模复验，因此通用默认仍是
+`se3_enable=false`；但 8.8 的 `pose9_endpoint` 配置已经在 Spatial task 5 以真实随机采样达到
+官方 10/10，不能再把所有完整 SE(3) 模式概括为“只有软件正确性”。
 
 ### 8.5 为什么仍默认关闭
 
@@ -748,9 +779,211 @@ Dense ObjectFlow checkpoint 都不具备功能等价性。旧 checkpoint 即使�
 
 ### 8.6 其他 SE(3) 参数
 
-- `se3_enable=true`：独立的实验性 SE(3)-twist flow 动作生成路径，不等于 WorldFlow。
+- `se3_enable=true`：把 Ego 动作流切换为完整的 SE(3)-twist geodesic flow；若同时开启
+  WorldFlow，World 流也同步使用 6D twist 头和群积分，并通过共轭连接。
+- `se3_noise_trans_scale`：Ego 起点平移李代数噪声标准差，单位米。
+- `se3_noise_rot_scale`：Ego 起点旋转李代数噪声标准差，单位弧度。
+- `se3_noise_gripper_scale`：夹爪宽度起点噪声标准差，单位米。
+- `se3_twist_head_mode`：
+  - `direct_twist` 新建 Ego 7D / World 6D 输出头，数学最直接，但旧 pose9 checkpoint 无法继承
+    末端动作头知识；
+  - `projected_pose9` 把旧 pose9 输出解释成瞬时矩阵导数并投影为 spatial twist；
+  - `pose9_endpoint` 保留旧 flow head 的终点语义，先得到
+    `x_hat_1=x_t+(1-t)v_pose9`，把 rotation-6D 投影到 SO(3)，再计算
+    `Log(H_hat_1 H_t^-1)/(1-t)`。随机起点、训练路径和积分仍全部位于 SE(3)，同时最适合从已训练
+    pose9 checkpoint warm-start；当前 10/10 候选使用该模式。
+- `se3_enable=true` 与 `pose9_action_noise_enable=true` 互斥；前者已经包含完整流形 prior，不能再叠加
+  pose9 prior。
 - `worldflow_se3_head_enable`：历史兼容参数，当前忽略。
 - `se3_final_correction_enable`：历史兼容参数，当前忽略。
+
+### 8.7 随机动作流：SO(3) prior、旧版 Gaussian 与双流噪声契约
+
+#### v0.4.2 原生普通噪声
+
+v0.4.2 对全部 action channel 使用独立的 Euclidean Gaussian：
+
+```python
+noise = Normal(0, 0.1)  # xyz、rotation-6D、gripper 一视同仁
+x_t = (1 - t) * noise + t * action
+u_t = action - noise
+```
+
+优点是实现简单、与官方 normalized-action flow 形式一致、旧 checkpoint 可严格复现。缺点是本项目
+使用 identity-normalized pose9：六个旋转 channel 的零均值随机向量通常不是正交旋转的前两列，
+甚至在接近零时需要依靠后续 Gram–Schmidt 才能解释成旋转；0.1 对米、弧度和夹爪宽度也没有统一
+物理含义。
+
+#### 当前 SO(3)/SE(3) 合法随机 prior
+
+开启 `pose9_action_noise_enable` 后，先在李代数中按物理单位采样：
+
+\[
+\xi_0=[v_0,\omega_0],\quad
+v_0\sim\mathcal N(0,\sigma_t^2),\quad
+\omega_0\sim\mathcal N(0,\sigma_r^2),\quad
+H_0=\operatorname{Exp}(\xi_0),
+\]
+
+再把合法的 `H0` 转成 pose9；夹爪独立按米采样。当前用于研究的随机起点（不是已验证的生产默认值）：
+
+```bash
+--policy.pose9_action_noise_enable=true \
+--policy.pose9_action_noise_trans_scale=0.15 \
+--policy.pose9_action_noise_rot_scale=0.35 \
+--policy.pose9_action_noise_gripper_scale=0.05
+```
+
+它保证随机起点旋转正交、尺度可解释，并避免 rotation-6D 零向量退化。但当前标准 Ego 路径仍在
+pose9 的 Euclidean 表示中做 rectified-flow 直线插值和 Euler 积分；因此这是“合法 SE(3) 端点
+prior + Euclidean pose9 flow”，不能宣称整条中间路径严格位于 SO(3) 流形。若需要整条路径都在
+群上，应改用 `se3_enable=true`；该模式现在可以与 WorldFlow 同开，而且两路共轭 geodesic 在全部
+训练时刻都保持同一个物理变换。
+
+完整 SE(3)+WorldFlow 的已验收小先验配置：
+
+```bash
+--policy.se3_enable=true \
+--policy.se3_twist_head_mode=pose9_endpoint \
+--policy.pose9_action_noise_enable=false \
+--policy.se3_noise_trans_scale=0.001 \
+--policy.se3_noise_rot_scale=0.005 \
+--policy.se3_noise_gripper_scale=0.0005 \
+--policy.worldflow_enable=true \
+--policy.worldflow_noise_coupling=conjugate_ego
+```
+
+三个尺度均为严格非零的物理随机量，分别对应 1 mm、约 0.286° 和 0.5 mm 标准差；它不是
+identity prior，也没有绕过去噪积分。该尺度已在 task5 固定 seed 上闭环验收，但不能直接外推为
+所有 LIBERO task 或真机的最优噪声。
+
+对于小数据，随机 prior 比单位起点明显更难：模型必须覆盖一族初始状态，而不是记住一条从 identity
+出发的确定性向量场。随机版通常需要更多数据/step，且应同时检查多 seed rollout；低 training loss
+本身不能证明采样质量更好。它的潜在收益是保留多模态动作分布、降低对固定起点的过拟合，
+并使推理时可通过 noise seed 产生不同候选轨迹；这些收益必须用充分训练后的多 seed
+闭环结果证明，不能从 prior 的几何合法性直接推导。
+
+#### 双流必须共享同一个物理随机轨迹
+
+令 `C` 为当前 EEF-to-World，Ego 随机 body transform 为 `B0`。推荐模式不是再独立采一个 World
+噪声，而是解析地构造：
+
+\[
+G_0=C B_0 C^{-1}.
+\]
+
+配置：
+
+```bash
+--policy.worldflow_enable=true \
+--policy.worldflow_noise_coupling=conjugate_ego
+```
+
+`conjugate_ego` 下 `worldflow_noise_trans_scale/rot_scale` 被忽略；World prior 完全由 Ego prior 与
+当前 `C` 决定。日志指标 `worldflow_noise_conjugacy_error` 应接近数值零。历史
+`worldflow_noise_coupling=independent` 保留用于旧实验复现，但随机 Ego/World 起点描述的是两条不同
+物理轨迹，会额外增加 bridge 学习难度。零噪声时两者都是 identity，因此旧问题会被掩盖。
+
+严格对比噪声方案时，必须固定：数据、cache、初始化 checkpoint、offset、batch 顺序、训练 step、
+PointSeg、WorldFlow 权重、推理 seed 和执行器。尤其不能再拿旧 `offset=0` 的随机实验与
+`offset=1` 的确定性实验直接比较。
+
+### 8.8 受控实验结论（2026-08-02）
+
+在 LIBERO Spatial task 5 上，使用同一 dataset/cache、`action_chunk_start_offset=1`、固定推理
+seed 和完全相同的无重试闭环执行器，完成了当前代码版本的最终验收：
+
+| Ego/World flow | SE(3) 起点尺度（平移/旋转/夹爪） | 额外训练 | 训练/离线表现 | 官方固定初始状态闭环 |
+| --- | --- | ---: | ---: | ---: |
+| pose9 Euclidean + WorldFlow，identity prior | 0 / 0 / 0 | 0 | 确定性基线 | **10/10** |
+| 完整 SE(3)，`direct_twist` 随机新头 | 0.03 m / 0.15 rad / 0.02 m | 1,000 | endpoint 50.29 mm / 3.05° | **0/3** |
+| 完整 SE(3)，`projected_pose9` | 0.01 m / 0.05 rad / 0.005 m | 1,000 | 随机采样平移误差 16.14 mm | **2/3** |
+| 完整 SE(3)，`pose9_endpoint` | 0.001 m / 0.005 rad / 0.0005 m | **250** | 随机采样平移误差 15.89 mm；训练 endpoint 约 6.8 mm / 0.85° | **10/10** |
+
+各完整 SE(3) 候选的 `worldflow_path_conjugacy_error` 均维持在约 `1e-7` 或更低，独立真实模型
+smoke test 中为 `3.35e-9`；说明两路随机起点、任意时刻路径和坐标共轭实现都达到浮点数值精度。
+单元测试还验证了旋转正交性、行列式为 1、用目标 twist 恢复 endpoint、训练 mask 和三套
+WorldFlow dataset wrapper 的动作 offset 一致性。
+
+注意 `loss_action` 不是不同 prior 之间可以单独下结论的指标：它的监督目标和物理尺度会随 prior
+改变。完整去噪 chunk 误差和不重试的闭环 rollout 才是最终判据。这次结果支持三个结论：
+
+1. 完整 SE(3) 加噪、geodesic 插值、twist 监督和群积分真实执行，不是把噪声置零或绕过流。
+2. `direct_twist` 的失败主要来自丢弃旧动作头并随机初始化新头，而非 SE(3) 共轭公式错误；
+   `projected_pose9` 进一步证明把旧输出误解为瞬时导数仍有明显 warm-start 失配。
+3. `pose9_endpoint` 保留旧 head 已学到的“预测 clean endpoint”语义，再把该 endpoint 转成严格
+   SE(3) geodesic velocity，因此只需 250 个低学习率更新就恢复到官方 10/10。
+4. 当前 task5 结论支持该模式进入扩大实验，但完整四套件与多随机 seed 尚未验收，所以仓库通用
+   默认值仍保持 `se3_enable=false`。
+
+最终候选与证据路径：
+
+```text
+checkpoint:
+/tmp/temp/training/task5_fullse3_endpoint_tinyprior_from_win_000500/
+  checkpoints/000250/pretrained_model
+
+official 10-episode report:
+/tmp/temp/evaluations/task5_fullse3_endpoint_tinyprior_000250_official_10eps/
+  overall_report.json
+```
+
+验收协议为 `policy_noise_mode=sample`、`policy_noise_seed=0`、官方 init states 0--9、每个状态一次
+不间断 rollout、无失败重试、无候选筛选、`action_index=0`、20 Hz、`exec_action_steps=20`。10 个
+episode 全部成功，用时 76--103 control steps；因此该结果不是 oracle、dataset-domain 环境或
+零噪声评测。
+
+复现最终闭环：
+
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=0 \
+CUDA_VISIBLE_DEVICES=0 SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+python benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /path/to/fullse3_endpoint/checkpoints/000250/pretrained_model \
+  --suite libero_spatial \
+  --task-id 5 \
+  --episodes 10 \
+  --task-workers 1 \
+  --isolated-policy-workers 1 \
+  --episode-workers-per-task 1 \
+  --inference-batch-size 1 \
+  --action-index 0 \
+  --exec-action-steps 20 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --control-freq 20 \
+  --no-use-suite-max-steps \
+  --max-steps 1000 \
+  --policy-noise-seed 0 \
+  --policy-noise-mode sample \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --no-save-video \
+  --output-dir /path/to/task5_fullse3_official_10eps
+```
+
+100,000 个 prior 的静态审计还显示：v0.4.2 raw Gaussian 的 rotation-6D 列范数误差均值
+0.840，Gram–Schmidt 解码后旋转角中位数 132.6°；合法 SE(3) prior 的正交误差为
+1e-8 级，旋转角中位数 30.8°。所以 raw Gaussian 虽然每个 channel 的标准差只有 0.1，
+并不代表“只加了小旋转”。
+
+几何限制现在按模式区分：`se3_enable=false` 的 pose9 Euclidean 双流仍只保证起点/终点共轭，
+中间线性点不严格保持共轭；`se3_enable=true` 则使用两路共轭 geodesic，任意中间时刻都严格满足
+`G(t)=C B(t) C^-1`。后者解决了表示问题，但本轮闭环结果证明，解决几何表示并不等于小数据下
+立即获得更好的策略性能。
+
+复现 World 分支因果消融时，对同一 checkpoint、episode 和 `--policy-noise-seed`
+分别运行正常评测与：
+
+```bash
+python benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  ... \
+  --ablate-worldflow-tokens
+```
+
+该开关保持 token 布局、position id、Ego noise 和 World noise 不变，只屏蔽 World scene/action
+token。“结果变了”证明 World 分支被实际使用；“成功率变好”才能证明它对当前任务有正收益。
 
 ---
 
@@ -798,6 +1031,21 @@ fixture 的 XML 布局。flattened simulator state 主要保存动态状态，�
 | `action_target_ee_poses/` | 命令目标在模型 world 中的 pose |
 
 实际 state 与 action 在接触、跟踪误差或控制延迟下本来就不同。这是正确数据，不应再次对齐为同值。
+
+#### 9.2.1 `state_observation_offset`、`action_chunk_start_offset` 与 `action_index`
+
+三者位于不同边界，不能互相替代：
+
+| 参数 | 生效位置 | 修复后 LIBERO 设置 |
+|---|---|---:|
+| `state_observation_offset` | HDF5 重建 observation | `1`，用 `state[i+1]` 重建 `obs[i]` |
+| `action_chunk_start_offset` | LeRobot DataLoader 读取监督 chunk | `1`，token 0 读取 `action[i+1]` |
+| `action_index` | 在线评测从模型预测 chunk 选哪一行执行 | `0`，执行模型 token 0 |
+
+这里看似出现两个 `+1`，但不是重复平移：前者修复 observation 对应的 simulator 快照，后者跳过已经
+产生该 post-action observation 的旧控制命令。模型用 offset 1 训练后，预测 token 0 已经是第一条
+因果未来命令，所以评测再设 `action_index=1` 会错误地多跳一帧。旧 offset0 checkpoint 临时使用
+`action_index=1` 只能作为兼容诊断，不能替代重新训练，也不能写回新数据规范。
 
 ### 9.3 点云与 RGB
 
@@ -1103,6 +1351,64 @@ accelerate launch --multi_gpu --num_processes 4 \
 `batch_size` 是每个进程的 batch。上例有效 batch 为 `48 × 4 = 192`。24 GB 显卡应从更小
 batch 开始，避免某个 rank 被系统 `SIGKILL`。
 
+#### 13.1.1 已通过 task5 闭环验收的 WorldFlow 流契约
+
+在已有双流训练命令上，当前稳定设置为：
+
+```bash
+--policy.worldflow_enable=true \
+--policy.pose9_action_noise_enable=true \
+--policy.pose9_action_noise_trans_scale=0 \
+--policy.pose9_action_noise_rot_scale=0 \
+--policy.pose9_action_noise_gripper_scale=0 \
+--policy.worldflow_noise_coupling=conjugate_ego \
+--policy.worldflow_loss_weight=0.01 \
+--policy.worldflow_geo_loss_weight=0.002 \
+--policy.worldflow_bridge_loss_weight=0.005 \
+--policy.worldflow_equiv_loss_weight=0.002 \
+--policy.se3_enable=false
+```
+
+已有 10/10 checkpoint 的旧 config 没有保存 `worldflow_noise_coupling`，加载时回退为
+`independent`；由于 Ego 的三个 noise scale 和 World 的两个 noise scale 都为零，两路起点都是 identity，与
+`conjugate_ego` 在数值上相同。新实验仍建议显式写出 `conjugate_ego`，避免以后只调大噪声却忘记
+同步双流物理契约。
+
+从已验证 identity checkpoint 迁移到完整随机 SE(3) 时，推荐 task5 受控配置为：
+
+```bash
+python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --policy.path=/path/to/identity_10_of_10/checkpoints/last/pretrained_model \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=/path/to/libero_dataset \
+  --pointseg_sample_cache_dir=/path/to/pointseg_cache \
+  --batch_size=5 \
+  --steps=500 \
+  --save_freq=250 \
+  --num_workers=4 \
+  --output_dir=/path/to/fullse3_endpoint_run \
+  --wandb.enable=false \
+  --policy.se3_enable=true \
+  --policy.se3_twist_head_mode=pose9_endpoint \
+  --policy.pose9_action_noise_enable=false \
+  --policy.se3_noise_trans_scale=0.001 \
+  --policy.se3_noise_rot_scale=0.005 \
+  --policy.se3_noise_gripper_scale=0.0005 \
+  --policy.worldflow_enable=true \
+  --policy.worldflow_noise_coupling=conjugate_ego \
+  --policy.flow_time_sampling=integration_grid \
+  --policy.flow_time_zero_probability=0.5 \
+  --policy.optimizer_lr=1e-6 \
+  --policy.scheduler_decay_lr=5e-7 \
+  --policy.scheduler_warmup_steps=50 \
+  --policy.scheduler_decay_steps=500
+```
+
+task5 最终使用 `000250`，不是机械地选择最后 checkpoint。完整 SE(3) 必须作为 checkpoint config
+保存后再评测；不能在已训练 pose9 checkpoint 的评测命令里临时切换，因为评测脚本只接收
+`--policy.path`，更重要的是旧网络需要适配新的群路径输入分布。该配置已有单任务 10/10，但真机或
+完整四套件仍应先做小规模安全验收。
+
 ### 13.2 warm start 与精确 resume
 
 从已有模型权重开始新实验：
@@ -1139,8 +1445,13 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 
 | 指标 | 含义 |
 |---|---|
-| `loss_action` | flow velocity MSE，不是 rollout 终点 action MSE |
+| `loss_action` | 主动作目标；普通模式是 velocity MSE，完整 SE(3) 模式是 twist、endpoint 与夹爪目标的加权和，不是 rollout 成功率 |
 | `loss_pointseg_aux` | soft BCE 与平滑项的加权辅助损失 |
+| `loss_se3_twist` / `loss_se3_endpoint` | 完整 SE(3) 模式的 twist 监督与群 endpoint 几何误差 |
+| `se3_action_trans_err` / `se3_action_rot_err_deg` | Ego endpoint 的米制平移误差与旋转角误差 |
+| `loss_worldflow_flow/geo/bridge/equiv` | World twist/pose9 flow、终点几何、World–Ego 桥接与坐标增广等变损失 |
+| `worldflow_noise_conjugacy_error` | Ego/World 随机起点是否满足 `G0=C B0 C^-1`；共轭模式应接近浮点零 |
+| `worldflow_path_conjugacy_error` | 当前训练时刻的双流状态是否仍共轭；完整 SE(3) 模式应接近浮点零 |
 | `pred_foreground_ratio` | 模型前景预测比例 |
 | `pseudo_foreground_ratio` | 有效 soft prior 的前景比例 |
 | `pseudo_valid_ratio` | 当前 batch 中 prior 有效监督覆盖率 |
@@ -1414,6 +1725,82 @@ python benchmarks/song_real_libero/scripts/smolvla_model_inference.py \
 但不能完全消除此风险，因为 Action Expert 同时读取 VLM prefix。应通过真实 RGB 多样性、图像
 增强、模态消融和闭环测试判断，而不是仅观察训练 loss。
 
+### 16.4 当前随机流与 WorldFlow 改动对真机的影响
+
+先给出部署结论：完整 SE(3) `pose9_endpoint` 候选已经在 LIBERO Spatial task 5 的官方
+10 episodes 达到 10/10，证明新随机路径可用于闭环；但这不是对真机安全性、相机 OOD 或全部任务
+的验收。真机正式运行前仍应先用离线 pickle、限速空载和小范围闭环逐级验证。不要在原本确定性
+checkpoint 上只修改推理参数开启 SE(3)；应加载已经按同一 config 训练并保存的 checkpoint。
+
+本轮改动没有改变 HDF5、LeRobot dataset、RGB、XYZRGB 点云或 PointSeg cache 的文件格式。
+因此，仅从确定性 identity prior 改为合法 SE(3) 随机 prior，或者把双流噪声改为共轭耦合，
+**不要求重新转换真机 dataset，也不要求重新生成 cache**。但 checkpoint 的训练目标发生了变化，
+启用新随机 prior 后必须继续训练或重新训练；不能只改推理配置后期待旧权重自动适配。当前
+`pose9_endpoint` 能继承旧 pose9 head，因此不需要随机新建输出头，但仍需要适配 SE(3) geodesic
+状态分布；task5 候选使用 250 个低学习率更新完成该适配。
+
+真机部署需要同步以下契约：
+
+- checkpoint 必须携带最终生效的 `se3_enable`、`se3_twist_head_mode`、`se3_noise_*`、
+  `worldflow_noise_coupling`、`action_chunk_start_offset` 和 `num_steps`，推理时不要改成另一套训练
+  未见过的 prior；task5 验收值是 `pose9_endpoint` 与 `0.001 m / 0.005 rad / 0.0005 m`；
+- 旧 checkpoint 没有 `worldflow_noise_coupling` 字段时会按 `independent` 加载。只要继续保持
+  `se3_enable=false`，state dict 与旧 WorldFlow 路径兼容；切换 `direct_twist` 会新增 Ego/World
+  输出头，不能把随机初始化缺失参数当成可用权重；`pose9_endpoint` 不新增输出头，而是复用
+  `action_out_proj/world_action_out_proj` 并解析转换为群速度；
+- `action_chunk_start_offset=1` 只决定训练标签从 dataset 的 `action[i+1]` 开始。真机仍执行预测
+  chunk 的第 0 个 token；当前 `single_inference()` / action queue 已是这一语义，不应再跳过一行；
+- `worldflow_enable=true` 时，部署必须提供与 overview 点云处于同一坐标系的当前 EEF pose9。
+  当前包装器会从 `pose_eular + gripper_width` 构造 raw pose9：Ego state 仍置为 identity，
+  但 `worldflow.current_ee_pose` 保留 raw 当前位姿，用来完成 Ego 点云到 World 点云的坐标变换和
+  随机初值的共轭变换；
+- 固定 overview 真机模式下，可继续把 overview 相机坐标系定义为 model world，不需要额外机器人
+  base 外参；前提是点云和 `pose_eular` 都已表达在这个同一相机系。二者一旦不共系，WorldFlow
+  的输入和 (G_0=C B_0 C^{-1}) 都会同时出错；
+- 合法随机 prior 会使不同随机种子的 action chunk 略有差异。闭环复现实验必须固定 PyTorch/CUDA
+  seed；正式部署可采样，但不能在同一个执行 chunk 中途因无关逻辑反复清空队列并重采样。当前
+  10/10 证据只覆盖 `policy_noise_seed=0`，不同 seed 仍需单独验证；
+- RGB adapter 输入、UMI Ego action 到 World 绝对目标的变换、夹爪点云加入方式和最后的
+  `pose9 -> xyz/euler_zyx` 控制接口均未由本轮改动改变。
+
+`deploy_savg_dp3_Desk_General.py` 当前导入的是
+`src/lerobot/scripts/smolvla_model_inference.py`。该包装器已经能在 WorldFlow checkpoint 下从 raw
+state 自动构造 `worldflow.current_ee_pose`，核心 policy 也会自动从同一个 Ego noise 推导 World
+noise。benchmark 推理包装器也已修正：`conjugate_ego` 时不再额外传一份独立 World noise。
+若要复现 LIBERO 的固定随机结果，仍需在部署侧显式固定每次重规划的 seed；当前 BestMan
+脚本默认使用进程 RNG，并在每次重规划时清空 action queue；因此重启、重规划次数或
+触发时刻变化时，随机版轨迹不保证逐位一致。确定性 identity prior 不受这一点影响。
+
+当前两份推理包装器的夹爪点云职责不同，真机切换导入路径时不能混用：
+
+- BestMan 在调用 `src/lerobot/scripts/smolvla_model_inference.py` 之前，已经手动把 500 个夹爪点
+  与 49,500 个场景点合并；`src` 包装器只将整云从 overview/model-world 系变到
+  current-Ego 系，不会再加一次夹爪。
+- `benchmarks/song_real_libero/scripts/smolvla_model_inference.py` 则可在 `single_inference()`
+  内部添加夹爪点。如果真机改为导入这一份，必须删除外部重复添加，或显式传
+  `add_gripper_cloud=False`；否则点数、夹爪比例和 PointSeg 输入分布都会改变。
+
+从代码变更范围看，本轮直接修改了核心 policy/config、训练/离线评测指标、LIBERO World-token
+消融和 benchmark 推理噪声构造；没有修改 BestMan 控制器、相机采集、真机 HDF5/dataset 转换、
+PointSeg cache 格式或 `src` 真机包装器的点云/动作坐标变换。因此，真机受到的主要影响是“加载
+新 checkpoint 后的随机动作生成规约变化”，而不是传感器或控制接口变化。
+`worldflow_enable=false` 时不要求 raw World pose；如果同时保持原 checkpoint 的 noise 配置，本轮
+WorldFlow 共轭代码不会改变该真机路径。
+
+具体到真机执行链，受影响与不受影响项如下：
+
+| 环节 | 是否受影响 | 说明 |
+| --- | --- | --- |
+| RGB-D/IMU 采集、HDF5 字段 | 否 | 没有修改 `record_bestman_rgbd.py` 或真机原始格式 |
+| HDF5 -> LeRobot dataset、PointSeg cache | 否 | 不因切换随机流重建；只有源 dataset/先验算法变化时才重建 |
+| overview 点云、虚拟夹爪、UMI Ego 变换 | 否 | 输入仍是当前 EEF 系 XYZRGB；不能重复添加夹爪点 |
+| `worldflow.current_ee_pose` | **是，WorldFlow 必需** | 必须保留 raw pose9，且与 overview/model-world 点云同坐标系 |
+| policy checkpoint 解析 | **是** | 必须识别 `pose9_endpoint`、非零 `se3_noise_*` 和 `conjugate_ego` |
+| action chunk 随机性 | **是** | 每次重规划会采 SE(3) 起点；固定 seed 才能逐次复现 |
+| 输出动作格式 | 否 | 仍返回 `xyz + rotation-6D + gripper`，上层仍可转 `xyz/euler_zyx` |
+| action queue / token 索引 | 契约不变 | offset 1 checkpoint 在线仍执行 token 0，不可二次跳到 action 1 |
+| 机器人控制器、限位与碰撞安全 | 否 | 本轮未修改，随机 checkpoint 必须沿用原安全约束并先限速验证 |
+
 ---
 
 ## 17. 可视化与诊断顺序
@@ -1648,7 +2035,8 @@ sha256sum /path/to/checkpoint/model.safetensors
 2. dataset 是否由逐 demo `model_file`、offset 1、controller target 版本生成？
 3. cache 是否由这份 dataset 重新生成？
 4. checkpoint 内 adapter、PointSeg、Point–Action fusion 开关是什么？
-5. WorldFlow 是否仍关闭；若开启，是否为 v2 独立 LitePT/PointAction 前端 + 共享专家并从头训练？
+5. WorldFlow/SE(3) 是否与 checkpoint 一致；若使用随机版，是否为 `pose9_endpoint`、
+   `conjugate_ego`、非零物理尺度并在目标任务上完成闭环验收？
 6. 训练与推理的 RGB key、点云坐标系和 EEF pose 是否一致？
 7. 比较 loss 时是否固定了样本、noise、\(t\) 和 processor？
 8. rollout 失败前，oracle action 能否通过同一执行器？

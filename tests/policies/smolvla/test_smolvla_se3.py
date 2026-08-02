@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -18,8 +19,12 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     WorldFlowActionBranch,
     make_att_2d_masks,
     matrix_to_pose9,
+    pose9_endpoint_velocity_to_spatial_twist,
+    pose9_velocity_to_spatial_twist,
     pose9_to_matrix,
     se3_exp,
+    se3_geodesic_flow_state,
+    se3_left_apply,
     se3_log,
     so3_exp,
     so3_log,
@@ -43,6 +48,86 @@ def test_se3_relative_update_recovers_target():
     b = se3_exp(torch.randn(8, 6) * 0.2)
     recovered = se3_exp(se3_log(a @ torch.linalg.inv(b))) @ b
     assert torch.allclose(recovered, a, atol=3e-4, rtol=3e-4)
+
+
+def test_se3_geodesic_flow_stays_on_group_and_exact_velocity_reaches_target():
+    torch.manual_seed(12)
+    noise = se3_exp(torch.randn(4, 7, 6) * 0.15)
+    target = se3_exp(torch.randn(4, 7, 6) * 0.15)
+    time = torch.tensor([0.0, 0.2, 0.6, 0.9])
+
+    state, velocity = se3_geodesic_flow_state(noise, target, time)
+    remaining = (1.0 - time)[:, None, None]
+    recovered = se3_left_apply(remaining * velocity, state)
+
+    rotation = state[..., :3, :3]
+    identity = torch.eye(3).expand_as(rotation)
+    assert torch.allclose(rotation.transpose(-1, -2) @ rotation, identity, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(torch.det(rotation), torch.ones_like(torch.det(rotation)), atol=4e-5, rtol=4e-5)
+    assert torch.allclose(recovered, target, atol=5e-4, rtol=5e-4)
+
+
+def test_pose9_velocity_projection_recovers_exact_spatial_twist():
+    torch.manual_seed(121)
+    transform = se3_exp(torch.randn(4, 7, 6) * 0.2)
+    twist = torch.randn(4, 7, 6) * 0.15
+    rotation = transform[..., :3, :3]
+    position = transform[..., :3, 3]
+    omega = twist[..., 3:6]
+    x, y, z = omega.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+    omega_hat = torch.stack(
+        [
+            torch.stack([zeros, -z, y], dim=-1),
+            torch.stack([z, zeros, -x], dim=-1),
+            torch.stack([-y, x, zeros], dim=-1),
+        ],
+        dim=-2,
+    )
+    rotation_dot = omega_hat @ rotation
+    position_dot = twist[..., :3] + torch.cross(omega, position, dim=-1)
+    pose9_velocity = torch.cat(
+        [position_dot, rotation_dot[..., :, 0], rotation_dot[..., :, 1]],
+        dim=-1,
+    )
+
+    recovered = pose9_velocity_to_spatial_twist(
+        matrix_to_pose9(transform),
+        pose9_velocity,
+    )
+
+    assert torch.allclose(recovered, twist, atol=4e-5, rtol=4e-5)
+
+
+def test_pose9_endpoint_velocity_recovers_projected_clean_endpoint():
+    torch.manual_seed(122)
+    current = matrix_to_pose9(se3_exp(torch.randn(4, 7, 6) * 0.15))
+    legacy_velocity = torch.randn(4, 7, 9) * 0.08
+    time = torch.tensor([0.0, 0.2, 0.6, 0.9])
+    remaining = (1.0 - time)[:, None, None]
+    expected_endpoint = pose9_to_matrix(current + remaining * legacy_velocity)
+
+    twist = pose9_endpoint_velocity_to_spatial_twist(current, legacy_velocity, time)
+    recovered_endpoint = se3_left_apply(remaining * twist, pose9_to_matrix(current))
+
+    assert torch.allclose(recovered_endpoint, expected_endpoint, atol=6e-4, rtol=6e-4)
+
+
+def test_conjugate_se3_geodesic_paths_match_at_every_time():
+    torch.manual_seed(14)
+    current = se3_exp(torch.randn(4, 6) * 0.15)
+    ego_noise = se3_exp(torch.randn(4, 9, 6) * 0.12)
+    ego_target = se3_exp(torch.randn(4, 9, 6) * 0.12)
+    current_inv = torch.linalg.inv(current)
+    world_noise = current.unsqueeze(1) @ ego_noise @ current_inv.unsqueeze(1)
+    world_target = current.unsqueeze(1) @ ego_target @ current_inv.unsqueeze(1)
+    time = torch.tensor([0.0, 0.25, 0.55, 0.9])
+
+    ego_state, _ = se3_geodesic_flow_state(ego_noise, ego_target, time)
+    world_state, _ = se3_geodesic_flow_state(world_noise, world_target, time)
+    expected_world_state = current.unsqueeze(1) @ ego_state @ current_inv.unsqueeze(1)
+
+    assert torch.allclose(world_state, expected_world_state, atol=6e-4, rtol=6e-4)
 
 
 def test_worldflow_noise_respects_physical_translation_and_rotation_scales():
@@ -139,6 +224,87 @@ def test_zero_pose9_and_worldflow_noise_scales_produce_identity_priors():
     assert torch.equal(pose9_to_matrix(ego_noise[..., :9]), identity)
     assert torch.count_nonzero(ego_noise[..., 9]) == 0
     assert torch.equal(pose9_to_matrix(world_noise), identity)
+
+
+def test_conjugate_worldflow_noise_matches_ego_prior_exactly():
+    torch.manual_seed(23)
+    cfg = SmolVLAConfig(
+        chunk_size=16,
+        n_action_steps=8,
+        pose9_action_noise_enable=True,
+        worldflow_enable=True,
+        worldflow_noise_coupling="conjugate_ego",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    ego_noise = model.sample_pose9_action_noise((5, cfg.chunk_size, 10), torch.device("cpu"))
+    current = matrix_to_pose9(se3_exp(torch.randn(5, 6) * 0.2))
+    world_noise = model.conjugate_ego_noise_to_world(ego_noise, current)
+
+    current_matrix = pose9_to_matrix(current)
+    expected = (
+        current_matrix.unsqueeze(1)
+        @ pose9_to_matrix(ego_noise[..., :9])
+        @ torch.linalg.inv(current_matrix).unsqueeze(1)
+    )
+    actual = pose9_to_matrix(world_noise)
+    assert torch.allclose(actual, expected, atol=3e-5, rtol=3e-5)
+
+    recovered_ego = (
+        torch.linalg.inv(current_matrix).unsqueeze(1)
+        @ actual
+        @ current_matrix.unsqueeze(1)
+    )
+    assert torch.allclose(
+        recovered_ego,
+        pose9_to_matrix(ego_noise[..., :9]),
+        atol=4e-5,
+        rtol=4e-5,
+    )
+
+
+def test_worldflow_and_complete_se3_flow_can_be_enabled_together():
+    cfg = SmolVLAConfig(
+        se3_enable=True,
+        worldflow_enable=True,
+        worldflow_noise_coupling="conjugate_ego",
+    )
+
+    assert cfg.se3_enable
+    assert cfg.worldflow_enable
+    assert "ego_flow=se3_geodesic_left_trivialized" in cfg.flow_contract_summary()
+    assert "worldflow=conjugate_ego" in cfg.flow_contract_summary()
+
+
+def test_projected_pose9_is_a_valid_complete_se3_head_mode():
+    cfg = SmolVLAConfig(
+        se3_enable=True,
+        se3_twist_head_mode="projected_pose9",
+        worldflow_enable=True,
+        worldflow_noise_coupling="conjugate_ego",
+    )
+
+    assert "se3_geodesic_left_trivialized(head=projected_pose9)" in cfg.flow_contract_summary()
+
+    endpoint_cfg = SmolVLAConfig(
+        se3_enable=True,
+        se3_twist_head_mode="pose9_endpoint",
+    )
+    assert "se3_geodesic_left_trivialized(head=pose9_endpoint)" in endpoint_cfg.flow_contract_summary()
+
+    with pytest.raises(ValueError, match="se3_twist_head_mode"):
+        SmolVLAConfig(se3_enable=True, se3_twist_head_mode="unknown")
+
+
+def test_conjugate_worldflow_noise_rejects_legacy_invalid_rotation_prior():
+    with pytest.raises(ValueError, match="pose9_action_noise_enable=True"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            pose9_action_noise_enable=False,
+            worldflow_noise_coupling="conjugate_ego",
+        )
 
 
 def test_integration_grid_time_sampling_matches_inference_euler_steps():
@@ -450,6 +616,44 @@ def test_world_ego_joint_attention_has_causal_blocks_and_bidirectional_actions()
     assert not mask[all_scenes[:, None], all_actions].any()
 
 
+def test_world_stream_ablation_preserves_layout_but_masks_world_tokens():
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_feature_dim=4,
+        worldflow_feature_dim=4,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.ego_scene_to_expert = nn.Linear(4, 8)
+    model.world_scene_to_expert = nn.Linear(4, 8)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 8))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 8))
+    model.last_ego_scene_global_feat = torch.randn(1, 4)
+    model.last_ego_scene_global_mask = torch.ones(1, dtype=torch.bool)
+    model.inference_ablation_modalities = frozenset({"world"})
+    world = {
+        "scene_tokens": torch.randn(1, 5, 4),
+        "scene_mask": torch.ones(1, 5, dtype=torch.bool),
+        "global_feat": torch.randn(1, 4),
+        "action_tokens": torch.randn(1, cfg.chunk_size, 8),
+        "action_mask": torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+    }
+
+    suffix, pad, _blocks, layout = model._build_world_ego_joint_suffix(
+        torch.randn(1, cfg.chunk_size, 8),
+        torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+        world,
+    )
+
+    assert suffix.shape[1] == 2 + 2 * cfg.chunk_size
+    assert pad[:, layout["ego_scene"]].all()
+    assert pad[:, layout["ego_action"]].all()
+    assert not pad[:, layout["world_scene"]].any()
+    assert not pad[:, layout["world_action"]].any()
+
+
 def test_joint_attention_carries_gradients_between_both_global_scenes_and_action_streams():
     torch.manual_seed(18)
     cfg = SmolVLAConfig(
@@ -558,6 +762,73 @@ def test_worldflow_joint_loss_uses_foreground_only_and_backpropagates_bridge():
     assert body_prediction.grad is not None
     assert "loss_worldflow_geo" in model.last_worldflow_metrics
     assert model.last_worldflow_metrics["worldflow_foreground_points"].item() == cfg.worldflow_max_points
+
+
+def test_joint_se3_worldflow_training_path_is_exactly_conjugate():
+    torch.manual_seed(21)
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        pointseg_enable=True,
+        worldflow_enable=True,
+        se3_enable=True,
+        worldflow_noise_coupling="conjugate_ego",
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_max_points=8,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = _make_tiny_worldflow_branch(cfg)
+    model.last_worldflow_metrics = {}
+
+    bsize, chunk_size = 2, cfg.chunk_size
+    foreground = torch.randn(bsize, 12, 6)
+    foreground[..., 3:6] = torch.rand(bsize, 12, 3) * 255.0
+    model.last_worldflow_payload = {"foreground_pc_ego": foreground}
+    current = se3_exp(torch.randn(bsize, 6) * 0.1)
+    body_target = se3_exp(torch.randn(bsize, chunk_size, 6) * 0.1)
+    target = current.unsqueeze(1) @ body_target
+    ego_noise_h = se3_exp(torch.randn(bsize, chunk_size, 6) * 0.1)
+    ego_noise = torch.cat(
+        [matrix_to_pose9(ego_noise_h), torch.zeros(bsize, chunk_size, 1)],
+        dim=-1,
+    )
+    time = torch.tensor([0.2, 0.7])
+    ego_state_h, _ = se3_geodesic_flow_state(ego_noise_h, body_target, time)
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state_h), torch.zeros(bsize, chunk_size, 1)],
+        dim=-1,
+    )
+    context = {
+        "current_ee_pose": matrix_to_pose9(current),
+        "ee_poses": matrix_to_pose9(target),
+        "step_is_pad": torch.zeros(bsize, chunk_size, dtype=torch.bool),
+    }
+
+    state = model._prepare_worldflow_training_state(
+        context,
+        torch.randint(0, 64, (bsize, 5)),
+        torch.ones(bsize, 5, dtype=torch.bool),
+        time,
+        actions_is_pad=None,
+        ego_noise=ego_noise,
+        ego_x_t=ego_x_t,
+    )
+    output = model._finalize_worldflow_training_loss(
+        state,
+        state["u_t"],
+        matrix_to_pose9(body_target),
+        time,
+    )
+
+    assert torch.allclose(state["path_conjugacy_error"], torch.zeros_like(state["path_conjugacy_error"]), atol=2e-4)
+    assert torch.allclose(output["pred_spatial"], state["spatial_gt"], atol=5e-4, rtol=5e-4)
+    assert output["loss_flow"].item() < 1e-7
+    assert output["loss_geo"].item() < 1e-4
+    assert output["loss_bridge"].item() < 1e-4
 
 
 def test_world_ego_bridge_formula_matches_body_transform():

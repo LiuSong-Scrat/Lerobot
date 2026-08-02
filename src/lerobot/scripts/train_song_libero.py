@@ -141,6 +141,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
+        action_start_offset: int = 0,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
@@ -149,6 +150,9 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         command_target_dir = self.root / "action_target_ee_poses"
         self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
+        self.action_start_offset = int(action_start_offset)
+        if self.action_start_offset < 0:
+            raise ValueError("WorldFlow action_start_offset must be non-negative.")
         self.mmap_mode = mmap_mode
         self._pose_cache: dict[int, np.ndarray] = {}
         self._target_pose_cache: dict[int, np.ndarray] = {}
@@ -245,7 +249,11 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             chunk_size = int(action.shape[0])
         else:
             chunk_size = self.chunk_size
-        frame_indices = frame_index + np.arange(chunk_size, dtype=np.int64)
+        frame_indices = (
+            frame_index
+            + self.action_start_offset
+            + np.arange(chunk_size, dtype=np.int64)
+        )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
         item["worldflow.ee_poses"] = torch.from_numpy(
             np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
@@ -609,6 +617,7 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         mmap_mode=mmap_mode,
     )
 
@@ -1248,6 +1257,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -1483,6 +1494,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
                     "worldflow_foreground_points",
+                    "worldflow_noise_conjugacy_error",
+                    "worldflow_path_conjugacy_error",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

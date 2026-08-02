@@ -8,12 +8,21 @@ from benchmarks.song_real_libero.scripts.smolvla_model_inference import SmolVLA_
 
 
 class _NoiseModel:
-    def __init__(self, *, se3_enable: bool, pose9_enable: bool) -> None:
+    def __init__(
+        self,
+        *,
+        se3_enable: bool,
+        pose9_enable: bool,
+        worldflow_enable: bool = False,
+        worldflow_noise_coupling: str = "independent",
+    ) -> None:
         self.config = SimpleNamespace(
             chunk_size=3,
             max_action_dim=10,
             se3_enable=se3_enable,
             pose9_action_noise_enable=pose9_enable,
+            worldflow_enable=worldflow_enable,
+            worldflow_noise_coupling=worldflow_noise_coupling,
         )
         self.calls: list[str] = []
 
@@ -67,3 +76,16 @@ def test_zero_noise_is_valid_identity_pose9_for_pose_checkpoints():
     expected[..., 3] = 1.0
     expected[..., 7] = 1.0
     assert torch.equal(noise, expected)
+
+
+def test_seeded_world_noise_is_deferred_to_model_when_conjugate_coupling_is_enabled():
+    model = _NoiseModel(
+        se3_enable=False,
+        pose9_enable=True,
+        worldflow_enable=True,
+        worldflow_noise_coupling="conjugate_ego",
+    )
+
+    world_noise = _inference_stub(model)._make_seeded_worldflow_noise({}, 7)
+
+    assert world_noise is None

@@ -164,6 +164,18 @@ class SmolVLAConfig(PreTrainedConfig):
     # noise on the same physical scale as the reachable trajectory.
     worldflow_noise_trans_scale: float = 0.15
     worldflow_noise_rot_scale: float = 0.20
+    # Noise relationship between the two action streams.
+    #
+    # ``independent`` reproduces the original experimental implementation:
+    # Ego body motion and World spatial motion start from unrelated random
+    # transforms. ``conjugate_ego`` samples one physically valid Ego SE(3)
+    # prior B_0 and derives the World prior exactly as G_0 = C B_0 C^{-1},
+    # where C is the current EEF-to-World pose.  The latter is the recommended
+    # stochastic double-flow contract.  It requires either the valid-pose9
+    # prior or the complete manifold SE(3) flow because legacy Euclidean
+    # Gaussian rotation-6D vectors are not elements of SE(3) and therefore
+    # cannot be conjugated safely.
+    worldflow_noise_coupling: str = "independent"
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -174,8 +186,18 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # ET-SEED-style SE(3) action generation.
     se3_enable: bool = False
+    # ``direct_twist`` uses dedicated randomly initialized 7D Ego / 6D World
+    # heads. ``projected_pose9`` reuses the pretrained pose9 velocity heads and
+    # analytically projects their instantaneous rigid-body derivative onto a
+    # spatial SE(3) twist. ``pose9_endpoint`` instead preserves the old flow
+    # head's endpoint semantics: x_t + (1-t) v_pose9 is projected to SE(3), then
+    # converted to the exact left-trivialized geodesic velocity from x_t. All
+    # modes use the same manifold-valued prior, geodesic training path and
+    # group integration; only the output parameterization differs.
+    se3_twist_head_mode: str = "direct_twist"
     se3_noise_trans_scale: float = 0.15
     se3_noise_rot_scale: float = 0.75
+    se3_noise_gripper_scale: float = 0.05
     se3_pose_loss_weight: float = 1.0
     se3_gripper_loss_weight: float = 1.0
     se3_endpoint_loss_weight: float = 0.25
@@ -245,6 +267,14 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if int(self.action_chunk_start_offset) < 0:
             raise ValueError("action_chunk_start_offset must be non-negative.")
+        if int(self.action_chunk_start_offset) > 0:
+            warnings.warn(
+                "ACTION TEMPORAL CONTRACT: action_chunk_start_offset="
+                f"{int(self.action_chunk_start_offset)} means predicted token 0 is trained from "
+                f"dataset action[i+{int(self.action_chunk_start_offset)}]. Online inference must "
+                "execute predicted token 0 (action_index=0); do not apply the offset a second time.",
+                stacklevel=2,
+            )
         if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
             raise ValueError(
                 "flow_time_sampling must be one of beta, uniform, integration_grid; "
@@ -267,8 +297,32 @@ class SmolVLAConfig(PreTrainedConfig):
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
+            if self.max_action_dim < 10:
+                raise ValueError("se3_enable=True requires max_action_dim >= 10.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+            if self.se3_twist_head_mode not in {
+                "direct_twist",
+                "projected_pose9",
+                "pose9_endpoint",
+            }:
+                raise ValueError(
+                    "se3_twist_head_mode must be 'direct_twist', 'projected_pose9', "
+                    "or 'pose9_endpoint'; "
+                    f"got {self.se3_twist_head_mode!r}."
+                )
+            for name in (
+                "se3_noise_trans_scale",
+                "se3_noise_rot_scale",
+                "se3_noise_gripper_scale",
+            ):
+                if float(getattr(self, name)) < 0:
+                    raise ValueError(f"{name} must be non-negative.")
+        if self.se3_enable and self.pose9_action_noise_enable:
+            raise ValueError(
+                "se3_enable and pose9_action_noise_enable are mutually exclusive: "
+                "se3_enable already supplies the complete manifold-valued SE(3) prior and flow."
+            )
         for name in (
             "action_loss_translation_weight",
             "action_loss_rotation_weight",
@@ -318,10 +372,54 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_noise_trans_scale must be non-negative.")
             if self.worldflow_noise_rot_scale < 0:
                 raise ValueError("worldflow_noise_rot_scale must be non-negative.")
-            if self.se3_enable:
+            if self.worldflow_noise_coupling not in {"independent", "conjugate_ego"}:
                 raise ValueError(
-                    "worldflow_enable and se3_enable cannot be combined: the joint World–Ego "
-                    "branch currently shares the standard flow-matching Action Expert output."
+                    "worldflow_noise_coupling must be 'independent' or 'conjugate_ego'; "
+                    f"got {self.worldflow_noise_coupling!r}."
+                )
+            if self.worldflow_noise_coupling == "conjugate_ego" and not (
+                self.pose9_action_noise_enable or self.se3_enable
+            ):
+                raise ValueError(
+                    "worldflow_noise_coupling='conjugate_ego' requires "
+                    "pose9_action_noise_enable=True or se3_enable=True so the Ego prior is a valid "
+                    "SE(3) transform."
+                )
+            if self.worldflow_noise_coupling == "conjugate_ego" and (
+                self.worldflow_noise_trans_scale != 0.15 or self.worldflow_noise_rot_scale != 0.20
+            ):
+                warnings.warn(
+                    "worldflow_noise_trans_scale/rot_scale are ignored when "
+                    "worldflow_noise_coupling='conjugate_ego'; the World prior is derived from "
+                    "the Ego prior and current pose by exact conjugation.",
+                    stacklevel=2,
+                )
+            ego_random_prior = (
+                any(
+                    float(getattr(self, name)) > 0.0
+                    for name in (
+                        "se3_noise_trans_scale",
+                        "se3_noise_rot_scale",
+                        "se3_noise_gripper_scale",
+                    )
+                )
+                if self.se3_enable
+                else self.pose9_action_noise_enable
+                and any(
+                    float(getattr(self, name)) > 0.0
+                    for name in (
+                        "pose9_action_noise_trans_scale",
+                        "pose9_action_noise_rot_scale",
+                        "pose9_action_noise_gripper_scale",
+                    )
+                )
+            )
+            if self.worldflow_noise_coupling == "independent" and ego_random_prior:
+                warnings.warn(
+                    "WorldFlow and Ego use independent random priors. This preserves legacy behavior "
+                    "but does not satisfy G_0=C B_0 C^{-1}; use "
+                    "worldflow_noise_coupling='conjugate_ego' for stochastic double-flow training.",
+                    stacklevel=2,
                 )
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("worldflow_enable=True is not compatible with RTC.")
@@ -331,6 +429,7 @@ class SmolVLAConfig(PreTrainedConfig):
                     "because World and Ego now share one Action Expert.",
                     stacklevel=2,
                 )
+
         if self.se3_final_correction_enable:
             warnings.warn(
                 "se3_final_correction_enable is kept only for CLI compatibility and is ignored. "
@@ -366,6 +465,41 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
                 self.train_expert_only = True
             self.freeze_vision_encoder = True
+
+    def flow_contract_summary(self) -> str:
+        """Describe the final resolved temporal and flow-origin contract."""
+
+        if self.se3_enable:
+            scales = (
+                float(self.se3_noise_trans_scale),
+                float(self.se3_noise_rot_scale),
+                float(self.se3_noise_gripper_scale),
+            )
+            origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
+            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            flow = f"se3_geodesic_left_trivialized(head={self.se3_twist_head_mode})"
+        elif self.pose9_action_noise_enable:
+            scales = (
+                float(self.pose9_action_noise_trans_scale),
+                float(self.pose9_action_noise_rot_scale),
+                float(self.pose9_action_noise_gripper_scale),
+            )
+            origin = "pose9_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "pose9_valid_se3_random"
+            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            flow = "pose9_euclidean"
+        else:
+            origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
+            flow = "channel_euclidean"
+        world = (
+            f",worldflow={self.worldflow_noise_coupling}"
+            if self.worldflow_enable
+            else ",worldflow=disabled"
+        )
+        return (
+            f"action_chunk_start_offset={int(self.action_chunk_start_offset)},"
+            f"online_action_index=0,ego_origin={origin},ego_flow={flow}{world},"
+            f"num_steps={int(self.num_steps)}"
+        )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

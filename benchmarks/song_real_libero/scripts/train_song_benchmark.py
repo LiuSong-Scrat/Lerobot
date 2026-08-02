@@ -143,6 +143,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
+        action_start_offset: int = 0,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
@@ -151,6 +152,9 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         command_target_dir = self.root / "action_target_ee_poses"
         self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
+        self.action_start_offset = int(action_start_offset)
+        if self.action_start_offset < 0:
+            raise ValueError("WorldFlow action_start_offset must be non-negative.")
         self.mmap_mode = mmap_mode
         self._pose_cache: dict[int, np.ndarray] = {}
         self._target_pose_cache: dict[int, np.ndarray] = {}
@@ -247,7 +251,11 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             chunk_size = int(action.shape[0])
         else:
             chunk_size = self.chunk_size
-        frame_indices = frame_index + np.arange(chunk_size, dtype=np.int64)
+        frame_indices = (
+            frame_index
+            + self.action_start_offset
+            + np.arange(chunk_size, dtype=np.int64)
+        )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
         item["worldflow.ee_poses"] = torch.from_numpy(
             np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
@@ -617,6 +625,7 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         mmap_mode=mmap_mode,
     )
 
@@ -1079,6 +1088,8 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    loss_scale: float = 1.0,
+    perform_optimizer_step: bool = True,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -1141,7 +1152,15 @@ def update_policy(
         return train_metrics, output_dict
 
     # Use accelerator's backward method
-    accelerator.backward(loss)
+    # Scale each micro-batch contribution so accumulated gradients equal the
+    # mean over the effective batch.  The unscaled loss is retained for logs.
+    accelerator.backward(loss * float(loss_scale))
+
+    if not perform_optimizer_step:
+        train_metrics.loss = loss.item()
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.update_s = time.perf_counter() - start_time
+        return train_metrics, output_dict
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -1277,6 +1296,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -1375,8 +1396,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        accumulation_steps = int(cfg.gradient_accumulation_steps)
+        effective_bs = cfg.batch_size * accumulation_steps * num_processes
+        logging.info(
+            "Effective batch size: "
+            f"{cfg.batch_size} x {accumulation_steps} accumulation x "
+            f"{num_processes} process(es) = {effective_bs}"
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -1437,9 +1463,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     }
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    accumulation_steps = int(cfg.gradient_accumulation_steps)
+    effective_batch_size = cfg.batch_size * accumulation_steps * accelerator.num_processes
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        cfg.batch_size * accumulation_steps,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
@@ -1461,20 +1488,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
     for _ in range(step, cfg.steps):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
-        )
+        optimizer.zero_grad(set_to_none=True)
+        output_dict = {}
+        for micro_step in range(accumulation_steps):
+            start_time = time.perf_counter()
+            batch = next(dl_iter)
+            batch = preprocessor(batch)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+            is_last_micro_step = micro_step + 1 == accumulation_steps
+            sync_context = nullcontext() if is_last_micro_step else accelerator.no_sync(policy)
+            with sync_context:
+                train_tracker, output_dict = update_policy(
+                    train_tracker,
+                    policy,
+                    batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                    rabc_weights_provider=rabc_weights,
+                    loss_scale=1.0 / accumulation_steps,
+                    perform_optimizer_step=is_last_micro_step,
+                )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -1512,6 +1547,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
                     "worldflow_foreground_points",
+                    "worldflow_noise_conjugacy_error",
+                    "worldflow_path_conjugacy_error",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

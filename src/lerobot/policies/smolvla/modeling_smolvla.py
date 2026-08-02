@@ -286,6 +286,133 @@ def se3_left_apply(delta_xi: Tensor, transform: Tensor) -> Tensor:
     return se3_exp(delta_xi) @ transform
 
 
+def se3_geodesic_flow_state(
+    noise_transform: Tensor,
+    target_transform: Tensor,
+    time: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Return the SE(3) geodesic state and its left-trivialized velocity.
+
+    The path is ``H(t) = Exp(t Log(H1 H0^-1)) H0``.  Both returned tensors
+    stay in physical units: ``H(t)`` is a valid rigid transform and the
+    velocity is a 6D twist in metres/radians per unit flow time.
+    """
+
+    if noise_transform.shape != target_transform.shape or noise_transform.shape[-2:] != (4, 4):
+        raise ValueError(
+            "SE(3) flow endpoints must have matching (...,4,4) shapes; "
+            f"got {noise_transform.shape} and {target_transform.shape}."
+        )
+    if time.ndim != 1 or time.shape[0] != noise_transform.shape[0]:
+        raise ValueError(
+            f"Expected time shape ({noise_transform.shape[0]},), got {time.shape}."
+        )
+    relative = target_transform @ invert_transform(noise_transform)
+    total_twist = se3_log(relative)
+    time_expanded = time.reshape(time.shape[0], *([1] * (total_twist.ndim - 1)))
+    state = se3_exp(time_expanded * total_twist) @ noise_transform
+    remaining = (1.0 - time).clamp_min(1e-4)
+    remaining_expanded = remaining.reshape(remaining.shape[0], *([1] * (total_twist.ndim - 1)))
+    velocity = se3_log(target_transform @ invert_transform(state)) / remaining_expanded
+    return state, velocity
+
+
+def pose9_velocity_to_spatial_twist(current_pose9: Tensor, pose9_velocity: Tensor) -> Tensor:
+    """Project an instantaneous pose9 derivative onto a spatial SE(3) twist.
+
+    ``pose9_velocity`` stores ``[p_dot, r1_dot, r2_dot]`` where ``r1`` and
+    ``r2`` are the first two columns of the current rotation.  The closest
+    tangent rotation derivative is obtained from the skew part of
+    ``R_dot R^T``.  For the left/spatial convention used by
+    :func:`se3_left_apply`, ``p_dot = omega x p + v``; therefore the returned
+    translational twist is ``v = p_dot - omega x p``.
+
+    This is an output parameterization adapter only.  It does not project the
+    state or the target: SE(3) training states and integration remain on the
+    group throughout the complete denoising path.
+    """
+
+    if current_pose9.shape[:-1] != pose9_velocity.shape[:-1]:
+        raise ValueError(
+            "pose9 state and velocity must have matching leading dimensions; "
+            f"got {current_pose9.shape} and {pose9_velocity.shape}."
+        )
+    if current_pose9.shape[-1] < 9 or pose9_velocity.shape[-1] < 9:
+        raise ValueError(
+            "pose9 state and velocity require at least 9 channels; "
+            f"got {current_pose9.shape[-1]} and {pose9_velocity.shape[-1]}."
+        )
+
+    transform = pose9_to_matrix(current_pose9[..., :9].to(dtype=torch.float32))
+    rotation = transform[..., :3, :3]
+    position = transform[..., :3, 3]
+    r1 = rotation[..., :, 0]
+    r2 = rotation[..., :, 1]
+    r1_dot = pose9_velocity[..., 3:6].to(dtype=torch.float32)
+    r2_dot = pose9_velocity[..., 6:9].to(dtype=torch.float32)
+    r3_dot = torch.cross(r1_dot, r2, dim=-1) + torch.cross(r1, r2_dot, dim=-1)
+    rotation_dot = torch.stack([r1_dot, r2_dot, r3_dot], dim=-1)
+
+    angular_matrix = rotation_dot @ rotation.transpose(-1, -2)
+    angular_matrix = 0.5 * (angular_matrix - angular_matrix.transpose(-1, -2))
+    omega = torch.stack(
+        [
+            angular_matrix[..., 2, 1],
+            angular_matrix[..., 0, 2],
+            angular_matrix[..., 1, 0],
+        ],
+        dim=-1,
+    )
+    position_dot = pose9_velocity[..., :3].to(dtype=torch.float32)
+    linear = position_dot - torch.cross(omega, position, dim=-1)
+    return torch.cat([linear, omega], dim=-1)
+
+
+def pose9_endpoint_velocity_to_spatial_twist(
+    current_pose9: Tensor,
+    pose9_velocity: Tensor,
+    time: Tensor,
+) -> Tensor:
+    """Convert a legacy pose9 flow velocity to an exact SE(3) velocity.
+
+    The original Euclidean flow head represents a clean endpoint as
+    ``x_hat_1 = x_t + (1 - t) * v_pose9``.  Reusing that endpoint semantics is
+    substantially better conditioned when warm-starting from a trained pose9
+    policy than interpreting ``v_pose9`` as an instantaneous rotation-matrix
+    derivative.  The candidate rotation is first projected to SO(3) by the
+    standard rot6d conversion, then the exact spatial/left-trivialized twist
+    from the current transform to that endpoint is returned.
+
+    This adapter does not make the flow Euclidean: the random prior and every
+    state remain on SE(3), and inference still integrates with group products.
+    """
+
+    if current_pose9.shape[:-1] != pose9_velocity.shape[:-1]:
+        raise ValueError(
+            "pose9 state and velocity must have matching leading dimensions; "
+            f"got {current_pose9.shape} and {pose9_velocity.shape}."
+        )
+    if current_pose9.shape[-1] < 9 or pose9_velocity.shape[-1] < 9:
+        raise ValueError(
+            "pose9 state and velocity require at least 9 channels; "
+            f"got {current_pose9.shape[-1]} and {pose9_velocity.shape[-1]}."
+        )
+    if time.ndim != 1 or time.shape[0] != current_pose9.shape[0]:
+        raise ValueError(f"Expected time shape ({current_pose9.shape[0]},), got {time.shape}.")
+
+    remaining = (1.0 - time.to(device=current_pose9.device, dtype=torch.float32)).clamp_min(1e-3)
+    remaining_expanded = remaining.reshape(
+        remaining.shape[0], *([1] * (current_pose9.ndim - 1))
+    )
+    endpoint_pose9 = (
+        current_pose9[..., :9].to(dtype=torch.float32)
+        + remaining_expanded * pose9_velocity[..., :9].to(dtype=torch.float32)
+    )
+    current_transform = pose9_to_matrix(current_pose9[..., :9].to(dtype=torch.float32))
+    endpoint_transform = pose9_to_matrix(endpoint_pose9)
+    return se3_log(endpoint_transform @ invert_transform(current_transform)) / remaining_expanded
+
+
 def se3_geodesic_loss(pred: Tensor, target: Tensor, trans_weight: float = 1.0, rot_weight: float = 1.0) -> Tensor:
     trans = F.smooth_l1_loss(pred[..., :3, 3], target[..., :3, 3], reduction="none").sum(dim=-1)
     rot = _rotation_geodesic(pred[..., :3, :3], target[..., :3, :3])
@@ -1041,7 +1168,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SmolVLA fine-tuning."""
         common_projections = (
-            "state_proj|action_in_proj|action_out_proj|se3_action_out_proj|action_time_mlp_in|action_time_mlp_out"
+            "state_proj|action_in_proj|action_out_proj|se3_action_out_proj|world_action_out_proj|"
+            "world_se3_action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
@@ -2099,7 +2227,9 @@ class VLAFlowMatching(nn.Module):
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
         self.se3_action_out_proj = (
-            nn.Linear(self.vlm_with_expert.expert_hidden_size, 7) if self.config.se3_enable else None
+            nn.Linear(self.vlm_with_expert.expert_hidden_size, 7)
+            if self.config.se3_enable and self.config.se3_twist_head_mode == "direct_twist"
+            else None
         )
         use_pointseg = self.config.pointseg_enable or self.config.pointseg_checkpoint_path is not None
         if self.config.worldflow_enable and not use_pointseg:
@@ -2181,6 +2311,11 @@ class VLAFlowMatching(nn.Module):
             self.ego_scene_to_expert = nn.Linear(self.config.pointseg_feature_dim, expert_dim)
             self.world_scene_to_expert = nn.Linear(self.config.worldflow_feature_dim, expert_dim)
             self.world_action_out_proj = nn.Linear(expert_dim, WorldFlowActionBranch.pose_dim)
+            self.world_se3_action_out_proj = (
+                nn.Linear(expert_dim, 6)
+                if self.config.se3_enable and self.config.se3_twist_head_mode == "direct_twist"
+                else None
+            )
             # Explicit stream identities are required because both action
             # chunks share one bidirectional block.  Sequence position alone
             # must not be the only cue that separates Ego from World.
@@ -2192,6 +2327,7 @@ class VLAFlowMatching(nn.Module):
             self.ego_scene_to_expert = None
             self.world_scene_to_expert = None
             self.world_action_out_proj = None
+            self.world_se3_action_out_proj = None
             self.register_parameter("world_ego_scene_type_embedding", None)
             self.register_parameter("world_ego_action_type_embedding", None)
 
@@ -2258,6 +2394,32 @@ class VLAFlowMatching(nn.Module):
             noise = pad_vector(noise, shape[-1])
         return noise
 
+    @staticmethod
+    def conjugate_ego_noise_to_world(ego_noise: Tensor, current_pose: Tensor) -> Tensor:
+        """Derive the World spatial prior from the Ego body prior.
+
+        For current EEF-to-World carrier ``C`` and Ego/body transform ``B``,
+        the corresponding World/spatial transform is ``G = C B C^{-1}``.
+        Keeping this relation at the random-flow origin prevents the two
+        streams from describing different physical noisy trajectories.
+        """
+
+        if ego_noise.ndim != 3 or ego_noise.shape[-1] < 9:
+            raise ValueError(f"Expected Ego noise shape (B,T,D>=9), got {ego_noise.shape}.")
+        if current_pose.ndim != 2 or current_pose.shape != (ego_noise.shape[0], 9):
+            raise ValueError(
+                f"Expected current pose shape {(ego_noise.shape[0], 9)}, got {current_pose.shape}."
+            )
+        ego_transform = pose9_to_matrix(ego_noise[..., :9].to(dtype=torch.float32))
+        current = pose9_to_matrix(current_pose.to(device=ego_noise.device, dtype=torch.float32))
+        current_inv = invert_transform(current)
+        world_transform = (
+            current.unsqueeze(1)
+            @ ego_transform
+            @ current_inv.unsqueeze(1)
+        )
+        return matrix_to_pose9(world_transform)
+
     def sample_time(self, bsize, device):
         mode = self.config.flow_time_sampling
         if mode == "integration_grid":
@@ -2297,7 +2459,12 @@ class VLAFlowMatching(nn.Module):
         xi_noise[..., :3] = xi_noise[..., :3] * float(self.config.se3_noise_trans_scale)
         xi_noise[..., 3:6] = xi_noise[..., 3:6] * float(self.config.se3_noise_rot_scale)
         pose_noise = se3_exp(xi_noise)
-        gripper_noise = self.sample_noise((*actions.shape[:2], 1), actions.device)
+        gripper_noise = torch.randn(
+            *actions.shape[:2],
+            1,
+            device=actions.device,
+            dtype=torch.float32,
+        ) * float(self.config.se3_noise_gripper_scale)
         noise_action = torch.cat([matrix_to_pose9(pose_noise), gripper_noise], dim=-1)
         if actions.shape[-1] > 10:
             noise_action = pad_vector(noise_action, actions.shape[-1])
@@ -2400,9 +2567,51 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
-        if self.se3_action_out_proj is None:
-            raise RuntimeError("se3_action_out_proj is not initialized.")
-        return self.se3_action_out_proj(suffix_out)
+        return self._predict_ego_se3_velocity(suffix_out, x_t, time)
+
+    def _predict_ego_se3_velocity(
+        self,
+        expert_out: Tensor,
+        ego_x_t: Tensor,
+        time: Tensor,
+    ) -> Tensor:
+        """Decode Ego expert features as spatial twist plus gripper velocity."""
+
+        if self.config.se3_twist_head_mode == "direct_twist":
+            if self.se3_action_out_proj is None:
+                raise RuntimeError("Direct Ego SE(3) twist head is not initialized.")
+            return self.se3_action_out_proj(expert_out)
+        if self.config.se3_twist_head_mode not in {"projected_pose9", "pose9_endpoint"}:
+            raise RuntimeError(f"Unknown se3_twist_head_mode={self.config.se3_twist_head_mode!r}.")
+        pose9_velocity = self.action_out_proj(expert_out)
+        if pose9_velocity.shape[-1] < 10:
+            raise RuntimeError("Projected Ego SE(3) mode requires a pose9 + gripper output head.")
+        if self.config.se3_twist_head_mode == "pose9_endpoint":
+            twist = pose9_endpoint_velocity_to_spatial_twist(ego_x_t, pose9_velocity, time)
+        else:
+            twist = pose9_velocity_to_spatial_twist(ego_x_t, pose9_velocity)
+        return torch.cat([twist, pose9_velocity[..., 9:10]], dim=-1)
+
+    def _predict_world_se3_velocity(
+        self,
+        expert_out: Tensor,
+        world_x_t: Tensor,
+        time: Tensor,
+    ) -> Tensor:
+        """Decode World expert features as a spatial twist."""
+
+        if self.config.se3_twist_head_mode == "direct_twist":
+            if self.world_se3_action_out_proj is None:
+                raise RuntimeError("Direct World SE(3) twist head is not initialized.")
+            return self.world_se3_action_out_proj(expert_out)
+        if self.config.se3_twist_head_mode not in {"projected_pose9", "pose9_endpoint"}:
+            raise RuntimeError(f"Unknown se3_twist_head_mode={self.config.se3_twist_head_mode!r}.")
+        if self.world_action_out_proj is None:
+            raise RuntimeError("Projected World SE(3) mode requires the pose9 World output head.")
+        pose9_velocity = self.world_action_out_proj(expert_out)
+        if self.config.se3_twist_head_mode == "pose9_endpoint":
+            return pose9_endpoint_velocity_to_spatial_twist(world_x_t, pose9_velocity, time)
+        return pose9_velocity_to_spatial_twist(world_x_t, pose9_velocity)
 
     def embed_prefix(
         self,
@@ -2800,6 +3009,14 @@ class VLAFlowMatching(nn.Module):
         )
         ego_action_mask = ego_action_mask.to(device=ego_action_tokens.device, dtype=torch.bool)
 
+        diagnostic_ablations = getattr(self, "inference_ablation_modalities", frozenset())
+        if "world" in diagnostic_ablations:
+            # Keep the exact suffix layout and positional IDs while removing
+            # every World-stream key/value. This makes fixed-noise comparisons
+            # isolate World information instead of changing model topology.
+            world_scene_mask = torch.zeros_like(world_scene_mask)
+            world_action_mask = torch.zeros_like(world_action_mask)
+
         ego_scene = ego_scene + self.world_ego_scene_type_embedding[0]
         world_scene = world_scene + self.world_ego_scene_type_embedding[1]
         ego_action_tokens = ego_action_tokens + self.world_ego_action_type_embedding[0]
@@ -2909,6 +3126,8 @@ class VLAFlowMatching(nn.Module):
         lang_masks: Tensor,
         time: Tensor,
         actions_is_pad: Tensor | None,
+        ego_noise: Tensor | None = None,
+        ego_x_t: Tensor | None = None,
     ) -> dict[str, Tensor | dict[str, Tensor]]:
         if self.worldflow_branch is None:
             raise RuntimeError("WorldFlow is disabled.")
@@ -2947,23 +3166,65 @@ class VLAFlowMatching(nn.Module):
         spatial_gt = target @ current_inv.unsqueeze(1)
         spatial_gt_pose9 = matrix_to_pose9(spatial_gt)
 
-        noise_twist = torch.randn(
-            *spatial_gt_pose9.shape[:2],
-            6,
-            device=point_cloud_world.device,
-            dtype=torch.float32,
+        if ego_noise is None:
+            if self.config.worldflow_noise_coupling == "conjugate_ego":
+                raise ValueError("Conjugate WorldFlow noise requires the sampled Ego noise tensor.")
+            ego_noise = torch.zeros(
+                *spatial_gt_pose9.shape[:2],
+                10,
+                device=point_cloud_world.device,
+                dtype=torch.float32,
+            )
+            ego_noise[..., 3] = 1.0
+            ego_noise[..., 7] = 1.0
+
+        if self.config.worldflow_noise_coupling == "conjugate_ego":
+            noise_pose9 = self.conjugate_ego_noise_to_world(ego_noise, current_pose)
+            noise_spatial = pose9_to_matrix(noise_pose9)
+        else:
+            noise_twist = torch.randn(
+                *spatial_gt_pose9.shape[:2],
+                6,
+                device=point_cloud_world.device,
+                dtype=torch.float32,
+            )
+            noise_twist[..., :3] = (
+                noise_twist[..., :3] * float(self.config.worldflow_noise_trans_scale)
+            )
+            noise_twist[..., 3:6] = (
+                noise_twist[..., 3:6] * float(self.config.worldflow_noise_rot_scale)
+            )
+            noise_spatial = se3_exp(noise_twist)
+            noise_pose9 = matrix_to_pose9(noise_spatial)
+
+        expected_conjugate_noise = pose9_to_matrix(
+            self.conjugate_ego_noise_to_world(ego_noise, current_pose)
         )
-        noise_twist[..., :3] = (
-            noise_twist[..., :3] * float(self.config.worldflow_noise_trans_scale)
+        noise_conjugacy_error = se3_geodesic_loss(
+            noise_spatial,
+            expected_conjugate_noise,
+            trans_weight=float(self.config.worldflow_trans_weight),
+            rot_weight=float(self.config.worldflow_rot_weight),
         )
-        noise_twist[..., 3:6] = (
-            noise_twist[..., 3:6] * float(self.config.worldflow_noise_rot_scale)
-        )
-        noise_spatial = se3_exp(noise_twist)
-        noise_pose9 = matrix_to_pose9(noise_spatial)
-        time_expanded = time[:, None, None]
-        x_t = (1.0 - time_expanded) * noise_pose9 + time_expanded * spatial_gt_pose9
-        u_t = spatial_gt_pose9 - noise_pose9
+        if self.config.se3_enable:
+            world_h_t, u_t = se3_geodesic_flow_state(noise_spatial, spatial_gt, time)
+            x_t = matrix_to_pose9(world_h_t)
+        else:
+            time_expanded = time[:, None, None]
+            x_t = (1.0 - time_expanded) * noise_pose9 + time_expanded * spatial_gt_pose9
+            u_t = spatial_gt_pose9 - noise_pose9
+
+        if ego_x_t is None:
+            path_conjugacy_error = torch.zeros_like(noise_conjugacy_error)
+        else:
+            ego_h_t = pose9_to_matrix(ego_x_t[..., :9].to(dtype=torch.float32))
+            expected_world_h_t = current.unsqueeze(1) @ ego_h_t @ current_inv.unsqueeze(1)
+            path_conjugacy_error = se3_geodesic_loss(
+                pose9_to_matrix(x_t),
+                expected_world_h_t,
+                trans_weight=float(self.config.worldflow_trans_weight),
+                rot_weight=float(self.config.worldflow_rot_weight),
+            )
 
         world_tokens = self.worldflow_branch(
             point_cloud_world,
@@ -2981,6 +3242,8 @@ class VLAFlowMatching(nn.Module):
             "current_inv": current_inv,
             "spatial_gt": spatial_gt,
             "noise_spatial": noise_spatial,
+            "noise_conjugacy_error": noise_conjugacy_error,
+            "path_conjugacy_error": path_conjugacy_error,
             "x_t": x_t,
             "u_t": u_t,
             "valid": valid,
@@ -3018,11 +3281,19 @@ class VLAFlowMatching(nn.Module):
         point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud_world, transform)
         spatial_gt_aug = transform.unsqueeze(1) @ spatial_gt @ transform_inv.unsqueeze(1)
         noise_spatial_aug = transform.unsqueeze(1) @ noise_spatial @ transform_inv.unsqueeze(1)
-        spatial_gt_aug_pose9 = matrix_to_pose9(spatial_gt_aug)
-        noise_aug_pose9 = matrix_to_pose9(noise_spatial_aug)
-        time_expanded = time[:, None, None]
-        x_t_aug = (1.0 - time_expanded) * noise_aug_pose9 + time_expanded * spatial_gt_aug_pose9
-        u_t_aug = spatial_gt_aug_pose9 - noise_aug_pose9
+        if self.config.se3_enable:
+            h_t_aug, u_t_aug = se3_geodesic_flow_state(
+                noise_spatial_aug,
+                spatial_gt_aug,
+                time,
+            )
+            x_t_aug = matrix_to_pose9(h_t_aug)
+        else:
+            spatial_gt_aug_pose9 = matrix_to_pose9(spatial_gt_aug)
+            noise_aug_pose9 = matrix_to_pose9(noise_spatial_aug)
+            time_expanded = time[:, None, None]
+            x_t_aug = (1.0 - time_expanded) * noise_aug_pose9 + time_expanded * spatial_gt_aug_pose9
+            u_t_aug = spatial_gt_aug_pose9 - noise_aug_pose9
         world_tokens_aug = self.worldflow_branch(
             point_cloud_aug,
             lang_tokens,
@@ -3069,14 +3340,26 @@ class VLAFlowMatching(nn.Module):
         current_inv = tensors["current_inv"]
         valid = tensors["valid"]
         point_cloud_world = tensors["point_cloud_world"]
+        noise_conjugacy_error = state.get("noise_conjugacy_error")
+        if not torch.is_tensor(noise_conjugacy_error):
+            raise TypeError("WorldFlow state is missing tensor noise_conjugacy_error.")
+        path_conjugacy_error = state.get("path_conjugacy_error")
+        if not torch.is_tensor(path_conjugacy_error):
+            raise TypeError("WorldFlow state is missing tensor path_conjugacy_error.")
 
         time_expanded = time[:, None, None]
-        pred_spatial_pose9 = x_t + (1.0 - time_expanded) * pred_velocity
-        pred_spatial = pose9_to_matrix(pred_spatial_pose9)
+        if self.config.se3_enable:
+            remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
+            pred_spatial = se3_left_apply(remaining * pred_velocity, pose9_to_matrix(x_t))
+            pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
+            flow_step = F.smooth_l1_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
+        else:
+            pred_spatial_pose9 = x_t + (1.0 - time_expanded) * pred_velocity
+            pred_spatial = pose9_to_matrix(pred_spatial_pose9)
+            flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
         pred_body_from_world = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
         pred_body = pose9_to_matrix(pred_body_pose9[..., :9])
 
-        flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
         geo_step = se3_geodesic_loss(
             pred_spatial,
             spatial_gt,
@@ -3099,9 +3382,24 @@ class VLAFlowMatching(nn.Module):
             spatial_gt_aug = augmented_state["spatial_gt"]
             if not all(torch.is_tensor(value) for value in (x_t_aug, u_t_aug, spatial_gt_aug)):
                 raise TypeError("Augmented WorldFlow state contains a non-tensor value.")
-            pred_aug_pose9 = x_t_aug + (1.0 - time_expanded) * pred_aug_velocity
-            pred_aug_spatial = pose9_to_matrix(pred_aug_pose9)
-            flow_step_aug = F.mse_loss(pred_aug_velocity, u_t_aug, reduction="none").mean(dim=-1)
+            if self.config.se3_enable:
+                pred_aug_spatial = se3_left_apply(
+                    remaining * pred_aug_velocity,
+                    pose9_to_matrix(x_t_aug),
+                )
+                flow_step_aug = F.smooth_l1_loss(
+                    pred_aug_velocity,
+                    u_t_aug,
+                    reduction="none",
+                ).mean(dim=-1)
+            else:
+                pred_aug_pose9 = x_t_aug + (1.0 - time_expanded) * pred_aug_velocity
+                pred_aug_spatial = pose9_to_matrix(pred_aug_pose9)
+                flow_step_aug = F.mse_loss(
+                    pred_aug_velocity,
+                    u_t_aug,
+                    reduction="none",
+                ).mean(dim=-1)
             geo_step_aug = se3_geodesic_loss(
                 pred_aug_spatial,
                 spatial_gt_aug,
@@ -3155,6 +3453,14 @@ class VLAFlowMatching(nn.Module):
                 device=point_cloud_world.device,
                 dtype=torch.float32,
             ),
+            "worldflow_noise_conjugacy_error": _masked_step_mean(
+                noise_conjugacy_error,
+                valid,
+            ).mean().detach(),
+            "worldflow_path_conjugacy_error": _masked_step_mean(
+                path_conjugacy_error,
+                valid,
+            ).mean().detach(),
         }
         return {
             "loss_flow": per_sample_flow.mean(),
@@ -3192,6 +3498,7 @@ class VLAFlowMatching(nn.Module):
         actions_is_pad: Tensor | None = None,
         images: list[Tensor] | None = None,
         image_masks: list[Tensor] | None = None,
+        worldflow_context: dict[str, Tensor] | None = None,
     ) -> Tensor:
         if actions.shape[-1] < 10:
             raise ValueError(f"se3_enable=True expects pose9 + gripper actions, got {actions.shape}.")
@@ -3205,15 +3512,13 @@ class VLAFlowMatching(nn.Module):
         else:
             if noise.shape[-1] < 10:
                 raise ValueError(f"SE(3) noise must have dim >= 10, got {noise.shape}.")
-            h_noise = pose9_to_matrix(noise[..., :9])
-            gripper_noise = noise[..., 9:10].to(dtype=torch.float32)
+            _noise_action = noise.to(device=actions.device, dtype=torch.float32)
+            h_noise = pose9_to_matrix(_noise_action[..., :9])
+            gripper_noise = _noise_action[..., 9:10]
 
         time_pose = time[:, None, None]
-        h_delta = h_gt @ invert_transform(h_noise)
-        xi_total = se3_log(h_delta)
-        h_t = se3_exp(time_pose * xi_total) @ h_noise
+        h_t, xi_target = se3_geodesic_flow_state(h_noise, h_gt, time)
         remaining = (1.0 - time).clamp_min(1e-3)
-        xi_target = se3_log(h_gt @ invert_transform(h_t)) / remaining[:, None, None]
         gripper_t = (1.0 - time_pose) * gripper_noise + time_pose * gripper_gt
         gripper_target = gripper_gt - gripper_noise
         x_t = torch.cat([matrix_to_pose9(h_t), gripper_t], dim=-1)
@@ -3229,14 +3534,90 @@ class VLAFlowMatching(nn.Module):
             images=images,
             image_masks=image_masks,
         )
-        pred = self._se3_predict_from_suffix(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            x_t,
-            time,
-            actions_is_pad=actions_is_pad,
-        )
+        if self.worldflow_branch is None:
+            pred = self._se3_predict_from_suffix(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                x_t,
+                time,
+                actions_is_pad=actions_is_pad,
+            )
+            world_state = None
+            world_velocity = None
+            augmented_state = None
+            pred_aug_velocity = None
+            augmentation_transform = None
+        else:
+            if worldflow_context is None:
+                raise ValueError(
+                    "worldflow_enable=True requires current and future world EEF poses during "
+                    "SE(3) training."
+                )
+            suffix_embs, suffix_pad_masks, _suffix_att_masks = self.embed_suffix(
+                x_t,
+                time,
+                actions_is_pad=actions_is_pad,
+            )
+            suffix_embs = self._inject_point_action_features(
+                suffix_embs,
+                actions_is_pad=actions_is_pad,
+            )
+            world_state = self._prepare_worldflow_training_state(
+                worldflow_context,
+                lang_tokens,
+                lang_masks,
+                time,
+                actions_is_pad,
+                _noise_action,
+                x_t,
+            )
+            world_tokens = world_state["world_tokens"]
+            if not isinstance(world_tokens, dict):
+                raise TypeError("WorldFlow token state must be a dictionary.")
+            ego_expert_out, world_expert_out = self._run_world_ego_joint_expert(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                suffix_embs,
+                suffix_pad_masks,
+                world_tokens,
+            )
+            pred = self._predict_ego_se3_velocity(ego_expert_out, x_t, time)
+            world_x_t = world_state["x_t"]
+            if not torch.is_tensor(world_x_t):
+                raise TypeError("WorldFlow SE(3) state is missing tensor x_t.")
+            world_velocity = self._predict_world_se3_velocity(world_expert_out, world_x_t, time)
+
+            augmented_state = None
+            pred_aug_velocity = None
+            augmentation_transform = None
+            if self.config.worldflow_equiv_loss_weight > 0:
+                augmented_state, augmentation_transform = self._augment_worldflow_training_state(
+                    world_state,
+                    lang_tokens,
+                    lang_masks,
+                    time,
+                )
+                augmented_tokens = augmented_state["world_tokens"]
+                if not isinstance(augmented_tokens, dict):
+                    raise TypeError("Augmented WorldFlow token state must be a dictionary.")
+                _, world_aug_expert_out = self._run_world_ego_joint_expert(
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    suffix_embs,
+                    suffix_pad_masks,
+                    augmented_tokens,
+                )
+                world_x_t_aug = augmented_state["x_t"]
+                if not torch.is_tensor(world_x_t_aug):
+                    raise TypeError("Augmented WorldFlow SE(3) state is missing tensor x_t.")
+                pred_aug_velocity = self._predict_world_se3_velocity(
+                    world_aug_expert_out,
+                    world_x_t_aug,
+                    time,
+                )
         twist_pred = pred[..., :6]
         gripper_vel_pred = pred[..., 6:7]
 
@@ -3270,9 +3651,25 @@ class VLAFlowMatching(nn.Module):
             "se3_action_rot_err_deg": torch.rad2deg(self._masked_scalar_mean(rot_err, valid).detach()),
         }
 
-        losses = actions.new_zeros(actions.shape)
-        losses[..., 0] = step_total * actions.shape[-1]
-        return losses
+        if world_state is not None:
+            if world_velocity is None:
+                raise RuntimeError("World SE(3) velocity was not produced.")
+            self.last_worldflow_aux = self._finalize_worldflow_training_loss(
+                world_state,
+                world_velocity,
+                self.last_body_pose9_prediction,
+                time,
+                augmented_state=augmented_state,
+                pred_aug_velocity=pred_aug_velocity,
+                augmentation_transform=augmentation_transform,
+            )
+
+        # The policy wrapper expects one loss value per original action channel
+        # before applying padding masks and taking the channel mean.  The SE(3)
+        # objective is already a scalar per action step, so repeat it uniformly;
+        # placing it only in channel 0 would accidentally rescale the complete
+        # objective whenever physical per-channel action weights are configured.
+        return step_total.unsqueeze(-1).expand_as(actions)
 
     def forward(
         self,
@@ -3306,6 +3703,7 @@ class VLAFlowMatching(nn.Module):
                 actions_is_pad=actions_is_pad,
                 images=images,
                 image_masks=image_masks,
+                worldflow_context=worldflow_context,
             )
         if noise is None:
             if self.config.pose9_action_noise_enable:
@@ -3348,6 +3746,8 @@ class VLAFlowMatching(nn.Module):
                 lang_masks,
                 time,
                 actions_is_pad,
+                noise,
+                x_t,
             )
             world_tokens = world_state["world_tokens"]
             if not isinstance(world_tokens, dict):
@@ -3467,6 +3867,8 @@ class VLAFlowMatching(nn.Module):
                 noise=noise,
                 images=images,
                 image_masks=image_masks,
+                current_ee_pose=current_ee_pose,
+                worldflow_noise=worldflow_noise,
                 **kwargs,
             )
         bsize = state.shape[0]
@@ -3501,7 +3903,13 @@ class VLAFlowMatching(nn.Module):
                 point_is_pad=point_is_pad,
             )
             if worldflow_noise is None:
-                world_x_t = self.sample_worldflow_noise(bsize, device)
+                if self.config.worldflow_noise_coupling == "conjugate_ego":
+                    world_x_t = self.conjugate_ego_noise_to_world(
+                        noise,
+                        current_ee_pose.to(device=device, dtype=torch.float32),
+                    )
+                else:
+                    world_x_t = self.sample_worldflow_noise(bsize, device)
             else:
                 expected_world_noise_shape = (bsize, self.config.chunk_size, 9)
                 if worldflow_noise.shape != expected_world_noise_shape:
@@ -3589,7 +3997,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Jointly denoise Ego body actions and World spatial transforms."""
-        if self.worldflow_branch is None or self.world_action_out_proj is None:
+        if self.worldflow_branch is None:
             raise RuntimeError("Joint World–Ego inference modules are not initialized.")
         ego_tokens, ego_mask, _ = self.embed_suffix(ego_x_t, timestep)
         ego_tokens = self._inject_point_action_features(ego_tokens)
@@ -3614,6 +4022,13 @@ class VLAFlowMatching(nn.Module):
             world_tokens,
             past_key_values=past_key_values,
         )
+        if self.config.se3_enable:
+            return (
+                self._predict_ego_se3_velocity(ego_out, ego_x_t, timestep),
+                self._predict_world_se3_velocity(world_out, world_x_t, timestep),
+            )
+        if self.world_action_out_proj is None:
+            raise RuntimeError("Joint World–Ego pose9 output projection is not initialized.")
         return self.action_out_proj(ego_out), self.world_action_out_proj(world_out)
 
     def sample_actions_se3(
@@ -3626,6 +4041,8 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         images: list[Tensor] | None = None,
         image_masks: list[Tensor] | None = None,
+        current_ee_pose: Tensor | None = None,
+        worldflow_noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         if self._rtc_enabled():
@@ -3651,6 +4068,29 @@ class VLAFlowMatching(nn.Module):
             images=images,
             image_masks=image_masks,
         )
+        world_scene = None
+        world_x_t = None
+        if self.worldflow_branch is not None:
+            if current_ee_pose is None:
+                raise ValueError("Joint World–Ego SE(3) inference requires current_ee_pose.")
+            current_ee_pose = current_ee_pose.to(device=device, dtype=torch.float32)
+            point_cloud_world, point_is_pad, _ = self._prepare_worldflow_foreground(current_ee_pose)
+            world_scene = self.worldflow_branch.encode_scene(
+                point_cloud_world,
+                point_is_pad=point_is_pad,
+            )
+            if worldflow_noise is None:
+                if self.config.worldflow_noise_coupling == "conjugate_ego":
+                    world_x_t = self.conjugate_ego_noise_to_world(x_t, current_ee_pose)
+                else:
+                    world_x_t = self.sample_worldflow_noise(bsize, device)
+            else:
+                expected_shape = (bsize, self.config.chunk_size, 9)
+                if worldflow_noise.shape != expected_shape:
+                    raise ValueError(
+                        f"Expected worldflow_noise shape {expected_shape}, got {worldflow_noise.shape}."
+                    )
+                world_x_t = worldflow_noise.to(device=device, dtype=torch.float32)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         _, past_key_values = self.vlm_with_expert.forward(
@@ -3666,12 +4106,27 @@ class VLAFlowMatching(nn.Module):
         for step in range(num_steps):
             time = step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-            pred = self.denoise_step(
-                x_t=x_t,
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                timestep=time_tensor,
-            )
+            if self.worldflow_branch is None:
+                pred = self.denoise_step(
+                    x_t=x_t,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    timestep=time_tensor,
+                )
+                world_twist = None
+            else:
+                if world_scene is None or world_x_t is None:
+                    raise RuntimeError("Joint World–Ego SE(3) inference state was not initialized.")
+                pred, world_twist = self.denoise_step_world_ego(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    ego_x_t=x_t,
+                    world_x_t=world_x_t,
+                    timestep=time_tensor,
+                    world_scene=world_scene,
+                    lang_tokens=lang_tokens,
+                    lang_masks=lang_masks,
+                )
             twist = pred[..., :6]
             gripper_vel = pred[..., 6:7]
             h_t = pose9_to_matrix(x_t[..., :9])
@@ -3680,6 +4135,9 @@ class VLAFlowMatching(nn.Module):
             x_t = torch.cat([matrix_to_pose9(h_next), gripper_next], dim=-1)
             if x_t.shape[-1] < self.config.max_action_dim:
                 x_t = pad_vector(x_t, self.config.max_action_dim)
+            if world_twist is not None:
+                world_h_next = se3_left_apply(dt * world_twist, pose9_to_matrix(world_x_t))
+                world_x_t = matrix_to_pose9(world_h_next)
 
         return x_t
 
@@ -3726,9 +4184,7 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         if self.config.se3_enable:
-            if self.se3_action_out_proj is None:
-                raise RuntimeError("se3_action_out_proj is not initialized.")
-            v_t = self.se3_action_out_proj(suffix_out)
+            v_t = self._predict_ego_se3_velocity(suffix_out, x_t, timestep)
         else:
             v_t = self.action_out_proj(suffix_out)
         return v_t

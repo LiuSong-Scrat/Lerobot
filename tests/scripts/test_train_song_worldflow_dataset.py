@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 import torch
 
+from benchmarks.song_real_libero.scripts.train_song_benchmark import (
+    WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
+)
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
+from lerobot.scripts.train_song_libero import (
+    WorldFlowMemmapDataset as LiberoWorldFlowMemmapDataset,
+)
 
 
 class _TinyDataset(torch.utils.data.Dataset):
@@ -59,7 +65,11 @@ def test_worldflow_dataset_uses_achieved_current_and_commanded_future_targets(tm
     )
 
 
-def test_worldflow_dataset_applies_same_causal_action_offset_as_ego_chunk(tmp_path):
+@pytest.mark.parametrize(
+    "dataset_cls",
+    [WorldFlowMemmapDataset, BenchmarkWorldFlowMemmapDataset, LiberoWorldFlowMemmapDataset],
+)
+def test_worldflow_dataset_applies_same_causal_action_offset_as_ego_chunk(tmp_path, dataset_cls):
     achieved = _pose_sequence(offset=10.0)
     commanded = _pose_sequence(offset=20.0)
     achieved_dir = tmp_path / "world_ee_poses"
@@ -69,7 +79,7 @@ def test_worldflow_dataset_applies_same_causal_action_offset_as_ego_chunk(tmp_pa
     np.save(achieved_dir / "episode_000000.npy", achieved)
     np.save(target_dir / "episode_000000.npy", commanded)
 
-    wrapped = WorldFlowMemmapDataset(
+    wrapped = dataset_cls(
         _TinyDataset(frame_index=0),
         tmp_path,
         chunk_size=4,

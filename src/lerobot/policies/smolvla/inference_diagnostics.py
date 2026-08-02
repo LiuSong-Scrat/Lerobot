@@ -26,11 +26,12 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
 )
 
-MODALITY_ABLATIONS = ("language", "rgb", "point", "action_context")
+MODALITY_ABLATIONS = ("language", "rgb", "point", "world", "action_context")
 MODALITY_LABELS = {
     "language": "Language tokens",
     "rgb": "RGB tokens",
     "point": "Point tokens",
+    "world": "World-flow tokens",
     "action_context": "Action-token context",
 }
 
@@ -129,7 +130,11 @@ class SmolVLAModalityAnalyzer:
     def _clone_batch(batch: dict[str, Any]) -> dict[str, Any]:
         return {key: value.clone() if torch.is_tensor(value) else value for key, value in batch.items()}
 
-    def _make_fixed_noise(self, model_batch: dict[str, Any], seed: int) -> torch.Tensor:
+    def _make_fixed_noise(
+        self,
+        model_batch: dict[str, Any],
+        seed: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         state = self.policy.prepare_state(model_batch)
         model = self.policy.model
         device = state.device
@@ -143,13 +148,26 @@ class SmolVLAModalityAnalyzer:
             shape = (state.shape[0], model.config.chunk_size, model.config.max_action_dim)
             if model.config.se3_enable:
                 dummy = torch.zeros(shape, dtype=torch.float32, device=device)
-                return model.sample_se3_action_noise(dummy)[2]
-            return model.sample_noise(shape, device)
+                ego_noise = model.sample_se3_action_noise(dummy)[2]
+            elif model.config.pose9_action_noise_enable:
+                ego_noise = model.sample_pose9_action_noise(shape, device)
+            else:
+                ego_noise = model.sample_noise(shape, device)
+
+            world_noise = None
+            if model.config.worldflow_enable:
+                coupling = getattr(model.config, "worldflow_noise_coupling", "independent")
+                if coupling == "independent":
+                    world_noise = model.sample_worldflow_noise(state.shape[0], device)
+                elif coupling != "conjugate_ego":
+                    raise ValueError(f"Unknown worldflow_noise_coupling={coupling!r}.")
+            return ego_noise, world_noise
 
     def _predict_normalized(
         self,
         model_batch: dict[str, Any],
         noise: torch.Tensor,
+        worldflow_noise: torch.Tensor | None,
         ablations: Iterable[str],
     ) -> torch.Tensor:
         batch = self._clone_batch(model_batch)
@@ -164,6 +182,7 @@ class SmolVLAModalityAnalyzer:
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
         model = self.policy.model
+        current_ee_pose = batch.get("worldflow.current_ee_pose")
         old_ablations = getattr(model, "inference_ablation_modalities", frozenset())
         model.inference_ablation_modalities = frozenset(str(name) for name in ablations)
         try:
@@ -174,6 +193,8 @@ class SmolVLAModalityAnalyzer:
                 lang_masks,
                 state,
                 noise=noise,
+                current_ee_pose=current_ee_pose,
+                worldflow_noise=worldflow_noise,
                 images=images,
                 image_masks=image_masks,
             )
@@ -205,13 +226,15 @@ class SmolVLAModalityAnalyzer:
         if unknown:
             raise ValueError(f"Unknown SmolVLA modality ablations: {unknown}")
 
-        noise = self._make_fixed_noise(model_batch, seed)
-        baseline_normalized = self._predict_normalized(model_batch, noise, ())
+        noise, worldflow_noise = self._make_fixed_noise(model_batch, seed)
+        baseline_normalized = self._predict_normalized(model_batch, noise, worldflow_noise, ())
         baseline = self._postprocess(baseline_normalized)
         variants: dict[str, np.ndarray] = {}
         influence: dict[str, dict[str, Any]] = {}
         for name in requested:
-            variant = self._postprocess(self._predict_normalized(model_batch, noise, (name,)))
+            variant = self._postprocess(
+                self._predict_normalized(model_batch, noise, worldflow_noise, (name,))
+            )
             variants[name] = variant
             influence[name] = action_difference_metrics(baseline, variant)
 
@@ -265,6 +288,10 @@ class SmolVLAModalityAnalyzer:
                 "language": "Mask language prefix tokens while preserving all other inputs.",
                 "rgb": "Mask image and image-special prefix tokens after vision encoding.",
                 "point": "Mask global point prefix tokens and disable local point-to-action fusion.",
+                "world": (
+                    "Mask World scene and World action tokens while preserving the joint suffix layout, "
+                    "Ego tokens, fixed Ego noise and fixed World noise."
+                ),
                 "action_context": "Keep each action token and prefix cross-attention, but remove action-to-action attention.",
             },
             "baseline_action": baseline,
