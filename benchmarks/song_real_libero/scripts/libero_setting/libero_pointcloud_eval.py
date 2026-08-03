@@ -4531,7 +4531,7 @@ def run_episode(
                 gripper_control_mode=gripper_control_mode,
                 gripper_delta_threshold=gripper_delta_threshold,
                 gripper_delta_alignment=gripper_delta_alignment,
-                gripper_previous_width=previous_gripper_width,
+                gripper_previous_width=gripper_previous_width,
             )
 
             latest_position_error = 0.0
