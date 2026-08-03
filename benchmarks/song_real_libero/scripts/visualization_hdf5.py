@@ -43,7 +43,7 @@ def visualize_cloud_rgb(cloud_rgb):
 # precise_episode_38.hdf5
 
 # 1. 打开HDF5文件
-hdf5_path = "benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo/noprecise_episode_0.hdf5"
+hdf5_path = "/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/temp/temp_num2/episode_0.hdf5"
 with h5py.File(hdf5_path, "r") as f:
     # 查看结构（可选）
     print("HDF5文件内容：")

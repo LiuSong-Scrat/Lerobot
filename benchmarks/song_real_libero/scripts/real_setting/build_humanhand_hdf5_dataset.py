@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,9 +107,10 @@ def main() -> None:
         "--camera-pose-jsonl",
         default=None,
         help=(
-            "Optional full-6DoF VIO/SLAM camera poses, one JSON object per frame. Records are matched by "
-            "record_index and must contain T_tracking_camera as camera_to_tracking/transform_matrix, or "
-            "translation_m + quaternion_xyzw."
+            "Optional full-6DoF VIO/SLAM camera poses. Accepts either one JSONL file or an ORB-SLAM3 "
+            "directory containing segment_*/dataset/camera_pose_orbslam3.jsonl. All records are merged "
+            "once by record_index before interactive slicing. Each exported episode is then independently "
+            "aligned to its own first camera frame when --align-to-episode-first is enabled."
         ),
     )
     parser.add_argument(
@@ -146,6 +147,40 @@ def main() -> None:
         help=(
             "Row-major T_tracking<-canonicalCamera in meters, stored in HDF5 for "
             "cross-episode canonical fixed-view alignment."
+        ),
+    )
+    parser.add_argument(
+        "--align-to-episode-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "During HDF5 export, transform cloud_rgb, gripper pose/orientation, 3D hand keypoints, "
+            "camera_tracking_pose, and (by default) RGB images into the first camera frame of each "
+            "exported episode. The first camera frame becomes the episode world frame. Requires a "
+            "complete --camera-pose-jsonl trajectory, --camera-reference-mode episode_first, and "
+            "--pose-frame camera."
+        ),
+    )
+    parser.add_argument(
+        "--reproject-rgb-to-episode-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "With --align-to-episode-first, replace each stored RGB frame by a z-buffered rendering "
+            "of that frame's complete valid RGB-D point cloud from the episode-first camera view. "
+            "All valid depth pixels are used; --max-points affects cloud_rgb only. Disable with "
+            "--no-reproject-rgb-to-episode-first to retain the legacy unwarped RGB images."
+        ),
+    )
+    parser.add_argument(
+        "--rgb-reproject-workers",
+        type=int,
+        default=0,
+        help=(
+            "Parallel frame workers used by episode-first RGB reprojection. "
+            "0 selects a conservative automatic value, 1 disables frame-level parallelism. "
+            "The implementation uses a bounded NumPy thread pool so full-resolution RGB-D "
+            "frames are not copied between processes."
         ),
     )
     parser.add_argument(
@@ -251,12 +286,24 @@ def main() -> None:
     args = parser.parse_args()
     if args.camera_pose_max_sync_error_ms < 0.0:
         raise ValueError("--camera-pose-max-sync-error-ms must be non-negative.")
+    if args.rgb_reproject_workers < 0:
+        raise ValueError("--rgb-reproject-workers must be >= 0.")
     if args.camera_reference_mode == "canonical" and args.canonical_camera_to_tracking_matrix is None:
         raise ValueError("--camera-reference-mode=canonical requires --canonical-camera-to-tracking-matrix.")
     if args.transform_to_world:
         args.pose_frame = "world"
         if args.camera_to_world_preset is None and args.camera_to_world_matrix is None:
             args.camera_to_world_preset = "humanhand_l515"
+    if args.align_to_episode_first:
+        if args.camera_pose_jsonl is None:
+            raise ValueError("--align-to-episode-first requires --camera-pose-jsonl.")
+        if args.camera_reference_mode != "episode_first":
+            raise ValueError(
+                "--align-to-episode-first requires --camera-reference-mode episode_first."
+            )
+        if args.pose_frame != "camera":
+            raise ValueError("--align-to-episode-first requires --pose-frame camera.")
+        args.require_camera_pose = True
 
     input_dir = Path(args.input).resolve()
     jsonl_path = Path(args.jsonl).resolve() if args.jsonl else input_dir / "handpose_wilor.jsonl"
@@ -431,35 +478,82 @@ def load_frame_records(input_dir: Path) -> list[dict]:
     return records
 
 
+def resolve_camera_pose_jsonl_paths(path: Path) -> list[Path]:
+    """Resolve one pose JSONL file or all per-segment ORB-SLAM3 pose JSONLs."""
+
+    path = path.expanduser().resolve()
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+
+    preferred = sorted(path.glob("segment_*/dataset/camera_pose_orbslam3.jsonl"))
+    if preferred:
+        return preferred
+
+    direct = path / "camera_pose_orbslam3.jsonl"
+    if direct.is_file():
+        return [direct]
+
+    recursive = sorted(path.glob("**/camera_pose_orbslam3.jsonl"))
+    if recursive:
+        return recursive
+
+    raise FileNotFoundError(
+        f"No camera_pose_orbslam3.jsonl files found under {path}. Expected "
+        "segment_*/dataset/camera_pose_orbslam3.jsonl."
+    )
+
+
+def camera_pose_sequence_name(jsonl_path: Path) -> str:
+    for parent in (jsonl_path.parent, *jsonl_path.parents):
+        if parent.name.startswith("segment_"):
+            return parent.name
+    return jsonl_path.stem
+
+
 def attach_external_camera_poses(
     frame_records: list[dict],
     jsonl_path: Path,
     *,
     max_sync_error_ms: float | None = None,
 ) -> list[dict]:
-    """Attach canonical T_tracking_camera matrices to RGB-D frame records."""
+    """Merge full-dataset per-segment camera trajectories, then attach them by record_index."""
 
-    if not jsonl_path.is_file():
-        raise FileNotFoundError(jsonl_path)
+    jsonl_paths = resolve_camera_pose_jsonl_paths(jsonl_path)
     pose_by_index: dict[int, dict] = {}
-    for line_number, line in enumerate(jsonl_path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        record = json.loads(line)
-        raw_index = record.get("record_index", record.get("index"))
-        if raw_index is None:
-            raise KeyError(f"{jsonl_path}:{line_number} has no record_index.")
-        index = int(raw_index)
-        if index in pose_by_index:
-            raise ValueError(f"Duplicate camera pose for record_index={index} in {jsonl_path}.")
-        matrix = matrix_from_json_record(record)
-        pose_by_index[index] = {
-            "camera_to_tracking": matrix.tolist(),
-            "camera_pose_source": str(record.get("tracking_source", record.get("source", "external_vio"))),
-            "camera_pose_timestamp_ms": record.get("timestamp_ms"),
-            "camera_pose_valid": bool(record.get("valid", True)),
-        }
+    for pose_path in jsonl_paths:
+        sequence_name = camera_pose_sequence_name(pose_path)
+        for line_number, line in enumerate(pose_path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            raw_index = record.get("record_index", record.get("index"))
+            if raw_index is None:
+                raise KeyError(f"{pose_path}:{line_number} has no record_index.")
+            index = int(raw_index)
+            matrix = matrix_from_json_record(record)
+            pose_record = {
+                "camera_to_tracking": matrix.tolist(),
+                "camera_pose_source": str(
+                    record.get("tracking_source", record.get("source", "external_vio"))
+                ),
+                "camera_pose_timestamp_ms": record.get("timestamp_ms"),
+                "camera_pose_valid": bool(record.get("valid", True)),
+                "camera_pose_sequence": sequence_name,
+                "camera_pose_jsonl": str(pose_path),
+            }
+            if index in pose_by_index:
+                previous = pose_by_index[index]
+                previous_matrix = np.asarray(previous["camera_to_tracking"], dtype=np.float64)
+                if not np.allclose(previous_matrix, matrix, atol=1e-9):
+                    raise ValueError(
+                        f"Conflicting camera poses for record_index={index}: "
+                        f"{previous['camera_pose_jsonl']} and {pose_path}."
+                    )
+                continue
+            pose_by_index[index] = pose_record
 
     output = []
     matched = 0
@@ -487,10 +581,13 @@ def attach_external_camera_poses(
         output.append(enriched)
     if matched == 0:
         raise RuntimeError(
-            f"No record_index values in {jsonl_path} matched the RGB-D frames. "
+            f"No record_index values from {jsonl_path} matched the RGB-D frames. "
             "Timestamp-only matching is intentionally not guessed."
         )
-    print(f"Attached {matched}/{len(frame_records)} external full-SE(3) camera poses from {jsonl_path}.")
+    print(
+        f"Attached {matched}/{len(frame_records)} external full-SE(3) camera poses "
+        f"from {len(jsonl_paths)} segment trajectory file(s)."
+    )
     return output
 
 
@@ -565,6 +662,7 @@ def run_interactive_slicer(
 
     index = 0
     start_record_index: int | None = None
+    start_camera_pose_sequence: str | None = None
     saved_paths: list[Path] = []
     print(
         "Controls: Right/D next, Left/A previous, Up/W set start, "
@@ -581,7 +679,9 @@ def run_interactive_slicer(
             index,
             len(samples),
             int(frame_record.get("index", index)),
+            str(frame_record.get("camera_pose_sequence", "no_pose")),
             start_record_index,
+            start_camera_pose_sequence,
             len(saved_paths),
         )
         cv2.imshow(args.window_name, preview)
@@ -594,18 +694,29 @@ def run_interactive_slicer(
             index = max(index - 1, 0)
         elif key in (82, 2490368, 65362, ord("w"), ord("W")):
             start_record_index = int(frame_record.get("index", index))
-            print(f"Segment start = frame {start_record_index}")
+            start_camera_pose_sequence = str(frame_record.get("camera_pose_sequence", "no_pose"))
+            print(
+                f"Episode start = frame {start_record_index} "
+                f"({start_camera_pose_sequence})"
+            )
         elif key in (84, 2621440, 65364, ord("s"), ord("S")):
             end_record_index = int(frame_record.get("index", index))
             if start_record_index is None:
                 print("Set a start frame first with Up/W.")
                 continue
+            end_camera_pose_sequence = str(frame_record.get("camera_pose_sequence", "no_pose"))
+            if end_camera_pose_sequence != start_camera_pose_sequence:
+                print(
+                    "Episode was not saved: start/end cross independent ORB-SLAM3 trajectories "
+                    f"({start_camera_pose_sequence} -> {end_camera_pose_sequence})."
+                )
+                continue
             segment = Segment(
                 start=min(start_record_index, end_record_index),
                 end=max(start_record_index, end_record_index),
             )
-            saved_paths.append(
-                save_segment_hdf5(
+            try:
+                saved_path = save_segment_hdf5(
                     segment,
                     samples,
                     input_dir,
@@ -615,11 +726,16 @@ def run_interactive_slicer(
                     camera_to_world,
                     args,
                 )
-            )
+            except RuntimeError as exc:
+                print(f"Episode was not saved: {exc}")
+                continue
+            saved_paths.append(saved_path)
             start_record_index = None
+            start_camera_pose_sequence = None
         elif key in (ord("r"), ord("R")):
             start_record_index = None
-            print("Cleared current segment start.")
+            start_camera_pose_sequence = None
+            print("Cleared current episode start.")
         elif key in (ord("u"), ord("U")) and saved_paths:
             last = saved_paths.pop()
             last.unlink(missing_ok=True)
@@ -701,6 +817,27 @@ def resolve_segment_workers(requested: int, segment_count: int) -> int:
     return min(segment_count, max(1, requested))
 
 
+def resolve_rgb_reproject_workers(
+    requested: int,
+    frame_count: int,
+    segment_workers: int,
+) -> int:
+    """Choose bounded frame-level parallelism for full-resolution RGB reprojection."""
+
+    if frame_count <= 1:
+        return 1
+    if requested < 0:
+        raise ValueError("--rgb-reproject-workers must be >= 0")
+    if requested > 0:
+        return min(frame_count, requested)
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    # When episodes are already exported by several processes, use fewer threads in
+    # each process to avoid CPU oversubscription and excessive RGB-D memory pressure.
+    automatic_cap = 2 if segment_workers != 1 else 4
+    return min(frame_count, cpu_count, automatic_cap)
+
+
 def init_segment_worker(
     samples: list[tuple[dict, dict]],
     input_dir: str,
@@ -764,68 +901,25 @@ def save_segment_hdf5(
     if not camera_names:
         raise ValueError("At least one camera name is required.")
 
-    images = []
-    clouds = []
-    qpos = []
-    pose_eular = []
-    action = []
-    eff_angular = []
-    gripper_quat_xyzw = []
-    keypoints_3d_m = []
-    source_indices = []
-    timestamps_ms = []
+    source_indices = [
+        int(frame.get("index", index)) for index, (frame, _payload) in enumerate(selected)
+    ]
     camera_to_tracking_poses: list[np.ndarray | None] = []
     camera_pose_sources: list[str] = []
+    camera_pose_sequences: list[str] = []
     camera_pose_sync_errors_ms: list[float] = []
-
-    start_s = time.time()
-    total_frames = len(selected)
-    for frame_offset, (frame_record, payload) in enumerate(selected, start=1):
-        color_bgr, depth_m, intrinsics = load_rgbd_frame(input_dir, frame_record, metadata)
-        resized_rgb = resize_image(color_bgr, args.image_width, args.image_height)[:, :, ::-1].copy()
-        cloud = make_cloud_rgb(color_bgr, depth_m, intrinsics, args.max_points)
-        hand = choose_hand(payload, allow_missing=args.allow_missing_gripper)
-        pose, quat, opening = gripper_state_from_hand(
-            hand,
-            args.pose_frame,
-            camera_to_world,
-            requested_x_offset_m=args.gripper_x_offset_cm / 100.0,
-            requested_z_offset_m=args.gripper_z_offset_cm / 100.0,
-        )
-        joints = keypoints_from_hand(hand, args.pose_frame, camera_to_world)
-        if should_transform_to_output_frame(args.pose_frame):
-            cloud = transform_cloud(cloud, camera_to_world)
-
-        images.append(resized_rgb)
-        clouds.append(cloud)
-        qpos.append(np.zeros(7, dtype=np.float64))
-        pose_eular.append(pose)
-        action.append(np.zeros(7, dtype=np.float64))
-        eff_angular.append(np.asarray([opening], dtype=np.float64))
-        gripper_quat_xyzw.append(quat)
-        keypoints_3d_m.append(joints)
-        source_indices.append(int(frame_record.get("index", len(source_indices))))
-        timestamps_ms.append(float(payload.get("timestamp_ms") or frame_record.get("timestamp_ms") or np.nan))
+    for frame_record, _payload in selected:
         raw_camera_pose = frame_record.get("camera_to_tracking", frame_record.get("camera_to_world"))
         camera_pose_valid = bool(frame_record.get("camera_pose_valid", raw_camera_pose is not None))
         camera_pose_sync_errors_ms.append(float(frame_record.get("camera_pose_sync_error_ms", np.nan)))
         if raw_camera_pose is None or not camera_pose_valid:
             camera_to_tracking_poses.append(None)
-        else:
-            camera_to_tracking_poses.append(
-                validate_transform_sequence(np.asarray(raw_camera_pose, dtype=np.float64).reshape(4, 4))[0]
-            )
-            camera_pose_sources.append(str(frame_record.get("camera_pose_source", "recorded_pose")))
-        if progress_enabled and (frame_offset == 1 or frame_offset == total_frames or frame_offset % 25 == 0):
-            print_progress(
-                f"Preparing segment {segment.start}:{segment.end}",
-                frame_offset,
-                total_frames,
-                start_s,
-            )
-    if progress_enabled:
-        sys.stderr.write("\n")
-        sys.stderr.flush()
+            continue
+        camera_to_tracking_poses.append(
+            validate_transform_sequence(np.asarray(raw_camera_pose, dtype=np.float64).reshape(4, 4))[0]
+        )
+        camera_pose_sources.append(str(frame_record.get("camera_pose_source", "recorded_pose")))
+        camera_pose_sequences.append(str(frame_record.get("camera_pose_sequence", "unknown")))
 
     available_camera_pose_count = sum(pose is not None for pose in camera_to_tracking_poses)
     if 0 < available_camera_pose_count < len(camera_to_tracking_poses):
@@ -849,6 +943,198 @@ def save_segment_hdf5(
         if camera_pose_sources and len(set(camera_pose_sources)) == 1
         else ("mixed" if camera_pose_sources else "none")
     )
+    unique_camera_pose_sequences = sorted(set(camera_pose_sequences))
+    camera_pose_sequence = (
+        unique_camera_pose_sequences[0]
+        if len(unique_camera_pose_sequences) == 1
+        else ("mixed" if unique_camera_pose_sequences else "none")
+    )
+
+    episode_first_camera_to_tracking: np.ndarray | None = None
+    tracking_to_episode_first_camera: np.ndarray | None = None
+    output_camera_poses: list[np.ndarray | None] = list(camera_to_tracking_poses)
+    if args.align_to_episode_first:
+        if not has_camera_poses:
+            raise RuntimeError(
+                "--align-to-episode-first requires a valid camera pose for every frame in the episode."
+            )
+        if len(unique_camera_pose_sequences) != 1:
+            raise RuntimeError(
+                "The selected episode crosses independent ORB-SLAM3 segment trajectories: "
+                f"{unique_camera_pose_sequences}. Choose start/end frames inside one segment."
+            )
+        episode_first_camera_to_tracking = np.asarray(camera_to_tracking_poses[0], dtype=np.float64)
+        tracking_to_episode_first_camera = np.linalg.inv(episode_first_camera_to_tracking)
+        output_camera_poses = [
+            tracking_to_episode_first_camera @ np.asarray(pose, dtype=np.float64)
+            for pose in camera_to_tracking_poses
+        ]
+        if not np.allclose(output_camera_poses[0], np.eye(4), atol=1e-8):
+            raise RuntimeError("Episode-first camera pose did not normalize to identity.")
+
+    clouds = []
+    qpos = []
+    pose_eular = []
+    action = []
+    eff_angular = []
+    gripper_quat_xyzw = []
+    keypoints_3d_m = []
+    timestamps_ms = []
+
+    start_s = time.time()
+    total_frames = len(selected)
+    images: list[np.ndarray | None] = [None] * total_frames
+    episode_first_intrinsics: CameraIntrinsics | None = None
+    episode_first_image_shape: tuple[int, int] | None = None
+
+    rgb_reprojection_active = bool(
+        args.align_to_episode_first and args.reproject_rgb_to_episode_first
+    )
+    rgb_reproject_worker_count = (
+        resolve_rgb_reproject_workers(
+            int(args.rgb_reproject_workers),
+            total_frames,
+            int(args.segment_workers),
+        )
+        if rgb_reprojection_active
+        else 0
+    )
+    rgb_executor = (
+        ThreadPoolExecutor(
+            max_workers=rgb_reproject_worker_count,
+            thread_name_prefix="rgb-reproject",
+        )
+        if rgb_reproject_worker_count > 1
+        else None
+    )
+    pending_rgb = deque()
+    max_pending_rgb = max(1, 2 * rgb_reproject_worker_count)
+
+    def collect_one_rgb() -> None:
+        image_index, future = pending_rgb.popleft()
+        images[image_index] = future.result()
+
+    try:
+        for frame_index, (frame_record, payload) in enumerate(selected):
+            frame_offset = frame_index + 1
+            color_bgr, depth_m, intrinsics = load_rgbd_frame(input_dir, frame_record, metadata)
+            if color_bgr.shape[:2] != depth_m.shape:
+                raise ValueError(
+                    f"Aligned RGB/depth shape mismatch at record_index={source_indices[frame_index]}: "
+                    f"color={color_bgr.shape[:2]}, depth={depth_m.shape}."
+                )
+            if frame_index == 0:
+                episode_first_intrinsics = intrinsics
+                episode_first_image_shape = depth_m.shape
+
+            cloud = make_cloud_rgb(color_bgr, depth_m, intrinsics, args.max_points)
+            hand = choose_hand(payload, allow_missing=args.allow_missing_gripper)
+            pose, quat, opening = gripper_state_from_hand(
+                hand,
+                args.pose_frame,
+                camera_to_world,
+                requested_x_offset_m=args.gripper_x_offset_cm / 100.0,
+                requested_z_offset_m=args.gripper_z_offset_cm / 100.0,
+            )
+            joints = keypoints_from_hand(hand, args.pose_frame, camera_to_world)
+
+            if args.align_to_episode_first:
+                current_camera_to_episode_world = np.asarray(
+                    output_camera_poses[frame_index],
+                    dtype=np.float64,
+                )
+                cloud = transform_cloud(cloud, current_camera_to_episode_world)
+                if hand is not None:
+                    pose, quat = transform_gripper_state(
+                        pose,
+                        quat,
+                        current_camera_to_episode_world,
+                    )
+                joints = transform_keypoints(joints, current_camera_to_episode_world)
+
+                if args.reproject_rgb_to_episode_first:
+                    if episode_first_intrinsics is None or episode_first_image_shape is None:
+                        raise RuntimeError("Episode-first RGB projection metadata is unavailable.")
+                    projection_kwargs = dict(
+                        color_bgr=color_bgr,
+                        depth_m=depth_m,
+                        source_intrinsics=intrinsics,
+                        source_camera_to_reference=current_camera_to_episode_world,
+                        reference_intrinsics=episode_first_intrinsics,
+                        reference_height=int(episode_first_image_shape[0]),
+                        reference_width=int(episode_first_image_shape[1]),
+                        output_width=int(args.image_width),
+                        output_height=int(args.image_height),
+                    )
+                    if rgb_executor is None:
+                        images[frame_index] = reproject_rgbd_to_reference_rgb(**projection_kwargs)
+                    else:
+                        pending_rgb.append(
+                            (
+                                frame_index,
+                                rgb_executor.submit(
+                                    reproject_rgbd_to_reference_rgb,
+                                    **projection_kwargs,
+                                ),
+                            )
+                        )
+                        if len(pending_rgb) >= max_pending_rgb:
+                            collect_one_rgb()
+                else:
+                    images[frame_index] = resize_image(
+                        color_bgr,
+                        args.image_width,
+                        args.image_height,
+                    )[:, :, ::-1].copy()
+            else:
+                images[frame_index] = resize_image(
+                    color_bgr,
+                    args.image_width,
+                    args.image_height,
+                )[:, :, ::-1].copy()
+                if should_transform_to_output_frame(args.pose_frame):
+                    cloud = transform_cloud(cloud, camera_to_world)
+
+            clouds.append(cloud)
+            qpos.append(np.zeros(7, dtype=np.float64))
+            pose_eular.append(pose)
+            action.append(np.zeros(7, dtype=np.float64))
+            eff_angular.append(np.asarray([opening], dtype=np.float64))
+            gripper_quat_xyzw.append(quat)
+            keypoints_3d_m.append(joints)
+            timestamps_ms.append(
+                float(payload.get("timestamp_ms") or frame_record.get("timestamp_ms") or np.nan)
+            )
+            if progress_enabled and (
+                frame_offset == 1
+                or frame_offset == total_frames
+                or frame_offset % 25 == 0
+            ):
+                print_progress(
+                    f"Preparing segment {segment.start}:{segment.end}",
+                    frame_offset,
+                    total_frames,
+                    start_s,
+                )
+
+        while pending_rgb:
+            collect_one_rgb()
+    finally:
+        if rgb_executor is not None:
+            rgb_executor.shutdown(wait=True, cancel_futures=True)
+
+    missing_rendered_images = [
+        index for index, image in enumerate(images) if image is None
+    ]
+    if missing_rendered_images:
+        raise RuntimeError(
+            "RGB reprojection did not produce every frame: "
+            f"missing local indices {missing_rendered_images[:20]}"
+        )
+    stored_images = [image for image in images if image is not None]
+    if progress_enabled:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
     path = output_path if output_path is not None else next_episode_path(output_dir)
     with h5py.File(path, "x", rdcc_nbytes=2 * 1024**2) as root:
@@ -860,19 +1146,57 @@ def save_segment_hdf5(
         )
         root.attrs["segment_start_record_index"] = segment.start
         root.attrs["segment_end_record_index"] = segment.end
-        root.attrs["pose_frame"] = args.pose_frame
-        if args.pose_frame == "camera":
-            # This is still raw per-frame camera data. The converter defines
-            # model world from the first overview-camera frame after applying
-            # the optional camera-to-tracking trajectory.
-            root.attrs["reference_frame"] = "current_camera"
+        root.attrs["source_pose_frame"] = args.pose_frame
+        root.attrs["episode_first_alignment_applied"] = bool(args.align_to_episode_first)
+        root.attrs["rgb_reprojected_to_episode_first"] = bool(
+            args.align_to_episode_first and args.reproject_rgb_to_episode_first
+        )
+        root.attrs["rgb_reprojection_point_selection"] = (
+            "all_valid_depth_pixels"
+            if args.align_to_episode_first and args.reproject_rgb_to_episode_first
+            else "not_applied"
+        )
+        root.attrs["rgb_reprojection_occlusion_method"] = (
+            "nearest_depth_z_buffer"
+            if args.align_to_episode_first and args.reproject_rgb_to_episode_first
+            else "not_applied"
+        )
+        root.attrs["rgb_reprojection_hole_fill"] = "black_zero"
+        root.attrs["rgb_reprojection_compute"] = (
+            "vectorized_numpy_matrix" if rgb_reprojection_active else "not_applied"
+        )
+        root.attrs["rgb_reprojection_parallel_backend"] = (
+            "bounded_thread_pool"
+            if rgb_reprojection_active and rgb_reproject_worker_count > 1
+            else ("serial" if rgb_reprojection_active else "not_applied")
+        )
+        root.attrs["rgb_reprojection_workers"] = int(rgb_reproject_worker_count)
+        if args.align_to_episode_first:
+            if episode_first_camera_to_tracking is None or tracking_to_episode_first_camera is None:
+                raise RuntimeError("Internal error: episode-first alignment metadata is unavailable.")
+            root.attrs["pose_frame"] = "world"
+            root.attrs["reference_frame"] = "episode_first_camera"
+            root.attrs["world_frame_definition"] = "camera frame at first source_record_index"
+            root.attrs["episode_first_record_index"] = int(source_indices[0])
+            root.attrs["episode_first_camera_to_tracking"] = episode_first_camera_to_tracking
+            root.attrs["tracking_to_episode_first_camera"] = tracking_to_episode_first_camera
             root.attrs["overview_camera_storage_name"] = camera_names[0]
             root.attrs["uses_camera_extrinsic"] = False
+            root.attrs["uses_camera_tracking_pose"] = True
         else:
-            # Legacy export mode only. The current training/conversion pipeline
-            # expects pose_frame="camera" and does not consume this extrinsic.
-            root.attrs["camera_to_world"] = camera_to_world
-            root.attrs["uses_camera_extrinsic"] = True
+            root.attrs["pose_frame"] = args.pose_frame
+            if args.pose_frame == "camera":
+                # This is still raw per-frame camera data. The converter defines
+                # model world from the first overview-camera frame after applying
+                # the optional camera-to-tracking trajectory.
+                root.attrs["reference_frame"] = "current_camera"
+                root.attrs["overview_camera_storage_name"] = camera_names[0]
+                root.attrs["uses_camera_extrinsic"] = False
+            else:
+                # Legacy export mode only. The current training/conversion pipeline
+                # expects pose_frame="camera" and does not consume this extrinsic.
+                root.attrs["camera_to_world"] = camera_to_world
+                root.attrs["uses_camera_extrinsic"] = True
         root.attrs["gripper_x_offset_cm"] = float(args.gripper_x_offset_cm)
         root.attrs["gripper_z_offset_cm"] = float(args.gripper_z_offset_cm)
         root.attrs["image_color_format"] = "rgb"
@@ -882,6 +1206,7 @@ def save_segment_hdf5(
         root.attrs["camera_datasets_hardlinked"] = len(camera_names) > 1
         root.attrs["camera_tracking_pose_available"] = bool(has_camera_poses)
         root.attrs["camera_pose_source"] = camera_pose_source
+        root.attrs["camera_pose_sequence"] = camera_pose_sequence
         root.attrs["camera_reference_mode"] = str(args.camera_reference_mode)
         if args.canonical_camera_to_tracking_matrix is not None:
             canonical_camera_to_tracking = validate_transform_sequence(
@@ -895,7 +1220,7 @@ def save_segment_hdf5(
         first_camera = camera_names[0]
         first_image = image_grp.create_dataset(
             first_camera,
-            data=np.asarray(images, dtype=np.uint8),
+            data=np.asarray(stored_images, dtype=np.uint8),
             compression="gzip",
             compression_opts=4,
         )
@@ -905,6 +1230,8 @@ def save_segment_hdf5(
             compression="gzip",
             compression_opts=4,
         )
+        first_cloud.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
+        first_cloud.attrs["alignment_applied"] = bool(args.align_to_episode_first)
         for name in camera_names[1:]:
             image_grp[name] = first_image
             cloud_grp[name] = first_cloud
@@ -912,10 +1239,16 @@ def save_segment_hdf5(
             camera_pose_grp = obs.create_group("camera_tracking_pose")
             first_camera_pose = camera_pose_grp.create_dataset(
                 first_camera,
-                data=np.asarray(camera_to_tracking_poses, dtype=np.float64),
+                data=np.asarray(output_camera_poses, dtype=np.float64),
             )
-            first_camera_pose.attrs["transform_direction"] = "camera_to_tracking"
-            first_camera_pose.attrs["notation"] = "T_tracking<-camera"
+            if args.align_to_episode_first:
+                first_camera_pose.attrs["transform_direction"] = "camera_to_episode_first_camera"
+                first_camera_pose.attrs["notation"] = "T_episodeFirstCamera<-camera"
+                first_camera_pose.attrs["reference_record_index"] = int(source_indices[0])
+                first_camera_pose.attrs["first_pose_is_identity"] = True
+            else:
+                first_camera_pose.attrs["transform_direction"] = "camera_to_tracking"
+                first_camera_pose.attrs["notation"] = "T_tracking<-camera"
             first_camera_pose.attrs["translation_unit"] = "meter"
             first_camera_pose.attrs["pose_format"] = "matrix"
             first_camera_pose.attrs["tracking_source"] = camera_pose_source
@@ -938,10 +1271,17 @@ def save_segment_hdf5(
             )
 
         obs.create_dataset("qpos", data=np.asarray(qpos, dtype=np.float64))
-        obs.create_dataset("pose_eular", data=np.asarray(pose_eular, dtype=np.float64))
+        pose_dataset = obs.create_dataset("pose_eular", data=np.asarray(pose_eular, dtype=np.float64))
+        pose_dataset.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
         obs.create_dataset("eff_angular", data=np.asarray(eff_angular, dtype=np.float64))
-        obs.create_dataset("gripper_quat_xyzw", data=np.asarray(gripper_quat_xyzw, dtype=np.float64))
-        obs.create_dataset("keypoints_3d_m", data=np.asarray(keypoints_3d_m, dtype=np.float64))
+        quat_dataset = obs.create_dataset(
+            "gripper_quat_xyzw", data=np.asarray(gripper_quat_xyzw, dtype=np.float64)
+        )
+        quat_dataset.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
+        keypoint_dataset = obs.create_dataset(
+            "keypoints_3d_m", data=np.asarray(keypoints_3d_m, dtype=np.float64)
+        )
+        keypoint_dataset.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
         root.create_dataset("action", data=np.asarray(action, dtype=np.float64))
         root.create_dataset("source_record_index", data=np.asarray(source_indices, dtype=np.int64))
         root.create_dataset("timestamp_ms", data=np.asarray(timestamps_ms, dtype=np.float64))
@@ -1161,6 +1501,159 @@ def transform_cloud(cloud_rgb: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return output
 
 
+def transform_gripper_state(
+    pose_euler: np.ndarray,
+    quaternion_xyzw: np.ndarray,
+    transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform one gripper pose from the current camera frame into the output frame."""
+
+    pose = np.asarray(pose_euler, dtype=np.float64)
+    quat = np.asarray(quaternion_xyzw, dtype=np.float64)
+    if pose.shape != (6,) or quat.shape != (4,):
+        raise ValueError("Invalid gripper pose shape.")
+    position, rotation = transform_pose(
+        pose[:3],
+        R.from_quat(quat).as_matrix(),
+        np.asarray(transform, dtype=np.float64),
+    )
+    output_rotation = R.from_matrix(rotation)
+    return (
+        np.concatenate([position, output_rotation.as_euler("zyx")]),
+        output_rotation.as_quat(),
+    )
+
+
+def transform_keypoints(keypoints: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Transform finite 3D keypoints while preserving NaN rows for missing detections."""
+
+    output = np.asarray(keypoints, dtype=np.float64).copy()
+    if output.shape != (21, 3):
+        return output
+    valid = np.all(np.isfinite(output), axis=1)
+    if np.any(valid):
+        output[valid] = transform_points(output[valid], np.asarray(transform, dtype=np.float64))
+    return output
+
+
+def reproject_rgbd_to_reference_camera(
+    *,
+    color_bgr: np.ndarray,
+    depth_m: np.ndarray,
+    source_intrinsics: CameraIntrinsics,
+    source_camera_to_reference: np.ndarray,
+    reference_intrinsics: CameraIntrinsics,
+    reference_height: int,
+    reference_width: int,
+) -> np.ndarray:
+    """Render one RGB-D frame using vectorized matrix operations over every valid depth pixel.
+
+    The input transform uses the convention T_reference<-sourceCamera. Points behind
+    the reference camera or outside its image are discarded. When multiple source
+    points hit the same reference pixel, the nearest positive reference-frame depth
+    wins. Pixels with no projected point remain black.
+    """
+
+    color = np.asarray(color_bgr, dtype=np.uint8)
+    depth = np.asarray(depth_m, dtype=np.float32)
+    if color.shape[:2] != depth.shape:
+        raise ValueError(
+            f"RGB/depth shape mismatch for reprojection: color={color.shape[:2]}, depth={depth.shape}."
+        )
+    if reference_height <= 0 or reference_width <= 0:
+        raise ValueError("Reference image dimensions must be positive.")
+
+    valid = np.isfinite(depth) & (depth > 0.0)
+    output = np.zeros((reference_height, reference_width, 3), dtype=np.uint8)
+    if not np.any(valid):
+        return output
+
+    source_v, source_u = np.nonzero(valid)
+    source_z = depth[source_v, source_u].astype(np.float64, copy=False)
+    source_x = (
+        (source_u.astype(np.float64) - float(source_intrinsics.ppx))
+        * source_z
+        / float(source_intrinsics.fx)
+    )
+    source_y = (
+        (source_v.astype(np.float64) - float(source_intrinsics.ppy))
+        * source_z
+        / float(source_intrinsics.fy)
+    )
+    source_points = np.column_stack((source_x, source_y, source_z))
+
+    transform = validate_transform_sequence(
+        np.asarray(source_camera_to_reference, dtype=np.float64).reshape(4, 4)
+    )[0]
+    reference_points = transform_points(source_points, transform)
+    reference_z = reference_points[:, 2]
+    finite_front = np.all(np.isfinite(reference_points), axis=1) & (reference_z > 0.0)
+    if not np.any(finite_front):
+        return output
+
+    reference_points = reference_points[finite_front]
+    reference_z = reference_z[finite_front]
+    colors = color[source_v[finite_front], source_u[finite_front]]
+
+    projected_u = np.rint(
+        float(reference_intrinsics.fx) * reference_points[:, 0] / reference_z
+        + float(reference_intrinsics.ppx)
+    ).astype(np.int64)
+    projected_v = np.rint(
+        float(reference_intrinsics.fy) * reference_points[:, 1] / reference_z
+        + float(reference_intrinsics.ppy)
+    ).astype(np.int64)
+
+    inside = (
+        (projected_u >= 0)
+        & (projected_u < reference_width)
+        & (projected_v >= 0)
+        & (projected_v < reference_height)
+    )
+    if not np.any(inside):
+        return output
+
+    projected_u = projected_u[inside]
+    projected_v = projected_v[inside]
+    reference_z = reference_z[inside]
+    colors = colors[inside]
+    flat_indices = projected_v * reference_width + projected_u
+
+    z_buffer = np.full(reference_height * reference_width, np.inf, dtype=np.float64)
+    np.minimum.at(z_buffer, flat_indices, reference_z)
+    nearest = reference_z <= z_buffer[flat_indices] + 1e-9
+
+    output.reshape(-1, 3)[flat_indices[nearest]] = colors[nearest]
+    return output
+
+
+def reproject_rgbd_to_reference_rgb(
+    *,
+    color_bgr: np.ndarray,
+    depth_m: np.ndarray,
+    source_intrinsics: CameraIntrinsics,
+    source_camera_to_reference: np.ndarray,
+    reference_intrinsics: CameraIntrinsics,
+    reference_height: int,
+    reference_width: int,
+    output_width: int,
+    output_height: int,
+) -> np.ndarray:
+    """Vectorized full-depth reprojection followed by resize and BGR-to-RGB conversion."""
+
+    projected_bgr = reproject_rgbd_to_reference_camera(
+        color_bgr=color_bgr,
+        depth_m=depth_m,
+        source_intrinsics=source_intrinsics,
+        source_camera_to_reference=source_camera_to_reference,
+        reference_intrinsics=reference_intrinsics,
+        reference_height=reference_height,
+        reference_width=reference_width,
+    )
+    resized_bgr = resize_image(projected_bgr, output_width, output_height)
+    return resized_bgr[:, :, ::-1].copy()
+
+
 def make_cloud_rgb(
     color_bgr: np.ndarray,
     depth_m: np.ndarray,
@@ -1294,12 +1787,17 @@ def draw_overlay(
     index: int,
     total: int,
     record_index: int,
+    camera_pose_sequence: str,
     start_record_index: int | None,
+    start_camera_pose_sequence: str | None,
     saved_count: int,
 ) -> None:
     lines = [
-        f"{index + 1}/{total} record_index={record_index}",
-        f"start={start_record_index if start_record_index is not None else '-'} saved={saved_count}",
+        f"{index + 1}/{total} record_index={record_index} pose={camera_pose_sequence}",
+        (
+            f"start={start_record_index if start_record_index is not None else '-'} "
+            f"start_pose={start_camera_pose_sequence or '-'} saved={saved_count}"
+        ),
         "Right/D Left/A | Up/W start | Down/S save | U undo | Q quit",
     ]
     x, y = 12, 24

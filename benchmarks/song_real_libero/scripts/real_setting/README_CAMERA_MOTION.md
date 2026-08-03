@@ -1,3 +1,174 @@
+# Ego数据采集--离线数据录制
+PIPE=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/real_setting/song_rgbd_pipeline.sh
+
+#动态相机---L515
+  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking
+  #数据采集
+  bash "$PIPE" record \
+    --camera L515 \
+    --output "$DYNAMIC_OUTPUT_DIR" 
+  #动态相机一键处理所有 segments
+  bash "$PIPE" process-all \
+    --mode dynamic \
+    --camera L515 \
+    --output "$DYNAMIC_OUTPUT_DIR" \
+    --fast \
+    --progress-every 10 \
+    --segment-workers 3
+  #单独处理并查看某个动态 segment
+  bash "$PIPE" process-segment \
+  --mode dynamic \
+  --camera L515 \
+  --output ${DYNAMIC_OUTPUT_DIR} \
+  --segment 0 \
+  --fast \
+  --progress-every 10 \
+  --view
+  #查看已经处理好的轨迹
+  bash "$PIPE" view \
+  --mode dynamic \
+  --output ${DYNAMIC_OUTPUT_DIR} \
+  --segment 1
+
+
+#固定相机---L515
+#数据采集
+STATIC_OUTPUT_DIR=/home/liusong/temp/temp_record
+bash "$PIPE" process-all \
+  --mode static \
+  --camera L515 \
+  --output ${STATIC_OUTPUT_DIR} 
+
+#单独处理并查看静态 segment
+bash "$PIPE" process-segment \
+  --mode static \
+  --camera L515 \
+  --output ${STATIC_OUTPUT_DIR} \
+  --segment 0 \
+  --view
+#查看已经处理好的轨迹
+bash "$PIPE" view \
+  --mode static \
+  --output ${STATIC_OUTPUT_DIR}\
+  --segment 0
+
+# Ego数据处理
+  ## 构造真机 HDF5 HDF5FromRawData  Raw--->HDF5
+  cd ~/ProgramFiles/Huggingface/lerobot
+  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking
+  HDF5_OUTPUT_DIR=benchmarks/song_real_libero/data/real_setting/hdf5_raw
+
+  ###############################
+  #inference可视化  --run-inference or --show-inference
+  #切片可视化  --show 
+  #真机数据保持在 overhead 相机坐标系，不使用 camera_to_world 外参。
+  #如果要一键离线推理再交互切片：
+  python benchmarks/song_real_libero/scripts/real_setting/build_humanhand_hdf5_dataset.py \
+    --input "$DYNAMIC_OUTPUT_DIR" \
+    --output-dir "$HDF5_OUTPUT_DIR" \
+    --camera-pose-jsonl "$DYNAMIC_OUTPUT_DIR/orbslam3" \
+    --require-camera-pose \
+    --camera-pose-max-sync-error-ms 20 \
+    --camera-reference-mode episode_first \
+    --pose-frame camera \
+    --align-to-episode-first \
+    --reproject-rgb-to-episode-first \
+    --rgb-reproject-workers 4 \
+    --run-inference \
+    --show-inference \
+    --wilor-repo /home/liusong/ProgramFiles/HandPoseExtraction/external/WiLoR \
+    --fast \
+    --force-handedness right \
+    --fusion-mode model-depth \
+    --camera-names overhead,hand
+    
+  #直接用推理后的结果交互切片
+  python benchmarks/song_real_libero/scripts/real_setting/build_humanhand_hdf5_dataset.py \
+    --input "$DYNAMIC_OUTPUT_DIR" \
+    --jsonl "$DYNAMIC_OUTPUT_DIR/handpose_wilor.jsonl" \
+    --output-dir "$HDF5_OUTPUT_DIR" \
+    --camera-pose-jsonl "$DYNAMIC_OUTPUT_DIR/orbslam3" \
+    --require-camera-pose \
+    --camera-pose-max-sync-error-ms 20 \
+    --camera-reference-mode episode_first \
+    --pose-frame camera \
+    --align-to-episode-first \
+    --reproject-rgb-to-episode-first \
+    --force-handedness right \
+    --fusion-mode model-depth \
+    --camera-names overhead,hand
+
+  #离线推理后切分点切片
+  python benchmarks/song_real_libero/scripts/real_setting/build_humanhand_hdf5_dataset.py \
+    --input "$DYNAMIC_OUTPUT_DIR" \
+    --jsonl "$DYNAMIC_OUTPUT_DIR/handpose_wilor.jsonl" \
+    --output-dir "$HDF5_OUTPUT_DIR" \
+    --no-interactive \
+    --camera-pose-jsonl "$DYNAMIC_OUTPUT_DIR/orbslam3" \
+    --require-camera-pose \
+    --camera-pose-max-sync-error-ms 20 \
+    --camera-reference-mode episode_first \
+    --pose-frame camera \
+    --align-to-episode-first \
+    --reproject-rgb-to-episode-first \
+    --force-handedness right \
+    --fusion-mode model-depth \
+    --camera-names overhead,hand \
+    --segments "$(cat "$DYNAMIC_OUTPUT_DIR/segments.txt")" \
+    --max-points 50000 \
+    --rgb-reproject-workers 4 \
+    --segment-workers 4
+    
+  ## 预处理---Continuous---HalfReduce---AddGripper---MixedStageGen
+    ## Continuous----Check HDF5 Quality
+      python benchmarks/song_real_libero/scripts/check_discontinuous_hdf5.py  --hdf5_dir benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo
+    ## Continuous----Check HDF5 Quality
+
+    python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/hdf5_edit_reduce.py
+
+    python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/add_gripper_cloud_to_hdf5.py
+
+    python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/check_discontinuous_hdf5.py
+
+
+
+  ## LeRobotDatasetFromRealHDF5  HDF5-->(Add Gripper-->)Current EEF/UMI-->Zarr-->Dataset
+    # 输入 HDF5 已经包含 observations/cloud_rgb/<camera>，不会下载 LIBERO 数据、
+    # 重播轨迹、渲染深度图或从深度图反投影点云。
+    # 如果 HDF5 已经由 add_gripper_cloud_to_hdf5.py 加过末端点云（StageGen Mixed），追加： --input-has-gripper-cloud 
+    # 如果无虚拟末端点云，使用 --gripper-points 500 --gripper-max-width 0.08 
+    # 当使用变长点云（适配StageGen Mixed）训练，使用 --num-points 0
+    export HDF5_USE_FILE_LOCKING=FALSE
+    python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py \
+      --input-dir benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo \
+      --output-root benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset \
+      --repo-id song_real_pointcloud \
+      --fps 15 \
+      --num-points 0 \
+      --input-has-gripper-cloud \
+      --point-cloud-storage zarr \
+      --workers 6 \
+      --vis-count 2 \
+      --overwrite \
+      --task  "Place the Red Cube on the Blue Cube"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # L515 / D435I 采集、位姿检查与移动相机补偿
 
 本文说明真机 RGB-D 数据的坐标约定、L515/D435I 采集调试、静止相机漂移检查，以及移动
@@ -68,10 +239,10 @@ python benchmarks/song_real_libero/scripts/real_setting/record_bestman_rgbd.py \
 
 ```bash
 python benchmarks/song_real_libero/scripts/real_setting/record_bestman_rgbd.py \
-  --camera D435I \
+  --camera L515 \
   --output /home/liusong/temp/temp_record \
   --storage compressed \
-  --num-frames 300 \
+  --space-toggle-recording \
   --record-imu \
   --camera-trajectory-mode rgbd_odometry \
   --visualize-aligned-point-cloud \
@@ -84,6 +255,9 @@ python benchmarks/song_real_libero/scripts/real_setting/record_bestman_rgbd.py \
 它会拒绝无法可靠配准的帧，不会用上一帧位姿静默填充。但是它仍属于视觉诊断/回退方案，
 不能自动等同于正式 SLAM/VIO ground truth。人手和物体大幅移动、静态背景很少或深度纹理
 不足时，训练数据优先使用 RTAB-Map 等输出的 metric 全 SE(3) 轨迹。
+
+
+
 
 正式外部轨迹模式：
 
@@ -302,6 +476,9 @@ SLAM/VIO 的输出必须转换成下一节的 `camera_to_tracking` JSONL，再�
 
 轨迹必须显式提供 `record_index`。若同时有时间戳，默认要求 RGB-D 与 pose 的绝对同步误差
 不超过 20 ms。
+
+
+
 
 ## 6. 构造真机 HDF5
 

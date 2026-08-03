@@ -2559,6 +2559,7 @@ class _InferenceRequest:
     task: str
     postprocess: bool
     state_pose_mode: str
+    noise_mode: str
     noise_seed: int | None
     future: Future[Any]
 
@@ -2632,6 +2633,7 @@ class BatchedInferenceScheduler:
         task: str | list[str] = "",
         postprocess: bool = True,
         state_pose_mode: str = "identity",
+        noise_mode: str = "sample",
         noise_seed: int | None = None,
     ) -> Any:
         if self._closed:
@@ -2647,6 +2649,7 @@ class BatchedInferenceScheduler:
                 task=str(task),
                 postprocess=bool(postprocess),
                 state_pose_mode=str(state_pose_mode),
+                noise_mode=str(noise_mode),
                 noise_seed=None if noise_seed is None else int(noise_seed),
                 future=future,
             )
@@ -2675,7 +2678,8 @@ class BatchedInferenceScheduler:
         try:
             postprocess_values = {request.postprocess for request in requests}
             state_modes = {request.state_pose_mode for request in requests}
-            if len(postprocess_values) != 1 or len(state_modes) != 1:
+            noise_modes = {request.noise_mode for request in requests}
+            if len(postprocess_values) != 1 or len(state_modes) != 1 or len(noise_modes) != 1:
                 raise ValueError("All requests in one dynamic batch must use the same inference options.")
             if len(requests) == 1:
                 # Preserve the exact serial preprocessing path.  Stacking a
@@ -2688,6 +2692,7 @@ class BatchedInferenceScheduler:
                     task=request.task,
                     postprocess=request.postprocess,
                     state_pose_mode=request.state_pose_mode,
+                    noise_mode=request.noise_mode,
                     noise_seed=request.noise_seed,
                 )
             else:
@@ -2699,6 +2704,7 @@ class BatchedInferenceScheduler:
                     task=[request.task for request in requests],
                     postprocess=requests[0].postprocess,
                     state_pose_mode=requests[0].state_pose_mode,
+                    noise_mode=requests[0].noise_mode,
                     noise_seed=[request.noise_seed for request in requests]
                     if all(request.noise_seed is not None for request in requests)
                     else None,
@@ -2750,6 +2756,7 @@ class _ProcessInferenceRequest:
     task: str
     postprocess: bool
     state_pose_mode: str
+    noise_mode: str
     noise_seed: int | None
 
 
@@ -2790,6 +2797,7 @@ class ProcessInferenceProxy:
         task: str | list[str] = "",
         postprocess: bool = True,
         state_pose_mode: str = "identity",
+        noise_mode: str = "sample",
         noise_seed: int | None = None,
     ) -> np.ndarray:
         if not isinstance(task, str):
@@ -2806,6 +2814,7 @@ class ProcessInferenceProxy:
                 task=str(task),
                 postprocess=bool(postprocess),
                 state_pose_mode=str(state_pose_mode),
+                noise_mode=str(noise_mode),
                 noise_seed=None if noise_seed is None else int(noise_seed),
             )
         )
@@ -2900,7 +2909,8 @@ def _execute_process_inference_batch(
     try:
         postprocess_values = {request.postprocess for request in requests}
         state_modes = {request.state_pose_mode for request in requests}
-        if len(postprocess_values) != 1 or len(state_modes) != 1:
+        noise_modes = {request.noise_mode for request in requests}
+        if len(postprocess_values) != 1 or len(state_modes) != 1 or len(noise_modes) != 1:
             raise ValueError("All requests in one dynamic batch must use the same inference options.")
         if len(requests) == 1:
             request = requests[0]
@@ -2909,6 +2919,7 @@ def _execute_process_inference_batch(
                 task=request.task,
                 postprocess=request.postprocess,
                 state_pose_mode=request.state_pose_mode,
+                noise_mode=request.noise_mode,
                 noise_seed=request.noise_seed,
             )
         else:
@@ -2918,6 +2929,7 @@ def _execute_process_inference_batch(
                 task=[request.task for request in requests],
                 postprocess=requests[0].postprocess,
                 state_pose_mode=requests[0].state_pose_mode,
+                noise_mode=requests[0].noise_mode,
                 noise_seed=[request.noise_seed for request in requests]
                 if all(request.noise_seed is not None for request in requests)
                 else None,

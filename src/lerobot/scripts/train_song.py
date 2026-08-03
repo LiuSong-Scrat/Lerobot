@@ -1644,8 +1644,8 @@ def _apply_song_debug_defaults() -> None:
         return
     sys.argv = [
         "train_song.py",
-        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
-        # "--policy.type=smolvla",
+        # "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
+        "--policy.type=smolvla",
         # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
         "--policy.push_to_hub=false",
         "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_adapter_lerobot_dataset",
@@ -1655,7 +1655,7 @@ def _apply_song_debug_defaults() -> None:
         "--policy.vlm_model_name=/home/liusong/hf_models/SmolVLM2-500M-Video-Instruct",
         "--policy.vlm_weights_path=/home/liusong/hf_models/smolvla_base",
         "--policy.load_vlm_weights=true",
-        "--batch_size=6",
+        "--batch_size=4-",
         "--steps=80000",
         "--log_freq=1",
         "--output_dir=/home/liusong/temp/train_test",

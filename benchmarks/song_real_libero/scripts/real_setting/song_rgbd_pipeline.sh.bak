@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+DEFAULT_ORB_ROOT="/home/liusong/ProgramFiles/ORB_SLAM3/ORB_SLAM3"
+DEFAULT_PROGRESS_EVERY=10
+DEFAULT_TIMESTAMP_TOLERANCE_S=0.001
+
+COMMAND=""
+MODE=""
+CAMERA="L515"
+OUTPUT_ROOT=""
+ORB_ROOT="${ORB_ROOT:-$DEFAULT_ORB_ROOT}"
+SEGMENT_ID=""
+TIMESTAMP_MODE="continuous"
+PROGRESS_EVERY="$DEFAULT_PROGRESS_EVERY"
+SEGMENT_WORKERS=1
+RECORD_FPS=""
+TIMESTAMP_TOLERANCE_S="$DEFAULT_TIMESTAMP_TOLERANCE_S"
+FAST=1
+VIEW_AFTER=0
+RECORD_IMU=1
+ALLOW_EXISTING=0
+
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME record          --camera L515|D435I --output DIR [options]
+  $SCRIPT_NAME process-all     --mode dynamic|static --camera L515|D435I --output DIR [options]
+  $SCRIPT_NAME process-segment --mode dynamic|static --camera L515|D435I --output DIR --segment N [--view]
+  $SCRIPT_NAME view            --mode dynamic|static --output DIR --segment N [options]
+  $SCRIPT_NAME summary         --output DIR
+
+Commands:
+  record          Record RGB-D only. Space starts/pauses episodes.
+  process-all     Prepare and process every segment_* as an episode.
+  process-segment Prepare and process exactly one segment.
+  view            Open the Open3D aligned-cloud viewer for one processed segment.
+  summary         Print trajectory coverage for all prepared segments.
+
+Common options:
+  --mode MODE                 dynamic uses ORB-SLAM3; static writes identity poses.
+  --camera NAME               L515 or D435I. Default: L515.
+  --output DIR                Recording root containing frames.jsonl.
+  --orb-root DIR              ORB-SLAM3 root. Default: $DEFAULT_ORB_ROOT
+  --segment N                 Segment ID, for example 0 or 12.
+  --timestamp-mode MODE       continuous or recorded. Default: continuous.
+  --progress-every N          ORB progress interval. Default: $DEFAULT_PROGRESS_EVERY.
+  --segment-workers N          Concurrent segment processes for process-all. Default: 1.
+  --fps N                      RGB-D capture FPS for record; passed to record_bestman_rgbd.py.
+  --timestamp-tolerance-s S   TUM-to-frame match tolerance. Default: $DEFAULT_TIMESTAMP_TOLERANCE_S.
+  --fast                      Disable real-time sleeping when supported. Default.
+  --realtime                  Preserve recorded pacing.
+  --view                      View after process-segment succeeds.
+  --record-imu                Also save raw IMU during recording. Default.
+  --no-record-imu             Do not record IMU.
+  --allow-existing            Allow record command when frames.jsonl already exists.
+  -h, --help                  Show this help.
+
+No pose interpolation is performed. A segment is marked failed when ORB-SLAM3
+does not produce a pose for every input frame.
+EOF
+}
+
+die() {
+  echo "[ERROR] $*" >&2
+  exit 1
+}
+
+note() {
+  echo "[INFO] $*"
+}
+
+warn() {
+  echo "[WARN] $*" >&2
+}
+
+require_file() {
+  [[ -s "$1" ]] || die "Missing or empty file: $1"
+}
+
+require_dir() {
+  [[ -d "$1" ]] || die "Missing directory: $1"
+}
+
+segment_name() {
+  local raw="$1"
+  [[ "$raw" =~ ^[0-9]+$ ]] || die "--segment must be a non-negative integer: $raw"
+  printf 'segment_%03d' "$((10#$raw))"
+}
+
+resolve_tools() {
+  RECORD_SCRIPT="${RECORD_SCRIPT:-$SCRIPT_DIR/record_bestman_rgbd.py}"
+  PREPARE_SCRIPT="${PREPARE_SCRIPT:-$SCRIPT_DIR/prepare_orbslam3_rgbd.py}"
+  CONVERTER_SCRIPT="${CONVERTER_SCRIPT:-$SCRIPT_DIR/convert_orbslam3_tum_to_jsonl.py}"
+  STATIC_SCRIPT="${STATIC_SCRIPT:-$SCRIPT_DIR/make_static_pose_jsonl.py}"
+  RGBD_TUM="$ORB_ROOT/Examples/RGB-D/rgbd_tum"
+  VOCABULARY="$ORB_ROOT/Vocabulary/ORBvoc.txt"
+
+  require_file "$RECORD_SCRIPT"
+  require_file "$PREPARE_SCRIPT"
+  require_file "$CONVERTER_SCRIPT"
+  require_file "$STATIC_SCRIPT"
+
+  if [[ "$COMMAND" == process-all || "$COMMAND" == process-segment ]] && [[ "$MODE" == dynamic ]]; then
+    [[ -x "$RGBD_TUM" ]] || die "ORB-SLAM3 executable is missing: $RGBD_TUM"
+    require_file "$VOCABULARY"
+  fi
+}
+
+parse_args() {
+  [[ $# -ge 1 ]] || { usage; exit 2; }
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode) MODE="${2:?missing value for --mode}"; shift 2 ;;
+      --camera) CAMERA="${2:?missing value for --camera}"; shift 2 ;;
+      --output) OUTPUT_ROOT="${2:?missing value for --output}"; shift 2 ;;
+      --orb-root) ORB_ROOT="${2:?missing value for --orb-root}"; shift 2 ;;
+      --segment) SEGMENT_ID="${2:?missing value for --segment}"; shift 2 ;;
+      --timestamp-mode) TIMESTAMP_MODE="${2:?missing value for --timestamp-mode}"; shift 2 ;;
+      --progress-every) PROGRESS_EVERY="${2:?missing value for --progress-every}"; shift 2 ;;
+      --segment-workers) SEGMENT_WORKERS="${2:?missing value for --segment-workers}"; shift 2 ;;
+      --fps) RECORD_FPS="${2:?missing value for --fps}"; shift 2 ;;
+      --timestamp-tolerance-s) TIMESTAMP_TOLERANCE_S="${2:?missing value for --timestamp-tolerance-s}"; shift 2 ;;
+      --fast) FAST=1; shift ;;
+      --realtime) FAST=0; shift ;;
+      --view) VIEW_AFTER=1; shift ;;
+      --record-imu) RECORD_IMU=1; shift ;;
+      --no-record-imu) RECORD_IMU=0; shift ;;
+      --allow-existing) ALLOW_EXISTING=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+
+  [[ "$COMMAND" =~ ^(record|process-all|process-segment|view|summary)$ ]] \
+    || die "Unknown command: $COMMAND"
+  [[ "$CAMERA" == L515 || "$CAMERA" == D435I ]] \
+    || die "--camera must be L515 or D435I"
+  [[ "$TIMESTAMP_MODE" == continuous || "$TIMESTAMP_MODE" == recorded ]] \
+    || die "--timestamp-mode must be continuous or recorded"
+  [[ "$PROGRESS_EVERY" =~ ^[1-9][0-9]*$ ]] \
+    || die "--progress-every must be a positive integer"
+  [[ "$SEGMENT_WORKERS" =~ ^[1-9][0-9]*$ ]] \
+    || die "--segment-workers must be a positive integer"
+  if [[ -n "$RECORD_FPS" ]]; then
+    [[ "$RECORD_FPS" =~ ^[1-9][0-9]*$ ]] \
+      || die "--fps must be a positive integer"
+  fi
+  [[ -n "$OUTPUT_ROOT" ]] || die "--output is required"
+  OUTPUT_ROOT=$(realpath -m "$OUTPUT_ROOT")
+  ORB_ROOT=$(realpath -m "$ORB_ROOT")
+
+  case "$COMMAND" in
+    process-all|process-segment|view)
+      [[ "$MODE" == dynamic || "$MODE" == static ]] \
+        || die "--mode must be dynamic or static"
+      ;;
+  esac
+  case "$COMMAND" in
+    process-segment|view)
+      [[ -n "$SEGMENT_ID" ]] || die "--segment is required"
+      ;;
+  esac
+}
+
+prepare_segments() {
+  local selection="$1"
+  require_dir "$OUTPUT_ROOT"
+  require_file "$OUTPUT_ROOT/frames.jsonl"
+  note "Preparing ORB-SLAM3 segment input: selection=$selection timestamp_mode=$TIMESTAMP_MODE"
+  python "$PREPARE_SCRIPT" \
+    "$OUTPUT_ROOT" \
+    --segments "$selection" \
+    --timestamp-mode "$TIMESTAMP_MODE"
+}
+
+find_rgbd_yaml() {
+  local segment_dir="$1"
+  local candidate
+  for candidate in \
+    "$segment_dir/${CAMERA}_RGBD.yaml" \
+    "$segment_dir/RGBD.yaml" \
+    "$segment_dir/L515_RGBD.yaml" \
+    "$segment_dir/D435I_RGBD.yaml"; do
+    if [[ -s "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  while IFS= read -r candidate; do
+    [[ "$(basename "$candidate")" == *IMU* ]] && continue
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(find "$segment_dir" -maxdepth 1 -type f -name '*RGBD*.yaml' | sort)
+  return 1
+}
+
+rgbd_tum_supports() {
+  local option="$1"
+  grep -a -q -- "$option" "$RGBD_TUM" 2>/dev/null
+}
+
+run_orb_segment() {
+  local segment_dir="$1"
+  local name settings log_file status input_count trajectory_count
+  name=$(basename "$segment_dir")
+  settings=$(find_rgbd_yaml "$segment_dir") \
+    || { warn "$name: no RGB-D YAML found"; return 1; }
+
+  require_file "$segment_dir/associations.txt"
+  require_file "$segment_dir/frame_map.jsonl"
+  require_dir "$segment_dir/dataset"
+
+  local -a runtime_options=()
+  if rgbd_tum_supports '--no-viewer'; then
+    runtime_options+=(--no-viewer)
+  else
+    warn "$name: rgbd_tum has no --no-viewer option; the stock Viewer may open"
+  fi
+  if rgbd_tum_supports '--progress-every'; then
+    runtime_options+=(--progress-every "$PROGRESS_EVERY")
+  else
+    warn "$name: rgbd_tum has no progress option; install the progress-enabled version"
+  fi
+  if (( FAST )); then
+    if rgbd_tum_supports '--no-realtime'; then
+      runtime_options+=(--no-realtime)
+    else
+      warn "$name: rgbd_tum has no --no-realtime option; processing remains real-time limited"
+    fi
+  elif rgbd_tum_supports '--realtime'; then
+    runtime_options+=(--realtime)
+  fi
+
+  rm -f \
+    "$segment_dir/CameraTrajectory.txt" \
+    "$segment_dir/KeyFrameTrajectory.txt" \
+    "$segment_dir/dataset/camera_pose_orbslam3.jsonl"
+
+  log_file="$segment_dir/orbslam3_rgbd.log"
+  note "$name: running ORB-SLAM3 with $(basename "$settings")"
+
+  set +e
+  (
+    cd "$segment_dir"
+    "$RGBD_TUM" \
+      "$VOCABULARY" \
+      "$settings" \
+      "$segment_dir/dataset" \
+      "$segment_dir/associations.txt" \
+      "${runtime_options[@]}"
+  ) 2>&1 | tee "$log_file"
+  status=${PIPESTATUS[0]}
+  set -e
+
+  if (( status != 0 )); then
+    warn "$name: ORB-SLAM3 exited with status $status; see $log_file"
+    return 1
+  fi
+  if [[ ! -s "$segment_dir/CameraTrajectory.txt" ]]; then
+    warn "$name: CameraTrajectory.txt was not generated"
+    return 1
+  fi
+
+  input_count=$(wc -l < "$segment_dir/associations.txt")
+  trajectory_count=$(wc -l < "$segment_dir/CameraTrajectory.txt")
+  if [[ "$input_count" -ne "$trajectory_count" ]]; then
+    warn "$name: incomplete tracking: frames=$input_count poses=$trajectory_count"
+    warn "$name: no interpolation will be performed"
+    return 1
+  fi
+
+  note "$name: converting complete TUM trajectory to camera_pose_orbslam3.jsonl"
+  if ! python "$CONVERTER_SCRIPT" \
+    "$segment_dir/frame_map.jsonl" \
+    "$segment_dir/CameraTrajectory.txt" \
+    "$segment_dir/dataset/camera_pose_orbslam3.jsonl" \
+    --timestamp-tolerance-s "$TIMESTAMP_TOLERANCE_S"; then
+    warn "$name: trajectory conversion failed"
+    return 1
+  fi
+
+  local json_count
+  json_count=$(wc -l < "$segment_dir/dataset/camera_pose_orbslam3.jsonl")
+  [[ "$json_count" -eq "$input_count" ]] \
+    || { warn "$name: JSONL coverage mismatch: frames=$input_count poses=$json_count"; return 1; }
+
+  note "$name: dynamic trajectory complete ($json_count/$input_count poses)"
+}
+
+run_static_segment() {
+  local segment_dir="$1"
+  local name input_count pose_count
+  name=$(basename "$segment_dir")
+  require_file "$segment_dir/dataset/frames.jsonl"
+
+  if ! python "$STATIC_SCRIPT" \
+    "$segment_dir/dataset/frames.jsonl" \
+    "$segment_dir/dataset/camera_pose_static.jsonl"; then
+    warn "$name: static trajectory generation failed"
+    return 1
+  fi
+
+  input_count=$(wc -l < "$segment_dir/dataset/frames.jsonl")
+  pose_count=$(wc -l < "$segment_dir/dataset/camera_pose_static.jsonl")
+  [[ "$input_count" -eq "$pose_count" ]] \
+    || { warn "$name: static pose coverage mismatch"; return 1; }
+  note "$name: static identity trajectory complete ($pose_count/$input_count poses)"
+}
+
+pose_path_for() {
+  local segment_dir="$1"
+  if [[ "$MODE" == dynamic ]]; then
+    printf '%s\n' "$segment_dir/dataset/camera_pose_orbslam3.jsonl"
+  else
+    printf '%s\n' "$segment_dir/dataset/camera_pose_static.jsonl"
+  fi
+}
+
+view_segment() {
+  local segment_dir="$1"
+  local pose_path
+  pose_path=$(pose_path_for "$segment_dir")
+  require_file "$pose_path"
+  require_file "$segment_dir/dataset/frames.jsonl"
+
+  note "Opening aligned point-cloud playback: $(basename "$segment_dir") mode=$MODE"
+  python "$RECORD_SCRIPT" \
+    --output "$segment_dir/dataset" \
+    --playback-only \
+    --aligned-point-cloud-pose-source external \
+    --aligned-point-cloud-pose-jsonl "$pose_path" \
+    --aligned-point-cloud-fps 15 \
+    --aligned-point-cloud-point-stride 4 \
+    --aligned-point-cloud-max-points 60000
+}
+
+line_count() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    wc -l < "$path"
+  else
+    echo 0
+  fi
+}
+
+write_summary() {
+  local summary_path="$OUTPUT_ROOT/orbslam3/trajectory_summary.tsv"
+  mkdir -p "$OUTPUT_ROOT/orbslam3"
+  printf 'segment\tframes\tdynamic_tum\tdynamic_jsonl\tstatic_jsonl\tdynamic_status\tstatic_status\n' \
+    > "$summary_path"
+
+  local segment_dir name frames dynamic_tum dynamic_json static_json dynamic_status static_status
+  shopt -s nullglob
+  for segment_dir in "$OUTPUT_ROOT"/orbslam3/segment_*; do
+    name=$(basename "$segment_dir")
+    frames=$(line_count "$segment_dir/dataset/frames.jsonl")
+    dynamic_tum=$(line_count "$segment_dir/CameraTrajectory.txt")
+    dynamic_json=$(line_count "$segment_dir/dataset/camera_pose_orbslam3.jsonl")
+    static_json=$(line_count "$segment_dir/dataset/camera_pose_static.jsonl")
+    dynamic_status=missing
+    static_status=missing
+    [[ "$frames" -gt 0 && "$dynamic_tum" -eq "$frames" && "$dynamic_json" -eq "$frames" ]] \
+      && dynamic_status=complete
+    [[ "$frames" -gt 0 && "$static_json" -eq "$frames" ]] \
+      && static_status=complete
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$frames" "$dynamic_tum" "$dynamic_json" "$static_json" \
+      "$dynamic_status" "$static_status" >> "$summary_path"
+  done
+  shopt -u nullglob
+
+  column -t -s $'\t' "$summary_path" 2>/dev/null || cat "$summary_path"
+  note "Summary written to $summary_path"
+}
+
+record_sequence() {
+  if [[ -s "$OUTPUT_ROOT/frames.jsonl" && "$ALLOW_EXISTING" -eq 0 ]]; then
+    die "$OUTPUT_ROOT already contains frames.jsonl; choose a new directory or pass --allow-existing"
+  fi
+  mkdir -p "$OUTPUT_ROOT"
+
+  local -a imu_options=()
+  local -a fps_options=()
+  (( RECORD_IMU )) && imu_options+=(--record-imu)
+  if [[ -n "$RECORD_FPS" ]]; then
+    if ! python "$RECORD_SCRIPT" --help 2>&1 | grep -q -- '--fps'; then
+      die "$RECORD_SCRIPT does not support --fps; install the FPS-enabled recorder"
+    fi
+    fps_options+=(--fps "$RECORD_FPS")
+  fi
+
+  note "Recording camera=$CAMERA output=$OUTPUT_ROOT fps=${RECORD_FPS:-config-default}"
+  python "$RECORD_SCRIPT" \
+    --camera "$CAMERA" \
+    --output "$OUTPUT_ROOT" \
+    --storage compressed \
+    --space-toggle-recording \
+    --record-only \
+    "${fps_options[@]}" \
+    "${imu_options[@]}"
+}
+
+process_one() {
+  local name segment_dir
+  name=$(segment_name "$SEGMENT_ID")
+  prepare_segments "$((10#$SEGMENT_ID))"
+  segment_dir="$OUTPUT_ROOT/orbslam3/$name"
+  require_dir "$segment_dir"
+
+  if [[ "$MODE" == dynamic ]]; then
+    run_orb_segment "$segment_dir"
+  else
+    run_static_segment "$segment_dir"
+  fi
+  write_summary
+  (( VIEW_AFTER )) && view_segment "$segment_dir"
+}
+
+
+process_prepared_segment() {
+  local segment_dir="$1"
+  echo
+  echo "================================================================"
+  echo "Processing $(basename "$segment_dir") mode=$MODE camera=$CAMERA"
+  echo "================================================================"
+
+  if [[ "$MODE" == dynamic ]]; then
+    run_orb_segment "$segment_dir"
+  else
+    run_static_segment "$segment_dir"
+  fi
+}
+
+process_all() {
+  prepare_segments all
+  shopt -s nullglob
+  local -a segments=("$OUTPUT_ROOT"/orbslam3/segment_*)
+  shopt -u nullglob
+  (( ${#segments[@]} > 0 )) || die "No prepared segment directories found"
+
+  local worker_limit="$SEGMENT_WORKERS"
+  (( worker_limit > ${#segments[@]} )) && worker_limit=${#segments[@]}
+  note "Processing ${#segments[@]} segment(s) with segment_workers=$worker_limit"
+
+  local ok=0 failed=0 active=0
+  local segment_dir name pid finished_pid status
+  declare -A PID_TO_NAME=()
+
+  reap_one_segment_job() {
+    local completed_pid="" completed_status=0 completed_name=""
+    set +e
+    wait -n -p completed_pid
+    completed_status=$?
+    set -e
+
+    completed_name="${PID_TO_NAME[$completed_pid]:-unknown}"
+    unset 'PID_TO_NAME[$completed_pid]'
+    active=$((active - 1))
+
+    if (( completed_status == 0 )); then
+      ok=$((ok + 1))
+      note "$completed_name: worker completed"
+    else
+      failed=$((failed + 1))
+      warn "$completed_name: worker failed with status $completed_status"
+    fi
+  }
+
+  for segment_dir in "${segments[@]}"; do
+    [[ -d "$segment_dir" ]] || continue
+    while (( active >= worker_limit )); do
+      reap_one_segment_job
+    done
+
+    name=$(basename "$segment_dir")
+    (
+      set -o pipefail
+      process_prepared_segment "$segment_dir" 2>&1 |
+        sed -u "s/^/[$name] /"
+    ) &
+    pid=$!
+    PID_TO_NAME["$pid"]="$name"
+    active=$((active + 1))
+  done
+
+  while (( active > 0 )); do
+    reap_one_segment_job
+  done
+
+  write_summary
+  echo
+  echo "Finished: complete=$ok failed=$failed"
+  (( failed == 0 )) || return 1
+}
+
+main() {
+  parse_args "$@"
+  resolve_tools
+
+  case "$COMMAND" in
+    record) record_sequence ;;
+    process-all) process_all ;;
+    process-segment) process_one ;;
+    view)
+      local name segment_dir
+      name=$(segment_name "$SEGMENT_ID")
+      segment_dir="$OUTPUT_ROOT/orbslam3/$name"
+      require_dir "$segment_dir"
+      view_segment "$segment_dir"
+      ;;
+    summary) write_summary ;;
+  esac
+}
+
+main "$@"
