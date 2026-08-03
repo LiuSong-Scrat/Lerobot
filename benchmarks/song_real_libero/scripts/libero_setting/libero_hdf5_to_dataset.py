@@ -64,8 +64,11 @@ POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
 POINT_CLOUD_CHANNELS = 6
-ACTION_LABEL_SEMANTICS = "source_raw_delta_to_source_state_anchored_absolute_model_eef_target"
-OBSERVATION_STATE_SEMANTICS = "achieved_eef_pose_at_reconstructed_observation"
+ACTION_LABEL_SEMANTICS = (
+    "causal_same_state_raw_delta_absolute_model_eef_target_"
+    "with_next_achieved_gripper_width"
+)
+OBSERVATION_STATE_SEMANTICS = "pre_action_achieved_eef_pose_and_gripper_width"
 
 DATASET_FEATURES = {
     "action": {
@@ -135,9 +138,9 @@ def parse_args() -> argparse.Namespace:
         choices=(0, 1),
         default=None,
         help=(
-            "State index used to reconstruct source observation i in states replay mode. "
-            "Official LIBERO v1 files require 1 because create_dataset.py records obs[i] "
-            "after action[i] while retaining states[i]."
+            "Optional source-index offset in states replay mode. Output frame i uses "
+            "observation states[i + offset] and source actions[i + offset], so the "
+            "observation and arm action remain causally aligned. The default is 0."
         ),
     )
     parser.add_argument(
@@ -385,8 +388,11 @@ def write_action_target_meta(root: Path) -> None:
         ),
         "coordinate_frame": "overview_camera",
         "source": "raw LIBERO HDF5 normalized OSC_POSE delta action",
-        "source_state_anchor": "states[i]",
-        "action_index_mapping": "output[i] uses source actions[i]",
+        "source_state_anchor": "states[source_index]",
+        "action_index_mapping": (
+            "output[i] uses source actions[source_index], where "
+            "source_index = i + state_observation_offset"
+        ),
         "conversion": (
             "controller.set_goal(raw[:6]) with use_delta=True, including "
             "controller orientation-goal history; map the controller-site goal "
@@ -663,12 +669,18 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
     if record.get("action_label_semantics") != ACTION_LABEL_SEMANTICS:
         shape_errors.append(
-            "record action_label_semantics does not identify raw-delta absolute targets"
+            "record action_label_semantics does not identify causal raw-delta absolute targets"
         )
     if record.get("observation_state_semantics") != OBSERVATION_STATE_SEMANTICS:
         shape_errors.append(
-            "record observation_state_semantics does not identify achieved EEF poses"
+            "record observation_state_semantics does not identify pre-action achieved EEF states"
         )
+    if record.get("gripper_action_semantics") != "next_state_achieved_physical_width_metres":
+        shape_errors.append(
+            "record gripper_action_semantics does not identify the next-state physical-width label"
+        )
+    if not record.get("gripper_action_mapping"):
+        shape_errors.append("record is missing gripper_action_mapping")
     finite_arrays = {
         "actions": actions,
         "observation_states": observation_states,
@@ -1369,6 +1381,19 @@ def collect_demo_episode(
     max_frames: int | None,
     episode_seed: int,
 ) -> dict[str, Any]:
+    """Convert one LIBERO demonstration into causally aligned training frames.
+
+    In states replay mode, output frame i uses one common source index k:
+
+        observation[i]      <- render(states[k])
+        arm action[i]       <- decode(actions[k], anchored at states[k])
+        gripper action[i]   <- achieved width in states[k + 1]
+        k                    = i + state_observation_offset
+
+    The default offset is zero. A nonzero offset only skips leading source
+    transitions; it never shifts the observation relative to its arm action.
+    """
+
     if states.ndim != 2:
         raise ValueError(f"Expected demo states shape (T, D), got {states.shape}")
     if actions is None:
@@ -1381,7 +1406,8 @@ def collect_demo_episode(
         raise ValueError(f"Expected raw LIBERO actions shape (T, 7), got {actions.shape}")
     if not np.isfinite(actions).all():
         raise ValueError("Raw LIBERO actions contain non-finite values.")
-    configured_state_observation_offset = int(cfg.get("state_observation_offset", 1))
+
+    configured_state_observation_offset = int(cfg.get("state_observation_offset", 0))
     if configured_state_observation_offset not in (0, 1):
         raise ValueError(
             "state_observation_offset must be 0 or 1, got "
@@ -1391,16 +1417,25 @@ def collect_demo_episode(
         configured_state_observation_offset if cfg["replay_mode"] == "states" else 0
     )
 
-    frame_count = min(len(states), len(actions))
     if cfg["replay_mode"] == "states":
-        # Keep the caller-selected source-observation convention. Action i is
-        # always decoded at states[i], independently of the rendered observation
-        # offset used by the existing dataset pipeline.
-        frame_count = min(frame_count, len(states) - state_observation_offset)
+        # A causal frame needs states[k] for the observation / arm-action anchor
+        # and states[k + 1] for the physical-width gripper target.
+        frame_count = min(
+            len(actions) - state_observation_offset,
+            len(states) - state_observation_offset - 1,
+        )
+    else:
+        # Step replay obtains the post-action gripper width directly from next_obs.
+        frame_count = min(len(states), len(actions))
+
     if max_frames is not None and max_frames > 0:
         frame_count = min(frame_count, int(max_frames))
     if frame_count <= 1:
-        raise ValueError("A collected LIBERO episode needs at least two frames.")
+        raise ValueError(
+            "A collected LIBERO episode needs at least two causal frames. "
+            f"Got states={len(states)}, actions={len(actions)}, "
+            f"offset={state_observation_offset}, replay_mode={cfg['replay_mode']!r}."
+        )
 
     num_points = int(cfg["num_points"])
     observation_height = int(cfg["observation_height"])
@@ -1411,7 +1446,8 @@ def collect_demo_episode(
     )
     reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
-    grippers = np.empty((frame_count, 1), dtype=np.float32)
+    observation_grippers = np.empty((frame_count, 1), dtype=np.float32)
+    action_grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
     image_frames: list[np.ndarray] = []
     save_rgb_images = bool(cfg.get("save_rgb_images", True))
@@ -1423,7 +1459,7 @@ def collect_demo_episode(
         frame_idx: int,
         raw_obs: dict[str, Any],
     ) -> np.ndarray:
-        """Store one achieved observation and return its model-EEF world pose."""
+        """Store one pre-action observation and return its model-EEF world pose."""
 
         if save_video:
             append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
@@ -1447,10 +1483,24 @@ def collect_demo_episode(
         )
         point_clouds_reference[frame_idx] = point_cloud_reference
         reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
-        grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+        observation_grippers[frame_idx, 0] = pose9_gripper_reference[-1]
         return pose9_to_homo_np(
             np.asarray(pose9_gripper_sim_world, dtype=np.float32)[:9]
         ).astype(np.float64)
+
+    def gripper_width_from_obs(raw_obs: dict[str, Any]) -> float:
+        pose9_gripper = np.asarray(
+            eef_pose9_gripper_from_obs(raw_obs), dtype=np.float32
+        ).reshape(-1)
+        if pose9_gripper.shape[0] < 10:
+            raise ValueError(
+                "Expected eef_pose9_gripper_from_obs() to return at least 10 values, "
+                f"got shape {pose9_gripper.shape}."
+            )
+        width = float(pose9_gripper[-1])
+        if not np.isfinite(width):
+            raise ValueError("Reconstructed gripper width is not finite.")
+        return width
 
     def store_model_action_target(frame_idx: int, target_model_world: np.ndarray) -> None:
         action_target_reference_ee_poses[frame_idx] = world_target_to_reference_pose9(
@@ -1459,23 +1509,21 @@ def collect_demo_episode(
             reference_camera,
         )
 
-    # Explicitly initialize orientation-goal history at the restored episode
-    # state. This prevents a reused task environment from leaking the previous
-    # demonstration's final controller goal into the next demonstration.
+    # Initialize the delta controller once at the beginning of the source
+    # sequence. Its orientation-goal history must then advance in source-action
+    # order, even when a nonzero source-index offset skips leading output frames.
     initial_obs = set_env_state_and_get_obs(env, states[0])
     reset_source_delta_controller_goal(env)
 
     if cfg["replay_mode"] == "step":
         raw_obs = initial_obs
         for frame_idx in range(frame_count):
-            # Observation and model/controller frame relation are measured before
-            # issuing actions[i], matching the source command's anchor state.
+            # The model observes the state immediately before actions[i].
             source_model_world = collect_observation_frame(frame_idx, raw_obs)
             source_controller_world = current_controller_eef_world(env)
 
-            # Execute the raw action exactly once. env.step() performs the
-            # controller.set_goal() call; reading goal_pos/goal_ori afterwards
-            # avoids the previous double-set_goal behavior in step replay.
+            # env.step() executes the raw action exactly once and updates both the
+            # controller goal and the achieved post-action gripper width.
             next_obs, _, done, _ = env.step(actions[frame_idx])
             target_controller_world = current_controller_goal_world(env)
             target_model_world = controller_target_to_model_target_world(
@@ -1484,6 +1532,7 @@ def collect_demo_episode(
                 source_controller_world,
             )
             store_model_action_target(frame_idx, target_model_world)
+            action_grippers[frame_idx, 0] = gripper_width_from_obs(next_obs)
             raw_obs = next_obs
             if bool(done) and frame_idx + 1 < frame_count:
                 raise RuntimeError(
@@ -1491,23 +1540,25 @@ def collect_demo_episode(
                     f"the expected {frame_count} converted frames."
                 )
     else:
+        # Advance controller goal history through skipped source actions. This is
+        # needed because robosuite's orientation delta semantics depend on the
+        # previous goal orientation, not only on the current achieved state.
+        for skipped_idx in range(state_observation_offset):
+            set_env_state_and_get_obs(env, states[skipped_idx])
+            libero_delta_action_to_absolute_target_world(env, actions[skipped_idx])
+
         for frame_idx in range(frame_count):
-            # actions[i] was issued from states[i]. Decode the controller target
-            # there, map it back into the model/data EEF frame, and only then
-            # restore the independently configured observation snapshot.
-            action_source_state_idx = frame_idx
-            observation_state_idx = frame_idx + state_observation_offset
-            source_obs = set_env_state_and_get_obs(
-                env, states[action_source_state_idx]
-            )
-            source_model_world = pose9_to_homo_np(
-                np.asarray(eef_pose9_gripper_from_obs(source_obs), dtype=np.float32)[:9]
-            ).astype(np.float64)
+            source_idx = frame_idx + state_observation_offset
+            next_state_idx = source_idx + 1
+
+            # Observation and arm action share the same pre-action source state.
+            source_obs = set_env_state_and_get_obs(env, states[source_idx])
+            source_model_world = collect_observation_frame(frame_idx, source_obs)
             source_controller_world = current_controller_eef_world(env)
             target_controller_world, _scaled_delta = (
                 libero_delta_action_to_absolute_target_world(
                     env,
-                    actions[frame_idx],
+                    actions[source_idx],
                 )
             )
             target_model_world = controller_target_to_model_target_world(
@@ -1515,20 +1566,19 @@ def collect_demo_episode(
                 source_model_world,
                 source_controller_world,
             )
-
-            raw_obs = (
-                source_obs
-                if observation_state_idx == action_source_state_idx
-                else set_env_state_and_get_obs(env, states[observation_state_idx])
-            )
-            collect_observation_frame(frame_idx, raw_obs)
             store_model_action_target(frame_idx, target_model_world)
+
+            # The gripper label remains a physical width, but now represents the
+            # achieved width after the aligned source action instead of copying
+            # the current observation width.
+            next_obs = set_env_state_and_get_obs(env, states[next_state_idx])
+            action_grippers[frame_idx, 0] = gripper_width_from_obs(next_obs)
 
     if cfg.get("add_gripper_cloud", True):
         point_clouds_reference = add_reference_gripper_clouds_to_episode(
             point_clouds_reference,
             reference_ee_poses,
-            grippers.reshape(-1),
+            observation_grippers.reshape(-1),
             total_points=int(cfg["num_points"]),
             gripper_points=int(cfg.get("gripper_points", 500)),
             gripper_len=float(cfg.get("gripper_len", 0.06)),
@@ -1539,6 +1589,7 @@ def collect_demo_episode(
             widths_are_normalized=False,
             gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         )
+
     point_clouds = reference_point_cloud_to_current_eff(
         point_clouds_reference, reference_ee_poses
     )
@@ -1552,19 +1603,45 @@ def collect_demo_episode(
         origin_pose9_eff_to_reference=episode_origin_pose,
     )
     observation_states = np.concatenate(
-        [observation_umi_poses, grippers], axis=-1
+        [observation_umi_poses, observation_grippers], axis=-1
     ).astype(np.float32)
-    # Preserve the existing physical-width gripper action space. Only the 9D
-    # arm pose is changed from achieved-state semantics to commanded-target
-    # semantics in the same model EEF frame used by observations and evaluation.
     episode_actions = np.concatenate(
-        [action_target_umi_poses, grippers], axis=-1
+        [action_target_umi_poses, action_grippers], axis=-1
     ).astype(np.float32)
     timestamps = np.arange(len(episode_actions), dtype=np.float32) / float(cfg["fps"])
     target_residual_m = np.linalg.norm(
         action_target_reference_ee_poses[:, :3] - reference_ee_poses[:, :3],
         axis=-1,
     )
+
+    if cfg["replay_mode"] == "states":
+        source_index_expr = f"i + {state_observation_offset}"
+        action_source_index_mapping = (
+            f"output[i] uses source actions[{source_index_expr}]"
+        )
+        action_source_state_mapping = (
+            f"source actions[{source_index_expr}] is anchored at "
+            f"states[{source_index_expr}]"
+        )
+        observation_state_mapping = (
+            f"output observation[i] is reconstructed from states[{source_index_expr}]"
+        )
+        gripper_action_mapping = (
+            f"output action gripper[i] is achieved physical width from "
+            f"states[{source_index_expr} + 1]"
+        )
+    else:
+        action_source_index_mapping = "output[i] uses source actions[i]"
+        action_source_state_mapping = (
+            "source actions[i] is anchored at the pre-action replay state"
+        )
+        observation_state_mapping = (
+            "output observation[i] is the pre-action replay state for actions[i]"
+        )
+        gripper_action_mapping = (
+            "output action gripper[i] is achieved physical width from next_obs "
+            "after actions[i]"
+        )
 
     episode = {
         "task": task_language,
@@ -1580,17 +1657,14 @@ def collect_demo_episode(
         "state_observation_offset": state_observation_offset,
         "action_label_semantics": ACTION_LABEL_SEMANTICS,
         "observation_state_semantics": OBSERVATION_STATE_SEMANTICS,
-        "action_source_index_mapping": "output[i] uses source actions[i]",
-        "action_source_state_mapping": "source actions[i] is anchored at states[i]",
+        "action_source_index_mapping": action_source_index_mapping,
+        "action_source_state_mapping": action_source_state_mapping,
         "action_target_eef_mapping": (
-            "source controller goal mapped through the source-state "
+            "source controller goal mapped through the aligned source-state "
             "controller-to-model EEF transform"
         ),
-        "observation_state_mapping": (
-            f"output observation[i] is reconstructed from states[i + {state_observation_offset}]"
-            if cfg["replay_mode"] == "states"
-            else "output observation[i] is the pre-action replay state for actions[i]"
-        ),
+        "observation_state_mapping": observation_state_mapping,
+        "gripper_action_mapping": gripper_action_mapping,
         "target_residual_translation_m_mean": float(target_residual_m.mean()),
         "target_residual_translation_m_max": float(target_residual_m.max()),
     }
@@ -1643,10 +1717,11 @@ def make_episode_record(
         ),
         "action_target_eef_mapping": str(episode["action_target_eef_mapping"]),
         "observation_state_mapping": str(episode["observation_state_mapping"]),
+        "gripper_action_mapping": str(episode["gripper_action_mapping"]),
         "action_pose_coordinate_frame": "episode_origin_eef",
         "observation_state_coordinate_frame": "episode_origin_eef",
         "absolute_action_target_sidecar_coordinate_frame": "overview_camera",
-        "gripper_action_semantics": "achieved_physical_width_metres_unchanged",
+        "gripper_action_semantics": "next_state_achieved_physical_width_metres",
         "heuristic_action_target_offset": False,
         "target_residual_translation_m_mean": float(
             episode["target_residual_translation_m_mean"]
@@ -1879,7 +1954,7 @@ def main() -> None:
             cfg,
             args.state_observation_offset,
             "state_observation_offset",
-            1,
+            0,
         )
     )
     cfg["restore_demo_model"] = bool(
@@ -1983,27 +2058,34 @@ def main() -> None:
         "fps": int(cfg["fps"]),
         "state_observation_alignment": {
             "replay_mode": str(cfg["replay_mode"]),
-            "state_index_offset": int(cfg["state_observation_offset"]),
+            "source_index_offset": int(cfg["state_observation_offset"]),
+            "causal_default": "state_observation_offset=0",
             "mapping": (
-                "output[i] = render(states[i + state_index_offset])"
+                "output observation[i] = render(states[k]); output action[i] "
+                "uses source actions[k]; k = i + state_observation_offset"
                 if str(cfg["replay_mode"]) == "states"
-                else "action replay"
+                else "output observation[i] is captured immediately before source actions[i]"
             ),
-            "official_libero_v1_default": "obs[i] ~= render(states[i + 1])",
             "terminal_policy": (
-                "drop source obs[T-1] because states[T] is unavailable"
+                "drop the final source transition because states[k + 1] is required "
+                "for the achieved physical-width gripper label"
                 if str(cfg["replay_mode"]) == "states"
-                and int(cfg["state_observation_offset"]) == 1
-                else "not_applicable"
+                else "next_obs supplies the post-action gripper width"
             ),
         },
         "action_label_semantics": {
             "pose_label": ACTION_LABEL_SEMANTICS,
             "observation_state": OBSERVATION_STATE_SEMANTICS,
-            "source_action_mapping": "output[i] uses source HDF5 actions[i]",
+            "source_action_mapping": (
+                f"output[i] uses source HDF5 actions[i + {int(cfg['state_observation_offset'])}]"
+                if str(cfg["replay_mode"]) == "states"
+                else "output[i] uses source HDF5 actions[i]"
+            ),
             "source_state_anchor": (
-                "actions[i] is converted at states[i], the state from which the "
-                "source OSC command was issued"
+                f"source actions[i + {int(cfg['state_observation_offset'])}] is converted "
+                f"at states[i + {int(cfg['state_observation_offset'])}]"
+                if str(cfg["replay_mode"]) == "states"
+                else "actions[i] is converted at its pre-action replay state"
             ),
             "observation_mapping": (
                 f"output observation[i] = render(states[i + {int(cfg['state_observation_offset'])}])"
@@ -2013,16 +2095,19 @@ def main() -> None:
             "absolute_target_conversion": (
                 "robosuite controller.set_goal(raw[:6]) with use_delta=True; "
                 "the resulting controller-site target is mapped into the "
-                "model/data EEF frame measured at source states[i]"
+                "model/data EEF frame measured at the same pre-action source state"
             ),
             "heuristic_target_offset": False,
             "contact_semantics": (
-                "action remains the commanded OSC setpoint even when contact "
+                "arm action remains the commanded OSC setpoint even when contact "
                 "prevents the achieved observation pose from reaching it"
             ),
             "stored_action_frame": "episode_origin_eef",
             "absolute_target_audit_sidecar_frame": "overview_camera",
-            "gripper_label": "achieved physical width metres (unchanged)",
+            "gripper_label": (
+                "achieved physical width after the aligned source action; "
+                "states[k + 1] in states replay or next_obs in step replay"
+            ),
         },
         "demo_model_restoration": (
             "per_demo_model_file" if bool(cfg["restore_demo_model"]) else "disabled"

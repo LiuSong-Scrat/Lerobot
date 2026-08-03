@@ -4518,9 +4518,10 @@ def run_episode(
                 )
             )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
-            previous_predicted_width = float(
-                chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
-            )
+            # previous_predicted_width = float(
+            #     chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
+            # )
+            gripper_previous_width = float(measured_gripper_width)
             actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
                 env=env,
                 current_eef_pose9_gripper=eef_pose,
@@ -4530,7 +4531,7 @@ def run_episode(
                 gripper_control_mode=gripper_control_mode,
                 gripper_delta_threshold=gripper_delta_threshold,
                 gripper_delta_alignment=gripper_delta_alignment,
-                gripper_previous_width=previous_predicted_width,
+                gripper_previous_width=previous_gripper_width,
             )
 
             latest_position_error = 0.0
