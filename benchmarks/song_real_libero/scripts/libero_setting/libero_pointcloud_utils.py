@@ -829,6 +829,97 @@ def observation_to_point_clouds(
     return point_cloud_eff, point_cloud_world, eef_pose_world
 
 
+def observation_to_model_point_cloud(
+    env: Any,
+    raw_obs: dict[str, Any],
+    camera_views: str | list[str] | tuple[str, ...],
+    height: int,
+    width: int,
+    num_points: int,
+    *,
+    add_gripper_cloud: bool = True,
+    gripper_points: int = 500,
+    gripper_len: float = 0.06,
+    gripper_template: str = "reap",
+    gripper_max_width: float = 0.08,
+    gripper_drop_strategy: str = "tail",
+    gripper_shuffle_points: bool = False,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the exact fixed-size point cloud expected by single/multi-view training.
+
+    Each selected camera first produces its own ``num_points`` cloud.  When the
+    gripper cloud is enabled, every per-camera cloud keeps the training layout:
+    scene points first and one addressable gripper tail.  The shared training
+    composition helper then returns either the unchanged single-view cloud or a
+    fixed-size multi-view cloud with an equal non-gripper budget per camera and
+    the first camera's gripper tail appended exactly once.
+
+    Returns:
+      model_point_cloud: xyzrgb in the current end-effector frame.
+      eef_pose_world:    current simulator EEF pose9 + physical gripper width.
+    """
+
+    # Import lazily so this utility remains importable in lightweight LIBERO-only
+    # tools that do not initialize the policy package.
+    from lerobot.policies.smolvla.song_pointseg import (
+        compose_point_cloud_views,
+        parse_camera_views,
+    )
+
+    views = parse_camera_views(camera_views)
+    stored_view_clouds: list[np.ndarray] = []
+    eef_pose_world: np.ndarray | None = None
+    total_points = int(num_points)
+    gripper_points = int(gripper_points)
+
+    for camera_index, camera_name in enumerate(views):
+        per_view_seed = int(seed) + camera_index * 1_000_003
+        point_cloud_eff, point_cloud_world, current_eef_pose_world = observation_to_point_clouds(
+            env,
+            raw_obs,
+            [camera_name],
+            int(height),
+            int(width),
+            total_points,
+            seed=per_view_seed,
+        )
+        if bool(add_gripper_cloud):
+            point_cloud_eff = add_world_gripper_cloud_to_point_cloud(
+                point_cloud_world,
+                current_eef_pose_world,
+                gripper_width_percent_from_scalar(
+                    float(current_eef_pose_world[-1]),
+                    max_physical_width=float(gripper_max_width),
+                ),
+                total_points=total_points,
+                gripper_points=gripper_points,
+                gripper_len=float(gripper_len),
+                gripper_template=str(gripper_template),
+                # Dataset conversion uses one common gripper seed for all views.
+                seed=int(seed),
+                drop_strategy=str(gripper_drop_strategy),
+                shuffle_points=bool(gripper_shuffle_points),
+            )
+        stored_view_clouds.append(np.ascontiguousarray(point_cloud_eff, dtype=np.float32))
+        eef_pose_world = np.asarray(current_eef_pose_world, dtype=np.float32)
+
+    if eef_pose_world is None:
+        raise RuntimeError("No camera view was selected for point-cloud construction.")
+
+    model_point_cloud = compose_point_cloud_views(
+        stored_view_clouds,
+        gripper_points=gripper_points if bool(add_gripper_cloud) else 0,
+        seed=int(seed),
+    )
+    expected_shape = (total_points, 6)
+    if model_point_cloud.shape != expected_shape:
+        raise RuntimeError(
+            f"Expected composed model point cloud shape {expected_shape}, got {model_point_cloud.shape}."
+        )
+    return np.ascontiguousarray(model_point_cloud, dtype=np.float32), eef_pose_world
+
+
 def observation_to_world_point_cloud(
     env: Any,
     raw_obs: dict[str, Any],

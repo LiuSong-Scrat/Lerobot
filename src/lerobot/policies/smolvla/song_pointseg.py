@@ -469,6 +469,96 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+POINT_CLOUD_VIEW_DIRS = {
+    "agentview": "point_clouds",
+    "robot0_eye_in_hand": "point_clouds_robot0_eye_in_hand",
+}
+
+
+def parse_camera_views(value: Any = None) -> tuple[str, ...]:
+    """Parse the one training/cache view option used by the benchmark scripts."""
+
+    if value is None:
+        return ("agentview",)
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value]
+    else:
+        text = str(value).strip().strip("[]")
+        parts = [part.strip().strip("\"'") for part in text.split(",")]
+    views = tuple(part for part in parts if part) or ("agentview",)
+    unknown = [view for view in views if view not in POINT_CLOUD_VIEW_DIRS]
+    if unknown:
+        raise ValueError(
+            f"Unsupported camera view(s) {unknown}; supported views are {sorted(POINT_CLOUD_VIEW_DIRS)}."
+        )
+    if len(set(views)) != len(views):
+        raise ValueError(f"camera views contain duplicates: {views}.")
+    return views
+
+
+def point_cloud_dir_for_view(dataset_root: str | Path, view: str) -> Path:
+    return Path(dataset_root) / POINT_CLOUD_VIEW_DIRS[str(view)]
+
+
+def compose_point_cloud_views(
+    view_clouds: list[np.ndarray] | tuple[np.ndarray, ...],
+    *,
+    gripper_points: int = 500,
+    seed: int = 0,
+) -> np.ndarray:
+    """Return one fixed-size model cloud from one or two stored camera clouds.
+
+    Every stored camera cloud keeps the original ``num_points`` layout and the
+    original gripper tail.  Single-view mode returns that cloud unchanged.  In
+    multi-view mode, the non-gripper budget is divided equally across views and
+    the gripper tail from the first view is appended exactly once.
+    """
+
+    clouds = [np.asarray(cloud, dtype=np.float32) for cloud in view_clouds]
+    if not clouds:
+        raise ValueError("At least one camera cloud is required.")
+    for cloud in clouds:
+        if cloud.ndim != 2 or cloud.shape[-1] != 6:
+            raise ValueError(f"Expected point cloud shape (N,6), got {cloud.shape}.")
+    if len(clouds) == 1:
+        return np.ascontiguousarray(clouds[0], dtype=np.float32)
+
+    total_points = int(clouds[0].shape[0])
+    if any(int(cloud.shape[0]) != total_points for cloud in clouds[1:]):
+        raise ValueError(
+            f"All camera clouds must contain the same number of points, got {[c.shape[0] for c in clouds]}."
+        )
+    gripper_points = int(gripper_points)
+    if gripper_points < 0 or gripper_points >= total_points:
+        raise ValueError(
+            f"gripper_points must be in [0, {total_points - 1}], got {gripper_points}."
+        )
+
+    scene_budget = total_points - gripper_points
+    base, remainder = divmod(scene_budget, len(clouds))
+    allocations = [base + (1 if index < remainder else 0) for index in range(len(clouds))]
+    rng = np.random.default_rng(int(seed))
+    parts: list[np.ndarray] = []
+    for cloud, count in zip(clouds, allocations, strict=True):
+        scene = cloud[:-gripper_points] if gripper_points else cloud
+        if len(scene) == 0:
+            raise ValueError("A camera cloud contains no non-gripper scene points.")
+        if len(scene) == count:
+            sample = scene
+        else:
+            indices = rng.choice(len(scene), count, replace=len(scene) < count)
+            sample = scene[indices]
+        parts.append(np.ascontiguousarray(sample, dtype=np.float32))
+    if gripper_points:
+        parts.append(np.ascontiguousarray(clouds[0][-gripper_points:], dtype=np.float32))
+    composed = np.ascontiguousarray(np.concatenate(parts, axis=0), dtype=np.float32)
+    if composed.shape != clouds[0].shape:
+        raise RuntimeError(
+            f"Composed cloud shape {composed.shape} does not match stored shape {clouds[0].shape}."
+        )
+    return composed
+
+
 class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     """Adds a temporal point-cloud window used only to build PointSeg supervision.
 
@@ -484,6 +574,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         dataset: torch.utils.data.Dataset,
         point_cloud_dir: str | Path,
         *,
+        camera_views: str | tuple[str, ...] | list[str] | None = None,
+        gripper_points: int | None = None,
         future_offsets: tuple[int, ...] | list[int] = DEFAULT_FUTURE_OFFSETS,
         bidirectional: bool = True,
         trajectory_samples: int = 32,
@@ -496,6 +588,21 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     ):
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
+        if camera_views is None:
+            camera_views = os.environ.get("SONG_CAMERA_VIEWS", "agentview")
+        if gripper_points is None:
+            gripper_points = int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500"))
+        self.camera_views = parse_camera_views(camera_views)
+        self.dataset_root = self.point_cloud_dir.parent
+        self.point_cloud_dirs = {
+            view: (
+                self.point_cloud_dir
+                if view == "agentview"
+                else point_cloud_dir_for_view(self.dataset_root, view)
+            )
+            for view in self.camera_views
+        }
+        self.gripper_points = int(gripper_points)
         self.future_offsets = tuple(int(offset) for offset in future_offsets)
         if any(offset <= 0 for offset in self.future_offsets):
             raise ValueError("future_offsets should contain positive frame offsets; current frame is added automatically.")
@@ -513,7 +620,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.return_full_point_cloud = return_full_point_cloud
         self.include_base_item = bool(include_base_item)
         self.mmap_mode = mmap_mode
-        self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._point_cloud_cache: dict[tuple[str, int], np.ndarray] = {}
         self._episode_motion_state_cache: dict[int, Tensor] = {}
         self._index_dataset = None
 
@@ -538,16 +645,31 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
-        point_clouds = self._point_cloud_cache.get(episode_index)
+    def _episode_point_clouds(self, view: str, episode_index: int) -> np.ndarray:
+        cache_key = (str(view), int(episode_index))
+        point_clouds = self._point_cloud_cache.get(cache_key)
         if point_clouds is None:
             point_clouds = open_episode_point_clouds(
-                self.point_cloud_dir,
+                self.point_cloud_dirs[str(view)],
                 episode_index,
                 mmap_mode=self.mmap_mode,
             )
-            self._point_cloud_cache[episode_index] = point_clouds
+            self._point_cloud_cache[cache_key] = point_clouds
         return point_clouds
+
+    def _point_cloud_frame(self, episode_index: int, frame_index: int) -> np.ndarray:
+        clouds = [
+            np.asarray(self._episode_point_clouds(view, episode_index)[frame_index], dtype=np.float32)
+            for view in self.camera_views
+        ]
+        # Keep view composition independent of the cache sampling seed so an
+        # indices cache can be reconstructed exactly during training.
+        seed = 1000 + int(episode_index) * 1_000_003 + int(frame_index) * 97
+        return compose_point_cloud_views(
+            clouds,
+            gripper_points=self.gripper_points,
+            seed=seed,
+        )
 
     def _episode_motion_states(self, episode_index: int) -> Tensor:
         """Load achieved EEF poses used by the geometric motion prior."""
@@ -668,11 +790,11 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         item = dict(self.dataset[idx]) if self.include_base_item else self._index_only_item(idx)
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
-        point_clouds = self._episode_point_clouds(episode_index)
-        episode_len = int(point_clouds.shape[0])
+        first_view_clouds = self._episode_point_clouds(self.camera_views[0], episode_index)
+        episode_len = int(first_view_clouds.shape[0])
         rng = np.random.default_rng(self.seed + idx)
 
-        current_full = np.asarray(point_clouds[frame_index], dtype=np.float32)
+        current_full = self._point_cloud_frame(episode_index, frame_index)
         current_sample, current_indices = _sample_rows_with_indices(current_full, self.current_points, rng)
         item["observation.point_cloud"] = torch.from_numpy(current_sample)
         item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
@@ -689,7 +811,13 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             clamped_index = min(max(raw_index, 0), episode_len - 1)
             future_is_pad.append(raw_index < 0 or raw_index >= episode_len)
             temporal_frame_indices.append(clamped_index)
-            future_samples.append(_sample_rows(np.asarray(point_clouds[clamped_index]), self.future_points, rng))
+            future_samples.append(
+                _sample_rows(
+                    self._point_cloud_frame(episode_index, clamped_index),
+                    self.future_points,
+                    rng,
+                )
+            )
 
         max_future_points = max(sample.shape[0] for sample in future_samples)
         if max_future_points <= 0:

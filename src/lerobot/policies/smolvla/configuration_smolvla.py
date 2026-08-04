@@ -49,6 +49,11 @@ class SmolVLAConfig(PreTrainedConfig):
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
+    # Comma-separated RGB/point-cloud views used by training.  Keeping the
+    # default as agentview preserves the original single-view policy inputs and
+    # allows old checkpoints to load without changing any model module.
+    camera_views: str = "agentview"
+
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
@@ -217,7 +222,36 @@ class SmolVLAConfig(PreTrainedConfig):
                 self.train_expert_only = True
             self.freeze_vision_encoder = True
 
+    @property
+    def selected_camera_views(self) -> tuple[str, ...]:
+        value = self.camera_views
+        if isinstance(value, (list, tuple)):
+            parts = [str(part).strip() for part in value]
+        else:
+            text = str(value).strip().strip("[]")
+            parts = [part.strip().strip("\"'") for part in text.split(",")]
+        views = tuple(part for part in parts if part)
+        if not views:
+            views = ("agentview",)
+        supported = {"agentview", "robot0_eye_in_hand"}
+        unknown = [view for view in views if view not in supported]
+        if unknown:
+            raise ValueError(
+                f"Unsupported camera view(s) {unknown}; supported views are {sorted(supported)}."
+            )
+        if len(set(views)) != len(views):
+            raise ValueError(f"camera_views contains duplicates: {views}.")
+        return views
+
     def validate_features(self) -> None:
+        selected = set(self.selected_camera_views)
+        for key in list(self.input_features):
+            if not key.startswith(f"{OBS_IMAGES}."):
+                continue
+            camera = key[len(OBS_IMAGES) + 1 :]
+            if camera in {"agentview", "robot0_eye_in_hand"} and camera not in selected:
+                del self.input_features[key]
+
         for i in range(self.empty_cameras):
             key = f"{OBS_IMAGES}.empty_camera_{i}"
             empty_camera = PolicyFeature(

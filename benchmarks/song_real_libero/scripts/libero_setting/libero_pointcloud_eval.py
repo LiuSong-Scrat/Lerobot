@@ -190,6 +190,7 @@ if __package__ and __package__.startswith("benchmarks."):
         gripper_width_percent_from_scalar,
         make_libero_env,
         normalize_render_camera_name,
+        observation_to_model_point_cloud,
         observation_to_point_clouds,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
@@ -209,6 +210,7 @@ else:
         gripper_width_percent_from_scalar,
         make_libero_env,
         normalize_render_camera_name,
+        observation_to_model_point_cloud,
         observation_to_point_clouds,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
@@ -554,6 +556,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
+    parser.add_argument(
+        "--policy.camera_views",
+        "--camera-views",
+        dest="camera_views",
+        default=None,
+        help=(
+            "RGB and point-cloud views used by the policy: agentview, "
+            "robot0_eye_in_hand, or agentview,robot0_eye_in_hand. "
+            "Defaults to agentview for backward compatibility."
+        ),
+    )
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument(
         "--suite-gpu-ids",
@@ -910,6 +923,28 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def cfg_get(cfg: dict[str, Any], cli_value: Any, key: str, default: Any = None) -> Any:
     return cli_value if cli_value is not None else cfg.get(key, default)
+
+
+def evaluation_camera_views(value: Any = None) -> tuple[str, ...]:
+    """Parse the same minimal camera-view option used during training."""
+
+    if value is None:
+        return ("agentview",)
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value]
+    else:
+        text = str(value).strip().strip("[]")
+        parts = [part.strip().strip("\"'") for part in text.split(",")]
+    views = tuple(part for part in parts if part) or ("agentview",)
+    supported = {"agentview", "robot0_eye_in_hand"}
+    unknown = [view for view in views if view not in supported]
+    if unknown:
+        raise ValueError(
+            f"Unsupported camera view(s) {unknown}; supported views are {sorted(supported)}."
+        )
+    if len(set(views)) != len(views):
+        raise ValueError(f"camera_views contains duplicates: {views}.")
+    return views
 
 
 def configured_demo_root(cfg: dict[str, Any]) -> Any:
@@ -1762,6 +1797,7 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "policy_path": cfg.get("policy_path"),
         "suites": suite_names,
         "camera_names": list(cfg.get("camera_names", [])),
+        "camera_views": list(evaluation_camera_views(cfg.get("camera_views", "agentview"))),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
         "render_mode": str(cfg.get("render_mode", "offscreen")),
         "evaluation_identity": cfg.get("evaluation_identity", {}),
@@ -1859,6 +1895,12 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "width": int(cfg["observation_width"]),
             "add_gripper_cloud": bool(cfg["add_gripper_cloud"]),
             "gripper_points": int(cfg.get("gripper_points", 0)),
+            "camera_views": list(evaluation_camera_views(cfg.get("camera_views", "agentview"))),
+            "multi_view_strategy": (
+                "equal_non_gripper_split_plus_first_view_gripper_tail"
+                if len(evaluation_camera_views(cfg.get("camera_views", "agentview"))) > 1
+                else "stored_single_view_layout"
+            ),
         },
         "control": {
             "controller_mode": "OSC_POSE absolute pose",
@@ -2273,31 +2315,24 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
     to the inference wrapper.  The current world_pose9 is kept only for converting
     the predicted UMI trajectory back to world/controller targets.
     """
-    pc_eff, pc_world, pose9_gripper = observation_to_point_clouds(
+    pc_eff, pose9_gripper = observation_to_model_point_cloud(
         env,
         raw_obs,
-        pointcloud_camera_names_from_config(cfg),
+        evaluation_camera_views(cfg.get("camera_views", "agentview")),
         int(cfg["observation_height"]),
         int(cfg["observation_width"]),
         int(cfg["num_points"]),
+        add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
+        gripper_points=int(cfg.get("gripper_points", 500)),
+        gripper_len=float(cfg.get("gripper_len", 0.06)),
+        gripper_template=str(cfg.get("gripper_template", "reap")),
+        gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
+        gripper_drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
+        gripper_shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
         seed=int(seed),
     )
     world_pose9 = np.asarray(pose9_gripper[:9], dtype=np.float32)
     gripper = float(pose9_gripper[-1])
-    if bool(cfg.get("add_gripper_cloud", True)):
-        gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
-        pc_eff = add_world_gripper_cloud_to_point_cloud(
-            pc_world,
-            pose9_gripper,
-            gripper_width_percent_from_scalar(gripper, max_physical_width=gripper_max_width),
-            total_points=int(cfg["num_points"]),
-            gripper_points=int(cfg.get("gripper_points", 500)),
-            gripper_len=float(cfg.get("gripper_len", 0.06)),
-            gripper_template=str(cfg.get("gripper_template", "reap")),
-            seed=int(seed),
-            drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-            shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-        )
     return np.ascontiguousarray(pc_eff, dtype=np.float32), world_pose9, gripper
 
 
@@ -3981,7 +4016,6 @@ def run_episode(
     contact_counts: list[int] = []
     robot_scene_contact_counts: list[int] = []
 
-    pc_camera_names = pointcloud_camera_names_from_config(cfg)
     save_video = bool(cfg.get("save_video", True))
     video_frames: dict[str, list[np.ndarray]] = {}
     if save_video:
@@ -4357,28 +4391,16 @@ def run_episode(
                     break
                 continue
 
-            point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
+            point_cloud, eef_pose9, gripper_width = build_point_cloud_observation(
                 env,
                 raw_obs,
-                pc_camera_names,
-                int(cfg["observation_height"]),
-                int(cfg["observation_width"]),
-                int(cfg["num_points"]),
+                cfg,
                 seed=steps,
             )
-            if bool(cfg.get("add_gripper_cloud", True)):
-                point_cloud = add_world_gripper_cloud_to_point_cloud(
-                    point_cloud_world,
-                    eef_pose,
-                    gripper_width_percent_from_scalar(float(eef_pose[-1]), max_physical_width=gripper_max_width),
-                    total_points=int(cfg["num_points"]),
-                    gripper_points=int(cfg.get("gripper_points", 500)),
-                    gripper_len=float(cfg.get("gripper_len", 0.06)),
-                    gripper_template=str(cfg.get("gripper_template", "reap")),
-                    seed=steps,
-                    drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-                    shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-                )
+            eef_pose = np.concatenate(
+                [eef_pose9, np.asarray([gripper_width], dtype=np.float32)],
+                axis=0,
+            ).astype(np.float32, copy=False)
 
             transported_grasp = update_grasp_transport_state(eef_pose)
 
@@ -5957,6 +5979,7 @@ def _isolated_policy_worker_entry(
             device=cfg["device"],
             visualize_foreground=False,
             foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
+            camera_views=cfg["camera_views"],
         )
         suite = benchmark.get_benchmark_dict()[suite_name]()
         summaries: list[dict[str, Any]] = []
@@ -6248,7 +6271,24 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["add_gripper_cloud"] = bool(cfg_get(cfg, args.add_gripper_cloud, "add_gripper_cloud", True))
     if args.gripper_points is not None:
         cfg["gripper_points"] = int(args.gripper_points)
-    cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
+    cfg.setdefault("gripper_points", 500)
+    cfg.setdefault("gripper_drop_strategy", "tail")
+    cfg.setdefault("gripper_shuffle_points", False)
+    selected_camera_views = evaluation_camera_views(
+        cfg_get(cfg, args.camera_views, "camera_views", "agentview")
+    )
+    cfg["camera_views"] = list(selected_camera_views)
+    # Point-cloud construction follows the selected training views.  Keep these
+    # fields synchronized for environment rendering and existing report code.
+    cfg["pointcloud_camera_names"] = list(selected_camera_views)
+    cfg["pointcloud_reference_camera"] = selected_camera_views[0]
+    configured_cameras = [
+        _normalized_camera_name(camera) for camera in list(cfg.get("camera_names") or [])
+    ]
+    for camera in selected_camera_views:
+        if camera not in configured_cameras:
+            configured_cameras.append(camera)
+    cfg["camera_names"] = configured_cameras
 
     cfg["control"]["control_freq"] = float(
         cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 5.0))
@@ -6822,11 +6862,13 @@ def main() -> None:
         device=cfg["device"],
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
+        camera_views=cfg["camera_views"],
     )
 
     print(
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={selected_episode_count}, "
+        f"camera_views={tuple(cfg['camera_views'])}, "
         f"task_workers={cfg['task_workers']}, "
         f"isolated_policy_workers={cfg['isolated_policy_workers']}, "
         f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
