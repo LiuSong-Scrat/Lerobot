@@ -30,7 +30,7 @@ import time
 import traceback
 import tty
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -576,7 +576,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default="outputs/temp")
 
     parser.add_argument("--observation-height", type=int, default=None)
     parser.add_argument("--observation-width", type=int, default=None)
@@ -584,6 +584,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-camera", default=None)
     parser.add_argument("--render-every-n-steps", type=int, default=None)
     parser.add_argument("--render-gpu-device-id", type=int, default=None)
+    parser.add_argument(
+        "--visualize-success-regions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When render-mode=viewer3d, show viewer-only overlays for LIBERO spatial, "
+            "object-on-object, and articulated success predicates. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--success-region-alpha",
+        type=float,
+        default=None,
+        help="Viewer3D alpha for unsatisfied success regions (default: 0.35).",
+    )
+    parser.add_argument(
+        "--goal-debug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Record decomposed LIBERO goal-predicate diagnostics. For object-on-object goals this "
+            "includes XY distance, exact contact, relative height, predicate transitions and stability."
+        ),
+    )
+    parser.add_argument(
+        "--goal-debug-log-every-n-steps",
+        type=int,
+        default=None,
+        help="Print one compact goal-debug line per predicate every N environment steps (default: 25).",
+    )
+    parser.add_argument(
+        "--goal-debug-stable-steps",
+        type=int,
+        default=None,
+        help=(
+            "Diagnostic-only number of consecutive true samples considered stable (default: 5). "
+            "This does not change LIBERO success semantics."
+        ),
+    )
+    parser.add_argument(
+        "--goal-debug-max-trace-points",
+        type=int,
+        default=None,
+        help="Maximum per-episode Viewer3D goal-debug samples retained in goal_debug.json (default: 5000).",
+    )
     parser.add_argument("--control-freq", type=float, default=None)
 
     parser.add_argument("--action-index", type=int, default=None)
@@ -965,6 +1010,171 @@ def _read_json_or_default(path: Path, default: dict[str, Any]) -> dict[str, Any]
         return default
 
 
+FAILED_EPISODES_FILE_NAME = "failed_episodes.json"
+
+
+def initialize_realtime_failure_log(output_dir: Path) -> None:
+    """Create one root-level failure index for the current evaluation run.
+
+    Multi-GPU suite children share the launcher's output directory, so only the
+    top-level launcher resets the file. All workers may update it afterwards.
+    """
+    if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") == "1":
+        return
+
+    failure_path = output_dir / FAILED_EPISODES_FILE_NAME
+    payload = {
+        "created_unix_s": time.time(),
+        "updated_unix_s": time.time(),
+        "failure_count": 0,
+        "failed_task_count": 0,
+        "failed_task_episodes": [],
+        "failures": [],
+        "path": str(failure_path),
+    }
+    with interprocess_file_lock(output_dir / ".failed_episodes.lock"):
+        write_json_atomic(failure_path, payload)
+
+
+def record_realtime_failed_episode(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+    episode_record: dict[str, Any],
+    task_name: str | None = None,
+    task_language: str | None = None,
+) -> None:
+    """Upsert one failed rollout into ``<output_dir>/failed_episodes.json``.
+
+    The update is process-safe and atomic. A stable suite/task/episode key
+    prevents duplicate entries if the same result is reported more than once.
+    """
+    if bool(episode_record.get("success", False)):
+        return
+
+    failure_path = output_dir / FAILED_EPISODES_FILE_NAME
+    task_id = int(task_id)
+    episode_index = int(episode_index)
+    failure_key = f"{suite_name}:{task_id}:{episode_index}"
+    result_path = (
+        output_dir
+        / suite_name
+        / f"task_{task_id:03d}"
+        / f"episode_{episode_index:03d}"
+        / "result.json"
+    )
+
+    failure_record = {
+        "key": failure_key,
+        "recorded_unix_s": time.time(),
+        "suite": str(suite_name),
+        "task_id": task_id,
+        "task_name": None if task_name is None else str(task_name),
+        "task_language": None if task_language is None else str(task_language),
+        "episode_index": episode_index,
+        "failure_type": "exception" if episode_record.get("error") else "rollout_failure",
+        "steps": int(episode_record.get("steps", 0) or 0),
+        "model_call_count": int(episode_record.get("model_call_count", 0) or 0),
+        "sum_reward": float(episode_record.get("sum_reward", 0.0) or 0.0),
+        "max_reward": float(episode_record.get("max_reward", 0.0) or 0.0),
+        "manual_failure": bool(episode_record.get("manual_failure", False)),
+        "termination_reason": episode_record.get("termination_reason"),
+        "error": episode_record.get("error"),
+        "goal_debug_path": episode_record.get("goal_debug_path"),
+        "goal_debug_summary": episode_record.get("goal_debug_summary"),
+        "result_path": str(result_path),
+    }
+
+    with interprocess_file_lock(output_dir / ".failed_episodes.lock"):
+        payload = _read_json_or_default(
+            failure_path,
+            {
+                "created_unix_s": time.time(),
+                "failures": [],
+                "path": str(failure_path),
+            },
+        )
+        failures_by_key: dict[str, dict[str, Any]] = {}
+        for item in payload.get("failures", []):
+            if not isinstance(item, dict):
+                continue
+            item_suite = str(item.get("suite", ""))
+            item_task = int(item.get("task_id", -1))
+            item_episode = int(item.get("episode_index", -1))
+            item_key = str(item.get("key") or f"{item_suite}:{item_task}:{item_episode}")
+            failures_by_key[item_key] = item
+        existing_failure = failures_by_key.get(failure_key)
+        is_new_failure = existing_failure is None
+        if existing_failure is not None:
+            failure_record["recorded_unix_s"] = float(
+                existing_failure.get("recorded_unix_s", failure_record["recorded_unix_s"])
+            )
+        failures_by_key[failure_key] = failure_record
+
+        failures = sorted(
+            failures_by_key.values(),
+            key=lambda item: (
+                str(item.get("suite", "")),
+                int(item.get("task_id", -1)),
+                int(item.get("episode_index", -1)),
+            ),
+        )
+        grouped: dict[tuple[str, int], list[int]] = {}
+        for item in failures:
+            group_key = (str(item["suite"]), int(item["task_id"]))
+            grouped.setdefault(group_key, []).append(int(item["episode_index"]))
+        failed_task_episodes = [
+            {
+                "suite": suite,
+                "task_id": task,
+                "episode_indices": sorted(set(indices)),
+                "failure_count": len(set(indices)),
+            }
+            for (suite, task), indices in sorted(grouped.items())
+        ]
+
+        payload.update(
+            {
+                "updated_unix_s": time.time(),
+                "failure_count": len(failures),
+                "failed_task_count": len(failed_task_episodes),
+                "failed_task_episodes": failed_task_episodes,
+                "failures": failures,
+                "path": str(failure_path),
+            }
+        )
+        write_json_atomic(failure_path, payload)
+
+    if is_new_failure:
+        print(
+            "[failure-log] recorded "
+            f"suite={suite_name} task={task_id} episode={episode_index} "
+            f"path={failure_path}",
+            flush=True,
+        )
+
+
+def record_failed_task_summary(output_dir: Path, summary: dict[str, Any]) -> None:
+    """Record every failed episode represented by a task-level summary."""
+    suite_name = str(summary.get("suite", "unknown_suite"))
+    task_id = int(summary.get("task_id", -1))
+    task_name = summary.get("task_name")
+    task_language = summary.get("task_language")
+    for episode in summary.get("episodes", []):
+        if isinstance(episode, dict) and not bool(episode.get("success", False)):
+            record_realtime_failed_episode(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                task_id=task_id,
+                episode_index=int(episode.get("episode_index", -1)),
+                episode_record=episode,
+                task_name=None if task_name is None else str(task_name),
+                task_language=None if task_language is None else str(task_language),
+            )
+
+
 def _suite_progress_summary(progress: dict[str, Any]) -> dict[str, Any]:
     return {
         "suite": str(progress["suite"]),
@@ -1100,6 +1310,8 @@ def update_realtime_episode_progress(
     task_id: int,
     episode_index: int,
     episode_record: dict[str, Any],
+    task_name: str | None = None,
+    task_language: str | None = None,
 ) -> None:
     suite_dir = output_dir / suite_name
     progress_path = suite_dir / "progress.json"
@@ -1150,6 +1362,15 @@ def update_realtime_episode_progress(
         episode_index=episode_index,
         event="episode_finished",
         episode_record=episode_record,
+    )
+    record_realtime_failed_episode(
+        output_dir=output_dir,
+        suite_name=suite_name,
+        task_id=task_id,
+        episode_index=episode_index,
+        episode_record=episode_record,
+        task_name=task_name,
+        task_language=task_language,
     )
     _update_root_progress(output_dir, progress)
 
@@ -1429,8 +1650,1345 @@ class EpisodeKeyboardControl:
         self._stdin_attrs = None
 
 
+
+class SuccessRegionVisualizer:
+    """Draw LIBERO goal conditions only in the interactive Viewer3D scene.
+
+    Supported goal forms:
+      * ``On(object, site)`` / ``In(object, site)``: mirror the exact MuJoCo site.
+      * ``On(object, movable_object)``: draw the actual 3 cm XY success disk used
+        by LIBERO's object-on-object predicate above the target object.
+      * ``Open/Close/Turnon/Turnoff(object)``: draw a small state beacon above the
+        articulated fixture so non-spatial conjuncts are visible as well.
+
+    All markers live exclusively in ``viewer.user_scn``.  This class never writes
+    to ``sim.model`` or ``sim.data`` and therefore cannot enter offscreen RGB,
+    depth, segmentation, point-cloud or proprioceptive policy observations.
+    """
+
+    UNSATISFIED_RGB = np.asarray([1.0, 0.28, 0.04], dtype=np.float32)
+    SATISFIED_RGB = np.asarray([0.05, 1.0, 0.16], dtype=np.float32)
+    # LIBERO's ObjectState.check_ontop uses a strict 3 cm world-XY radius.
+    # Lift the Viewer3D copy so it cannot be hidden by a plate rim or z-fight.
+    OBJECT_ON_RADIUS = 0.03
+    OBJECT_ON_COLUMN_HALF_HEIGHT = 0.040
+    OBJECT_ON_COLUMN_CLEARANCE = 0.008
+    OBJECT_ON_RING_HEIGHT = 0.100
+    OBJECT_ON_RING_BEADS = 16
+    OBJECT_ON_RING_BEAD_RADIUS = 0.0045
+    OBJECT_ON_AXIS_RADIUS = 0.0025
+    OBJECT_ON_CENTER_BEACON_RADIUS = 0.007
+    STATE_BEACON_RADIUS = 0.025
+    DEBUG_TRUE_RGB = np.asarray([0.05, 1.0, 0.16], dtype=np.float32)
+    DEBUG_FALSE_RGB = np.asarray([1.0, 0.05, 0.05], dtype=np.float32)
+    DEBUG_UNKNOWN_RGB = np.asarray([0.55, 0.55, 0.55], dtype=np.float32)
+    DEBUG_SOURCE_RGB = np.asarray([0.10, 0.65, 1.0], dtype=np.float32)
+    DEBUG_BEACON_RADIUS = 0.006
+    DEBUG_SOURCE_RADIUS = 0.007
+
+    def __init__(
+        self,
+        env: Any,
+        *,
+        alpha: float = 0.35,
+        debug_enabled: bool = True,
+        debug_log_every_n_steps: int = 25,
+        debug_stable_steps: int = 5,
+        debug_max_trace_points: int = 5000,
+    ) -> None:
+        self.env = env
+        self.base_env = self._find_libero_base_env(env)
+        self.alpha = float(np.clip(float(alpha), 0.02, 1.0))
+        self.sim = getattr(self.base_env, "sim", None) if self.base_env is not None else None
+        self.model = getattr(self.sim, "model", None) if self.sim is not None else None
+        self.data = getattr(self.sim, "data", None) if self.sim is not None else None
+        self.raw_model = getattr(self.model, "_model", self.model) if self.model is not None else None
+        self.raw_data = getattr(self.data, "_data", self.data) if self.data is not None else None
+        self.model_identity = id(self.raw_model) if self.raw_model is not None else None
+        self.entries: list[dict[str, Any]] = []
+        self.skipped_goal_states: list[list[Any]] = []
+        self._last_satisfied: dict[str, bool] = {}
+        self._viewer_identity: int | None = None
+        self._marker_start: int | None = None
+        self._marker_count = 0
+        self._unsupported_viewer_reported = False
+        self._capacity_warning_reported = False
+        self._reported_geometry: set[str] = set()
+        self._pose_failure_reported: set[str] = set()
+        self.debug_enabled = bool(debug_enabled)
+        self.debug_log_every_n_steps = max(1, int(debug_log_every_n_steps))
+        self.debug_stable_steps = max(1, int(debug_stable_steps))
+        self.debug_max_trace_points = max(10, int(debug_max_trace_points))
+        self._episode_identity: dict[str, Any] = {}
+        self._debug_trace: list[dict[str, Any]] = []
+        self._debug_trace_truncated = False
+        self._debug_stats: dict[str, dict[str, Any]] = {}
+        self._debug_last_signature: dict[str, tuple[Any, ...]] = {}
+        self._debug_last_log_step: dict[str, int] = {}
+        self._debug_previous_positions: dict[str, np.ndarray] = {}
+        self._debug_all_true_run = 0
+        self._debug_longest_all_true_run = 0
+        self._debug_ever_all_true = False
+        self._debug_last_step = 0
+        self._debug_legend_reported = False
+        self._discover_goal_regions()
+
+    @staticmethod
+    def _find_libero_base_env(env: Any) -> Any | None:
+        for candidate in reversed(iter_env_chain(env)):
+            if hasattr(candidate, "parsed_problem") and hasattr(candidate, "sim"):
+                return candidate
+        return None
+
+    @staticmethod
+    def _site_id(model: Any, site_name: str) -> int | None:
+        if model is None:
+            return None
+        fn = getattr(model, "site_name2id", None)
+        if callable(fn):
+            try:
+                site_id = int(fn(site_name))
+                return site_id if site_id >= 0 else None
+            except Exception:
+                pass
+        names = getattr(model, "site_names", None)
+        if names is not None:
+            normalized = [item.decode() if isinstance(item, bytes) else str(item) for item in names]
+            try:
+                return normalized.index(str(site_name))
+            except ValueError:
+                return None
+        raw_model = getattr(model, "_model", None)
+        if raw_model is not None:
+            try:
+                import mujoco
+
+                site_id = int(mujoco.mj_name2id(raw_model, mujoco.mjtObj.mjOBJ_SITE, str(site_name)))
+                return site_id if site_id >= 0 else None
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _passive_viewer_handle(viewer: Any) -> Any | None:
+        current = viewer
+        seen: set[int] = set()
+        for _ in range(8):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            if getattr(current, "user_scn", None) is not None:
+                return current
+            next_viewer = None
+            for attr in ("viewer", "_viewer", "handle", "_handle"):
+                candidate = getattr(current, attr, None)
+                if candidate is not None and candidate is not current:
+                    next_viewer = candidate
+                    break
+            current = next_viewer
+        return None
+
+    def _entity_exists(self, name: str) -> bool:
+        if self.base_env is None:
+            return False
+        state_dict = getattr(self.base_env, "object_states_dict", {})
+        if str(name) in state_dict:
+            return True
+        for attr in ("objects_dict", "fixtures_dict"):
+            mapping = getattr(self.base_env, attr, {})
+            if str(name) in mapping:
+                return True
+        body_map = getattr(self.base_env, "obj_body_id", {})
+        return str(name) in body_map
+
+    def _discover_goal_regions(self) -> None:
+        if self.base_env is None or self.model is None:
+            return
+        parsed_problem = getattr(self.base_env, "parsed_problem", {})
+        goal_states = parsed_problem.get("goal_state", []) if isinstance(parsed_problem, dict) else []
+        entries: list[dict[str, Any]] = []
+        by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for raw_state in goal_states:
+            state = list(raw_state) if isinstance(raw_state, (list, tuple)) else [raw_state]
+            predicate = str(state[0]).lower() if state else ""
+            entry: dict[str, Any] | None = None
+
+            if len(state) == 3 and predicate in {"on", "in"}:
+                target_name = str(state[2])
+                site_id = self._site_id(self.model, target_name)
+                if site_id is not None:
+                    key = ("site", target_name)
+                    entry = by_key.setdefault(
+                        key,
+                        {
+                            "kind": "site",
+                            "name": target_name,
+                            "site_id": int(site_id),
+                            "predicates": [],
+                        },
+                    )
+                elif predicate == "on" and self._entity_exists(target_name):
+                    # LIBERO ObjectState.check_ontop uses a world-XY center-distance
+                    # threshold of 0.03 m plus contact and relative height.
+                    key = ("object_on", target_name)
+                    entry = by_key.setdefault(
+                        key,
+                        {
+                            "kind": "object_on",
+                            "name": target_name,
+                            "entity_name": target_name,
+                            "predicates": [],
+                        },
+                    )
+
+            elif len(state) == 2 and predicate in {"open", "close", "turnon", "turnoff"}:
+                entity_name = str(state[1])
+                if self._entity_exists(entity_name):
+                    key = ("state", entity_name)
+                    entry = by_key.setdefault(
+                        key,
+                        {
+                            "kind": "state",
+                            "name": entity_name,
+                            "entity_name": entity_name,
+                            "predicates": [],
+                        },
+                    )
+
+            if entry is None:
+                self.skipped_goal_states.append(state)
+            else:
+                entry["predicates"].append(state)
+
+        entries.extend(by_key.values())
+        self.entries = entries
+
+    @property
+    def active(self) -> bool:
+        return bool(self.entries)
+
+    def matches_current_sim(self, env: Any) -> bool:
+        base_env = self._find_libero_base_env(env)
+        sim = getattr(base_env, "sim", None) if base_env is not None else None
+        model = getattr(sim, "model", None) if sim is not None else None
+        identity = id(getattr(model, "_model", model)) if model is not None else None
+        return identity is not None and identity == self.model_identity
+
+    def _predicate_satisfied(self, state: list[Any]) -> bool:
+        eval_fn = getattr(self.base_env, "_eval_predicate", None)
+        if callable(eval_fn):
+            try:
+                return bool(eval_fn(state))
+            except Exception:
+                pass
+        # Some LIBERO versions expose only object_states_dict.  This fallback is
+        # intentionally narrow and preserves the official predicate semantics.
+        states = getattr(self.base_env, "object_states_dict", {})
+        predicate = str(state[0]).lower() if state else ""
+        try:
+            if len(state) == 3 and state[1] in states and state[2] in states:
+                src, dst = states[state[1]], states[state[2]]
+                if predicate == "on":
+                    return bool(dst.check_ontop(src))
+                if predicate == "in":
+                    return bool(dst.check_contact(src) and dst.check_contain(src))
+            if len(state) == 2 and state[1] in states:
+                target = states[state[1]]
+                return bool(
+                    {
+                        "open": target.is_open,
+                        "close": target.is_close,
+                        "turnon": target.turn_on, 
+                        "turnoff": target.turn_off,
+                    }[predicate]()
+                )
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _predicate_key(state: list[Any]) -> str:
+        return " ".join(str(value) for value in state)
+
+    def begin_episode(
+        self,
+        *,
+        suite_name: str,
+        task_id: int,
+        episode_index: int,
+    ) -> None:
+        identity = {
+            "suite": str(suite_name),
+            "task_id": int(task_id),
+            "episode_index": int(episode_index),
+        }
+        if identity == self._episode_identity:
+            return
+        self._episode_identity = identity
+        self._debug_trace = []
+        self._debug_trace_truncated = False
+        self._debug_stats = {}
+        self._debug_last_signature = {}
+        self._debug_last_log_step = {}
+        self._debug_previous_positions = {}
+        self._debug_all_true_run = 0
+        self._debug_longest_all_true_run = 0
+        self._debug_ever_all_true = False
+        self._debug_last_step = 0
+        self._last_satisfied = {}
+        print(
+            "[goal-debug] begin "
+            f"suite={identity['suite']} task={identity['task_id']} "
+            f"episode={identity['episode_index']} stable_steps={self.debug_stable_steps}",
+            flush=True,
+        )
+
+    def _entity_state(self, entity_name: str) -> Any | None:
+        if self.base_env is None:
+            return None
+        states = getattr(self.base_env, "object_states_dict", {})
+        return states.get(entity_name) if isinstance(states, dict) else None
+
+    def _geom_name(self, geom_id: int) -> str:
+        if self.model is not None:
+            fn = getattr(self.model, "geom_id2name", None)
+            if callable(fn):
+                try:
+                    value = fn(int(geom_id))
+                    if value is not None:
+                        return value.decode() if isinstance(value, bytes) else str(value)
+                except Exception:
+                    pass
+        try:
+            import mujoco
+
+            value = mujoco.mj_id2name(self.raw_model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id))
+            return str(value) if value is not None else f"geom_{int(geom_id)}"
+        except Exception:
+            return f"geom_{int(geom_id)}"
+
+    def _entity_geom_ids(self, entity_name: str) -> set[int]:
+        if self.raw_model is None:
+            return set()
+        result: set[int] = set()
+        obj = self._entity_object(entity_name)
+        for attr in ("contact_geoms", "visual_geoms"):
+            names = getattr(obj, attr, None) if obj is not None else None
+            if names is None:
+                continue
+            for name in names:
+                try:
+                    fn = getattr(self.model, "geom_name2id", None)
+                    if callable(fn):
+                        geom_id = int(fn(str(name)))
+                    else:
+                        import mujoco
+
+                        geom_id = int(
+                            mujoco.mj_name2id(
+                                self.raw_model, mujoco.mjtObj.mjOBJ_GEOM, str(name)
+                            )
+                        )
+                    if geom_id >= 0:
+                        result.add(geom_id)
+                except Exception:
+                    continue
+        body_id = self._entity_body_id(entity_name)
+        if body_id is None:
+            return result
+        try:
+            parents = np.asarray(self.raw_model.body_parentid, dtype=np.int64)
+            geom_bodies = np.asarray(self.raw_model.geom_bodyid, dtype=np.int64)
+            descendants: set[int] = set()
+            for candidate in range(len(parents)):
+                current = int(candidate)
+                for _ in range(len(parents) + 1):
+                    if current == int(body_id):
+                        descendants.add(int(candidate))
+                        break
+                    parent = int(parents[current])
+                    if parent == current or parent < 0:
+                        break
+                    current = parent
+            result.update(
+                int(index)
+                for index, geom_body in enumerate(geom_bodies)
+                if int(geom_body) in descendants
+            )
+        except Exception:
+            pass
+        return result
+
+    def _contact_diagnostics(self, source_name: str, target_name: str) -> dict[str, Any]:
+        official_contact: bool | None = None
+        source_state = self._entity_state(source_name)
+        target_state = self._entity_state(target_name)
+        check_contact = getattr(target_state, "check_contact", None)
+        if callable(check_contact) and source_state is not None:
+            try:
+                official_contact = bool(check_contact(source_state))
+            except Exception:
+                official_contact = None
+
+        source_geom_ids = self._entity_geom_ids(source_name)
+        target_geom_ids = self._entity_geom_ids(target_name)
+        pairs: list[dict[str, Any]] = []
+        if self.raw_data is not None and source_geom_ids and target_geom_ids:
+            try:
+                ncon = int(getattr(self.raw_data, "ncon", 0))
+                for contact_index in range(ncon):
+                    contact = self.raw_data.contact[contact_index]
+                    geom1 = int(contact.geom1)
+                    geom2 = int(contact.geom2)
+                    direct = geom1 in source_geom_ids and geom2 in target_geom_ids
+                    reverse = geom2 in source_geom_ids and geom1 in target_geom_ids
+                    if not (direct or reverse):
+                        continue
+                    source_geom = geom1 if direct else geom2
+                    target_geom = geom2 if direct else geom1
+                    pairs.append(
+                        {
+                            "source_geom": self._geom_name(source_geom),
+                            "target_geom": self._geom_name(target_geom),
+                            "distance_m": float(getattr(contact, "dist", 0.0)),
+                        }
+                    )
+            except Exception:
+                pairs = []
+        scanned_contact = bool(pairs)
+        effective = official_contact if official_contact is not None else scanned_contact
+        return {
+            "ok": bool(effective),
+            "official_check_contact": official_contact,
+            "active_pair_count": len(pairs),
+            "active_pairs": pairs[:12],
+            "source_geom_count": len(source_geom_ids),
+            "target_geom_count": len(target_geom_ids),
+        }
+
+    def _diagnose_object_on(self, state: list[Any]) -> dict[str, Any]:
+        source_name = str(state[1])
+        target_name = str(state[2])
+        exact = self._predicate_satisfied(state)
+        source_pose = self._entity_pose(source_name)
+        target_pose = self._entity_pose(target_name)
+        debug: dict[str, Any] = {
+            "predicate": self._predicate_key(state),
+            "state": list(state),
+            "kind": "object_on",
+            "source": source_name,
+            "target": target_name,
+            "exact_satisfied": bool(exact),
+            "xy_threshold_m": float(self.OBJECT_ON_RADIUS),
+        }
+        if source_pose is None or target_pose is None:
+            debug.update(
+                {
+                    "xy_distance_m": None,
+                    "xy_margin_m": None,
+                    "xy_ok": None,
+                    "height_margin_m": None,
+                    "height_ok": None,
+                    "contact": self._contact_diagnostics(source_name, target_name),
+                    "failure_reasons": ["pose_unavailable"],
+                }
+            )
+            return debug
+        source_position = np.asarray(source_pose[0], dtype=np.float64)
+        target_position = np.asarray(target_pose[0], dtype=np.float64)
+        xy_distance = float(np.linalg.norm(source_position[:2] - target_position[:2]))
+        xy_margin = float(self.OBJECT_ON_RADIUS - xy_distance)
+        xy_ok = bool(xy_distance < self.OBJECT_ON_RADIUS)
+        height_margin = float(source_position[2] - target_position[2])
+        height_ok = bool(height_margin > 0.0)
+        contact = self._contact_diagnostics(source_name, target_name)
+        previous = self._debug_previous_positions.get(source_name)
+        motion = (
+            float(np.linalg.norm(source_position - previous))
+            if previous is not None
+            else None
+        )
+        self._debug_previous_positions[source_name] = source_position.copy()
+        reasons: list[str] = []
+        if not xy_ok:
+            reasons.append("xy_outside")
+        if not bool(contact["ok"]):
+            reasons.append("no_contact")
+        if not height_ok:
+            reasons.append("source_not_above_target")
+        reconstructed = bool(xy_ok and contact["ok"] and height_ok)
+        if reconstructed != bool(exact):
+            reasons.append("exact_predicate_mismatch")
+        debug.update(
+            {
+                "source_position_world_m": source_position.tolist(),
+                "target_position_world_m": target_position.tolist(),
+                "source_motion_since_last_viewer_sample_m": motion,
+                "xy_distance_m": xy_distance,
+                "xy_margin_m": xy_margin,
+                "xy_ok": xy_ok,
+                "height_margin_m": height_margin,
+                "height_ok": height_ok,
+                "contact": contact,
+                "reconstructed_satisfied": reconstructed,
+                "failure_reasons": reasons,
+            }
+        )
+        return debug
+
+    def _diagnose_site_predicate(self, state: list[Any]) -> dict[str, Any]:
+        source_name = str(state[1])
+        site_name = str(state[2])
+        exact = self._predicate_satisfied(state)
+        source_pose = self._entity_pose(source_name)
+        site_id = self._site_id(self.model, site_name)
+        debug: dict[str, Any] = {
+            "predicate": self._predicate_key(state),
+            "state": list(state),
+            "kind": "site",
+            "source": source_name,
+            "target": site_name,
+            "exact_satisfied": bool(exact),
+            "failure_reasons": [] if exact else ["exact_site_predicate_false"],
+        }
+        if source_pose is None or site_id is None:
+            debug["geometry_hint"] = None
+            return debug
+        geometry = self._site_geometry(int(site_id))
+        if geometry is None:
+            debug["geometry_hint"] = None
+            return debug
+        geom_type, size, position, rotation = geometry
+        source_position = np.asarray(source_pose[0], dtype=np.float64)
+        local = rotation.T @ (source_position - position)
+        hint: dict[str, Any] = {
+            "site_type": int(geom_type),
+            "site_size": np.asarray(size, dtype=np.float64).tolist(),
+            "site_position_world_m": np.asarray(position, dtype=np.float64).tolist(),
+            "source_position_world_m": source_position.tolist(),
+            "source_position_site_local_m": local.tolist(),
+            "center_distance_m": float(np.linalg.norm(source_position - position)),
+            "note": "Geometric hint only; exact_satisfied is authoritative.",
+        }
+        try:
+            import mujoco
+
+            if int(geom_type) == int(mujoco.mjtGeom.mjGEOM_BOX):
+                margins = np.asarray(size) - np.abs(local)
+                hint["box_axis_margins_m"] = margins.tolist()
+            elif int(geom_type) == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+                hint["cylinder_radial_margin_m"] = float(size[0] - np.linalg.norm(local[:2]))
+                hint["cylinder_vertical_margin_m"] = float(size[1] - abs(local[2]))
+        except Exception:
+            pass
+        debug["geometry_hint"] = hint
+        return debug
+
+    def _diagnose_predicate(self, state: list[Any]) -> dict[str, Any]:
+        predicate = str(state[0]).lower() if state else ""
+        if len(state) == 3 and predicate == "on" and self._site_id(self.model, str(state[2])) is None:
+            return self._diagnose_object_on(state)
+        if len(state) == 3 and predicate in {"on", "in"}:
+            return self._diagnose_site_predicate(state)
+        exact = self._predicate_satisfied(state)
+        return {
+            "predicate": self._predicate_key(state),
+            "state": list(state),
+            "kind": "state",
+            "source": str(state[1]) if len(state) > 1 else None,
+            "target": None,
+            "exact_satisfied": bool(exact),
+            "failure_reasons": [] if exact else ["exact_state_predicate_false"],
+        }
+
+    @staticmethod
+    def _debug_score(debug: dict[str, Any]) -> tuple[float, float, float, float]:
+        exact = 1.0 if debug.get("exact_satisfied") else 0.0
+        conditions = sum(
+            1.0
+            for key in ("xy_ok", "height_ok")
+            if debug.get(key) is True
+        )
+        contact = 1.0 if debug.get("contact", {}).get("ok") else 0.0
+        xy = debug.get("xy_distance_m")
+        return exact, conditions + contact, -float(xy) if xy is not None else -1e9, -len(debug.get("failure_reasons", []))
+
+    def _record_debug(self, step: int, diagnostics: list[dict[str, Any]]) -> None:
+        if not self.debug_enabled:
+            return
+        step = int(step)
+        self._debug_last_step = step
+        all_satisfied = bool(diagnostics) and all(bool(item.get("exact_satisfied")) for item in diagnostics)
+        if all_satisfied:
+            self._debug_all_true_run += 1
+            self._debug_ever_all_true = True
+        else:
+            self._debug_all_true_run = 0
+        self._debug_longest_all_true_run = max(
+            self._debug_longest_all_true_run, self._debug_all_true_run
+        )
+
+        trace_item = {
+            "step": step,
+            "all_goal_predicates_satisfied": all_satisfied,
+            "all_goal_true_run": int(self._debug_all_true_run),
+            "predicates": json_safe(diagnostics),
+        }
+        if len(self._debug_trace) >= self.debug_max_trace_points:
+            remove_count = max(1, self.debug_max_trace_points // 4)
+            del self._debug_trace[:remove_count]
+            self._debug_trace_truncated = True
+        self._debug_trace.append(trace_item)
+
+        for debug in diagnostics:
+            key = str(debug["predicate"])
+            exact = bool(debug.get("exact_satisfied"))
+            stats = self._debug_stats.setdefault(
+                key,
+                {
+                    "predicate": key,
+                    "state": debug.get("state"),
+                    "kind": debug.get("kind"),
+                    "samples": 0,
+                    "exact_true_steps": 0,
+                    "transitions": 0,
+                    "current_true_run": 0,
+                    "longest_true_run": 0,
+                    "ever_satisfied": False,
+                    "failure_reason_counts": {},
+                    "condition_true_counts": {"xy": 0, "contact": 0, "height": 0},
+                    "min_xy_distance_m": None,
+                    "max_xy_margin_m": None,
+                    "best_sample": None,
+                    "best_score": None,
+                    "last_exact": None,
+                },
+            )
+            stats["samples"] += 1
+            if exact:
+                stats["exact_true_steps"] += 1
+                stats["current_true_run"] += 1
+                stats["ever_satisfied"] = True
+            else:
+                stats["current_true_run"] = 0
+            stats["longest_true_run"] = max(
+                int(stats["longest_true_run"]), int(stats["current_true_run"])
+            )
+            if stats["last_exact"] is not None and bool(stats["last_exact"]) != exact:
+                stats["transitions"] += 1
+            stats["last_exact"] = exact
+            if debug.get("xy_ok") is True:
+                stats["condition_true_counts"]["xy"] += 1
+            if debug.get("contact", {}).get("ok") is True:
+                stats["condition_true_counts"]["contact"] += 1
+            if debug.get("height_ok") is True:
+                stats["condition_true_counts"]["height"] += 1
+            for reason in debug.get("failure_reasons", []):
+                counts = stats["failure_reason_counts"]
+                counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+            xy = debug.get("xy_distance_m")
+            margin = debug.get("xy_margin_m")
+            if xy is not None:
+                stats["min_xy_distance_m"] = (
+                    float(xy)
+                    if stats["min_xy_distance_m"] is None
+                    else min(float(stats["min_xy_distance_m"]), float(xy))
+                )
+            if margin is not None:
+                stats["max_xy_margin_m"] = (
+                    float(margin)
+                    if stats["max_xy_margin_m"] is None
+                    else max(float(stats["max_xy_margin_m"]), float(margin))
+                )
+            score = self._debug_score(debug)
+            if stats["best_score"] is None or tuple(score) > tuple(stats["best_score"]):
+                stats["best_score"] = list(score)
+                stats["best_sample"] = {"step": step, **json_safe(debug)}
+
+            signature = (
+                exact,
+                debug.get("xy_ok"),
+                debug.get("contact", {}).get("ok"),
+                debug.get("height_ok"),
+                tuple(debug.get("failure_reasons", [])),
+            )
+            previous_signature = self._debug_last_signature.get(key)
+            last_log_step = int(self._debug_last_log_step.get(key, -10**9))
+            due_periodic = step == 0 or step - last_log_step >= self.debug_log_every_n_steps
+            due_change = previous_signature != signature and step - last_log_step >= 3
+            if due_periodic or due_change:
+                if debug.get("kind") == "object_on":
+                    xy_value = debug.get("xy_distance_m")
+                    xy_text = "unknown" if xy_value is None else f"{float(xy_value):.4f}/{self.OBJECT_ON_RADIUS:.4f}"
+                    contact = debug.get("contact", {})
+                    height = debug.get("height_margin_m")
+                    motion = debug.get("source_motion_since_last_viewer_sample_m")
+                    print(
+                        "[goal-debug] "
+                        f"step={step} predicate={key!r} exact={int(exact)} "
+                        f"xy={xy_text} xy_ok={debug.get('xy_ok')} "
+                        f"contact={contact.get('ok')} pairs={contact.get('active_pair_count')} "
+                        f"height_margin={height} height_ok={debug.get('height_ok')} "
+                        f"motion={motion} true_run={stats['current_true_run']} "
+                        f"reasons={debug.get('failure_reasons', [])}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[goal-debug] "
+                        f"step={step} predicate={key!r} exact={int(exact)} "
+                        f"reasons={debug.get('failure_reasons', [])}",
+                        flush=True,
+                    )
+                self._debug_last_log_step[key] = step
+            self._debug_last_signature[key] = signature
+
+    def export_debug_payload(self, *, success: bool | None = None) -> dict[str, Any]:
+        summaries: list[dict[str, Any]] = []
+        for stats in self._debug_stats.values():
+            samples = max(1, int(stats["samples"]))
+            condition_counts = stats.get("condition_true_counts", {})
+            summaries.append(
+                {
+                    "predicate": stats["predicate"],
+                    "state": stats.get("state"),
+                    "kind": stats.get("kind"),
+                    "samples": int(stats["samples"]),
+                    "final_satisfied": bool(stats.get("last_exact")),
+                    "ever_satisfied": bool(stats.get("ever_satisfied")),
+                    "exact_true_steps": int(stats["exact_true_steps"]),
+                    "exact_true_ratio": float(stats["exact_true_steps"] / samples),
+                    "transitions": int(stats["transitions"]),
+                    "longest_true_run": int(stats["longest_true_run"]),
+                    "stable_for_debug": int(stats["longest_true_run"]) >= self.debug_stable_steps,
+                    "failure_reason_counts": dict(stats.get("failure_reason_counts", {})),
+                    "xy_true_ratio": float(condition_counts.get("xy", 0) / samples),
+                    "contact_true_ratio": float(condition_counts.get("contact", 0) / samples),
+                    "height_true_ratio": float(condition_counts.get("height", 0) / samples),
+                    "min_xy_distance_m": stats.get("min_xy_distance_m"),
+                    "max_xy_margin_m": stats.get("max_xy_margin_m"),
+                    "best_sample": stats.get("best_sample"),
+                }
+            )
+        summary = {
+            **self._episode_identity,
+            "success": None if success is None else bool(success),
+            "last_step": int(self._debug_last_step),
+            "required_stable_steps_debug_only": int(self.debug_stable_steps),
+            "all_goal_predicates_ever_satisfied_same_step": bool(self._debug_ever_all_true),
+            "longest_all_goal_true_run": int(self._debug_longest_all_true_run),
+            "all_goal_stable_for_debug": int(self._debug_longest_all_true_run) >= self.debug_stable_steps,
+            "trace_sample_count": len(self._debug_trace),
+            "trace_truncated": bool(self._debug_trace_truncated),
+            "predicates": summaries,
+        }
+        return {"summary": json_safe(summary), "trace": json_safe(self._debug_trace)}
+
+    def print_final_debug(self, *, success: bool) -> None:
+        if not self.debug_enabled:
+            return
+        payload = self.export_debug_payload(success=success)
+        summary = payload["summary"]
+        print(
+            "[goal-debug-final] "
+            f"success={bool(success)} ever_all={summary['all_goal_predicates_ever_satisfied_same_step']} "
+            f"longest_all_true_run={summary['longest_all_goal_true_run']}",
+            flush=True,
+        )
+        for item in summary["predicates"]:
+            best = item.get("best_sample") or {}
+            print(
+                "[goal-debug-final] "
+                f"predicate={item['predicate']!r} final={item['final_satisfied']} "
+                f"ever={item['ever_satisfied']} transitions={item['transitions']} "
+                f"longest_true_run={item['longest_true_run']} "
+                f"min_xy={item.get('min_xy_distance_m')} "
+                f"failure_counts={item.get('failure_reason_counts')} "
+                f"best_step={best.get('step')}",
+                flush=True,
+            )
+
+    def _site_geometry(self, site_id: int) -> tuple[int, np.ndarray, np.ndarray, np.ndarray] | None:
+        if self.raw_model is None or self.raw_data is None:
+            return None
+        try:
+            geom_type = int(np.asarray(self.raw_model.site_type)[site_id])
+            size = np.asarray(self.raw_model.site_size[site_id], dtype=np.float64).reshape(3).copy()
+            position = np.asarray(self.raw_data.site_xpos[site_id], dtype=np.float64).reshape(3).copy()
+            rotation = np.asarray(self.raw_data.site_xmat[site_id], dtype=np.float64).reshape(3, 3).copy()
+        except Exception as exc:
+            print(f"[warn] failed to read success-region site geometry id={site_id}: {exc!r}", flush=True)
+            return None
+        # Completely flat/zero-size sites are hard to see.  Inflate only the
+        # viewer copy, never the model site used by the task predicate.
+        size = np.maximum(size, np.asarray([0.004, 0.004, 0.002], dtype=np.float64))
+        return geom_type, size, position, rotation
+
+    def _entity_object(self, entity_name: str) -> Any | None:
+        if self.base_env is None:
+            return None
+        get_object = getattr(self.base_env, "get_object", None)
+        if callable(get_object):
+            try:
+                value = get_object(entity_name)
+                if value is not None:
+                    return value
+            except Exception:
+                pass
+        for attr in ("objects_dict", "fixtures_dict"):
+            mapping = getattr(self.base_env, attr, {})
+            if entity_name in mapping:
+                return mapping[entity_name]
+        return None
+
+    def _entity_body_id(self, entity_name: str) -> int | None:
+        body_map = getattr(self.base_env, "obj_body_id", {}) if self.base_env is not None else {}
+        if entity_name in body_map:
+            try:
+                return int(body_map[entity_name])
+            except Exception:
+                pass
+        obj = self._entity_object(entity_name)
+        root_body = getattr(obj, "root_body", None) if obj is not None else None
+        if root_body is not None and self.model is not None:
+            fn = getattr(self.model, "body_name2id", None)
+            if callable(fn):
+                try:
+                    return int(fn(root_body))
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _quat_to_rotation(quat: Any, *, scalar_first: bool = False) -> np.ndarray:
+        """Best-effort quaternion conversion used only for Viewer3D marker height.
+
+        MuJoCo ``body_xquat`` uses wxyz, while robosuite transform helpers commonly
+        expose xyzw.  The caller specifies the convention explicitly.  Body rotation
+        from MuJoCo remains preferred whenever it is directly available.
+        """
+        try:
+            q = np.asarray(quat, dtype=np.float64).reshape(4)
+            if not np.isfinite(q).all() or float(np.linalg.norm(q)) < 1e-8:
+                return np.eye(3, dtype=np.float64)
+            q = q / np.linalg.norm(q)
+            from scipy.spatial.transform import Rotation as _Rotation
+
+            if scalar_first:
+                q = np.asarray([q[1], q[2], q[3], q[0]], dtype=np.float64)
+            return _Rotation.from_quat(q).as_matrix().astype(np.float64)
+        except Exception:
+            return np.eye(3, dtype=np.float64)
+
+    def _state_geom_pose(self, entity_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """Read an object's canonical pose through LIBERO's predicate state API.
+
+        ``ObjectState.get_geom_state()`` is the same path used by LIBERO object
+        predicates and is more version-stable than relying only on wrapper-specific
+        ``obj_body_id`` exposure.
+        """
+        if self.base_env is None:
+            return None
+        state_map = getattr(self.base_env, "object_states_dict", {})
+        state = state_map.get(entity_name) if isinstance(state_map, dict) else None
+        get_geom_state = getattr(state, "get_geom_state", None)
+        if not callable(get_geom_state):
+            return None
+        try:
+            geom_state = get_geom_state()
+            if not isinstance(geom_state, dict) or "pos" not in geom_state:
+                return None
+            position = np.asarray(geom_state["pos"], dtype=np.float64).reshape(3).copy()
+            if not np.isfinite(position).all():
+                return None
+            # Official ObjectState.get_geom_state returns MuJoCo body_xquat
+            # (wxyz). Site-like custom states generally use robosuite xyzw.
+            scalar_first = str(getattr(state, "object_state_type", "object")).lower() == "object"
+            rotation = self._quat_to_rotation(
+                geom_state.get("quat", [1.0, 0.0, 0.0, 0.0] if scalar_first else [0.0, 0.0, 0.0, 1.0]),
+                scalar_first=scalar_first,
+            )
+            return position, rotation
+        except Exception:
+            return None
+
+    def _body_pose_from_env(self, env: Any, entity_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        if env is None:
+            return None
+        body_map = getattr(env, "obj_body_id", {})
+        if entity_name not in body_map:
+            return None
+        try:
+            body_id = int(body_map[entity_name])
+            sim = getattr(env, "sim", None)
+            data = getattr(sim, "data", None)
+            raw_data = getattr(data, "_data", data)
+            position = np.asarray(raw_data.body_xpos[body_id], dtype=np.float64).reshape(3).copy()
+            rotation = np.asarray(raw_data.body_xmat[body_id], dtype=np.float64).reshape(3, 3).copy()
+            if np.isfinite(position).all() and np.isfinite(rotation).all():
+                return position, rotation
+        except Exception:
+            pass
+        return None
+
+    def _entity_pose(self, entity_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        # 1) Canonical LIBERO ObjectState path.  Task 4 plates are guaranteed to
+        # exist here even when a wrapper does not expose obj_body_id directly.
+        state_pose = self._state_geom_pose(entity_name)
+
+        # 2) Prefer exact MuJoCo body orientation when the base env exposes it.
+        base_body_pose = self._body_pose_from_env(self.base_env, entity_name)
+        if base_body_pose is not None:
+            return base_body_pose
+        if state_pose is not None:
+            return state_pose
+
+        # 3) Some wrappers store the real environment on the ObjectState itself.
+        state_map = getattr(self.base_env, "object_states_dict", {}) if self.base_env is not None else {}
+        state = state_map.get(entity_name) if isinstance(state_map, dict) else None
+        state_env_pose = self._body_pose_from_env(getattr(state, "env", None), entity_name)
+        if state_env_pose is not None:
+            return state_env_pose
+
+        # 4) Legacy root-body lookup retained for custom LIBERO forks.
+        if self.raw_data is not None:
+            body_id = self._entity_body_id(entity_name)
+            if body_id is not None:
+                try:
+                    position = np.asarray(self.raw_data.body_xpos[body_id], dtype=np.float64).reshape(3).copy()
+                    rotation = np.asarray(self.raw_data.body_xmat[body_id], dtype=np.float64).reshape(3, 3).copy()
+                    if np.isfinite(position).all() and np.isfinite(rotation).all():
+                        return position, rotation
+                except Exception:
+                    pass
+
+        # Emit one actionable diagnostic instead of silently producing no markers.
+        if entity_name not in self._pose_failure_reported:
+            body_keys = list(getattr(self.base_env, "obj_body_id", {}).keys()) if self.base_env is not None else []
+            state_keys = list(state_map.keys()) if isinstance(state_map, dict) else []
+            print(
+                "[warn] Viewer3D goal overlay could not resolve object pose "
+                f"target={entity_name!r}; obj_body_id_has={entity_name in body_keys} "
+                f"object_state_has={entity_name in state_keys} "
+                f"sample_body_keys={body_keys[:12]} sample_state_keys={state_keys[:12]}",
+                flush=True,
+            )
+            self._pose_failure_reported.add(entity_name)
+        return None
+
+    def _entity_top_world(self, entity_name: str) -> np.ndarray | None:
+        pose = self._entity_pose(entity_name)
+        if pose is None:
+            return None
+        position, rotation = pose
+        obj = self._entity_object(entity_name)
+        top_offset = getattr(obj, "top_offset", None) if obj is not None else None
+        if top_offset is not None:
+            try:
+                offset = np.asarray(top_offset, dtype=np.float64).reshape(3)
+                return position + rotation @ offset
+            except Exception:
+                pass
+        # Conservative Viewer-only fallback.  It does not affect the exact 3 cm
+        # X/Y acceptance circle or any simulation / policy observation.
+        result = position.copy()
+        result[2] += 0.04
+        return result
+
+    @staticmethod
+    def _geometry_spec(
+        geom_type: int,
+        size: np.ndarray,
+        position: np.ndarray,
+        rotation: np.ndarray,
+        *,
+        alpha_scale: float = 1.0,
+        min_alpha: float = 0.0,
+        emission: float = 0.20,
+        rgb: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "geom_type": int(geom_type),
+            "size": np.asarray(size, dtype=np.float64).reshape(3),
+            "position": np.asarray(position, dtype=np.float64).reshape(3),
+            "rotation": np.asarray(rotation, dtype=np.float64).reshape(3, 3),
+            "alpha_scale": float(alpha_scale),
+            "min_alpha": float(min_alpha),
+            "emission": float(emission),
+            "rgb": None if rgb is None else np.asarray(rgb, dtype=np.float32).reshape(3),
+        }
+
+    def _entry_geometries(self, entry: dict[str, Any], mujoco: Any) -> list[dict[str, Any]]:
+        """Return viewer-only geoms for one goal entry.
+
+        Object-on-object goals use a raised translucent acceptance column plus
+        a bright bead ring.  The radius remains the exact 3 cm world-XY threshold
+        used by LIBERO, but the display is no longer coplanar with the plate.
+        """
+        kind = str(entry["kind"])
+        if kind == "site":
+            geometry = self._site_geometry(int(entry["site_id"]))
+            if geometry is None:
+                return []
+            geom_type, size, position, rotation = geometry
+            return [self._geometry_spec(
+                geom_type, size, position, rotation,
+                alpha_scale=1.0, min_alpha=0.20, emission=0.30,
+            )]
+
+        if kind == "object_on":
+            entity_name = str(entry["entity_name"])
+            pose = self._entity_pose(entity_name)
+            top = self._entity_top_world(entity_name)
+            if pose is None or top is None:
+                return []
+            body_position, _body_rotation = pose
+            # Official check_ontop compares body_xpos[:2], so center X/Y must
+            # come from the target body's world position, not from top_offset.
+            center_xy = np.asarray(body_position[:2], dtype=np.float64)
+            top_z = float(max(float(top[2]), float(body_position[2]) + 0.005))
+            column_bottom = top_z + self.OBJECT_ON_COLUMN_CLEARANCE
+            column_center_z = column_bottom + self.OBJECT_ON_COLUMN_HALF_HEIGHT
+            ring_z = top_z + self.OBJECT_ON_RING_HEIGHT
+            identity = np.eye(3, dtype=np.float64)
+
+            specs: list[dict[str, Any]] = [
+                self._geometry_spec(
+                    int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+                    np.asarray([self.OBJECT_ON_RADIUS, self.OBJECT_ON_COLUMN_HALF_HEIGHT, 0.0]),
+                    np.asarray([center_xy[0], center_xy[1], column_center_z]),
+                    identity,
+                    alpha_scale=0.60,
+                    min_alpha=0.16,
+                    emission=0.35,
+                )
+            ]
+            # Bright vertical axis connecting the target object to the halo.
+            axis_half_height = max(0.005, 0.5 * (ring_z - top_z))
+            specs.append(self._geometry_spec(
+                int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+                np.asarray([self.OBJECT_ON_AXIS_RADIUS, axis_half_height, 0.0]),
+                np.asarray([center_xy[0], center_xy[1], top_z + axis_half_height]),
+                identity,
+                alpha_scale=1.0,
+                min_alpha=0.85,
+                emission=1.0,
+            ))
+            # Elevated ring avoids plate-rim occlusion and depth-buffer z-fighting.
+            bead_count = max(8, int(self.OBJECT_ON_RING_BEADS))
+            for bead_index in range(bead_count):
+                angle = 2.0 * np.pi * bead_index / bead_count
+                specs.append(self._geometry_spec(
+                    int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                    np.asarray([self.OBJECT_ON_RING_BEAD_RADIUS, 0.0, 0.0]),
+                    np.asarray([
+                        center_xy[0] + self.OBJECT_ON_RADIUS * np.cos(angle),
+                        center_xy[1] + self.OBJECT_ON_RADIUS * np.sin(angle),
+                        ring_z,
+                    ]),
+                    identity,
+                    alpha_scale=1.0,
+                    min_alpha=0.90,
+                    emission=1.0,
+                ))
+            specs.append(self._geometry_spec(
+                int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                np.asarray([self.OBJECT_ON_CENTER_BEACON_RADIUS, 0.0, 0.0]),
+                np.asarray([center_xy[0], center_xy[1], ring_z]),
+                identity,
+                alpha_scale=1.0,
+                min_alpha=0.95,
+                emission=1.0,
+            ))
+
+            # Debug-only status row above the target. World-X order is:
+            # XY threshold, exact contact, relative height. Green=true, red=false.
+            entry_debug = entry.get("_goal_debug", {})
+            predicate_debug = (entry_debug.get("predicates") or [{}])[0]
+            status_values = [
+                predicate_debug.get("xy_ok"),
+                predicate_debug.get("contact", {}).get("ok"),
+                predicate_debug.get("height_ok"),
+            ]
+            status_z = ring_z + 0.035
+            for status_index, status_value in enumerate(status_values):
+                status_rgb = (
+                    self.DEBUG_TRUE_RGB
+                    if status_value is True
+                    else self.DEBUG_FALSE_RGB
+                    if status_value is False
+                    else self.DEBUG_UNKNOWN_RGB
+                )
+                specs.append(self._geometry_spec(
+                    int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                    np.asarray([self.DEBUG_BEACON_RADIUS, 0.0, 0.0]),
+                    np.asarray([center_xy[0] + (status_index - 1) * 0.020, center_xy[1], status_z]),
+                    identity,
+                    min_alpha=0.95,
+                    emission=1.0,
+                    rgb=status_rgb,
+                ))
+            source_position = predicate_debug.get("source_position_world_m")
+            if source_position is not None:
+                source_position = np.asarray(source_position, dtype=np.float64)
+                specs.append(self._geometry_spec(
+                    int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                    np.asarray([self.DEBUG_SOURCE_RADIUS, 0.0, 0.0]),
+                    np.asarray([source_position[0], source_position[1], ring_z + 0.020]),
+                    identity,
+                    min_alpha=0.95,
+                    emission=1.0,
+                    rgb=self.DEBUG_SOURCE_RGB,
+                ))
+            if not self._debug_legend_reported:
+                print(
+                    "[viewer3d] goal-debug beacons: status row world-X left=XY, center=CONTACT, "
+                    "right=HEIGHT; cyan=source body-center XY projection",
+                    flush=True,
+                )
+                self._debug_legend_reported = True
+
+            report_key = f"object_on:{entity_name}"
+            if report_key not in self._reported_geometry:
+                print(
+                    "[viewer3d] object-on acceptance region "
+                    f"target={entity_name} xy_center=({center_xy[0]:.4f},{center_xy[1]:.4f}) "
+                    f"top_z={top_z:.4f} radius={self.OBJECT_ON_RADIUS:.3f} "
+                    f"ring_z={ring_z:.4f} geoms={len(specs)}",
+                    flush=True,
+                )
+                self._reported_geometry.add(report_key)
+            return specs
+
+        if kind == "state":
+            top = self._entity_top_world(str(entry["entity_name"]))
+            if top is None:
+                return []
+            position = top.copy()
+            position[2] += 0.065
+            return [self._geometry_spec(
+                int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                np.asarray([self.STATE_BEACON_RADIUS, 0.0, 0.0]),
+                position,
+                np.eye(3, dtype=np.float64),
+                alpha_scale=1.0,
+                min_alpha=0.75,
+                emission=0.80,
+            )]
+        return []
+
+    def _bind_marker_slots(self, handle: Any, marker_count: int) -> tuple[Any, int, int] | None:
+        scene = getattr(handle, "user_scn", None)
+        if scene is None:
+            return None
+        viewer_identity = id(handle)
+        current_ngeom = int(getattr(scene, "ngeom", 0))
+        capacity = len(getattr(scene, "geoms", ()))
+        slots_valid = (
+            self._viewer_identity == viewer_identity
+            and self._marker_start is not None
+            and self._marker_count == marker_count
+            and current_ngeom >= self._marker_start + marker_count
+        )
+        if not slots_valid:
+            self._viewer_identity = viewer_identity
+            self._marker_start = current_ngeom
+            available = max(0, capacity - current_ngeom)
+            self._marker_count = min(marker_count, available)
+            if self._marker_count < marker_count and not self._capacity_warning_reported:
+                print(
+                    "[warn] Viewer3D user scene has insufficient marker capacity: "
+                    f"requested={marker_count} available={available}",
+                    flush=True,
+                )
+                self._capacity_warning_reported = True
+            scene.ngeom = current_ngeom + self._marker_count
+        return scene, int(self._marker_start), int(self._marker_count)
+
+    def update(self, viewer: Any, *, step: int = 0) -> None:
+        if not self.active:
+            return
+        handle = self._passive_viewer_handle(viewer)
+        if handle is None:
+            if not self._unsupported_viewer_reported:
+                print(
+                    "[warn] Viewer3D goal overlay requires the modern MuJoCo passive viewer; "
+                    "overlay disabled rather than modifying sim.model.",
+                    flush=True,
+                )
+                self._unsupported_viewer_reported = True
+            return
+        try:
+            import mujoco
+        except ImportError as exc:
+            if not self._unsupported_viewer_reported:
+                print(f"[warn] MuJoCo Python module unavailable for Viewer3D overlay: {exc!r}", flush=True)
+                self._unsupported_viewer_reported = True
+            return
+
+        render_items: list[tuple[dict[str, Any], bool, dict[str, Any]]] = []
+        entry_states: list[tuple[dict[str, Any], bool]] = []
+        all_diagnostics: list[dict[str, Any]] = []
+        for entry in self.entries:
+            predicate_diagnostics = [self._diagnose_predicate(state) for state in entry["predicates"]]
+            satisfied = bool(predicate_diagnostics) and all(
+                bool(item.get("exact_satisfied")) for item in predicate_diagnostics
+            )
+            entry_debug = {
+                "kind": entry["kind"],
+                "target": entry["name"],
+                "satisfied": satisfied,
+                "predicates": predicate_diagnostics,
+            }
+            entry["_goal_debug"] = entry_debug
+            all_diagnostics.extend(predicate_diagnostics)
+            entry_states.append((entry, satisfied))
+            for geometry in self._entry_geometries(entry, mujoco):
+                render_items.append((entry, satisfied, geometry))
+        self._record_debug(int(step), all_diagnostics)
+        if not render_items:
+            return
+
+        lock_fn = getattr(handle, "lock", None)
+        lock_context = lock_fn() if callable(lock_fn) else nullcontext()
+        rendered_count = 0
+        with lock_context:
+            bound = self._bind_marker_slots(handle, len(render_items))
+            if bound is None:
+                return
+            scene, marker_start, marker_count = bound
+            for marker_offset, (_entry, satisfied, geometry) in enumerate(render_items[:marker_count]):
+                rgba = np.empty(4, dtype=np.float32)
+                explicit_rgb = geometry.get("rgb")
+                rgba[:3] = (
+                    np.asarray(explicit_rgb, dtype=np.float32)
+                    if explicit_rgb is not None
+                    else self.SATISFIED_RGB if satisfied else self.UNSATISFIED_RGB
+                )
+                base_alpha = min(1.0, self.alpha + 0.30) if satisfied else self.alpha
+                rgba[3] = max(
+                    float(geometry.get("min_alpha", 0.0)),
+                    min(1.0, base_alpha * float(geometry.get("alpha_scale", 1.0))),
+                )
+                geom = scene.geoms[marker_start + marker_offset]
+                mujoco.mjv_initGeom(
+                    geom,
+                    int(geometry["geom_type"]),
+                    np.ascontiguousarray(geometry["size"], dtype=np.float64),
+                    np.ascontiguousarray(geometry["position"], dtype=np.float64),
+                    np.ascontiguousarray(geometry["rotation"].reshape(-1), dtype=np.float64),
+                    np.ascontiguousarray(rgba, dtype=np.float32),
+                )
+                if hasattr(mujoco, "mjtCatBit") and hasattr(geom, "category"):
+                    geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+                if hasattr(geom, "emission"):
+                    geom.emission = float(geometry.get("emission", 0.20))
+                if hasattr(geom, "specular"):
+                    geom.specular = 0.0
+                if hasattr(geom, "shininess"):
+                    geom.shininess = 0.0
+                rendered_count += 1
+            # Publish after initialization, matching MuJoCo's passive-viewer API example.
+            scene.ngeom = marker_start + rendered_count
+
+        for entry, satisfied in entry_states:
+            log_key = f"{entry['kind']}:{entry['name']}"
+            previous = self._last_satisfied.get(log_key)
+            if previous is None or previous != satisfied:
+                print(
+                    "[viewer3d] goal overlay "
+                    f"kind={entry['kind']} target={entry['name']} "
+                    f"predicates={entry['predicates']} satisfied={satisfied} "
+                    f"user_scene_geoms={rendered_count}",
+                    flush=True,
+                )
+            self._last_satisfied[log_key] = satisfied
+
+def configure_success_region_visualization(
+    env: Any,
+    cfg: dict[str, Any],
+    viewer: Any,
+    *,
+    step: int = 0,
+) -> SuccessRegionVisualizer | None:
+    """Create or refresh one per-environment viewer-only success-region overlay."""
+    if str(cfg.get("render_mode", "offscreen")).lower() != "viewer3d":
+        return None
+    if not bool(cfg.get("visualize_success_regions", True)):
+        return None
+
+    base_env = SuccessRegionVisualizer._find_libero_base_env(env)
+    if base_env is None:
+        return None
+    visualizer = getattr(base_env, "_song_success_region_visualizer", None)
+    if not isinstance(visualizer, SuccessRegionVisualizer) or not visualizer.matches_current_sim(env):
+        visualizer = SuccessRegionVisualizer(
+            env,
+            alpha=float(cfg.get("success_region_alpha", 0.35)),
+            debug_enabled=bool(cfg.get("goal_debug", True)),
+            debug_log_every_n_steps=int(cfg.get("goal_debug_log_every_n_steps", 25)),
+            debug_stable_steps=int(cfg.get("goal_debug_stable_steps", 5)),
+            debug_max_trace_points=int(cfg.get("goal_debug_max_trace_points", 5000)),
+        )
+        setattr(base_env, "_song_success_region_visualizer", visualizer)
+        if visualizer.active:
+            print(
+                "[viewer3d] drawing viewer-only LIBERO goal overlays: "
+                + ", ".join(f"{entry['kind']}:{entry['name']}" for entry in visualizer.entries),
+                flush=True,
+            )
+        else:
+            print(
+                "[viewer3d] this task has no supported spatial or articulated goal overlay; "
+                f"goal_states={getattr(base_env, 'parsed_problem', {}).get('goal_state', [])}",
+                flush=True,
+            )
+    episode_identity = getattr(base_env, "_song_goal_debug_episode_identity", None)
+    if isinstance(episode_identity, dict):
+        visualizer.begin_episode(
+            suite_name=str(episode_identity.get("suite", "unknown")),
+            task_id=int(episode_identity.get("task_id", -1)),
+            episode_index=int(episode_identity.get("episode_index", -1)),
+        )
+    visualizer.update(viewer, step=int(step))
+    return visualizer
+
+
+def begin_goal_debug_episode(
+    env: Any,
+    *,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+) -> None:
+    base_env = SuccessRegionVisualizer._find_libero_base_env(env)
+    if base_env is None:
+        return
+    identity = {
+        "suite": str(suite_name),
+        "task_id": int(task_id),
+        "episode_index": int(episode_index),
+    }
+    setattr(base_env, "_song_goal_debug_episode_identity", identity)
+    visualizer = getattr(base_env, "_song_success_region_visualizer", None)
+    if isinstance(visualizer, SuccessRegionVisualizer):
+        visualizer.begin_episode(**identity)
+
+
+def finalize_goal_debug_episode(env: Any, *, success: bool) -> dict[str, Any]:
+    base_env = SuccessRegionVisualizer._find_libero_base_env(env)
+    if base_env is None:
+        return {"summary": {}, "trace": []}
+    visualizer = getattr(base_env, "_song_success_region_visualizer", None)
+    if not isinstance(visualizer, SuccessRegionVisualizer):
+        return {"summary": {}, "trace": []}
+    visualizer.print_final_debug(success=bool(success))
+    return visualizer.export_debug_payload(success=bool(success))
+
+
 def render_viewer3d(env: Any, cfg: dict[str, Any], step: int, *, force: bool = False) -> None:
-    """Minimal Viewer3D attach/sync; intentionally no complex lifecycle logic."""
+    """Refresh Viewer3D and its viewer-only debug overlays."""
     render_mode = str(cfg.get("render_mode", "offscreen")).lower()
     if render_mode != "viewer3d":
         return
@@ -1445,11 +3003,20 @@ def render_viewer3d(env: Any, cfg: dict[str, Any], step: int, *, force: bool = F
         viewer = attach_mujoco_3d_viewer(env, render_camera=render_camera)
 
     try:
-        sync_viewer(viewer)
+        visualizer = configure_success_region_visualization(env, cfg, viewer, step=int(step))
+        passive_handle = (
+            visualizer._passive_viewer_handle(viewer)
+            if visualizer is not None
+            else None
+        )
+        direct_sync = getattr(passive_handle, "sync", None) if passive_handle is not None else None
+        if callable(direct_sync):
+            direct_sync()
+        else:
+            sync_viewer(viewer)
         time.sleep(1.0 / 60.0)
     except Exception as exc:
         print(f"[WARN] Viewer3D sync failed: {exc!r}", flush=True)
-
 
 def gripper_threshold_command(
     predicted_width: float,
@@ -1966,6 +3533,7 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "object_positions",
         "object_quaternions",
         "goal_predicate_values",
+        "goal_debug_trace",
         "scene_joint_values",
         "contact_pair_strings",
         "robot_scene_contact_pair_strings",
@@ -1989,6 +3557,16 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
     if action_npz is not None:
         record["action_npz"] = action_npz
     return json_safe(record)
+
+
+def save_episode_goal_debug(result: dict[str, Any], episode_dir: Path) -> str | None:
+    summary = result.get("goal_debug_summary")
+    trace = result.get("goal_debug_trace")
+    if not summary and not trace:
+        return None
+    path = episode_dir / "goal_debug.json"
+    write_json_atomic(path, {"summary": summary or {}, "trace": trace or []})
+    return str(path)
 
 
 def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | None:
@@ -4067,6 +5645,12 @@ def run_episode(
     start_s = time.perf_counter()
 
     manual_failure = False
+    begin_goal_debug_episode(
+        env,
+        suite_name=suite_name,
+        task_id=int(task_id),
+        episode_index=int(episode_index),
+    )
     keyboard = EpisodeKeyboardControl()
     if bool(cfg.get("keyboard_control_enabled", True)):
         keyboard.start_terminal()
@@ -4725,6 +6309,7 @@ def run_episode(
     if manual_failure:
         success_ever = False
 
+    goal_debug_payload = finalize_goal_debug_episode(env, success=bool(success_ever))
     final_eef_pose = eef_pose9_gripper_from_obs(raw_obs)
     return {
         "evaluation_protocol": evaluation_protocol_for_config(cfg),
@@ -4844,6 +6429,8 @@ def run_episode(
         "final_goal_predicate_values": (
             goal_predicate_values[-1] if goal_predicate_values else initial_goal_predicate_values
         ),
+        "goal_debug_summary": goal_debug_payload.get("summary", {}),
+        "goal_debug_trace": goal_debug_payload.get("trace", []),
         "scene_joint_names": scene_joint_names,
         "scene_joint_types": scene_joint_types,
         "scene_joint_ranges": scene_joint_ranges,
@@ -5433,7 +7020,10 @@ def evaluate_task(
                 result["hard_reset_warmup_count"] = int(reset_warmup_count)
 
                 action_npz = save_episode_actions(result, episode_dir)
+                goal_debug_path = save_episode_goal_debug(result, episode_dir)
                 episode_record = compact_episode_record(result, episode_idx, action_npz)
+                if goal_debug_path is not None:
+                    episode_record["goal_debug_path"] = goal_debug_path
 
                 if bool(cfg.get("save_video", True)):
                     video_record = {
@@ -5457,6 +7047,8 @@ def evaluate_task(
                     task_id=int(task_id),
                     episode_index=int(episode_idx),
                     episode_record=episode_record,
+                    task_name=task_name,
+                    task_language=task_language,
                 )
                 task_results.append(episode_record)
                 print(
@@ -5486,6 +7078,8 @@ def evaluate_task(
                     task_id=int(task_id),
                     episode_index=int(episode_idx),
                     episode_record=failure,
+                    task_name=task_name,
+                    task_language=task_language,
                 )
                 task_results.append(failure)
                 print(
@@ -5797,6 +7391,7 @@ def evaluate_suite_process_parallel(
                     episode_indices=list(job.episode_indices),
                 )
             worker_summaries[worker_id] = summary
+            record_failed_task_summary(output_dir, summary)
             finished_workers.add(worker_id)
 
         def _drain_results() -> None:
@@ -5824,13 +7419,15 @@ def evaluate_suite_process_parallel(
                     f"shard={job.shard_index} episodes={list(job.episode_indices)}: {exc}",
                     flush=True,
                 )
-                worker_summaries[worker_id] = failed_task_summary(
+                summary = failed_task_summary(
                     suite_name=suite_name,
                     task_id=task_id,
                     episode_count=int(cfg["episodes"]),
                     exc=exc,
                     episode_indices=list(job.episode_indices),
                 )
+                worker_summaries[worker_id] = summary
+                record_failed_task_summary(output_dir, summary)
                 finished_workers.add(worker_id)
 
         try:
@@ -6075,7 +7672,7 @@ def evaluate_suite_isolated_policy_processes(
                         f"{error_repr}\n{error_traceback}",
                         flush=True,
                     )
-                    summaries.extend(
+                    failed_summaries = [
                         failed_task_summary(
                             suite_name=suite_name,
                             task_id=task_id,
@@ -6083,7 +7680,10 @@ def evaluate_suite_isolated_policy_processes(
                             exc=RuntimeError(error_repr),
                         )
                         for task_id in worker_task_ids
-                    )
+                    ]
+                    summaries.extend(failed_summaries)
+                    for summary in failed_summaries:
+                        record_failed_task_summary(output_dir, summary)
                 finished.add(worker_id)
 
             for worker_id, process in processes.items():
@@ -6095,7 +7695,7 @@ def evaluate_suite_isolated_policy_processes(
                     f"(exitcode={process.exitcode})"
                 )
                 failures.append(error)
-                summaries.extend(
+                failed_summaries = [
                     failed_task_summary(
                         suite_name=suite_name,
                         task_id=task_id,
@@ -6103,7 +7703,10 @@ def evaluate_suite_isolated_policy_processes(
                         exc=RuntimeError(error),
                     )
                     for task_id in worker_task_ids
-                )
+                ]
+                summaries.extend(failed_summaries)
+                for summary in failed_summaries:
+                    record_failed_task_summary(output_dir, summary)
                 finished.add(worker_id)
     except BaseException:
         for process in processes.values():
@@ -6208,6 +7811,41 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["render_camera"] = cfg_get(cfg, args.render_camera, "render_camera", "agentview")
     cfg["render_every_n_steps"] = int(cfg_get(cfg, args.render_every_n_steps, "render_every_n_steps", 1))
     cfg["render_gpu_device_id"] = int(cfg_get(cfg, args.render_gpu_device_id, "render_gpu_device_id", -1))
+    cfg["visualize_success_regions"] = bool(
+        cfg_get(
+            cfg,
+            args.visualize_success_regions,
+            "visualize_success_regions",
+            str(cfg["render_mode"]).lower() == "viewer3d",
+        )
+    )
+    cfg["success_region_alpha"] = float(
+        np.clip(
+            float(cfg_get(cfg, args.success_region_alpha, "success_region_alpha", 0.35)),
+            0.02,
+            1.0,
+        )
+    )
+    cfg["goal_debug"] = bool(
+        cfg_get(
+            cfg,
+            args.goal_debug,
+            "goal_debug",
+            str(cfg["render_mode"]).lower() == "viewer3d",
+        )
+    )
+    cfg["goal_debug_log_every_n_steps"] = max(
+        1,
+        int(cfg_get(cfg, args.goal_debug_log_every_n_steps, "goal_debug_log_every_n_steps", 25)),
+    )
+    cfg["goal_debug_stable_steps"] = max(
+        1,
+        int(cfg_get(cfg, args.goal_debug_stable_steps, "goal_debug_stable_steps", 5)),
+    )
+    cfg["goal_debug_max_trace_points"] = max(
+        10,
+        int(cfg_get(cfg, args.goal_debug_max_trace_points, "goal_debug_max_trace_points", 5000)),
+    )
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", True))
     cfg["visualize_foreground"] = bool(
         cfg_get(cfg, args.visualize_foreground, "visualize_foreground", False)
@@ -6744,6 +8382,7 @@ def main() -> None:
     args = parse_args()
     cfg, suite_names, output_dir = prepare_config(args)
     acquire_evaluation_run_lock(output_dir)
+    initialize_realtime_failure_log(output_dir)
     if args.suite_gpu_ids is not None:
         run_multi_gpu_suite_launcher(
             args=args,
@@ -6863,6 +8502,11 @@ def main() -> None:
         f"save_video={cfg['save_video']}, "
         f"render_mode={cfg.get('render_mode')}, "
         f"render_every_n_steps={cfg.get('render_every_n_steps')}, "
+        f"visualize_success_regions={cfg.get('visualize_success_regions')}, "
+        f"success_region_alpha={cfg.get('success_region_alpha')}, "
+        f"goal_debug={cfg.get('goal_debug')}, "
+        f"goal_debug_log_every_n_steps={cfg.get('goal_debug_log_every_n_steps')}, "
+        f"goal_debug_stable_steps={cfg.get('goal_debug_stable_steps')}, "
         f"visualize_foreground={cfg.get('visualize_foreground')}, "
         f"visualize_action_trajectory={cfg.get('visualize_action_trajectory')}, "
         f"trajectory_vis_every_n_model_calls="
@@ -6998,6 +8642,7 @@ def main() -> None:
                             episode_count=int(cfg["episodes"]),
                             exc=exc,
                         )
+                        record_failed_task_summary(output_dir, summary)
                     all_task_summaries.append(summary)
                     all_task_summaries.sort(
                         key=lambda item: (
