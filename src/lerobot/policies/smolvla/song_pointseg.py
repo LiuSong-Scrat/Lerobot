@@ -37,7 +37,7 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 7
+POINTSEG_CACHE_VERSION = 11
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -63,6 +63,8 @@ POINTSEG_CACHE_LABEL_FIELDS = (
 )
 
 _POINTOPS_KNN_FAILED = False
+_TOOL_SWEEP_LOCAL_FALLBACK_WARNED = False
+_TOOL_SWEEP_OFFSETS_WARNED = False
 
 
 def infer_litept_output_channels(backbone: nn.Module) -> int:
@@ -107,6 +109,54 @@ class PseudoLabelConfig:
     approach_margin: float = 0.005
     approach_tau: float = 0.025
     background_trajectory_sigma: float = 0.20
+    # Tool-conditioned interaction foreground.  The segmentation network and
+    # cached tensor shapes stay unchanged; these parameters only affect the
+    # temporal pseudo-label generator.
+    tool_interaction_enable: bool = True
+    tool_candidate_min_score: float = 0.35
+    tool_candidate_max_points: int = 320
+    tool_candidate_distance_boost: float = 0.35
+    tool_candidate_distance_scale: float = 0.45
+    # Restrict the conditioned tool cloud to the high-motion component that is
+    # spatially connected to the gripper.  This prevents repeated table / wall
+    # structure from entering the swept tool cloud merely because nearest-neighbour
+    # motion residuals are ambiguous.
+    tool_candidate_bridge_min_score: float = 0.18
+    tool_candidate_seed_radius: float = 0.14
+    tool_candidate_seed_min_score: float = 0.35
+    tool_candidate_component_radius: float = 0.070
+    tool_candidate_component_hops: int = 10
+    tool_candidate_preselect_multiplier: int = 6
+    tool_candidate_max_radius: float = 0.65
+    tool_candidate_support_sigma: float = 0.035
+    # Use the sparse episode trajectory only for the conditioned tool sweep.  The
+    # legacy EEF contact / approach priors remain local to the temporal point-cloud
+    # window.  A bounded frame window avoids sweeping the currently held object
+    # through unrelated pre-grasp / post-release phases.
+    tool_sweep_max_poses: int = 20
+    tool_sweep_use_full_trajectory: bool = True
+    tool_sweep_max_frame_offset: int = 96
+    tool_sweep_max_translation: float = 0.65
+    tool_sweep_contact_radius: float = 0.12
+    tool_sweep_contact_temperature: float = 0.020
+    # A scene point is a tool-conditioned target only when it is both absolutely
+    # near the localized tool sweep and among the nearest fraction of scene points.
+    # The rank gate is a safety valve against catastrophic all-scene foreground.
+    tool_target_max_fraction: float = 0.18
+    tool_target_static_min_score: float = 0.35
+    tool_target_tool_exclusion_radius: float = 0.030
+    tool_target_rigid_exclusion_score: float = 0.60
+    tool_target_rank_temperature: float = 0.012
+    tool_target_min_candidate_count: int = 4
+    tool_target_candidate_count_temperature: float = 2.0
+    tool_target_candidate_score_threshold: float = 0.40
+    tool_target_candidate_score_temperature: float = 0.08
+    tool_approach_margin: float = 0.030
+    tool_approach_temperature: float = 0.015
+    tool_sweep_dwell_sigma: float = 0.10
+    interaction_motion_threshold: float = 0.020
+    interaction_motion_temperature: float = 0.008
+    background_tool_sweep_sigma: float = 0.16
     soft_background_weight: float = 0.20
     min_confidence: float = 0.20
     background_min_confidence: float = 0.55
@@ -128,7 +178,13 @@ class SongPointSegLossConfig:
     soft_bce_weight: float = 1.0
     smoothness_weight: float = 0.04
     smooth_voxel_size: float = 0.025
-    class_weights: tuple[float, float] = (0.50, 2.00)
+    # The previous 4x foreground/background ratio amplified a few broad pseudo
+    # masks into near-all-foreground predictions.  Keep a mild foreground boost,
+    # then explicitly regularize frame-level foreground mass instead.
+    class_weights: tuple[float, float] = (1.00, 1.25)
+    foreground_mass_weight: float = 0.12
+    foreground_mass_margin: float = 0.04
+    foreground_mass_max: float = 0.45
     ignore_index: int = ROLE_IGNORE
 
 
@@ -1123,6 +1179,421 @@ def _motion_residuals_batched(
     return held_residual, static_residual, residual_gap, motion_weights, motion_baseline
 
 
+
+def _subsample_pose_sequence(
+    poses: Tensor,
+    pose_is_pad: Tensor,
+    max_poses: int,
+) -> tuple[Tensor, Tensor]:
+    """Select an evenly spaced valid pose subset independently for each batch item."""
+    if poses.ndim != 3 or pose_is_pad.shape != poses.shape[:2]:
+        raise ValueError(
+            f"Expected poses (B,L,D) and pose_is_pad {poses.shape[:2]}, got "
+            f"{poses.shape} and {pose_is_pad.shape}."
+        )
+    max_poses = max(1, int(max_poses))
+    bsize, sequence_len, pose_dim = poses.shape
+    if sequence_len <= max_poses and not bool(pose_is_pad.any().item()):
+        return poses, pose_is_pad
+
+    selected = poses.new_zeros((bsize, max_poses, pose_dim))
+    selected_is_pad = torch.ones((bsize, max_poses), dtype=torch.bool, device=poses.device)
+    for batch_index in range(bsize):
+        valid_indices = torch.nonzero(~pose_is_pad[batch_index], as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            continue
+        if valid_indices.numel() > max_poses:
+            positions = torch.linspace(
+                0,
+                valid_indices.numel() - 1,
+                steps=max_poses,
+                device=poses.device,
+            ).round().to(dtype=torch.long)
+            valid_indices = valid_indices[positions]
+        count = int(valid_indices.numel())
+        selected[batch_index, :count] = poses[batch_index, valid_indices]
+        selected_is_pad[batch_index, :count] = False
+    return selected, selected_is_pad
+
+
+
+def _filter_tool_sweep_poses(
+    poses: Tensor,
+    pose_is_pad: Tensor,
+    pose_offsets: Tensor | None,
+    *,
+    max_frame_offset: int,
+    max_translation: float,
+) -> tuple[Tensor, Tensor]:
+    """Mask unrelated pre-grasp / post-release poses from the conditioned sweep."""
+    filtered_is_pad = pose_is_pad.clone()
+    if pose_offsets is not None:
+        pose_offsets = pose_offsets.to(device=poses.device)
+        if pose_offsets.shape != poses.shape[:2]:
+            raise ValueError(
+                f"Expected pose_offsets shape {poses.shape[:2]}, got {tuple(pose_offsets.shape)}."
+            )
+        filtered_is_pad |= pose_offsets.abs() > max(0, int(max_frame_offset))
+    translation = torch.linalg.norm(poses[..., :3], dim=-1)
+    filtered_is_pad |= translation > max(float(max_translation), 0.0)
+    # Index zero is the current pose in SongTemporalPointCloudDataset.  Keep it
+    # whenever it is structurally valid so current-distance diagnostics remain
+    # well-defined even when all other poses are filtered.
+    filtered_is_pad[:, 0] = pose_is_pad[:, 0]
+    return poses, filtered_is_pad
+
+
+def _fractional_distance_gate(
+    distance: Tensor,
+    point_is_pad: Tensor,
+    fraction: float,
+    temperature: float,
+    eligible: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Keep the nearest eligible targets under a full-frame point budget.
+
+    The budget is still ``fraction * all_valid_scene_points`` so this branch cannot
+    activate the whole scene.  Ranking, however, is performed only over eligible
+    static non-tool points.  Robot and held-tool points therefore no longer consume
+    the complete target budget before a nearby flower pot can enter it.
+    """
+    if distance.shape != point_is_pad.shape:
+        raise ValueError(f"Expected matching distance/mask shapes, got {distance.shape} and {point_is_pad.shape}.")
+    if eligible is not None and eligible.shape != distance.shape:
+        raise ValueError(f"Expected eligible shape {distance.shape}, got {eligible.shape}.")
+    fraction = float(min(max(fraction, 1e-4), 1.0))
+    temperature = max(float(temperature), 1e-6)
+    gate = distance.new_zeros(distance.shape)
+    radii = distance.new_zeros((distance.shape[0],))
+    for batch_index in range(distance.shape[0]):
+        all_valid = (~point_is_pad[batch_index]) & torch.isfinite(distance[batch_index])
+        candidate = all_valid
+        if eligible is not None:
+            candidate = candidate & eligible[batch_index].to(device=distance.device, dtype=torch.bool)
+        candidate_indices = torch.nonzero(candidate, as_tuple=False).flatten()
+        if candidate_indices.numel() == 0:
+            continue
+        # Preserve the original global safety cap, but do not spend it on the
+        # gripper / robot / held object itself.
+        full_budget = max(1, int(np.ceil(float(all_valid.sum().item()) * fraction)))
+        k = min(int(candidate_indices.numel()), full_budget)
+        values = distance[batch_index, candidate_indices]
+        selected_values, selected_local = torch.topk(values, k=k, largest=False)
+        selected_indices = candidate_indices[selected_local]
+        radius = selected_values.max()
+        radii[batch_index] = radius
+        selected_gate = 0.5 + 0.5 * torch.sigmoid((radius - selected_values) / temperature)
+        gate[batch_index, selected_indices] = selected_gate
+    return gate, radii
+
+def _select_tool_sweep_candidates(
+    current_xyz: Tensor,
+    rigid_tool_score: Tensor,
+    current_is_pad: Tensor,
+    *,
+    max_points: int,
+    min_score: float,
+    bridge_min_score: float,
+    distance_boost: float,
+    distance_scale: float,
+    seed_radius: float,
+    seed_min_score: float,
+    component_radius: float,
+    component_hops: int,
+    preselect_multiplier: int,
+    max_radius: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Select the gripper-connected rigid component as the conditioned tool cloud.
+
+    Motion residuals on repeated planes can assign moderate ``rigid_tool_score`` to
+    distant background.  A global top-k therefore pollutes the swept cloud and can
+    make almost the entire scene appear close to the tool at some pose.  We first
+    preselect high-score points, seed the component near the EEF origin, and then
+    grow only through short spatial links.  The resulting component can include a
+    long grasped object, but cannot jump directly to a far table, wall, or cabinet.
+    """
+    if current_xyz.ndim != 3 or current_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected current_xyz (B,N,3), got {current_xyz.shape}.")
+    if rigid_tool_score.shape != current_xyz.shape[:2]:
+        raise ValueError(
+            f"Expected rigid_tool_score shape {current_xyz.shape[:2]}, got {rigid_tool_score.shape}."
+        )
+    if current_is_pad.shape != current_xyz.shape[:2]:
+        raise ValueError(f"Expected current_is_pad shape {current_xyz.shape[:2]}, got {current_is_pad.shape}.")
+
+    bsize, n_points = current_xyz.shape[:2]
+    count = max(1, min(int(max_points), n_points))
+    pre_count = max(count, min(n_points, count * max(1, int(preselect_multiplier))))
+    scale = max(float(distance_scale), 1e-6)
+    radial = torch.linalg.norm(current_xyz, dim=-1)
+    radial_factor = 1.0 + float(distance_boost) * (radial / scale).clamp(0.0, 1.0)
+    eligible = (
+        (~current_is_pad)
+        & (rigid_tool_score >= float(bridge_min_score))
+        & (radial <= float(max_radius))
+    )
+    ranking_score = (rigid_tool_score * radial_factor).masked_fill(~eligible, -torch.inf)
+    pre_rank, pre_indices = torch.topk(ranking_score, k=pre_count, dim=1, largest=True)
+    pre_xyz = current_xyz.gather(1, pre_indices[..., None].expand(bsize, pre_count, 3))
+    pre_raw_scores = rigid_tool_score.gather(1, pre_indices)
+    pre_radial = radial.gather(1, pre_indices)
+    pre_valid = torch.isfinite(pre_rank)
+
+    selected_xyz = current_xyz.new_zeros((bsize, count, 3))
+    selected_scores = rigid_tool_score.new_zeros((bsize, count))
+    selected_is_pad = torch.ones((bsize, count), dtype=torch.bool, device=current_xyz.device)
+    link_radius = max(float(component_radius), 1e-6)
+    hops = max(1, int(component_hops))
+
+    for batch_index in range(bsize):
+        valid = pre_valid[batch_index]
+        if not bool(valid.any().item()):
+            continue
+        xyz = pre_xyz[batch_index]
+        scores = pre_raw_scores[batch_index]
+        seed = (
+            valid
+            & (pre_radial[batch_index] <= float(seed_radius))
+            & (scores >= max(float(seed_min_score), float(min_score)))
+        )
+        if not bool(seed.any().item()):
+            # Do not invent a tool component from a far high-score patch.  A weak
+            # near-EEF fallback is allowed only inside a slightly enlarged seed ball.
+            fallback = valid & (pre_radial[batch_index] <= 1.5 * float(seed_radius))
+            if not bool(fallback.any().item()):
+                continue
+            fallback_scores = scores.masked_fill(~fallback, -torch.inf)
+            seed = torch.zeros_like(valid)
+            seed[int(torch.argmax(fallback_scores).item())] = True
+
+        distance = torch.cdist(xyz.unsqueeze(0), xyz.unsqueeze(0)).squeeze(0)
+        adjacency = (distance <= link_radius) & valid[:, None] & valid[None, :]
+        reachable = seed.clone()
+        for _ in range(hops):
+            expanded = adjacency[reachable].any(dim=0) if bool(reachable.any().item()) else reachable
+            expanded = expanded & valid
+            if torch.equal(expanded, reachable):
+                break
+            reachable = expanded
+        if not bool(reachable.any().item()):
+            continue
+
+        connected_rank = pre_rank[batch_index].masked_fill(~reachable, -torch.inf)
+        connected_count = min(count, int(reachable.sum().item()))
+        _, local_indices = torch.topk(connected_rank, k=connected_count, largest=True)
+        selected_xyz[batch_index, :connected_count] = xyz[local_indices]
+        selected_scores[batch_index, :connected_count] = scores[local_indices]
+        selected_is_pad[batch_index, :connected_count] = False
+
+    return selected_xyz, selected_is_pad, selected_scores
+
+def _nearest_distances_to_swept_points(
+    current_xyz: Tensor,
+    swept_xyz: Tensor,
+    swept_is_pad: Tensor,
+    current_is_pad: Tensor,
+    *,
+    chunk_size: int,
+) -> Tensor:
+    """Compute current-point distance to a per-sample swept tool cloud.
+
+    The per-sample loop deliberately bounds the GEMM fallback memory when the
+    optional pointops KNN extension is unavailable.  With pointops installed the
+    same helper still uses its fast CUDA nearest-neighbour kernel.
+    """
+    if swept_xyz.ndim != 3 or swept_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected swept_xyz (B,M,3), got {swept_xyz.shape}.")
+    if swept_is_pad.shape != swept_xyz.shape[:2]:
+        raise ValueError(f"Expected swept_is_pad shape {swept_xyz.shape[:2]}, got {swept_is_pad.shape}.")
+    if current_is_pad.shape != current_xyz.shape[:2]:
+        raise ValueError(f"Expected current_is_pad shape {current_xyz.shape[:2]}, got {current_is_pad.shape}.")
+
+    bsize, n_points = current_xyz.shape[:2]
+    out = current_xyz.new_full((bsize, n_points), float("inf"))
+    query_chunk = max(1, int(chunk_size))
+    for batch_index in range(bsize):
+        valid_target = ~swept_is_pad[batch_index]
+        if not bool(valid_target.any().item()):
+            continue
+        target = swept_xyz[batch_index, valid_target].unsqueeze(0).contiguous()
+        for start in range(0, n_points, query_chunk):
+            end = min(start + query_chunk, n_points)
+            query = current_xyz[batch_index : batch_index + 1, start:end].contiguous()
+            out[batch_index, start:end] = _nearest_distances_from_grouped_queries(query, target)[0]
+    return out.masked_fill(current_is_pad, 0.0)
+
+
+def _nearest_distances_to_tool_pose_clouds(
+    current_xyz: Tensor,
+    tool_xyz_by_pose: Tensor,
+    tool_is_pad_by_pose: Tensor,
+    current_is_pad: Tensor,
+    *,
+    chunk_size: int,
+) -> Tensor:
+    """Return point-to-tool distance for every selected tool pose.
+
+    Shapes are ``current_xyz=(B,N,3)``, ``tool_xyz_by_pose=(B,L,C,3)`` and the
+    result is ``(B,L,N)``.  Keeping the pose axis lets the caller distinguish a
+    target that the conditioned tool *approaches* from a point that is merely near
+    one flattened sweep sample.
+    """
+    if tool_xyz_by_pose.ndim != 4 or tool_xyz_by_pose.shape[-1] != 3:
+        raise ValueError(f"Expected tool_xyz_by_pose (B,L,C,3), got {tool_xyz_by_pose.shape}.")
+    if tool_is_pad_by_pose.shape != tool_xyz_by_pose.shape[:3]:
+        raise ValueError(
+            f"Expected tool_is_pad_by_pose shape {tool_xyz_by_pose.shape[:3]}, "
+            f"got {tool_is_pad_by_pose.shape}."
+        )
+    bsize, pose_count = tool_xyz_by_pose.shape[:2]
+    n_points = current_xyz.shape[1]
+    out = current_xyz.new_full((bsize, pose_count, n_points), float("inf"))
+    query_chunk = max(1, int(chunk_size))
+    for batch_index in range(bsize):
+        valid_pose = ~tool_is_pad_by_pose[batch_index].all(dim=-1)
+        valid_indices = torch.nonzero(valid_pose, as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            continue
+        targets = tool_xyz_by_pose[batch_index, valid_indices].contiguous()
+        target_is_pad = tool_is_pad_by_pose[batch_index, valid_indices].contiguous()
+        for start in range(0, n_points, query_chunk):
+            end = min(start + query_chunk, n_points)
+            query = current_xyz[batch_index, start:end]
+            query = query.unsqueeze(0).expand(valid_indices.numel(), -1, -1).contiguous()
+            distances = _nearest_distances_from_grouped_queries(query, targets, target_is_pad)
+            out[batch_index, valid_indices, start:end] = distances
+    return out.masked_fill(current_is_pad[:, None, :], 0.0)
+
+
+def _compute_tool_sweep_distance(
+    current_xyz: Tensor,
+    rigid_tool_score: Tensor,
+    current_is_pad: Tensor,
+    sweep_poses: Tensor,
+    sweep_is_pad: Tensor,
+    *,
+    sweep_offsets: Tensor | None,
+    candidate_max_points: int,
+    candidate_min_score: float,
+    candidate_bridge_min_score: float,
+    candidate_distance_boost: float,
+    candidate_distance_scale: float,
+    candidate_seed_radius: float,
+    candidate_seed_min_score: float,
+    candidate_component_radius: float,
+    candidate_component_hops: int,
+    candidate_preselect_multiplier: int,
+    candidate_max_radius: float,
+    max_poses: int,
+    max_frame_offset: int,
+    max_translation: float,
+    dwell_sigma: float,
+    nn_chunk_size: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Build the rigid gripper+condition sweep and its temporal approach cues.
+
+    The selected points are the cloud that co-moves with the end effector: gripper
+    points plus any grasped / conditioned object points.  For every scene point we
+    retain the distance at each sampled pose, then derive:
+
+    * minimum swept distance;
+    * distance to the conditioned cloud at the current pose;
+    * distance span across the trajectory (far-to-near evidence);
+    * trajectory dwell near that point.
+
+    This is the key distinction needed by watering-style tasks: the flower pot may
+    remain perfectly static, but the kettle-conditioned cloud clearly approaches it.
+    """
+    candidates, candidate_is_pad, candidate_scores = _select_tool_sweep_candidates(
+        current_xyz,
+        rigid_tool_score,
+        current_is_pad,
+        max_points=candidate_max_points,
+        min_score=candidate_min_score,
+        bridge_min_score=candidate_bridge_min_score,
+        distance_boost=candidate_distance_boost,
+        distance_scale=candidate_distance_scale,
+        seed_radius=candidate_seed_radius,
+        seed_min_score=candidate_seed_min_score,
+        component_radius=candidate_component_radius,
+        component_hops=candidate_component_hops,
+        preselect_multiplier=candidate_preselect_multiplier,
+        max_radius=candidate_max_radius,
+    )
+    sweep_poses, sweep_is_pad = _filter_tool_sweep_poses(
+        sweep_poses,
+        sweep_is_pad,
+        sweep_offsets,
+        max_frame_offset=max_frame_offset,
+        max_translation=max_translation,
+    )
+    selected_poses, selected_pose_is_pad = _subsample_pose_sequence(
+        sweep_poses,
+        sweep_is_pad,
+        max_poses=max_poses,
+    )
+    transforms = pose9_to_matrix(selected_poses[..., :9])
+    rotation = transforms[..., :3, :3]
+    translation = transforms[..., :3, 3]
+    swept_by_pose = torch.einsum("blij,bkj->blki", rotation, candidates)
+    swept_by_pose = swept_by_pose + translation[:, :, None, :]
+    swept_is_pad_by_pose = selected_pose_is_pad[:, :, None] | candidate_is_pad[:, None, :]
+
+    distance_by_pose = _nearest_distances_to_tool_pose_clouds(
+        current_xyz,
+        swept_by_pose,
+        swept_is_pad_by_pose,
+        current_is_pad,
+        chunk_size=nn_chunk_size,
+    )
+    valid_pose = ~selected_pose_is_pad
+    finite_pose = valid_pose[:, :, None] & torch.isfinite(distance_by_pose)
+    min_distance = distance_by_pose.masked_fill(~finite_pose, float("inf")).amin(dim=1)
+    max_distance = distance_by_pose.masked_fill(~finite_pose, -torch.inf).amax(dim=1)
+    any_valid = finite_pose.any(dim=1)
+    distance_span = torch.where(
+        any_valid,
+        (max_distance - min_distance).clamp_min(0.0),
+        torch.zeros_like(min_distance),
+    )
+
+    current_distance = _nearest_distances_to_tool_pose_clouds(
+        current_xyz,
+        candidates[:, None, :, :],
+        candidate_is_pad[:, None, :],
+        current_is_pad,
+        chunk_size=nn_chunk_size,
+    )[:, 0]
+    current_to_min_delta = torch.where(
+        torch.isfinite(current_distance) & torch.isfinite(min_distance),
+        (current_distance - min_distance).clamp_min(0.0),
+        torch.zeros_like(min_distance),
+    )
+
+    sigma = max(float(dwell_sigma), 1e-6)
+    pose_proximity = torch.exp(-distance_by_pose / sigma)
+    pose_proximity = torch.where(finite_pose, pose_proximity, torch.zeros_like(pose_proximity))
+    valid_count = finite_pose.sum(dim=1).clamp_min(1).to(dtype=pose_proximity.dtype)
+    dwell = pose_proximity.sum(dim=1) / valid_count
+
+    min_distance = torch.where(any_valid, min_distance, torch.full_like(min_distance, float("inf")))
+    min_distance = min_distance.masked_fill(current_is_pad, 0.0)
+    current_distance = current_distance.masked_fill(current_is_pad, 0.0)
+    distance_span = distance_span.masked_fill(current_is_pad, 0.0)
+    current_to_min_delta = current_to_min_delta.masked_fill(current_is_pad, 0.0)
+    dwell = dwell.masked_fill(current_is_pad, 0.0)
+    valid_candidate_count = (~candidate_is_pad).sum(dim=1)
+    return (
+        min_distance,
+        current_distance,
+        current_to_min_delta,
+        distance_span,
+        dwell,
+        valid_candidate_count,
+        candidate_scores,
+    )
+
+
 def compute_motion_priors(
     current_pc: Tensor,
     future_pc: Tensor,
@@ -1133,6 +1604,7 @@ def compute_motion_priors(
     future_point_is_pad: Tensor | None = None,
     trajectory_poses: Tensor | None = None,
     trajectory_is_pad: Tensor | None = None,
+    trajectory_offsets: Tensor | None = None,
     nn_chunk_size: int = 1024,
     motion_gap_eps: float = 0.005,
     motion_rotation_radius: float = 0.08,
@@ -1140,6 +1612,26 @@ def compute_motion_priors(
     motion_baseline_temperature: float = 0.005,
     motion_evidence_topk: int = 3,
     contact_sigma: float = 0.10,
+    tool_candidate_min_score: float = 0.35,
+    tool_candidate_bridge_min_score: float = 0.18,
+    tool_candidate_max_points: int = 320,
+    tool_candidate_distance_boost: float = 0.35,
+    tool_candidate_distance_scale: float = 0.45,
+    tool_candidate_seed_radius: float = 0.14,
+    tool_candidate_seed_min_score: float = 0.35,
+    tool_candidate_component_radius: float = 0.070,
+    tool_candidate_component_hops: int = 10,
+    tool_candidate_preselect_multiplier: int = 6,
+    tool_candidate_max_radius: float = 0.65,
+    tool_sweep_max_poses: int = 20,
+    tool_sweep_use_full_trajectory: bool = True,
+    tool_sweep_max_frame_offset: int = 96,
+    tool_sweep_max_translation: float = 0.65,
+    tool_sweep_dwell_sigma: float = 0.10,
+    tool_interaction_enable: bool = True,
+    held_sigma: float = 0.025,
+    motion_relative_margin: float = 0.10,
+    motion_relative_tau: float = 0.10,
 ) -> dict[str, Tensor]:
     """Compute geometry/motion priors used by pseudo labels and the segmentation network."""
     if current_pc.ndim != 3 or future_pc.ndim != 4 or future_poses.ndim != 3:
@@ -1185,8 +1677,20 @@ def compute_motion_priors(
     static_residual = torch.where(current_is_pad, torch.ones_like(static_residual), static_residual)
 
     if trajectory_poses is None:
+        global _TOOL_SWEEP_LOCAL_FALLBACK_WARNED
+        if bool(tool_sweep_use_full_trajectory) and not _TOOL_SWEEP_LOCAL_FALLBACK_WARNED:
+            warnings.warn(
+                "tool_sweep_use_full_trajectory=True but trajectory_poses was not provided; "
+                "falling back to the local temporal window. Pass "
+                "batch['pointseg_trajectory_ee_poses'] so delayed tool-target interactions "
+                "such as kettle-to-flower watering are visible to the pseudo-label generator.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _TOOL_SWEEP_LOCAL_FALLBACK_WARNED = True
         trajectory_poses = future_poses
         trajectory_is_pad = future_is_pad
+        trajectory_offsets = None
     else:
         if trajectory_poses.ndim != 3 or trajectory_poses.shape[0] != bsize or trajectory_poses.shape[-1] < 3:
             raise ValueError(
@@ -1205,9 +1709,33 @@ def compute_motion_priors(
                     f"Expected trajectory_is_pad shape {trajectory_poses.shape[:2]}, "
                     f"got {tuple(trajectory_is_pad.shape)}."
                 )
+        if trajectory_offsets is not None:
+            trajectory_offsets = trajectory_offsets.to(device=current_pc.device)
+            if trajectory_offsets.shape != trajectory_poses.shape[:2]:
+                raise ValueError(
+                    f"Expected trajectory_offsets shape {trajectory_poses.shape[:2]}, "
+                    f"got {tuple(trajectory_offsets.shape)}."
+                )
+        elif bool(tool_sweep_use_full_trajectory):
+            global _TOOL_SWEEP_OFFSETS_WARNED
+            if not _TOOL_SWEEP_OFFSETS_WARNED:
+                warnings.warn(
+                    "Full-trajectory conditioned tool sweep received no trajectory_offsets; "
+                    "using translation-only filtering. Pass batch['pointseg_trajectory_offsets'] "
+                    "to prevent unrelated pre-grasp / post-release poses from entering the sweep.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _TOOL_SWEEP_OFFSETS_WARNED = True
 
-    trajectory_xyz = trajectory_poses[..., :3]
-    valid_traj = ~trajectory_is_pad
+    # Crucial separation: EEF-local contact / approach evidence must use the
+    # local temporal point-cloud window.  The sparse episode trajectory is only
+    # for the conditioned-tool sweep; using it here marks the entire robot path
+    # as foreground in every frame.
+    local_trajectory_poses = future_poses
+    local_trajectory_is_pad = future_is_pad
+    trajectory_xyz = local_trajectory_poses[..., :3]
+    valid_traj = ~local_trajectory_is_pad
     point_to_traj = torch.linalg.norm(current_xyz[:, :, None, :] - trajectory_xyz[:, None, :, :], dim=-1)
     point_to_traj = point_to_traj.masked_fill(~valid_traj[:, None, :], float("inf"))
     point_to_traj = point_to_traj.masked_fill(current_is_pad[:, :, None], float("inf"))
@@ -1237,6 +1765,62 @@ def compute_motion_priors(
     approach_delta = torch.where(current_is_pad, torch.zeros_like(approach_delta), approach_delta)
     residual_gap = torch.where(current_is_pad, torch.zeros_like(residual_gap), residual_gap)
 
+    held_score_for_sweep = torch.exp(-held_residual / max(float(held_sigma), 1e-6))
+    motion_score_for_sweep = torch.sigmoid(
+        (residual_gap - float(motion_relative_margin)) / max(float(motion_relative_tau), 1e-6)
+    )
+    rigid_tool_score_for_sweep = (held_score_for_sweep * motion_score_for_sweep).clamp(0.0, 1.0)
+    if bool(tool_sweep_use_full_trajectory):
+        sweep_poses = trajectory_poses
+        sweep_is_pad = trajectory_is_pad
+        sweep_offsets = trajectory_offsets
+    else:
+        sweep_poses = future_poses
+        sweep_is_pad = future_is_pad
+        sweep_offsets = None
+    if bool(tool_interaction_enable):
+        (
+            tool_sweep_dist,
+            tool_current_dist,
+            tool_approach_delta,
+            tool_distance_span,
+            tool_sweep_dwell,
+            tool_candidate_count,
+            tool_candidate_scores,
+        ) = _compute_tool_sweep_distance(
+            current_xyz,
+            rigid_tool_score_for_sweep,
+            current_is_pad,
+            sweep_poses,
+            sweep_is_pad,
+            sweep_offsets=sweep_offsets,
+            candidate_max_points=tool_candidate_max_points,
+            candidate_min_score=tool_candidate_min_score,
+            candidate_bridge_min_score=tool_candidate_bridge_min_score,
+            candidate_distance_boost=tool_candidate_distance_boost,
+            candidate_distance_scale=tool_candidate_distance_scale,
+            candidate_seed_radius=tool_candidate_seed_radius,
+            candidate_seed_min_score=tool_candidate_seed_min_score,
+            candidate_component_radius=tool_candidate_component_radius,
+            candidate_component_hops=tool_candidate_component_hops,
+            candidate_preselect_multiplier=tool_candidate_preselect_multiplier,
+            candidate_max_radius=tool_candidate_max_radius,
+            max_poses=tool_sweep_max_poses,
+            max_frame_offset=tool_sweep_max_frame_offset,
+            max_translation=tool_sweep_max_translation,
+            dwell_sigma=tool_sweep_dwell_sigma,
+            nn_chunk_size=nn_chunk_size,
+        )
+    else:
+        tool_sweep_dist = current_xyz.new_full(current_xyz.shape[:2], float("inf"))
+        tool_sweep_dist = tool_sweep_dist.masked_fill(current_is_pad, 0.0)
+        tool_current_dist = tool_sweep_dist.clone()
+        tool_approach_delta = current_xyz.new_zeros(current_xyz.shape[:2])
+        tool_distance_span = current_xyz.new_zeros(current_xyz.shape[:2])
+        tool_sweep_dwell = current_xyz.new_zeros(current_xyz.shape[:2])
+        tool_candidate_count = torch.zeros(bsize, dtype=torch.long, device=current_xyz.device)
+        tool_candidate_scores = current_xyz.new_zeros((bsize, 1))
+
     priors = torch.stack(
         [
             ee_dist,
@@ -1264,6 +1848,15 @@ def compute_motion_priors(
         "context_observability": context_observability,
         "motion_weights": motion_weights,
         "motion_baseline": motion_baseline,
+        # Extra dictionary-only priors.  They are intentionally not appended to
+        # the fixed 8-D `priors` tensor, preserving cache/model tensor shapes.
+        "tool_sweep_dist": tool_sweep_dist,
+        "tool_current_dist": tool_current_dist,
+        "tool_approach_delta": tool_approach_delta,
+        "tool_distance_span": tool_distance_span,
+        "tool_sweep_dwell": tool_sweep_dwell,
+        "tool_candidate_count": tool_candidate_count,
+        "tool_candidate_scores": tool_candidate_scores,
     }
 
 
@@ -1308,27 +1901,157 @@ def generate_pseudo_labels_from_priors(
     trajectory_near = torch.exp(-min_traj_dist / config.trajectory_sigma)
     approach_score = torch.sigmoid((approach_delta - config.approach_margin) / config.approach_tau)
 
-    # Three pieces of trajectory evidence, not semantic roles.  Every value is a
-    # continuous probability-like score and no branch is hardened into a class.
-    tool_score = held_score * motion_score * trajectory_near
+    # Keep the legacy EEF-local evidence for cache/API compatibility, but add a
+    # trajectory-independent rigid carrier score so the far end of a long tool
+    # is not suppressed merely because it is distant from the robot hand.
+    legacy_tool_score = held_score * motion_score * trajectory_near
+    rigid_tool_score = (held_score * motion_score).clamp(0.0, 1.0)
     approached_score = approach_score * trajectory_near
     contact_score = torch.sigmoid(
         (float(config.contact_radius) - min_traj_dist)
         / max(float(config.contact_temperature), 1e-6)
     )
-    evidence_scores = torch.stack([tool_score, approached_score, contact_score], dim=-1).clamp(0.0, 1.0)
 
-    # Probabilistic OR preserves weak but complementary evidence while remaining
-    # fully soft.  In particular, target evidence no longer assumes static motion.
-    foreground_score = (1.0 - (1.0 - evidence_scores).prod(dim=-1)).clamp(0.0, 1.0)
+    has_conditioned_tool_sweep = "tool_sweep_dist" in prior_dict
+    tool_sweep_dist = prior_dict.get("tool_sweep_dist", min_traj_dist)
+    tool_sweep_dist = tool_sweep_dist.to(device=min_traj_dist.device, dtype=min_traj_dist.dtype)
+    tool_current_dist = prior_dict.get("tool_current_dist", ee_dist)
+    tool_current_dist = tool_current_dist.to(device=min_traj_dist.device, dtype=min_traj_dist.dtype)
+    tool_approach_delta = prior_dict.get(
+        "tool_approach_delta", (tool_current_dist - tool_sweep_dist).clamp_min(0.0)
+    ).to(device=min_traj_dist.device, dtype=min_traj_dist.dtype)
+    tool_distance_span = prior_dict.get("tool_distance_span", tool_approach_delta)
+    tool_distance_span = tool_distance_span.to(device=min_traj_dist.device, dtype=min_traj_dist.dtype)
+    tool_sweep_dwell = prior_dict.get("tool_sweep_dwell", torch.zeros_like(tool_sweep_dist))
+    tool_sweep_dwell = tool_sweep_dwell.to(device=min_traj_dist.device, dtype=min_traj_dist.dtype)
+
+    point_is_pad_for_gate = prior_dict.get("point_is_pad")
+    if point_is_pad_for_gate is None:
+        point_is_pad_for_gate = torch.zeros_like(ee_dist, dtype=torch.bool)
+    else:
+        point_is_pad_for_gate = point_is_pad_for_gate.to(device=ee_dist.device, dtype=torch.bool)
+
+    # Absolute proximity alone is insufficient when the candidate cloud is
+    # contaminated: a flattened sweep can pass near most of the scene.  Keep only
+    # the nearest configurable fraction, with a soft rank boundary.
+    target_rank_eligible = (
+        (static_score >= float(config.tool_target_static_min_score))
+        & (tool_current_dist >= float(config.tool_target_tool_exclusion_radius))
+        & (rigid_tool_score <= float(config.tool_target_rigid_exclusion_score))
+        & torch.isfinite(tool_sweep_dist)
+    )
+    tool_rank_gate, tool_rank_radius = _fractional_distance_gate(
+        tool_sweep_dist,
+        point_is_pad_for_gate,
+        config.tool_target_max_fraction,
+        config.tool_target_rank_temperature,
+        eligible=target_rank_eligible,
+    )
+    tool_sweep_contact_score = torch.sigmoid(
+        (float(config.tool_sweep_contact_radius) - tool_sweep_dist)
+        / max(float(config.tool_sweep_contact_temperature), 1e-6)
+    )
+    tool_spatial_gate = (tool_sweep_contact_score * tool_rank_gate).clamp(0.0, 1.0)
+
+    # Use both current-to-closest change and the bounded sweep span.  The span
+    # keeps a flower pot active at the actual pouring frame, while the spatial
+    # gate prevents that temporal contrast from activating distant background.
+    tool_temporal_delta = torch.maximum(tool_approach_delta, tool_distance_span)
+    tool_temporal_approach_score = torch.sigmoid(
+        (tool_temporal_delta - float(config.tool_approach_margin))
+        / max(float(config.tool_approach_temperature), 1e-6)
+    )
+    tool_temporal_score = (
+        1.0 - (1.0 - tool_temporal_approach_score) * (1.0 - tool_sweep_dwell.clamp(0.0, 1.0))
+    ).clamp(0.0, 1.0)
+
+    nonstatic_score = torch.sigmoid(
+        (static_residual - float(config.interaction_motion_threshold))
+        / max(float(config.interaction_motion_temperature), 1e-6)
+    )
+    context_score = context_observability.clamp(0.0, 1.0)
+    tool_candidate_count = prior_dict.get("tool_candidate_count")
+    tool_candidate_scores = prior_dict.get("tool_candidate_scores")
+    if tool_candidate_count is None or tool_candidate_scores is None:
+        candidate_quality_scalar = torch.zeros(ee_dist.shape[0], device=ee_dist.device, dtype=ee_dist.dtype)
+    else:
+        candidate_count = tool_candidate_count.to(device=ee_dist.device, dtype=ee_dist.dtype)
+        candidate_scores = tool_candidate_scores.to(device=ee_dist.device, dtype=ee_dist.dtype)
+        count_quality = torch.sigmoid(
+            (candidate_count - float(config.tool_target_min_candidate_count))
+            / max(float(config.tool_target_candidate_count_temperature), 1e-6)
+        )
+        peak_score = candidate_scores.amax(dim=-1)
+        score_quality = torch.sigmoid(
+            (peak_score - float(config.tool_target_candidate_score_threshold))
+            / max(float(config.tool_target_candidate_score_temperature), 1e-6)
+        )
+        candidate_quality_scalar = (count_quality * score_quality).clamp(0.0, 1.0)
+    candidate_quality = candidate_quality_scalar
+    while candidate_quality.ndim < ee_dist.ndim:
+        candidate_quality = candidate_quality.unsqueeze(-1)
+    candidate_quality = candidate_quality.expand_as(ee_dist)
+
+    connected_tool_support = torch.exp(
+        -tool_current_dist / max(float(config.tool_candidate_support_sigma), 1e-6)
+    )
+    connected_rigid_tool_score = (
+        rigid_tool_score * connected_tool_support * candidate_quality
+    ).clamp(0.0, 1.0)
+
+    # Static targets are allowed, but only inside the localized, rank-limited
+    # conditioned sweep.  This retains the flower pot while rejecting far tables,
+    # walls, drawers and repeated planar background.
+    static_tool_target_score = (
+        static_score
+        * tool_spatial_gate
+        * tool_temporal_score
+        * candidate_quality
+    ).clamp(0.0, 1.0)
+    moved_interaction_score = (
+        nonstatic_score
+        * tool_spatial_gate
+        * context_score
+        * candidate_quality
+    ).clamp(0.0, 1.0)
+    if not has_conditioned_tool_sweep:
+        static_tool_target_score = torch.zeros_like(static_tool_target_score)
+        moved_interaction_score = torch.zeros_like(moved_interaction_score)
+        connected_rigid_tool_score = legacy_tool_score
+    interaction_score = (
+        1.0 - (1.0 - static_tool_target_score) * (1.0 - moved_interaction_score)
+    ).clamp(0.0, 1.0)
+    conditioned_approach_score = (
+        1.0 - (1.0 - approached_score) * (1.0 - static_tool_target_score)
+    ).clamp(0.0, 1.0)
+
+    if bool(config.tool_interaction_enable):
+        foreground_evidence = torch.stack(
+            [connected_rigid_tool_score, conditioned_approach_score, contact_score, moved_interaction_score],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+    else:
+        foreground_evidence = torch.stack(
+            [legacy_tool_score, approached_score, contact_score], dim=-1
+        ).clamp(0.0, 1.0)
+    foreground_score = (1.0 - (1.0 - foreground_evidence).prod(dim=-1)).clamp(0.0, 1.0)
     class_scores = torch.stack([1.0 - foreground_score, foreground_score], dim=-1)
+
+    # Preserve the established three-channel tensor for checkpoint compatibility.
+    evidence_scores = torch.stack(
+        [legacy_tool_score, conditioned_approach_score, contact_score], dim=-1
+    ).clamp(0.0, 1.0)
 
     far_from_trajectory = 1.0 - torch.exp(
         -min_traj_dist / max(config.background_trajectory_sigma, 1e-6)
     )
+    far_from_tool_sweep = 1.0 - torch.exp(
+        -tool_sweep_dist / max(config.background_tool_sweep_sigma, 1e-6)
+    )
     background_confidence = (
         (1.0 - foreground_score)
         * far_from_trajectory
+        * far_from_tool_sweep
         * (0.25 + 0.75 * context_observability.clamp(0.0, 1.0))
     )
     weights = (
@@ -1346,6 +2069,34 @@ def generate_pseudo_labels_from_priors(
         class_scores = torch.where(point_is_pad[..., None], torch.zeros_like(class_scores), class_scores)
         evidence_scores = torch.where(point_is_pad[..., None], torch.zeros_like(evidence_scores), evidence_scores)
         foreground_score = torch.where(point_is_pad, torch.zeros_like(foreground_score), foreground_score)
+        rigid_tool_score = torch.where(point_is_pad, torch.zeros_like(rigid_tool_score), rigid_tool_score)
+        connected_rigid_tool_score = torch.where(
+            point_is_pad, torch.zeros_like(connected_rigid_tool_score), connected_rigid_tool_score
+        )
+        target_rank_eligible = torch.where(
+            point_is_pad, torch.zeros_like(target_rank_eligible), target_rank_eligible
+        )
+        tool_rank_gate = torch.where(point_is_pad, torch.zeros_like(tool_rank_gate), tool_rank_gate)
+        tool_spatial_gate = torch.where(point_is_pad, torch.zeros_like(tool_spatial_gate), tool_spatial_gate)
+        candidate_quality = torch.where(point_is_pad, torch.zeros_like(candidate_quality), candidate_quality)
+        tool_sweep_contact_score = torch.where(
+            point_is_pad, torch.zeros_like(tool_sweep_contact_score), tool_sweep_contact_score
+        )
+        tool_temporal_approach_score = torch.where(
+            point_is_pad, torch.zeros_like(tool_temporal_approach_score), tool_temporal_approach_score
+        )
+        tool_temporal_score = torch.where(point_is_pad, torch.zeros_like(tool_temporal_score), tool_temporal_score)
+        static_tool_target_score = torch.where(
+            point_is_pad, torch.zeros_like(static_tool_target_score), static_tool_target_score
+        )
+        moved_interaction_score = torch.where(
+            point_is_pad, torch.zeros_like(moved_interaction_score), moved_interaction_score
+        )
+        conditioned_approach_score = torch.where(
+            point_is_pad, torch.zeros_like(conditioned_approach_score), conditioned_approach_score
+        )
+        nonstatic_score = torch.where(point_is_pad, torch.zeros_like(nonstatic_score), nonstatic_score)
+        interaction_score = torch.where(point_is_pad, torch.zeros_like(interaction_score), interaction_score)
 
     return {
         **prior_dict,
@@ -1353,14 +2104,34 @@ def generate_pseudo_labels_from_priors(
         "weights": weights,
         "class_scores": class_scores.detach(),
         # Legacy field name retained for cache compatibility.  Its channels are
-        # now [tool_comotion, trajectory_approach, near_contact].
+        # now [tool_comotion, EEF-or-conditioned-tool approach, near_contact].
         "role_scores": evidence_scores.detach(),
         "foreground_score": foreground_score.detach(),
         "background_confidence": background_confidence.detach(),
         "held_score": held_score.detach(),
         "static_score": static_score.detach(),
         "approach_score": approach_score.detach(),
+        "conditioned_approach_score": conditioned_approach_score.detach(),
         "contact_score": contact_score.detach(),
+        "rigid_tool_score": rigid_tool_score.detach(),
+        "connected_rigid_tool_score": connected_rigid_tool_score.detach(),
+        "tool_sweep_dist": tool_sweep_dist.detach(),
+        "tool_current_dist": tool_current_dist.detach(),
+        "tool_approach_delta": tool_approach_delta.detach(),
+        "tool_distance_span": tool_distance_span.detach(),
+        "tool_sweep_dwell": tool_sweep_dwell.detach(),
+        "tool_candidate_quality": candidate_quality.detach(),
+        "tool_rank_radius": tool_rank_radius.detach(),
+        "tool_target_rank_eligible": target_rank_eligible.detach(),
+        "tool_rank_gate": tool_rank_gate.detach(),
+        "tool_spatial_gate": tool_spatial_gate.detach(),
+        "tool_sweep_contact_score": tool_sweep_contact_score.detach(),
+        "tool_temporal_approach_score": tool_temporal_approach_score.detach(),
+        "tool_temporal_score": tool_temporal_score.detach(),
+        "static_tool_target_score": static_tool_target_score.detach(),
+        "moved_interaction_score": moved_interaction_score.detach(),
+        "nonstatic_score": nonstatic_score.detach(),
+        "interaction_score": interaction_score.detach(),
     }
 
 
@@ -1374,6 +2145,7 @@ def generate_pseudo_labels(
     future_point_is_pad: Tensor | None = None,
     trajectory_poses: Tensor | None = None,
     trajectory_is_pad: Tensor | None = None,
+    trajectory_offsets: Tensor | None = None,
     config: PseudoLabelConfig | None = None,
 ) -> dict[str, Tensor]:
     config = config or PseudoLabelConfig()
@@ -1386,6 +2158,7 @@ def generate_pseudo_labels(
         future_point_is_pad=future_point_is_pad,
         trajectory_poses=trajectory_poses,
         trajectory_is_pad=trajectory_is_pad,
+        trajectory_offsets=trajectory_offsets,
         nn_chunk_size=config.nn_chunk_size,
         motion_gap_eps=config.motion_gap_eps,
         motion_rotation_radius=config.motion_rotation_radius,
@@ -1393,6 +2166,26 @@ def generate_pseudo_labels(
         motion_baseline_temperature=config.motion_baseline_temperature,
         motion_evidence_topk=config.motion_evidence_topk,
         contact_sigma=config.contact_sigma,
+        tool_candidate_min_score=config.tool_candidate_min_score,
+        tool_candidate_bridge_min_score=config.tool_candidate_bridge_min_score,
+        tool_candidate_max_points=config.tool_candidate_max_points,
+        tool_candidate_distance_boost=config.tool_candidate_distance_boost,
+        tool_candidate_distance_scale=config.tool_candidate_distance_scale,
+        tool_candidate_seed_radius=config.tool_candidate_seed_radius,
+        tool_candidate_seed_min_score=config.tool_candidate_seed_min_score,
+        tool_candidate_component_radius=config.tool_candidate_component_radius,
+        tool_candidate_component_hops=config.tool_candidate_component_hops,
+        tool_candidate_preselect_multiplier=config.tool_candidate_preselect_multiplier,
+        tool_candidate_max_radius=config.tool_candidate_max_radius,
+        tool_sweep_max_poses=config.tool_sweep_max_poses,
+        tool_sweep_use_full_trajectory=config.tool_sweep_use_full_trajectory,
+        tool_sweep_max_frame_offset=config.tool_sweep_max_frame_offset,
+        tool_sweep_max_translation=config.tool_sweep_max_translation,
+        tool_sweep_dwell_sigma=config.tool_sweep_dwell_sigma,
+        tool_interaction_enable=config.tool_interaction_enable,
+        held_sigma=config.held_sigma,
+        motion_relative_margin=config.motion_relative_margin,
+        motion_relative_tau=config.motion_relative_tau,
     )
     return generate_pseudo_labels_from_priors(prior_dict, config=config)
 
@@ -1670,7 +2463,28 @@ class SongPointSegLoss(nn.Module):
         smoothness = _voxel_smoothness_loss(
             logits, current_pc[..., :3], self.config.smooth_voxel_size, point_is_pad
         )
-        loss = self.config.soft_bce_weight * soft_bce + self.config.smoothness_weight * smoothness
+        if point_is_pad is None:
+            geometric_valid = torch.ones_like(soft_target, dtype=torch.bool)
+        else:
+            geometric_valid = ~point_is_pad
+        geometric_valid_f = geometric_valid.to(dtype=logits.dtype)
+        denom = geometric_valid_f.sum(dim=-1).clamp_min(1.0)
+        pred_mean_by_frame = (
+            outputs["operation_prob"] * geometric_valid_f
+        ).sum(dim=-1) / denom
+        target_mean_by_frame = (
+            soft_target * geometric_valid_f
+        ).sum(dim=-1) / denom
+        allowed_mass = torch.minimum(
+            target_mean_by_frame + float(self.config.foreground_mass_margin),
+            torch.full_like(target_mean_by_frame, float(self.config.foreground_mass_max)),
+        )
+        foreground_mass = torch.relu(pred_mean_by_frame - allowed_mass).square().mean()
+        loss = (
+            self.config.soft_bce_weight * soft_bce
+            + self.config.smoothness_weight * smoothness
+            + self.config.foreground_mass_weight * foreground_mass
+        )
         zero = logits.sum().detach() * 0.0
         metrics = {
             "loss": loss.detach(),
@@ -1679,6 +2493,9 @@ class SongPointSegLoss(nn.Module):
             "loss_ce": zero,
             "loss_foreground_bce": soft_bce.detach(),
             "loss_smoothness": smoothness.detach(),
+            "loss_foreground_mass": foreground_mass.detach(),
+            "pred_foreground_mean_by_frame_max": pred_mean_by_frame.max().detach(),
+            "target_foreground_mean_by_frame_max": target_mean_by_frame.max().detach(),
             "loss_motion": zero,
             "pseudo_valid_ratio": valid_f.mean().detach(),
             "pseudo_valid_foreground_ratio": (
@@ -1775,6 +2592,29 @@ def save_pointseg_npz(
             data["pseudo_role_scores_gripper_condition_target"] = pseudo["role_scores"].detach().cpu().numpy()
         if "foreground_score" in pseudo:
             data["pseudo_foreground_score"] = pseudo["foreground_score"].detach().cpu().numpy()
+        for diagnostic_key in (
+            "rigid_tool_score",
+            "connected_rigid_tool_score",
+            "conditioned_approach_score",
+            "static_tool_target_score",
+            "moved_interaction_score",
+            "interaction_score",
+            "tool_sweep_dist",
+            "tool_current_dist",
+            "tool_approach_delta",
+            "tool_distance_span",
+            "tool_sweep_dwell",
+            "tool_candidate_quality",
+            "tool_target_rank_eligible",
+            "tool_rank_radius",
+            "tool_rank_gate",
+            "tool_spatial_gate",
+            "tool_sweep_contact_score",
+            "tool_temporal_approach_score",
+            "tool_temporal_score",
+        ):
+            if diagnostic_key in pseudo:
+                data[f"pseudo_{diagnostic_key}"] = pseudo[diagnostic_key].detach().cpu().numpy()
     if metadata is not None:
         for key, value in metadata.items():
             data[f"meta_{key}"] = np.asarray(value)
