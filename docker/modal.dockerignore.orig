@@ -1,0 +1,40 @@
+# Modal-only context exclusions. Keep this file free of negated patterns so
+# Modal can prune directories without traversing the project's large datasets.
+.git
+.gitignore
+.cache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.so
+*.key
+tmp
+wandb
+logs
+outputs
+data
+media
+build
+dist
+downloads
+*.egg-info
+
+# Unrelated benchmark worktrees and assets are not required by the current
+# song_real_libero training entry point and total hundreds of gigabytes.
+benchmarks/CoppeliaSim
+benchmarks/RLBench
+benchmarks/open_x_embodiment
+benchmarks/video
+benchmarks/xuan_calvin
+benchmarks/xuan_libero_plus
+benchmarks/xuan_metaworld
+benchmarks/xuan_robotwin
+
+# Explicit nested paths document the runtime Volume boundary even if generic
+# basename matching behavior changes in a future Modal SDK.
+benchmarks/song_real_libero/data
+benchmarks/song_real_libero/outputs

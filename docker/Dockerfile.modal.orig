@@ -1,0 +1,79 @@
+# Modal image for WEP-VLA training on an A100-80GB.
+#
+# The existing Dockerfile.user is intentionally left unchanged. WEP-VLA's
+# LitePT path imports several compiled CUDA extensions, so Modal needs a CUDA
+# development image with nvcc. Versions below mirror the currently working
+# `reap` server environment rather than creating a second dependency policy.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=8.0 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    MUJOCO_GL=egl
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ffmpeg \
+        git \
+        libegl1 \
+        libgl1 \
+        libglib2.0-0 \
+        ninja-build \
+        pkg-config \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /lerobot
+
+# Install the CUDA-enabled PyTorch build before project dependencies so every
+# extension compiles against the same ABI and CUDA runtime.
+RUN python3 -m pip install \
+        torch==2.7.0 \
+        torchvision==0.22.0 \
+        torchaudio==2.7.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# The LIBERO extra builds hf-egl-probe from source during the editable project
+# install. Its build backend invokes CMake directly.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# pyproject.toml remains the authoritative dependency declaration. Copy source
+# before the editable install so later runtime code uses this exact checkout.
+COPY pyproject.toml setup.py README.md MANIFEST.in ./
+COPY src ./src
+RUN python3 -m pip install -e ".[smolvla,libero]"
+
+# These imports are required by the current PointSeg/LitePT training path but
+# are not declared by the root pyproject. They match the verified server stack.
+RUN python3 -m pip install \
+        open3d==0.19.0 \
+        spconv-cu124==2.3.8 \
+    && python3 -m pip install \
+        torch-scatter==2.1.2 \
+        --find-links https://data.pyg.org/whl/torch-2.7.0+cu128.html
+
+# FlashAttention is compiled against torch/CUDA in this image. Limiting build
+# parallelism prevents host RAM spikes during Modal image construction.
+RUN MAX_JOBS=8 python3 -m pip install \
+        flash-attn==2.8.3 \
+        --no-build-isolation
+
+# Project-native CUDA extensions. PointROPE already targets sm_80, the compute
+# capability of A100; TORCH_CUDA_ARCH_LIST applies to PointOps.
+RUN python3 -m pip install --no-build-isolation \
+        ./src/lerobot/policies/smolvla/litept/libs/pointops \
+    && python3 -m pip install --no-build-isolation \
+        ./src/lerobot/policies/smolvla/litept/libs/pointrope
+
+# The existing .dockerignore excludes datasets, outputs, logs, caches, keys,
+# and compiled artifacts. Runtime data is supplied exclusively by Volumes.
+COPY . .

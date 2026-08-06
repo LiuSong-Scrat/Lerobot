@@ -1,0 +1,3 @@
+# Client-only dependency for modal_runner.py. The normal Linux server training
+# environment does not install or import this file.
+modal==1.5.3

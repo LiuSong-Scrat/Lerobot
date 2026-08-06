@@ -15,7 +15,7 @@ os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/lerobot_hf_datasets_cache")
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -66,6 +66,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--vis-count", type=int, default=8)
+    parser.add_argument("--motion-rotation-radius", type=float, default=0.08)
+    parser.add_argument("--motion-baseline-threshold", type=float, default=0.015)
+    parser.add_argument("--motion-baseline-temperature", type=float, default=0.005)
+    parser.add_argument("--motion-relative-margin", type=float, default=0.10)
+    parser.add_argument("--motion-relative-tau", type=float, default=0.10)
+    parser.add_argument("--trajectory-sigma", type=float, default=0.13)
+    parser.add_argument("--contact-radius", type=float, default=0.22)
+    parser.add_argument("--contact-temperature", type=float, default=0.02)
+    parser.add_argument("--approach-margin", type=float, default=0.005)
+    parser.add_argument("--approach-tau", type=float, default=0.025)
+    parser.add_argument("--background-trajectory-sigma", type=float, default=0.20)
+    parser.add_argument(
+        "--episode-indices",
+        type=str,
+        default=None,
+        help="Comma-separated episode indices to cache, for example 0,100,200.",
+    )
+    parser.add_argument(
+        "--vis-one-episode-per-task",
+        action="store_true",
+        help="Keep the full cache, but save previews from one episode per task.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
@@ -208,15 +230,39 @@ def _sample_from_batch(
 def _episode_preview_targets(
     dataset: SongTemporalPointCloudDataset,
     total_samples: int,
+    selected_dataset_indices: list[int] | None = None,
+    vis_one_episode_per_task: bool = False,
 ) -> dict[int, list[tuple[int, str, int]]]:
     episodes = dataset.meta.episodes
     if episodes is None:
         raise ValueError("Episode metadata is required to save first/middle/last pseudo-label previews.")
 
     targets: dict[int, list[tuple[int, str, int]]] = {}
+    selected_index_to_local = (
+        {int(dataset_index): local_index for local_index, dataset_index in enumerate(selected_dataset_indices)}
+        if selected_dataset_indices is not None
+        else None
+    )
+    selected_episode_ids = None
+    if selected_index_to_local is not None:
+        selected_episode_ids = set()
+        for episode in episodes:
+            start_index = int(episode["dataset_from_index"])
+            end_index = int(episode["dataset_to_index"])
+            if any(start_index <= index < end_index for index in selected_index_to_local):
+                selected_episode_ids.add(int(episode.get("episode_index", 0)))
+
+    seen_tasks: set[str] = set()
     for episode_position in range(len(episodes)):
         episode = episodes[episode_position]
         episode_index = int(episode.get("episode_index", episode_position))
+        if selected_episode_ids is not None and episode_index not in selected_episode_ids:
+            continue
+        tasks = episode.get("tasks", [])
+        task_name = str(tasks[0]) if tasks else f"task_{episode_position}"
+        if vis_one_episode_per_task and task_name in seen_tasks:
+            continue
+        seen_tasks.add(task_name)
         start_index = int(episode["dataset_from_index"])
         end_index = int(episode["dataset_to_index"])
         episode_length = end_index - start_index
@@ -229,10 +275,26 @@ def _episode_preview_targets(
             ("last", episode_length - 1),
         )
         for position, frame_index in frame_targets:
-            dataset_index = start_index + frame_index
-            if 0 <= dataset_index < total_samples:
-                targets.setdefault(dataset_index, []).append((episode_index, position, frame_index))
+            absolute_index = start_index + frame_index
+            local_index = (
+                selected_index_to_local.get(absolute_index)
+                if selected_index_to_local is not None
+                else absolute_index
+            )
+            if local_index is not None and 0 <= local_index < total_samples:
+                targets.setdefault(local_index, []).append((episode_index, position, frame_index))
     return targets
+
+
+def _parse_episode_indices(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not values:
+        raise ValueError("--episode-indices must contain at least one integer.")
+    if any(value < 0 for value in values):
+        raise ValueError("--episode-indices must be non-negative.")
+    return tuple(dict.fromkeys(values))
 
 
 def _save_episode_preview(
@@ -269,12 +331,59 @@ def cache_samples(args: argparse.Namespace) -> None:
     storage_dtype = np.dtype(args.storage_dtype)
     _prepare_output_dir(args.output_dir, args.overwrite)
 
-    pseudo_cfg = replace(PseudoLabelConfig(), nn_chunk_size=args.nn_chunk_size)
-    dataset = make_dataset(args)
-    total_samples = len(dataset) if args.max_samples is None else min(len(dataset), args.max_samples)
+    pseudo_cfg = replace(
+        PseudoLabelConfig(),
+        nn_chunk_size=args.nn_chunk_size,
+        motion_rotation_radius=args.motion_rotation_radius,
+        motion_baseline_threshold=args.motion_baseline_threshold,
+        motion_baseline_temperature=args.motion_baseline_temperature,
+        motion_relative_margin=args.motion_relative_margin,
+        motion_relative_tau=args.motion_relative_tau,
+        trajectory_sigma=args.trajectory_sigma,
+        contact_radius=args.contact_radius,
+        contact_temperature=args.contact_temperature,
+        approach_margin=args.approach_margin,
+        approach_tau=args.approach_tau,
+        background_trajectory_sigma=args.background_trajectory_sigma,
+    )
+    full_dataset = make_dataset(args)
+    requested_episode_indices = _parse_episode_indices(args.episode_indices)
+    selected_episode_indices = None
+    selected_dataset_indices = None
+    if requested_episode_indices is not None:
+        episodes = full_dataset.meta.episodes
+        episodes_by_id = {
+            int(episodes[index].get("episode_index", index)): episodes[index]
+            for index in range(len(episodes))
+        }
+        missing = sorted(set(requested_episode_indices) - set(episodes_by_id))
+        if missing:
+            raise ValueError(f"Requested episode indices do not exist: {missing}")
+        selected_episode_indices = requested_episode_indices
+        selected_dataset_indices = []
+        for episode_index in selected_episode_indices:
+            episode = episodes_by_id[episode_index]
+            selected_dataset_indices.extend(
+                range(int(episode["dataset_from_index"]), int(episode["dataset_to_index"]))
+            )
+        if args.max_samples is not None:
+            selected_dataset_indices = selected_dataset_indices[: args.max_samples]
+        total_samples = len(selected_dataset_indices)
+    else:
+        total_samples = len(full_dataset) if args.max_samples is None else min(len(full_dataset), args.max_samples)
+    dataset = (
+        Subset(full_dataset, selected_dataset_indices)
+        if selected_dataset_indices is not None
+        else full_dataset
+    )
     if total_samples <= 0:
         raise ValueError("Song pointseg cache needs at least one sample.")
-    preview_targets = _episode_preview_targets(dataset, total_samples)
+    preview_targets = _episode_preview_targets(
+        full_dataset,
+        total_samples,
+        selected_dataset_indices=selected_dataset_indices,
+        vis_one_episode_per_task=args.vis_one_episode_per_task,
+    )
     shards = _make_shard_manifest(total_samples, args.shard_size)
     manifest = {
         "version": POINTSEG_CACHE_VERSION,
@@ -283,12 +392,15 @@ def cache_samples(args: argparse.Namespace) -> None:
         "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
         "cache_mode": "indices",
         "num_samples": total_samples,
+        "selected_episode_indices": (
+            list(selected_episode_indices) if selected_episode_indices is not None else None
+        ),
         "future_offsets": list(args.future_offsets),
-        "temporal_offsets": list(dataset.temporal_offsets),
-        "temporal_mode": "bidirectional" if dataset.bidirectional else "future_only",
+        "temporal_offsets": list(full_dataset.temporal_offsets),
+        "temporal_mode": "bidirectional" if full_dataset.bidirectional else "future_only",
         "trajectory_mode": "sparse_full_episode",
         "trajectory_pose_source": "observation.state (achieved EEF pose)",
-        "trajectory_samples": dataset.trajectory_samples,
+        "trajectory_samples": full_dataset.trajectory_samples,
         "current_points": args.current_points,
         "future_points": args.future_points,
         "variable_num_points": True,
@@ -364,8 +476,14 @@ def cache_samples(args: argparse.Namespace) -> None:
                     previews_saved += 1
 
             for batch_index in range(batch_size):
+                local_dataset_index = written
+                cache_dataset_index = (
+                    selected_dataset_indices[local_dataset_index]
+                    if selected_dataset_indices is not None
+                    else local_dataset_index
+                )
                 shard_samples.append(
-                    _sample_from_batch(current_pc, pseudo, batch, batch_index, written)
+                    _sample_from_batch(current_pc, pseudo, batch, batch_index, cache_dataset_index)
                 )
                 written += 1
                 progress.update(1)

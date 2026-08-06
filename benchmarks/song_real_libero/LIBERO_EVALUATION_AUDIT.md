@@ -475,23 +475,20 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
 
 
 
-  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+
+ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v031_v7_adapter_libero_after_3w2_after3w2_after2w4/checkpoints/026000/pretrained_model \
-  --suite libero_spatial \
-  --suite libero_object \
+  --policy.path /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/libero_setting/train_libero_fresh/checkpoints/last/pretrained_model \
   --suite libero_10 \
-  --suite libero_goal \
-  --suite-gpu-ids 0,1,2,3 \
   --all-tasks \
   --episodes 10 \
   --policy-noise-seed 0 \
   --env-seed 7 \
-  --isolated-policy-workers 7 \
-  --task-workers 1 \
-  --episode-workers-per-task 1 \
-  --inference-batch-size 1 \
+  --isolated-policy-workers 1 \
+  --task-workers 10 \
+  --episode-workers-per-task 2 \
+  --inference-batch-size 20 \
   --no-release-event-exec-enable \
   --waypoint-max-hold-steps 1 \
   --gripper-control-mode delta_width \
@@ -502,13 +499,13 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --synchronize-gripper-controller-state \
   --control-freq 20 \
   --action-index 0 \
-  --exec-action-steps 16 \
-  --adaptive-exec-max-steps 16 \
-  --grasp-exec-steps 16 \
-  --max-steps 600 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
   --no-use-suite-max-steps \
   --recreate-env-per-episode \
   --render-mode offscreen \
   --no-visualize-foreground \
   --save-video \
-  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_fixed16_4suite_4gpu_7workers
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/wepvla_v042_temp

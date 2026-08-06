@@ -282,6 +282,85 @@ def create_panda_gripper_points(
     return points
 
 
+RLBENCH_PANDA_GRIPPER_TEMPLATE = "rlbench_panda"
+RLBENCH_PANDA_GRIPPER_TEMPLATE_VERSION = "rlbench_panda_tip_ttm_v1"
+RLBENCH_PANDA_MAX_WIDTH = 0.08
+
+
+def rlbench_panda_gripper_local_boxes(
+    width_percent: float,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Return a conservative RLBench Panda mesh approximation in Panda_tip.
+
+    The dimensions come from ``rlbench/robot_ttms/panda.ttm`` queried through
+    PyRep. In Panda_tip, the fingers open along +/-Y, their tips end at Z=0,
+    and the palm extends toward -Z. The exported mesh has sub-millimetre
+    left/right offsets, so the measured envelopes are rounded outwards and
+    symmetrized about the Panda_tip Y=0 plane.
+
+    ``width_percent`` follows RLBench/PyRep: 0 is closed and 1 is open. Width
+    is the total inner-finger gap, whose model limit is 2 * 0.04 m.
+    """
+    width = float(np.clip(width_percent, 0.0, 1.0)) * RLBENCH_PANDA_MAX_WIDTH
+    half_gap = width / 2.0
+
+    # Open-state visible-mesh AABBs measured in Panda_tip (metres):
+    # fingers X=[-0.010516, 0.010486], Z=[-0.053554, 0.000213],
+    # palm X=[-0.031295, 0.031505], Y=[-0.100352, 0.104165],
+    # Z=[-0.137846, -0.046086].
+    finger_half_x = 0.0106
+    finger_outer_depth = 0.0265
+    finger_min_z = -0.0536
+    finger_max_z = 0.0003
+    finger_size = np.array(
+        [2.0 * finger_half_x, finger_outer_depth, finger_max_z - finger_min_z],
+        dtype=np.float64,
+    )
+    palm_half_x = 0.0316
+    palm_half_y = 0.1043
+    palm_min_z = -0.1381
+    palm_max_z = -0.0460
+
+    return {
+        "left_finger": (
+            np.array([-finger_half_x, -half_gap - finger_outer_depth, finger_min_z]),
+            finger_size.copy(),
+        ),
+        "right_finger": (
+            np.array([-finger_half_x, half_gap, finger_min_z]),
+            finger_size.copy(),
+        ),
+        "palm": (
+            np.array([-palm_half_x, -palm_half_y, palm_min_z]),
+            np.array([2.0 * palm_half_x, 2.0 * palm_half_y, palm_max_z - palm_min_z]),
+        ),
+    }
+
+
+def create_rlbench_panda_gripper_points(
+    width_percent: float,
+    pose: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample the RLBench Panda geometry with ``pose`` expressed at Panda_tip."""
+    boxes = list(rlbench_panda_gripper_local_boxes(width_percent).values())
+    box_areas = [
+        2.0 * (size[0] * size[1] + size[0] * size[2] + size[1] * size[2])
+        for _, size in boxes
+    ]
+    box_counts = allocate_counts(count, box_areas)
+    points = [
+        sample_box_surface(min_corner, size, box_count, rng)
+        for box_count, (min_corner, size) in zip(box_counts, boxes, strict=True)
+    ]
+    points = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
+
+    pose = np.asarray(pose, dtype=np.float64)
+    pose_rot = R.from_euler("zyx", pose[3:]).as_matrix()
+    return points @ pose_rot.T + pose[:3]
+
+
 def create_gripper_cloud_rgb(
     width_percent: float,
     pose: np.ndarray,
@@ -292,6 +371,8 @@ def create_gripper_cloud_rgb(
 ) -> np.ndarray:
     if gripper_template == "panda":
         points = create_panda_gripper_points(width_percent, pose, count, rng)
+    elif gripper_template == RLBENCH_PANDA_GRIPPER_TEMPLATE:
+        points = create_rlbench_panda_gripper_points(width_percent, pose, count, rng)
     else:
         points = create_gripper_points(
             width_percent,

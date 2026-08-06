@@ -188,6 +188,9 @@ outputs/
 /benchmarks/xuan_libero_plus/
 /benchmarks/xuan_metaworld/
 /benchmarks/xuan_robotwin/
+/benchmarks/CoppeliaSim/
+/benchmarks/RH20T/
+/benchmarks/RLBench/
 /benchmarks/song_real_libero/scripts/libero_setting/libero_hdf5_to_dataset\ copy.py
 /benchmarks/song_real_libero/scripts/libero_setting/run_libero_4suite_eval.sh
 /benchmarks/虚拟环境.md
