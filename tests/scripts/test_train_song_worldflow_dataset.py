@@ -110,3 +110,21 @@ def test_worldflow_dataset_rejects_mismatched_achieved_and_target_lengths(tmp_pa
     wrapped = WorldFlowMemmapDataset(_TinyDataset(), tmp_path, chunk_size=4)
     with pytest.raises(ValueError, match="achieved/target lengths differ"):
         wrapped[0]
+
+
+@pytest.mark.parametrize(
+    "dataset_cls",
+    [WorldFlowMemmapDataset, BenchmarkWorldFlowMemmapDataset, LiberoWorldFlowMemmapDataset],
+)
+def test_worldflow_dataset_can_require_command_target_sidecar(tmp_path, dataset_cls):
+    achieved_dir = tmp_path / "world_ee_poses"
+    achieved_dir.mkdir()
+    np.save(achieved_dir / "episode_000000.npy", _pose_sequence(offset=10.0))
+
+    with pytest.raises(FileNotFoundError, match="action_target_ee_poses"):
+        dataset_cls(
+            _TinyDataset(),
+            tmp_path,
+            chunk_size=4,
+            require_action_target_sidecar=True,
+        )

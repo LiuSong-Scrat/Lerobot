@@ -25,15 +25,18 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.processor_smolvla import (
     SmolVLANewLineProcessor,
     make_smolvla_pre_post_processors,
+    validate_smolvla_worldflow_preprocessor,
 )
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     EnvTransition,
     NormalizerProcessorStep,
+    PolicyProcessorPipeline,
     ProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
+    UMIProcessor,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
@@ -60,11 +63,11 @@ def create_default_config():
     """Create a default SmolVLA configuration for testing."""
     config = SmolVLAConfig()
     config.input_features = {
-        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(10,)),
         OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
     }
     config.output_features = {
-        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(10,)),
     }
     config.normalization_mapping = {
         FeatureType.STATE: NormalizationMode.MEAN_STD,
@@ -81,9 +84,9 @@ def create_default_config():
 def create_default_stats():
     """Create default dataset statistics for testing."""
     return {
-        OBS_STATE: {"mean": torch.zeros(8), "std": torch.ones(8)},
+        OBS_STATE: {"mean": torch.zeros(10), "std": torch.ones(10)},
         OBS_IMAGE: {},  # No normalization for images
-        ACTION: {"min": torch.full((7,), -1.0), "max": torch.ones(7)},
+        ACTION: {"min": torch.full((10,), -1.0), "max": torch.ones(10)},
     }
 
 
@@ -105,13 +108,15 @@ def test_make_smolvla_processor_basic():
     assert postprocessor.name == "policy_postprocessor"
 
     # Check steps in preprocessor
-    assert len(preprocessor.steps) == 6
+    assert len(preprocessor.steps) == 7
     assert isinstance(preprocessor.steps[0], RenameObservationsProcessorStep)
     assert isinstance(preprocessor.steps[1], AddBatchDimensionProcessorStep)
     assert isinstance(preprocessor.steps[2], SmolVLANewLineProcessor)
     # Step 3 would be TokenizerProcessorStep but it's mocked
-    assert isinstance(preprocessor.steps[4], DeviceProcessorStep)
-    assert isinstance(preprocessor.steps[5], NormalizerProcessorStep)
+    assert isinstance(preprocessor.steps[4], UMIProcessor)
+    assert isinstance(preprocessor.steps[5], DeviceProcessorStep)
+    assert isinstance(preprocessor.steps[6], NormalizerProcessorStep)
+    validate_smolvla_worldflow_preprocessor(preprocessor)
 
     # Check steps in postprocessor
     assert len(postprocessor.steps) == 2
@@ -206,10 +211,10 @@ def test_smolvla_processor_cuda():
 
     # Create CPU data
     observation = {
-        OBS_STATE: torch.randn(8),
+        OBS_STATE: torch.randn(10),
         OBS_IMAGE: torch.randn(3, 224, 224),
     }
-    action = torch.randn(7)
+    action = torch.randn(10)
     transition = create_transition(observation, action, complementary_data={"task": "test task"})
 
     batch = transition_to_batch(transition)
@@ -265,10 +270,10 @@ def test_smolvla_processor_accelerate_scenario():
     # Simulate Accelerate: data already on GPU and batched
     device = torch.device("cuda:0")
     observation = {
-        OBS_STATE: torch.randn(1, 8).to(device),
+        OBS_STATE: torch.randn(1, 10).to(device),
         OBS_IMAGE: torch.randn(1, 3, 224, 224).to(device),
     }
-    action = torch.randn(1, 7).to(device)
+    action = torch.randn(1, 10).to(device)
     transition = create_transition(observation, action, complementary_data={"task": ["test task"]})
 
     batch = transition_to_batch(transition)
@@ -324,10 +329,10 @@ def test_smolvla_processor_multi_gpu():
     # Simulate data on different GPU
     device = torch.device("cuda:1")
     observation = {
-        OBS_STATE: torch.randn(1, 8).to(device),
+        OBS_STATE: torch.randn(1, 10).to(device),
         OBS_IMAGE: torch.randn(1, 3, 224, 224).to(device),
     }
-    action = torch.randn(1, 7).to(device)
+    action = torch.randn(1, 10).to(device)
     transition = create_transition(observation, action, complementary_data={"task": ["test task"]})
 
     batch = transition_to_batch(transition)
@@ -358,6 +363,37 @@ def test_smolvla_processor_without_stats():
     # Should still create processors
     assert preprocessor is not None
     assert postprocessor is not None
+
+
+def test_worldflow_preprocessor_validation_rejects_missing_or_duplicate_umi():
+    missing = PolicyProcessorPipeline(steps=[], name="missing_umi")
+    with pytest.raises(ValueError, match="exactly one UMIProcessor"):
+        validate_smolvla_worldflow_preprocessor(missing)
+
+    duplicate = PolicyProcessorPipeline(steps=[UMIProcessor(), UMIProcessor()], name="duplicate_umi")
+    with pytest.raises(ValueError, match="exactly one UMIProcessor"):
+        validate_smolvla_worldflow_preprocessor(duplicate)
+
+    wrong_order = PolicyProcessorPipeline(
+        steps=[
+            NormalizerProcessorStep(features={}, norm_map={}, stats={}),
+            UMIProcessor(),
+        ],
+        name="wrong_order",
+    )
+    with pytest.raises(ValueError, match="before NormalizerProcessorStep"):
+        validate_smolvla_worldflow_preprocessor(wrong_order)
+
+
+def test_worldflow_umi_contract_survives_processor_serialization(tmp_path):
+    pipeline = PolicyProcessorPipeline(steps=[UMIProcessor()], name="worldflow_preprocessor")
+    pipeline.save_pretrained(tmp_path, config_filename="worldflow_preprocessor.json")
+    loaded = PolicyProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="worldflow_preprocessor.json",
+    )
+    validate_smolvla_worldflow_preprocessor(loaded)
+    assert isinstance(loaded.steps[0], UMIProcessor)
 
 
 def test_smolvla_newline_processor_state_dict():
@@ -427,16 +463,16 @@ def test_smolvla_processor_bfloat16_device_float32_normalizer():
             modified_steps.append(step)
     preprocessor.steps = modified_steps
 
-    # Verify initial normalizer configuration (SmolVLA has NormalizerProcessorStep at index 5)
-    normalizer_step = preprocessor.steps[5]  # NormalizerProcessorStep
+    # Verify initial normalizer configuration.
+    normalizer_step = preprocessor.steps[6]
     assert normalizer_step.dtype == torch.float32
 
     # Create test data with both state and visual observations
     observation = {
-        OBS_STATE: torch.randn(8, dtype=torch.float32),
+        OBS_STATE: torch.randn(10, dtype=torch.float32),
         OBS_IMAGE: torch.randn(3, 224, 224, dtype=torch.float32),
     }
-    action = torch.randn(7, dtype=torch.float32)
+    action = torch.randn(10, dtype=torch.float32)
     transition = create_transition(
         observation, action, complementary_data={"task": "test bfloat16 adaptation"}
     )

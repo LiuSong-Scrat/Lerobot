@@ -112,12 +112,27 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 #   --policy.worldflow_trans_weight=1.0 \
 #   --policy.worldflow_rot_weight=1.0 \
 #   --policy.worldflow_max_points=0 \
-#   --policy.worldflow_noise_coupling=independent \
+#   --policy.worldflow_require_action_target_sidecar=true \
+#   --policy.pose9_action_noise_enable=true \
+#   --policy.worldflow_noise_coupling=conjugate_ego \
 #   --policy.worldflow_augmentation_trans_scale=0.05 \
 #   --policy.worldflow_augmentation_rot_scale=0.2 \
 #   --policy.worldflow_se3_head_enable=false \
 #   --policy.se3_enable=false \
 #   --policy.se3_final_correction_enable=false
+#
+# This keeps the original pose9 Action Expert while making the World and Ego
+# random flow origins describe the same physical transform. For the legacy
+# ablation use pose9_action_noise_enable=false and
+# worldflow_noise_coupling=independent; that path remains supported but is not
+# a geometrically coupled double flow.
+#
+# Full manifold ablation (larger behavior change): replace the pose9/se3 flags
+# above with:
+#   --policy.pose9_action_noise_enable=false \
+#   --policy.se3_enable=true \
+#   --policy.se3_twist_head_mode=pose9_endpoint \
+#   --policy.worldflow_noise_coupling=conjugate_ego
 
 
 # Real RGB-D collection and moving-camera processing

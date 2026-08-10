@@ -78,8 +78,8 @@ def make_smolvla_pre_post_processors(
             padding_side="right",
             max_length=config.tokenizer_max_length,
         ),
-        DeviceProcessorStep(device=config.device),
         UMIProcessor(),
+        DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
@@ -107,6 +107,39 @@ def make_smolvla_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+
+def validate_smolvla_worldflow_preprocessor(
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+) -> None:
+    """Reject processor pipelines that would violate the World--Ego frame contract.
+
+    Checkpoints load their saved processor topology instead of rebuilding the
+    current SmolVLA defaults. WorldFlow requires exactly one UMI transform, and
+    that transform must run before action normalization so the model receives
+    current-EEF-relative physical pose9 actions.
+    """
+
+    umi_indices = [
+        index for index, step in enumerate(preprocessor.steps) if isinstance(step, UMIProcessor)
+    ]
+    if len(umi_indices) != 1:
+        raise ValueError(
+            "worldflow_enable=True requires exactly one UMIProcessor in the policy "
+            f"preprocessor, found {len(umi_indices)}. Rebuild the processor from the current "
+            "SmolVLA configuration instead of reusing an incompatible checkpoint pipeline."
+        )
+
+    normalizer_indices = [
+        index
+        for index, step in enumerate(preprocessor.steps)
+        if isinstance(step, NormalizerProcessorStep)
+    ]
+    if normalizer_indices and umi_indices[0] > min(normalizer_indices):
+        raise ValueError(
+            "WorldFlow requires UMIProcessor to run before NormalizerProcessorStep so the "
+            "Ego action is converted to the current EEF frame in physical pose9 coordinates."
+        )
 
 
 @ProcessorStepRegistry.register(name="smolvla_new_line_processor")

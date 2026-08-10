@@ -159,6 +159,10 @@ class SmolVLAConfig(PreTrainedConfig):
     # 0 keeps the complete predicted foreground. A positive value is an
     # optional memory cap applied after PointSeg foreground selection.
     worldflow_max_points: int = 0
+    # Command-target sidecars keep the World target exactly aligned with the
+    # Ego action chunk. False preserves legacy datasets that only contain
+    # achieved poses; production WorldFlow recipes should enable this guard.
+    worldflow_require_action_target_sidecar: bool = False
     # Legacy v0.5 CLI fields. v0.5.1+ shares the Ego Action Expert, so these
     # values are parsed for old commands but do not instantiate another expert.
     worldflow_action_expert_layers: int = -1
@@ -419,11 +423,19 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 )
             )
-            if self.worldflow_noise_coupling == "independent" and ego_random_prior:
+            if self.worldflow_noise_coupling == "independent":
+                detail = (
+                    " Both priors are valid poses, but their random origins still describe different "
+                    "physical trajectories."
+                    if ego_random_prior
+                    else " The legacy Ego prior is also an unconstrained rotation-6D vector rather than "
+                    "an SE(3) pose."
+                )
                 warnings.warn(
                     "WorldFlow and Ego use independent random priors. This preserves legacy behavior "
-                    "but does not satisfy G_0=C B_0 C^{-1}; use "
-                    "worldflow_noise_coupling='conjugate_ego' for stochastic double-flow training.",
+                    "but does not satisfy G_0=C B_0 C^{-1}." + detail + " Use "
+                    "pose9_action_noise_enable=True (or se3_enable=True) together with "
+                    "worldflow_noise_coupling='conjugate_ego' for geometrically coupled double-flow training.",
                     stacklevel=2,
                 )
             if self.rtc_config is not None and self.rtc_config.enabled:
@@ -495,11 +507,18 @@ class SmolVLAConfig(PreTrainedConfig):
         else:
             origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
             flow = "channel_euclidean"
-        world = (
-            f",worldflow={self.worldflow_noise_coupling}"
-            if self.worldflow_enable
-            else ",worldflow=disabled"
-        )
+        if self.worldflow_enable:
+            target_contract = (
+                "commanded_required"
+                if self.worldflow_require_action_target_sidecar
+                else "legacy_fallback_allowed"
+            )
+            world = (
+                f",worldflow={self.worldflow_noise_coupling},"
+                f"worldflow_targets={target_contract}"
+            )
+        else:
+            world = ",worldflow=disabled"
         return (
             f"action_chunk_start_offset={int(self.action_chunk_start_offset)},"
             f"online_action_index=0,ego_origin={origin},ego_flow={flow}{world},"

@@ -40,6 +40,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla.processor_smolvla import validate_smolvla_worldflow_preprocessor
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
     PseudoLabelConfig,
@@ -142,12 +143,19 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         *,
         chunk_size: int,
         action_start_offset: int = 0,
+        require_action_target_sidecar: bool = False,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
         self.root = Path(root)
         self.pose_dir = self.root / "world_ee_poses"
         command_target_dir = self.root / "action_target_ee_poses"
+        if require_action_target_sidecar and not command_target_dir.is_dir():
+            raise FileNotFoundError(
+                "WorldFlow requires commanded action targets but the sidecar directory is missing: "
+                f"{command_target_dir}. Regenerate the dataset with action_target_ee_poses or set "
+                "worldflow_require_action_target_sidecar=False only for an explicitly achieved-trajectory dataset."
+            )
         self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
         self.action_start_offset = int(action_start_offset)
@@ -618,6 +626,9 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
         action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
+        require_action_target_sidecar=bool(
+            getattr(policy_cfg, "worldflow_require_action_target_sidecar", False)
+        ),
         mmap_mode=mmap_mode,
     )
 
@@ -1308,6 +1319,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    if bool(getattr(policy.config, "worldflow_enable", False)):
+        validate_smolvla_worldflow_preprocessor(preprocessor)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
