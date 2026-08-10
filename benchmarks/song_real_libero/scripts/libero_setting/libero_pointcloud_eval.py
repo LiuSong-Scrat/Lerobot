@@ -12,6 +12,8 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
+EVAL_BUILD_TAG = "strict_official_delta_width_initial_sync_v11_20260810"
+
 import argparse
 import atexit
 import hashlib
@@ -458,6 +460,19 @@ def parse_args() -> argparse.Namespace:
 
     ###################TrainDatasetTest##########
     parser.add_argument(
+        "--strict-official-init",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For standard benchmark evaluation, use the official LIBERO initialization "
+            "sequence exactly: fixed init state followed by 10 env.step([0]*7) dummy "
+            "actions. This disables custom settling, forced gripper opening, controller "
+            "gripper synchronization, and custom warmup. Dataset-domain diagnostics "
+            "intentionally do not apply this sequence."
+        ),
+    )
+
+    parser.add_argument(
         "--dataset-domain-env",
         "--align-env-to-training-data",
         dest="dataset_domain_env",
@@ -811,12 +826,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gripper-control-mode",
-        choices=("delta_width", "absolute_width", "target_width"),
+        choices=(
+            "delta_width",
+            "delta_width_initial_sync",
+            "absolute_width",
+            "target_width",
+            "absolute_width_position",
+        ),
         default=None,
         help=(
-            "Convert predicted widths either from their temporal derivative (legacy evaluator behavior) "
-            "by thresholding the absolute physical width, or by tracking the predicted physical width "
-            "against the measured gripper width."
+            "Gripper execution mode. delta_width_initial_sync performs exactly one episode-start "
+            "synchronization from the first predicted physical width into robosuite's internal "
+            "absolute gripper target, then uses the original chunk-relative delta decoder for all "
+            "rollout actions (the first executed row of every policy chunk is self-referenced and "
+            "therefore emits zero gripper command). absolute_width_position remains available as "
+            "the per-row absolute-position diagnostic mode."
         ),
     )
     parser.add_argument(
@@ -1407,63 +1431,51 @@ def libero_delta_action_to_absolute_action(
     env: Any,
     source_action: np.ndarray,
     *,
-    force_controller_update: bool = False,
+    force_controller_update: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert one source OSC delta command to an equivalent absolute command.
+    """Reconstruct robosuite's exact relative-OSC goal for one source action.
 
-    LIBERO demonstrations store normalized OSC deltas. A demonstrated state,
-    however, is the pose reached *after* contact dynamics and is not the OSC
-    setpoint encoded by the action that generated it. Replaying reached poses
-    as controller commands therefore changes the source action semantics.
-
-    This helper preserves an absolute-pose controller while reconstructing the
-    setpoint that robosuite's delta branch encodes at the supplied controller
-    state. No heuristic offset is added, and the source gripper command is
-    copied unchanged.
+    This diagnostic helper is called in source-action order while
+    controller.use_delta=True. Using controller.set_goal() preserves the OSC
+    controller's goal-orientation history, including zero-rotation-delta rows.
     """
 
     raw_action = np.asarray(source_action, dtype=np.float64).reshape(-1)
     if raw_action.shape != (7,):
-        raise ValueError(f"Expected one LIBERO source action with shape (7,), got {raw_action.shape}.")
+        raise ValueError(
+            f"Expected one LIBERO source action with shape (7,), got {raw_action.shape}."
+        )
     if not np.isfinite(raw_action).all():
         raise ValueError("LIBERO source action contains non-finite values.")
     if len(getattr(env, "robots", [])) != 1:
-        raise ValueError("Source-action absolute conversion currently requires one LIBERO robot.")
+        raise ValueError("Source-action goal reconstruction requires one LIBERO robot.")
 
     import robosuite.utils.transform_utils as T
-    from robosuite.utils.control_utils import set_goal_orientation, set_goal_position
 
     controller = env.robots[0].controller
-    if bool(getattr(controller, "use_delta", True)):
+    if not bool(getattr(controller, "use_delta", False)):
         raise RuntimeError(
-            "libero_delta_action_to_absolute_action requires controller.use_delta=False."
+            "Exact teacher-goal reconstruction requires controller.use_delta=True."
         )
-    # Normal online conversion mirrors OperationalSpaceController.set_goal().
-    # Source-state reconstruction explicitly force-refreshes after setting each
-    # saved MuJoCo state so the absolute target is anchored to that source pose.
+    if str(getattr(controller, "impedance_mode", "fixed")) != "fixed":
+        raise RuntimeError("Raw 7D LIBERO actions require fixed OSC impedance mode.")
+
     controller.update(force=bool(force_controller_update))
-    scaled_delta = np.asarray(controller.scale_action(raw_action[:6]), dtype=np.float64)
-    target_position = set_goal_position(
-        scaled_delta[:3],
-        np.asarray(controller.ee_pos, dtype=np.float64),
-        position_limit=controller.position_limits,
+    scaled_delta = np.asarray(
+        controller.scale_action(raw_action[:6]), dtype=np.float64
     )
-    target_orientation = set_goal_orientation(
-        scaled_delta[3:],
-        np.asarray(controller.ee_ori_mat, dtype=np.float64),
-        orientation_limit=controller.orientation_limits,
-    )
+    controller.set_goal(raw_action[:6])
+
+    target_position = np.asarray(controller.goal_pos, dtype=np.float64).copy()
+    target_orientation = np.asarray(controller.goal_ori, dtype=np.float64).copy()
 
     target_controller_world = np.eye(4, dtype=np.float64)
-    target_controller_world[:3, :3] = np.asarray(target_orientation, dtype=np.float64)
-    target_controller_world[:3, 3] = np.asarray(target_position, dtype=np.float64)
+    target_controller_world[:3, :3] = target_orientation
+    target_controller_world[:3, 3] = target_position
+
     absolute_action = np.concatenate(
         [
-            np.asarray(target_position, dtype=np.float64),
-            # Use robosuite's own matrix -> quaternion -> axis-angle
-            # convention. SciPy projects a slightly non-orthogonal MuJoCo
-            # matrix onto SO(3); close to pi this changed one source target by
-            # about 0.02 in matrix space and was enough to break contact replay.
+            target_position,
             T.quat2axisangle(T.mat2quat(target_orientation)),
             raw_action[6:7],
         ]
@@ -3078,6 +3090,153 @@ def predicted_release_event_end(
     return base + peak_offset + 1, opening_change
 
 
+def set_gripper_absolute_width_position_target(
+    env: Any,
+    predicted_width: float,
+) -> dict[str, Any]:
+    """Set robosuite's gripper to an absolute physical opening-width target.
+
+    This is an action-representation adapter, not a bang-bang controller.
+
+    The model predicts total physical finger opening in metres.  MuJoCo
+    position-actuator control ranges are used to derive the fully-closed and
+    fully-open mechanical endpoints.  The requested total opening is then
+    linearly interpolated between those endpoints and converted to robosuite's
+    normalized ``gripper.current_action``.
+
+    The caller should pass a zero scalar gripper action to ``env.step`` after
+    this function. PandaGripper.format_action(0) leaves ``current_action``
+    unchanged, so robosuite continues to command this absolute position target.
+
+    No width threshold, temporal derivative, task phase, grasp detector, or
+    benchmark-specific rule is used.
+    """
+    sim = get_sim(env)
+    model = sim.model
+    records: list[dict[str, Any]] = []
+
+    for robot in getattr(env, "robots", []):
+        raw_grippers = getattr(robot, "gripper", None)
+        if raw_grippers is None:
+            continue
+        grippers = (
+            list(raw_grippers.values())
+            if isinstance(raw_grippers, dict)
+            else [raw_grippers]
+        )
+        for gripper in grippers:
+            actuator_names = list(getattr(gripper, "actuators", []))
+            if not actuator_names:
+                continue
+
+            actuator_ids = np.asarray(
+                [model.actuator_name2id(name) for name in actuator_names],
+                dtype=np.int64,
+            )
+            ctrl_range = np.asarray(
+                model.actuator_ctrlrange[actuator_ids],
+                dtype=np.float64,
+            )
+            if ctrl_range.ndim != 2 or ctrl_range.shape[1] != 2:
+                raise RuntimeError(
+                    f"Unexpected gripper actuator ctrlrange shape: {ctrl_range.shape}."
+                )
+
+            # For the LIBERO Panda fingers, qpos=0 is the mechanically closed
+            # position.  Derive endpoints from actuator metadata rather than
+            # hard-coding left/right signs or a nominal 0.08 m width.
+            lower = ctrl_range[:, 0]
+            upper = ctrl_range[:, 1]
+            closed_targets = np.where(
+                np.abs(lower) <= np.abs(upper),
+                lower,
+                upper,
+            )
+            open_targets = np.where(
+                np.abs(lower) > np.abs(upper),
+                lower,
+                upper,
+            )
+            finger_travel = np.abs(open_targets - closed_targets)
+            mechanical_max_width = float(np.sum(finger_travel))
+            if not np.isfinite(mechanical_max_width) or mechanical_max_width <= 1e-12:
+                raise RuntimeError(
+                    "Could not derive a positive gripper opening range from "
+                    f"actuator ctrlrange={ctrl_range!r}."
+                )
+
+            target_width = float(
+                np.clip(float(predicted_width), 0.0, mechanical_max_width)
+            )
+            opening_fraction = float(target_width / mechanical_max_width)
+            physical_targets = (
+                closed_targets
+                + opening_fraction * (open_targets - closed_targets)
+            )
+
+            # robosuite Manipulator.grip_action maps normalized [-1, +1]
+            # current_action linearly into each actuator ctrlrange.
+            bias = 0.5 * (upper + lower)
+            weight = 0.5 * (upper - lower)
+            if np.any(np.abs(weight) < 1e-12):
+                raise RuntimeError(
+                    f"Gripper actuator has a degenerate control range: {ctrl_range!r}."
+                )
+            normalized_targets = np.clip(
+                (physical_targets - bias) / weight,
+                -1.0,
+                1.0,
+            )
+
+            current = np.asarray(
+                getattr(gripper, "current_action", normalized_targets),
+                dtype=np.float64,
+            ).reshape(-1)
+            if current.size != normalized_targets.size:
+                raise RuntimeError(
+                    "Gripper current_action dimension does not match actuator count: "
+                    f"current_action={current.shape}, actuators={len(actuator_names)}."
+                )
+
+            # This is the key operation: replace the integrated directional
+            # target with the absolute target represented by the model width.
+            gripper.current_action = normalized_targets.copy()
+
+            records.append(
+                {
+                    "actuator_names": actuator_names,
+                    "mechanical_max_width": mechanical_max_width,
+                    "requested_width": float(predicted_width),
+                    "target_width": target_width,
+                    "opening_fraction": opening_fraction,
+                    "physical_targets": physical_targets.astype(np.float32).tolist(),
+                    "normalized_targets": normalized_targets.astype(np.float32).tolist(),
+                }
+            )
+
+    if not records:
+        raise RuntimeError(
+            "absolute_width_position could not find any robosuite gripper actuators."
+        )
+
+    # LIBERO uses one Panda gripper.  If a future env exposes several grippers,
+    # require compatible mechanical ranges rather than silently mixing them.
+    max_widths = [float(record["mechanical_max_width"]) for record in records]
+    if max(max_widths) - min(max_widths) > 1e-6:
+        raise RuntimeError(
+            "absolute_width_position found incompatible multi-gripper ranges: "
+            f"{max_widths!r}."
+        )
+
+    return {
+        "mechanical_max_width": float(max_widths[0]),
+        "requested_width": float(predicted_width),
+        "target_width": float(records[0]["target_width"]),
+        "opening_fraction": float(records[0]["opening_fraction"]),
+        "grippers": records,
+    }
+
+
 def synchronize_gripper_controller_state(env: Any) -> list[list[float]]:
     """Match robosuite's integrated gripper target to the physical finger qpos.
 
@@ -3234,7 +3393,13 @@ def action_chunk_to_absolute_libero_actions(
     libero_actions: list[np.ndarray] = []
     target_controller_pose9: list[np.ndarray] = []
     control_mode = str(gripper_control_mode)
-    if control_mode not in {"delta_width", "absolute_width", "target_width"}:
+    if control_mode not in {
+        "delta_width",
+        "delta_width_initial_sync",
+        "absolute_width",
+        "target_width",
+        "absolute_width_position",
+    }:
         raise ValueError(f"Unsupported gripper_control_mode={control_mode!r}.")
     delta_alignment = str(gripper_delta_alignment)
     if delta_alignment not in {"current_minus_previous", "next_minus_current"}:
@@ -3249,7 +3414,7 @@ def action_chunk_to_absolute_libero_actions(
                 threshold=float(gripper_threshold),
                 max_physical_width=float(gripper_max_width),
             )
-        elif control_mode == "delta_width":
+        elif control_mode in {"delta_width", "delta_width_initial_sync"}:
             if delta_alignment == "current_minus_previous":
                 # Row i is the endpoint of the previous->current trajectory
                 # interval, so its gripper event belongs to this same env step.
@@ -3262,8 +3427,9 @@ def action_chunk_to_absolute_libero_actions(
             threshold = float(gripper_delta_threshold)
             gripper_action = -1.0 if delta_width > threshold else 1.0 if delta_width < -threshold else 0.0
         else:
-            # The measured width is available only after each environment
-            # step, so run_episode replaces this placeholder online.
+            # target_width and absolute_width_position are resolved online.
+            # For absolute_width_position this scalar remains zero because the
+            # model width is written directly into gripper.current_action.
             gripper_action = 0.0
         libero_actions.append(np.concatenate([arm_action, np.asarray([gripper_action], dtype=np.float32)]))
         target_controller_pose9.append(matrix_to_pose9(target_controller_world))
@@ -3376,47 +3542,76 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "mode": (
                 "source_demo_exact_observation"
                 if bool(cfg.get("dataset_domain_env", False))
-                else "standard_libero_settled"
+                else "official_libero_fixed_state_plus_10_zero_steps"
+                if bool(cfg.get("strict_official_init", True))
+                else "legacy_custom_settled"
             ),
-            "settling_applied": not bool(cfg.get("dataset_domain_env", False)),
+            "strict_official_init": bool(
+                cfg.get("strict_official_init", True)
+                and not cfg.get("dataset_domain_env", False)
+            ),
+            "official_dummy_action": (
+                [0.0] * 7
+                if bool(cfg.get("strict_official_init", True))
+                and not bool(cfg.get("dataset_domain_env", False))
+                else None
+            ),
+            "official_dummy_steps": (
+                10
+                if bool(cfg.get("strict_official_init", True))
+                and not bool(cfg.get("dataset_domain_env", False))
+                else 0
+            ),
+            "settling_applied": bool(
+                not bool(cfg.get("dataset_domain_env", False))
+                and not bool(cfg.get("strict_official_init", True))
+            ),
             "settle_steps": (
                 0
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else int(cfg["settle_steps"])
             ),
             "settle_min_seconds": (
                 0.0
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else float(cfg["settle_min_seconds"])
             ),
             "settle_stable_seconds": (
                 0.0
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else float(cfg["settle_stable_seconds"])
             ),
             "settle_max_seconds": (
                 0.0
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else float(cfg["settle_max_seconds"])
             ),
             "settle_require_stable": (
                 False
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else bool(cfg["settle_require_stable"])
             ),
             "settle_keep_robot_fixed": (
                 False
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else bool(cfg["settle_keep_robot_fixed"])
             ),
             "initial_gripper_open": (
                 False
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else bool(cfg["initial_gripper_open"])
             ),
             "warmup_steps": (
                 0
                 if bool(cfg.get("dataset_domain_env", False))
+                or bool(cfg.get("strict_official_init", True))
                 else int(cfg["control"].get("warmup_steps", 0))
             ),
         },
@@ -3528,6 +3723,10 @@ def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz:
         "gripper_width_pcts",
         "gripper_actual_widths",
         "gripper_width_errors",
+        "gripper_absolute_position_target_widths",
+        "gripper_absolute_position_opening_fractions",
+        "gripper_absolute_position_normalized_targets",
+        "gripper_absolute_position_mechanical_max_widths",
         "initial_object_positions",
         "initial_object_quaternions",
         "object_positions",
@@ -3608,6 +3807,18 @@ def save_episode_actions(result: dict[str, Any], episode_dir: Path) -> str | Non
         "gripper_width_pcts": np.asarray(result.get("gripper_width_pcts", []), dtype=np.float32),
         "gripper_actual_widths": np.asarray(result.get("gripper_actual_widths", []), dtype=np.float32),
         "gripper_width_errors": np.asarray(result.get("gripper_width_errors", []), dtype=np.float32),
+        "gripper_absolute_position_target_widths": np.asarray(
+            result.get("gripper_absolute_position_target_widths", []), dtype=np.float32
+        ),
+        "gripper_absolute_position_opening_fractions": np.asarray(
+            result.get("gripper_absolute_position_opening_fractions", []), dtype=np.float32
+        ),
+        "gripper_absolute_position_normalized_targets": np.asarray(
+            result.get("gripper_absolute_position_normalized_targets", []), dtype=np.float32
+        ),
+        "gripper_absolute_position_mechanical_max_widths": np.asarray(
+            result.get("gripper_absolute_position_mechanical_max_widths", []), dtype=np.float32
+        ),
         "release_event_predicted_width_changes": np.asarray(
             result.get("release_event_predicted_width_changes", []), dtype=np.float32
         ),
@@ -5488,12 +5699,34 @@ def run_episode(
         raw_obs = get_raw_obs(env, force_update=True)
     raw_obs = env.set_init_state(init_state)
 
+    strict_official_init = (
+        bool(cfg.get("strict_official_init", True))
+        and not dataset_domain_env
+    )
+    official_dummy_steps_applied = 0
+
     if dataset_domain_env:
-        # This state is the exact simulator snapshot rendered into the first
-        # converted training observation. Advancing physics or forcing the
-        # fingers open here would immediately move evaluation out of that domain.
+        # Dataset-domain diagnostic: preserve the exact converted training
+        # observation state. Official benchmark warmup is intentionally NOT
+        # applied here because that would change the diagnostic domain.
         raw_obs = get_raw_obs(env, force_update=True)
+    elif strict_official_init:
+        # Strict official LIBERO initialization, matching the public LIBERO
+        # example:
+        #   env.reset()
+        #   env.set_init_state(fixed_init_state)
+        #   for _ in range(10): env.step([0.] * 7)
+        #
+        # The environment is constructed with delta OSC for these no-op steps.
+        for robot in env.robots:
+            robot.controller.use_delta = True
+        dummy_action = np.zeros(7, dtype=np.float32)
+        for _ in range(10):
+            raw_obs, _, _, _ = env.step(dummy_action)
+            official_dummy_steps_applied += 1
     else:
+        # Legacy / non-official evaluator initialization retained only for
+        # controlled ablations.
         raw_obs = settle_scene_after_reset(
             env,
             steps=int(cfg["settle_steps"]),
@@ -5508,23 +5741,26 @@ def run_episode(
             open_gripper=bool(cfg["initial_gripper_open"]),
             cfg=cfg,
         )
+
     synchronized_gripper_controller_actions: list[list[float]] = []
-    effective_synchronize_gripper_controller_state = bool(
-        control.get("synchronize_gripper_controller_state", True)
-    ) and not oracle_actions_enabled
+    effective_synchronize_gripper_controller_state = (
+        bool(control.get("synchronize_gripper_controller_state", True))
+        and not oracle_actions_enabled
+        and not strict_official_init
+    )
     if effective_synchronize_gripper_controller_state:
         synchronized_gripper_controller_actions = synchronize_gripper_controller_state(env)
         raw_obs = get_raw_obs(env, force_update=True)
 
-
-    # Absolute pose execution only.
+    # Model / oracle execution uses absolute OSC after initialization.
     for robot in env.robots:
         robot.controller.use_delta = False
     refresh_arm_controller_state(env)
 
-
-    for _ in range(warmup_steps):
-        raw_obs, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
+    # Custom warmup is disabled in strict official mode.
+    if not strict_official_init:
+        for _ in range(warmup_steps):
+            raw_obs, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
 
     if not bool(getattr(infer, "shared_parallel_inference", False)):
         infer.policy.reset()
@@ -5582,6 +5818,20 @@ def run_episode(
     gripper_width_pcts: list[float] = []
     gripper_actual_widths: list[float] = []
     gripper_width_errors: list[float] = []
+    gripper_absolute_position_target_widths: list[float] = []
+    gripper_absolute_position_opening_fractions: list[float] = []
+    gripper_absolute_position_normalized_targets: list[np.ndarray] = []
+    gripper_absolute_position_mechanical_max_widths: list[float] = []
+
+    # delta_width_initial_sync state.  This is intentionally episode-global
+    # and fires exactly once, after the first policy prediction and before the
+    # first policy action is executed.  No extra env.step is inserted.
+    gripper_initial_sync_applied = False
+    gripper_initial_sync_requested_width: float | None = None
+    gripper_initial_sync_target_width: float | None = None
+    gripper_initial_sync_opening_fraction: float | None = None
+    gripper_initial_sync_mechanical_max_width: float | None = None
+    gripper_initial_sync_normalized_targets: list[list[float]] = []
     achieved_model_worlds: list[np.ndarray] = []
     tracking_position_errors: list[float] = []
     tracking_rotation_errors: list[float] = []
@@ -6102,10 +6352,53 @@ def run_episode(
                 )
             )
             selected_chunk = np.asarray(chunk[start_idx:end_idx], dtype=np.float32)
-            previous_predicted_width = float(
-                chunk[start_idx - 1, -1] if start_idx > 0 else chunk[start_idx, -1]
-            )
-            # gripper_previous_width = float(measured_gripper_width)
+            # delta_width_initial_sync intentionally restores the original
+            # chunk-relative gripper semantics:
+            #
+            #   first row of every executed policy chunk:
+            #       previous = that same predicted row -> delta = 0
+            #
+            #   remaining rows:
+            #       row_i - row_(i-1)
+            #
+            # This isolates each newly replanned chunk from discontinuities
+            # between the previous rollout prediction and the new prediction.
+            #
+            # The only absolute-width operation in this mode is the ONE-TIME
+            # episode-start synchronization below.
+            if gripper_control_mode == "delta_width_initial_sync":
+                if not gripper_initial_sync_applied:
+                    initial_sync_info = set_gripper_absolute_width_position_target(
+                        env,
+                        float(chunk[0, -1]),
+                    )
+                    gripper_initial_sync_applied = True
+                    gripper_initial_sync_requested_width = float(chunk[0, -1])
+                    gripper_initial_sync_target_width = float(
+                        initial_sync_info["target_width"]
+                    )
+                    gripper_initial_sync_opening_fraction = float(
+                        initial_sync_info["opening_fraction"]
+                    )
+                    gripper_initial_sync_mechanical_max_width = float(
+                        initial_sync_info["mechanical_max_width"]
+                    )
+                    gripper_initial_sync_normalized_targets = [
+                        list(map(float, record["normalized_targets"]))
+                        for record in initial_sync_info["grippers"]
+                    ]
+
+                # Self-reference the first EXECUTED row. This preserves the
+                # original decoder even when action_index > 0.
+                previous_predicted_width = float(chunk[start_idx, -1])
+            else:
+                # V5 / V9 semantics for the existing delta_width mode:
+                # row0 is anchored to current measured physical width.
+                previous_predicted_width = float(
+                    chunk[start_idx - 1, -1]
+                    if start_idx > 0
+                    else measured_gripper_width
+                )
             actions, model_worlds, controller_pose9 = action_chunk_to_absolute_libero_actions(
                 env=env,
                 current_eef_pose9_gripper=eef_pose,
@@ -6173,6 +6466,7 @@ def run_episode(
                         rollback_requested = True
                         break
                     step_action = np.asarray(action, dtype=np.float32).copy()
+                    absolute_position_info: dict[str, Any] | None = None
                     if gripper_control_mode == "target_width":
                         step_action[-1] = gripper_target_width_command(
                             float(row[-1]),
@@ -6180,13 +6474,18 @@ def run_episode(
                             tolerance=gripper_target_tolerance,
                             max_physical_width=gripper_max_width,
                         )
+                    elif gripper_control_mode == "absolute_width_position":
+                        absolute_position_info = set_gripper_absolute_width_position_target(
+                            env,
+                            float(row[-1]),
+                        )
+                        # Do not add a directional OPEN/CLOSE event. The
+                        # absolute normalized target was already written into
+                        # gripper.current_action above.
+                        step_action[-1] = 0.0
                     elif _hold_index > 0:
-                        # LIBERO's Panda gripper integrates a directional
-                        # command into an internal target. Repeating the same
-                        # event while holding an arm waypoint changes one
-                        # predicted open/close event into several events.
-                        # A zero command keeps tracking the target established
-                        # on the first controller step.
+                        # Legacy delta_width: do not duplicate one predicted
+                        # directional event across repeated arm-waypoint holds.
                         step_action[-1] = 0.0
                     gripper_reach_direction = (
                         float(step_action[-1])
@@ -6228,6 +6527,24 @@ def run_episode(
                     target_controller_pose9.append(np.asarray(controller_pose, dtype=np.float32))
                     gripper_commands.append(float(step_action[-1]))
                     gripper_raw_widths.append(float(row[-1]))
+                    if (
+                        gripper_control_mode == "absolute_width_position"
+                        and absolute_position_info is not None
+                    ):
+                        gripper_absolute_position_target_widths.append(
+                            float(absolute_position_info["target_width"])
+                        )
+                        gripper_absolute_position_opening_fractions.append(
+                            float(absolute_position_info["opening_fraction"])
+                        )
+                        gripper_absolute_position_mechanical_max_widths.append(
+                            float(absolute_position_info["mechanical_max_width"])
+                        )
+                        normalized = np.asarray(
+                            absolute_position_info["grippers"][0]["normalized_targets"],
+                            dtype=np.float32,
+                        )
+                        gripper_absolute_position_normalized_targets.append(normalized)
                     gripper_width_pcts.append(
                         gripper_width_percent_from_scalar(
                             float(row[-1]), max_physical_width=gripper_max_width
@@ -6316,13 +6633,26 @@ def run_episode(
         "initialization_mode": (
             "source_demo_exact_observation"
             if dataset_domain_env
-            else "standard_libero_settled"
+            else "official_libero_fixed_state_plus_10_zero_steps"
+            if strict_official_init
+            else "legacy_custom_settled"
         ),
-        "settling_applied": not dataset_domain_env,
+        "strict_official_init": bool(strict_official_init),
+        "official_dummy_action": (
+            [0.0] * 7 if strict_official_init else None
+        ),
+        "official_dummy_steps_applied": int(official_dummy_steps_applied),
+        "settling_applied": bool((not dataset_domain_env) and (not strict_official_init)),
         "forced_initial_gripper_open_applied": (
-            bool(cfg["initial_gripper_open"]) and not dataset_domain_env
+            bool(cfg["initial_gripper_open"])
+            and not dataset_domain_env
+            and not strict_official_init
         ),
-        "warmup_steps_applied": int(warmup_steps),
+        "warmup_steps_applied": (
+            int(official_dummy_steps_applied)
+            if strict_official_init
+            else int(warmup_steps)
+        ),
         "success": bool(success_ever),
         "done": bool(done),
         "manual_failure": bool(manual_failure),
@@ -6379,6 +6709,71 @@ def run_episode(
         ),
         "initial_gripper_controller_actions": synchronized_gripper_controller_actions,
         "gripper_target_tolerance": float(gripper_target_tolerance),
+        "gripper_delta_width_initial_sync_mode": (
+            "first_policy_row_absolute_internal_target_then_chunk_relative_delta"
+            if gripper_control_mode == "delta_width_initial_sync"
+            else "not_applicable"
+        ),
+        "gripper_initial_sync_applied": bool(gripper_initial_sync_applied),
+        "gripper_initial_sync_requested_width": (
+            None
+            if gripper_initial_sync_requested_width is None
+            else float(gripper_initial_sync_requested_width)
+        ),
+        "gripper_initial_sync_target_width": (
+            None
+            if gripper_initial_sync_target_width is None
+            else float(gripper_initial_sync_target_width)
+        ),
+        "gripper_initial_sync_opening_fraction": (
+            None
+            if gripper_initial_sync_opening_fraction is None
+            else float(gripper_initial_sync_opening_fraction)
+        ),
+        "gripper_initial_sync_mechanical_max_width": (
+            None
+            if gripper_initial_sync_mechanical_max_width is None
+            else float(gripper_initial_sync_mechanical_max_width)
+        ),
+        "gripper_initial_sync_normalized_targets": (
+            gripper_initial_sync_normalized_targets
+            if gripper_control_mode == "delta_width_initial_sync"
+            else []
+        ),
+        "gripper_chunk_boundary_reference_mode": (
+            "self_reference_first_executed_predicted_row"
+            if gripper_control_mode == "delta_width_initial_sync"
+            else (
+                "measured_width_or_previous_predicted_row"
+                if gripper_control_mode == "delta_width"
+                else "not_applicable"
+            )
+        ),
+        "gripper_absolute_width_position_mapping": (
+            "physical_width_to_mujoco_position_actuator_ctrlrange"
+            if gripper_control_mode == "absolute_width_position"
+            else "not_applicable"
+        ),
+        "gripper_absolute_width_position_mechanical_max_width": (
+            float(np.median(gripper_absolute_position_mechanical_max_widths))
+            if gripper_absolute_position_mechanical_max_widths
+            else None
+        ),
+        "gripper_absolute_width_position_target_clipped_count": (
+            int(
+                np.sum(
+                    np.abs(
+                        np.asarray(gripper_absolute_position_target_widths, dtype=np.float64)
+                        - np.asarray(gripper_raw_widths, dtype=np.float64)[
+                            : len(gripper_absolute_position_target_widths)
+                        ]
+                    )
+                    > 1e-8
+                )
+            )
+            if gripper_absolute_position_target_widths
+            else 0
+        ),
         "waypoint_max_hold_steps": int(waypoint_max_hold_steps),
         "adaptive_exec_max_steps": int(adaptive_exec_max_steps),
         "adaptive_exec_position_error_threshold": float(
@@ -6416,6 +6811,9 @@ def run_episode(
         "first_model_input_component_hashes": first_model_input_component_hashes,
         "gripper_open_steps": int(np.sum(np.asarray(gripper_commands) < 0.0)),
         "gripper_close_steps": int(np.sum(np.asarray(gripper_commands) > 0.0)),
+        "gripper_absolute_width_position_update_count": int(
+            len(gripper_absolute_position_target_widths)
+        ),
         "final_gripper_qpos_sum": float(gripper_scalar(raw_obs)),
         "gripper_width_error_median_abs_m": (
             float(np.median(np.abs(gripper_width_errors))) if gripper_width_errors else 0.0
@@ -6503,6 +6901,18 @@ def run_episode(
         "gripper_width_pcts": np.asarray(gripper_width_pcts, dtype=np.float32),
         "gripper_actual_widths": np.asarray(gripper_actual_widths, dtype=np.float32),
         "gripper_width_errors": np.asarray(gripper_width_errors, dtype=np.float32),
+        "gripper_absolute_position_target_widths": np.asarray(
+            gripper_absolute_position_target_widths, dtype=np.float32
+        ),
+        "gripper_absolute_position_opening_fractions": np.asarray(
+            gripper_absolute_position_opening_fractions, dtype=np.float32
+        ),
+        "gripper_absolute_position_normalized_targets": np.asarray(
+            gripper_absolute_position_normalized_targets, dtype=np.float32
+        ),
+        "gripper_absolute_position_mechanical_max_widths": np.asarray(
+            gripper_absolute_position_mechanical_max_widths, dtype=np.float32
+        ),
         "release_event_predicted_width_changes": np.asarray(
             release_event_predicted_width_changes, dtype=np.float32
         ),
@@ -6719,7 +7129,19 @@ def load_dataset_domain_raw_action_trajectory(
     )
 
     for robot in env.robots:
-        robot.controller.use_delta = False
+        robot.controller.use_delta = True
+
+    # Initialize controller goal history at the source trajectory start.
+    env.set_init_state(states[0])
+    refresh_arm_controller_state(env)
+    controller = env.robots[0].controller
+    reset_goal = getattr(controller, "reset_goal", None)
+    if callable(reset_goal):
+        reset_goal()
+    else:
+        controller.goal_pos = np.asarray(controller.ee_pos, dtype=np.float64).copy()
+        controller.goal_ori = np.asarray(controller.ee_ori_mat, dtype=np.float64).copy()
+
     absolute_actions: list[np.ndarray] = []
     scaled_deltas: list[np.ndarray] = []
     for source_action_index, source_action in zip(
@@ -6741,9 +7163,12 @@ def load_dataset_domain_raw_action_trajectory(
         absolute_actions.append(absolute_action)
         scaled_deltas.append(scaled_delta)
 
-    # Leave the simulator at the observation used to start evaluation. The
-    # episode runner sets this state again, but restoring it here prevents this
-    # loader from exposing the final source state to any caller.
+    # Execution consumes the reconstructed teacher goals with absolute OSC.
+    for robot in env.robots:
+        robot.controller.use_delta = False
+
+    # Leave the simulator at the source initial state. run_episode restores it
+    # again before executing the oracle trajectory.
     env.set_init_state(states[0])
     refresh_arm_controller_state(env)
     absolute_trajectory = np.ascontiguousarray(
@@ -6871,8 +7296,12 @@ def evaluate_task(
                 render_mode=str(cfg.get("render_mode", "offscreen")),
                 render_camera=str(cfg.get("render_camera", "agentview")),
                 render_gpu_device_id=int(cfg.get("render_gpu_device_id", -1)),
-                control_delta=False,
-                control_freq=float(cfg["control"].get("control_freq", 5.0)),
+                control_delta=(
+                    bool(cfg.get("strict_official_init", True))
+                    and not bool(cfg.get("dataset_domain_env", False))
+                )
+                or bool(cfg.get("dataset_domain_oracle_actions", False)),
+                control_freq=float(cfg["control"].get("control_freq", 20.0)),
                 horizon=(
                     int(LIBERO_STANDARD_MAX_STEPS[suite_name])
                     if bool(cfg.get("use_suite_max_steps", False))
@@ -6968,24 +7397,32 @@ def evaluate_task(
                 else:
                     assert init_states is not None
                     episode_init_state = init_states[episode_idx]
-                    if bool(cfg.get("recreate_env_per_episode", False)):
-                        reset_warmup_count = int(episode_idx)
+                    strict_official = bool(cfg.get("strict_official_init", True))
+
+                    if strict_official and bool(cfg.get("recreate_env_per_episode", False)):
+                        # make_libero_env() already reset the freshly-created env once.
+                        # Do not consume episode-index-dependent extra resets before
+                        # applying the fixed benchmark state.
+                        reset_warmup_count = 0
                     else:
-                        if int(episode_idx) < shared_layout_index:
-                            raise RuntimeError(
-                                "Episode reset sequence cannot move backwards: "
-                                f"current={shared_layout_index}, requested={episode_idx}."
+                        if bool(cfg.get("recreate_env_per_episode", False)):
+                            reset_warmup_count = int(episode_idx)
+                        else:
+                            if int(episode_idx) < shared_layout_index:
+                                raise RuntimeError(
+                                    "Episode reset sequence cannot move backwards: "
+                                    f"current={shared_layout_index}, requested={episode_idx}."
+                                )
+                            reset_warmup_count = int(episode_idx) - shared_layout_index
+                        for _ in range(reset_warmup_count):
+                            env.reset()
+                        if reset_warmup_count:
+                            print(
+                                "[eval] advanced LIBERO hard-reset RNG sequence: "
+                                f"suite={suite_name} task={task_id} episode={episode_idx} "
+                                f"skipped_resets={reset_warmup_count}",
+                                flush=True,
                             )
-                        reset_warmup_count = int(episode_idx) - shared_layout_index
-                    for _ in range(reset_warmup_count):
-                        env.reset()
-                    if reset_warmup_count:
-                        print(
-                            "[eval] advanced LIBERO hard-reset RNG sequence: "
-                            f"suite={suite_name} task={task_id} episode={episode_idx} "
-                            f"skipped_resets={reset_warmup_count}",
-                            flush=True,
-                        )
 
                     if not bool(cfg.get("recreate_env_per_episode", False)):
                         shared_layout_index = int(episode_idx)
@@ -7748,6 +8185,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["evaluation_identity"]["eval_config_path"] = str(config_path)
     cfg["evaluation_identity"]["eval_config_sha256"] = _sha256_file(config_path)
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
+    cfg["strict_official_init"] = bool(
+        cfg_get(cfg, args.strict_official_init, "strict_official_init", True)
+    )
     cfg["dataset_domain_env"] = bool(
         cfg_get(cfg, args.dataset_domain_env, "dataset_domain_env", False)
     )
@@ -7773,12 +8213,12 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["dataset_domain_state_observation_offset"] = int(
         cfg.get(
             "dataset_domain_state_observation_offset",
-            cfg.get("state_observation_offset", 1),
+            cfg.get("state_observation_offset", 0),
         )
     )
-    if cfg["dataset_domain_state_observation_offset"] not in (0, 1):
+    if cfg["dataset_domain_state_observation_offset"] != 0:
         raise ValueError(
-            "state_observation_offset must be 0 or 1 for dataset-domain evaluation, "
+            "This evaluator requires dataset_domain_state_observation_offset=0; "
             f"got {cfg['dataset_domain_state_observation_offset']}."
         )
     if cfg["dataset_domain_env"] and not cfg["dataset_domain_demo_root"]:
@@ -7889,8 +8329,13 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
 
     cfg["control"]["control_freq"] = float(
-        cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 5.0))
+        cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 20.0))
     )
+    if not np.isclose(cfg["control"]["control_freq"], 20.0):
+        raise ValueError(
+            "This LIBERO evaluator requires control_freq=20 Hz; "
+            f"got {cfg['control']['control_freq']}."
+        )
     cfg["control"]["action_index"] = int(cfg_get(cfg["control"], args.action_index, "action_index", 0))
     cfg["control"]["exec_action_steps"] = int(cfg_get(cfg["control"], args.exec_action_steps, "exec_action_steps", 12))
     cfg["control"]["adaptive_exec_max_steps"] = max(
@@ -8101,8 +8546,21 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         cfg_get(cfg["control"], args.gripper_threshold, "gripper_threshold", 0.5)
     )
     cfg["control"]["gripper_control_mode"] = str(
-        cfg_get(cfg["control"], args.gripper_control_mode, "gripper_control_mode", "delta_width")
+        cfg_get(cfg["control"], args.gripper_control_mode, "gripper_control_mode", "target_width")
     )
+    if cfg["control"]["gripper_control_mode"] not in {
+        "delta_width",
+        "delta_width_initial_sync",
+        "absolute_width",
+        "target_width",
+        "absolute_width_position",
+    }:
+        raise ValueError(
+            "gripper_control_mode must be one of "
+            "{'delta_width', 'delta_width_initial_sync', 'absolute_width', "
+            "'target_width', 'absolute_width_position'}, got "
+            f"{cfg['control']['gripper_control_mode']!r}."
+        )
     cfg["control"]["gripper_delta_threshold"] = float(
         cfg_get(cfg["control"], args.gripper_delta_threshold, "gripper_delta_threshold", 0.003)
     )
@@ -8208,6 +8666,23 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["initial_gripper_open"] = bool(
         cfg_get(cfg, args.initial_gripper_open, "initial_gripper_open", True)
     )
+    if bool(cfg["strict_official_init"]) and not bool(cfg["dataset_domain_env"]):
+        # Strict official LIBERO benchmark initialization:
+        #   env.reset()
+        #   env.set_init_state(fixed_init_state)
+        #   10 x env.step([0, 0, 0, 0, 0, 0, 0])
+        #
+        # Do not mix this with the evaluator's custom direct-MuJoCo settling
+        # path or any forced initial gripper/controller manipulation.
+        cfg["initial_gripper_open"] = False
+        cfg["settle_keep_robot_fixed"] = False
+        cfg["settle_require_stable"] = False
+        cfg["settle_steps"] = 0
+        cfg["settle_min_seconds"] = 0.0
+        cfg["settle_stable_seconds"] = 0.0
+        cfg["settle_max_seconds"] = 0.0
+        cfg["control"]["warmup_steps"] = 0
+        cfg["control"]["synchronize_gripper_controller_state"] = False
     cfg["inference_batch_size"] = max(
         1,
         int(
@@ -8379,6 +8854,7 @@ def run_multi_gpu_suite_launcher(
 
 
 def main() -> None:
+    print(f"[eval-build] {EVAL_BUILD_TAG}", flush=True)
     args = parse_args()
     cfg, suite_names, output_dir = prepare_config(args)
     acquire_evaluation_run_lock(output_dir)
@@ -8455,6 +8931,25 @@ def main() -> None:
 
     cfg["torch_determinism"] = configure_torch_determinism(bool(cfg["deterministic_torch"]))
     cfg["evaluation_identity"]["torch_determinism"] = cfg["torch_determinism"]
+
+    # The process-parallel backend deliberately has one GPU-policy parent and
+    # many CPU MuJoCo workers. Do not let the parent PyTorch process create a
+    # machine-wide CPU thread pool: it starves the environment workers.
+    import torch
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError as exc:
+        # This can only happen if another operation already initialized the
+        # inter-op pool. The shell-level OMP/MKL caps are still authoritative.
+        print(f"[warn] torch.set_num_interop_threads(1) could not be applied: {exc}", flush=True)
+
+    print(
+        f"[parent-thread-cap] torch_num_threads={torch.get_num_threads()} "
+        f"torch_num_interop_threads={torch.get_num_interop_threads()}",
+        flush=True,
+    )
+
     infer = SmolVLA_ModelInference(
         policy_path=cfg["policy_path"],
         policy_repo_id=cfg.get("policy_repo_id"),

@@ -841,3 +841,238 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
   --no-visualize-foreground \
   --save-video \
   --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_goal_chunk24_freq20_thresh4
+
+
+
+######################
+#########PARAMETER CORRECT##########
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model \
+  --suite-gpu-ids 0,1,2,3 \
+  --suite libero_object \
+  --suite libero_spatial \
+  --suite libero_10 \
+  --suite libero_goal \
+  --all-tasks \
+  --episodes 50 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 1 \
+  --task-workers 10 \
+  --episode-workers-per-task 2 \
+  --inference-batch-size 80 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --initial-gripper-open \
+  --settle-keep-robot-fixed \
+  --synchronize-gripper-controller-state \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/30k_eval_wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5_FULL
+
+
+
+######################
+#########PARAMETER CORRECT##########
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl  CUDA_VISIBLE_DEVICES=5 MUJOCO_EGL_DEVICE_ID=5   python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model \
+  --suite libero_goal \
+  --all-tasks \
+  --episodes 10 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --isolated-policy-workers 1 \
+  --task-workers 10 \
+  --episode-workers-per-task 5 \
+  --inference-batch-size 50 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode delta_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --initial-gripper-open \
+  --settle-keep-robot-fixed \
+  --synchronize-gripper-controller-state \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/30k_eval_wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5_goal_temp
+
+
+
+
+
+
+PYOPENGL_PLATFORM=egl  CUDA_VISIBLE_DEVICES=5 MUJOCO_EGL_DEVICE_ID=5   python   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_after32k/checkpoints/028000/pretrained_model    --suite libero_10   --task-id 4    --task-id 6    --task-id 8    --task-id 9    --episodes 50   --policy-noise-seed 0   --env-seed 7   --isolated-policy-workers 1   --task-workers 4   --episode-workers-per-task 10  --inference-batch-size 40   --no-release-event-exec-enable   --waypoint-max-hold-steps 1   --gripper-control-mode delta_width   --gripper-delta-threshold 0.002   --gripper-delta-alignment current_minus_previous   --initial-gripper-open   --settle-keep-robot-fixed   --synchronize-gripper-controller-state   --control-freq 20   --action-index 0   --exec-action-steps 24   --adaptive-exec-max-steps 24   --grasp-exec-steps 24   --max-steps 1000   --no-use-suite-max-steps   --recreate-env-per-episode   --render-mode offscreen   --no-visualize-foreground   --save-video   --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_wep_vla_v042_general_dataset_toolseg_all_train_long4689_28k_after32k_after32k
+
+
+
+
+PYOPENGL_PLATFORM=egl  CUDA_VISIBLE_DEVICES=5 MUJOCO_EGL_DEVICE_ID=5   python   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py   --config benchmarks/song_real_libero/configs/libero.json   --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_after32k_after32k/checkpoints/028000/pretrained_model    --suite libero_goal   --task-id 2    --task-id 3    --task-id 5    --task-id 6  --task-id 9    --episodes 50   --policy-noise-seed 0   --env-seed 7   --isolated-policy-workers 1   --task-workers 5   --episode-workers-per-task 10  --inference-batch-size 40   --no-release-event-exec-enable   --waypoint-max-hold-steps 1   --gripper-control-mode delta_width   --gripper-delta-threshold 0.002   --gripper-delta-alignment current_minus_previous   --initial-gripper-open   --settle-keep-robot-fixed   --synchronize-gripper-controller-state   --control-freq 20   --action-index 0   --exec-action-steps 24   --adaptive-exec-max-steps 24   --grasp-exec-steps 24   --max-steps 600   --no-use-suite-max-steps   --recreate-env-per-episode   --render-mode offscreen   --no-visualize-foreground   --save-video   --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_wep_vla_v042_general_dataset_toolseg_all_train_goal23569_28k_after32k_after32k_after32k
+
+
+
+
+######################
+#########PARAMETER CORRECT##########
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model \
+  --suite libero_goal \
+  --task-id 3 \
+  --task-id 5 \
+  --task-id 6 \
+  --episodes 50 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --strict-official-init \
+  --max-steps 800  \
+  --no-use-suite-max-steps  \
+  --isolated-policy-workers 1 \
+  --task-workers 3 \
+  --episode-workers-per-task 25 \
+  --inference-batch-size 75 \
+  --no-release-event-exec-enable \
+  --waypoint-max-hold-steps 1 \
+  --gripper-control-mode target_width \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_strict_official_maxstep800
+
+
+
+python -m pip install --no-deps --force-reinstall \
+  "mujoco==2.3.1.post1"
+
+
+
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model \
+  --suite-gpu-ids 0,1,2,3 \
+  --suite libero_spatial \
+  --suite libero_object \
+  --suite libero_goal \
+  --suite libero_10 \
+  --all-tasks \
+  --episodes 50 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --strict-official-init \
+  --gripper-control-mode delta_width_initial_sync \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --waypoint-max-hold-steps 1 \
+  --isolated-policy-workers 1 \
+  --task-workers 10 \
+  --episode-workers-per-task 2 \
+  --inference-batch-size 80 \
+  --no-release-event-exec-enable \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_FULL
+
+
+
+
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model \
+  --suite libero_goal \
+  --task-id 3 \
+  --task-id 5 \
+  --task-id 6 \
+  --episodes 50 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --strict-official-init \
+  --gripper-control-mode delta_width_initial_sync \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --waypoint-max-hold-steps 1 \
+  --isolated-policy-workers 1 \
+  --task-workers 3 \
+  --episode-workers-per-task 25 \
+  --inference-batch-size 75 \
+  --no-release-event-exec-enable \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 800 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_delta_width_initial_sync_800_mujoco334

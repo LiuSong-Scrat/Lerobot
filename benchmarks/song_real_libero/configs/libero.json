@@ -28,7 +28,7 @@
   "observation_height": 256,
   "observation_width": 256,
   "replay_mode": "states",
-  "state_observation_offset": 1,
+  "state_observation_offset": 0,
   "restore_demo_model": true,
   "require_source_fps_match": true,
   "max_frames_per_demo": null,
