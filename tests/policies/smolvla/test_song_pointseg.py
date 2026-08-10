@@ -18,14 +18,37 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegNet,
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
+    compose_point_cloud_views,
     force_small_current_clouds_foreground,
     generate_pseudo_labels,
     generate_pseudo_labels_from_priors,
     matrix_to_pose9,
+    parse_camera_views,
     pose9_to_matrix,
     refine_pseudo_labels_with_teacher,
     relative_poses_to_first,
 )
+
+
+def test_multiview_point_cloud_composition_keeps_one_gripper_tail():
+    first = np.zeros((10, 6), dtype=np.float32)
+    second = np.ones((10, 6), dtype=np.float32)
+    first[-2:, :3] = 7.0
+    second[-2:, :3] = 9.0
+
+    fused = compose_point_cloud_views([first, second], gripper_points=2, seed=11)
+
+    assert fused.shape == first.shape
+    assert np.all(fused[-2:, :3] == 7.0)
+    assert np.any(np.all(fused[:-2] == 0.0, axis=1))
+    assert np.any(np.all(fused[:-2] == 1.0, axis=1))
+
+
+def test_parse_camera_views_accepts_overhead_and_hand_pair():
+    assert parse_camera_views("agentview,robot0_eye_in_hand") == (
+        "agentview",
+        "robot0_eye_in_hand",
+    )
 
 
 def _pose_from_translation(xyz):

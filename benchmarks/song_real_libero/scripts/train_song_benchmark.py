@@ -45,8 +45,11 @@ from lerobot.policies.smolvla.song_pointseg import (
     PseudoLabelConfig,
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
+    compose_point_cloud_views,
     generate_pseudo_labels,
     open_episode_point_clouds,
+    parse_camera_views,
+    point_cloud_dir_for_view,
     song_pointseg_collate,
     write_role_ply,
 )
@@ -79,12 +82,25 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         point_cloud_dir: str | Path,
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
+        camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        gripper_points: int = 500,
     ):
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
+        self.dataset_root = self.point_cloud_dir.parent
+        self.camera_views = parse_camera_views(camera_views)
+        self.point_cloud_dirs = {
+            view: (
+                self.point_cloud_dir
+                if view == "agentview"
+                else point_cloud_dir_for_view(self.dataset_root, view)
+            )
+            for view in self.camera_views
+        }
+        self.gripper_points = int(gripper_points)
         self.key = key
         self.mmap_mode = mmap_mode
-        self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._point_cloud_cache: dict[tuple[str, int], np.ndarray] = {}
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -105,22 +121,35 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
-        point_clouds = self._point_cloud_cache.get(episode_index)
+    def _episode_point_clouds(self, view: str, episode_index: int) -> np.ndarray:
+        cache_key = (str(view), int(episode_index))
+        point_clouds = self._point_cloud_cache.get(cache_key)
         if point_clouds is None:
             point_clouds = open_episode_point_clouds(
-                self.point_cloud_dir,
+                self.point_cloud_dirs[str(view)],
                 episode_index,
                 mmap_mode=self.mmap_mode,
             )
-            self._point_cloud_cache[episode_index] = point_clouds
+            self._point_cloud_cache[cache_key] = point_clouds
         return point_clouds
+
+    def _point_cloud_frame(self, episode_index: int, frame_index: int) -> np.ndarray:
+        clouds = [
+            np.asarray(self._episode_point_clouds(view, episode_index)[frame_index], dtype=np.float32)
+            for view in self.camera_views
+        ]
+        seed = 1000 + int(episode_index) * 1_000_003 + int(frame_index) * 97
+        return compose_point_cloud_views(
+            clouds,
+            gripper_points=self.gripper_points,
+            seed=seed,
+        )
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
-        point_cloud = np.asarray(self._episode_point_clouds(episode_index)[frame_index], dtype=np.float32).copy()
+        point_cloud = self._point_cloud_frame(episode_index, frame_index).copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
 
@@ -234,6 +263,8 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         point_cloud_dir: str | Path | None = None,
         strict: bool = True,
         mmap_mode: str = "r",
+        camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        gripper_points: int = 500,
     ):
         self.dataset = dataset
         self.cache = SongPointSegCachedDataset(cache_dir)
@@ -242,9 +273,24 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             root_value = dataset.meta.root
         root = Path(root_value)
         self.point_cloud_dir = Path(point_cloud_dir) if point_cloud_dir is not None else root / "point_clouds"
+        self.camera_views = parse_camera_views(camera_views)
+        self.point_cloud_dirs = {
+            view: (
+                self.point_cloud_dir
+                if view == "agentview"
+                else point_cloud_dir_for_view(root, view)
+            )
+            for view in self.camera_views
+        }
+        self.gripper_points = int(gripper_points)
+        cached_views = self.cache.manifest.get("camera_views")
+        if cached_views is not None and tuple(cached_views) != self.camera_views:
+            raise ValueError(
+                f"PointSeg cache views {tuple(cached_views)} do not match training views {self.camera_views}."
+            )
         self.strict = strict
         self.mmap_mode = mmap_mode
-        self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._point_cloud_cache: dict[tuple[str, int], np.ndarray] = {}
         if self.strict and len(self.cache) < len(self.dataset):
             raise ValueError(
                 f"Song pointseg cache has {len(self.cache)} samples but action dataset has {len(self.dataset)}. "
@@ -270,16 +316,29 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
-        point_clouds = self._point_cloud_cache.get(episode_index)
+    def _episode_point_clouds(self, view: str, episode_index: int) -> np.ndarray:
+        cache_key = (str(view), int(episode_index))
+        point_clouds = self._point_cloud_cache.get(cache_key)
         if point_clouds is None:
             point_clouds = open_episode_point_clouds(
-                self.point_cloud_dir,
+                self.point_cloud_dirs[str(view)],
                 episode_index,
                 mmap_mode=self.mmap_mode,
             )
-            self._point_cloud_cache[episode_index] = point_clouds
+            self._point_cloud_cache[cache_key] = point_clouds
         return point_clouds
+
+    def _point_cloud_frame(self, episode_index: int, frame_index: int) -> np.ndarray:
+        clouds = [
+            np.asarray(self._episode_point_clouds(view, episode_index)[frame_index], dtype=np.float32)
+            for view in self.camera_views
+        ]
+        seed = 1000 + int(episode_index) * 1_000_003 + int(frame_index) * 97
+        return compose_point_cloud_views(
+            clouds,
+            gripper_points=self.gripper_points,
+            seed=seed,
+        )
 
     def _check_alignment(self, item: dict[str, Any], cache_item: dict[str, torch.Tensor], idx: int) -> None:
         if "episode_index" in item and "episode_index" in cache_item:
@@ -312,8 +371,10 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             episode_index = self._to_int(cache_item["episode_index"])
             frame_index = self._to_int(cache_item["frame_index"])
             indices = cache_item["observation.point_cloud_indices"].detach().cpu().numpy().astype(np.int64)
-            point_clouds = self._episode_point_clouds(episode_index)
-            point_cloud = np.asarray(point_clouds[frame_index][indices], dtype=np.float32).copy()
+            point_cloud = np.asarray(
+                self._point_cloud_frame(episode_index, frame_index)[indices],
+                dtype=np.float32,
+            ).copy()
             cache_item["observation.point_cloud"] = torch.from_numpy(point_cloud)
         for key in self.pointseg_keys:
             if key in cache_item:
@@ -357,6 +418,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10_000),
             future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
+            camera_views=getattr(policy_cfg, "camera_views", "agentview"),
+            gripper_points=self._env_int("SONG_POINTCLOUD_GRIPPER_POINTS", 500),
             mmap_mode=mmap_mode,
         )
         self.current_points = int(self.dataset.current_points)
@@ -540,19 +603,36 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         point_cloud_dir=point_cloud_dir,
         strict=strict,
         mmap_mode=mmap_mode,
+        camera_views=getattr(policy_cfg, "camera_views", "agentview"),
+        gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
     )
 
 
-def maybe_wrap_point_cloud_memmap_dataset(dataset):
+def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
     if isinstance(dataset, (PointSegCacheInjectedDataset, OnlinePointSegPseudoDataset)):
         return dataset
     root = Path(getattr(dataset, "root", dataset.meta.root))
     point_cloud_dir = root / "point_clouds"
     if not point_cloud_dir.is_dir():
         return dataset
-    logging.info(f"Loading point clouds from per-episode memmap files in {point_cloud_dir}")
+    camera_views = parse_camera_views(getattr(policy_cfg, "camera_views", "agentview"))
+    for view in camera_views:
+        view_dir = point_cloud_dir if view == "agentview" else point_cloud_dir_for_view(root, view)
+        if not view_dir.is_dir():
+            raise FileNotFoundError(f"Selected point-cloud view {view!r} is missing: {view_dir}")
+    logging.info(
+        "Loading point clouds with camera_views=%s and fixed model point count from %s",
+        camera_views,
+        root,
+    )
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
-    return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
+    return PointCloudMemmapDataset(
+        dataset,
+        point_cloud_dir=point_cloud_dir,
+        mmap_mode=mmap_mode,
+        camera_views=camera_views,
+        gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
+    )
 
 
 def _find_wrapped_dataset(dataset, cls):
@@ -1217,7 +1297,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
         dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
-        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
+        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
     accelerator.wait_for_everyone()
@@ -1226,7 +1306,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
         dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
-        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
+        dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
@@ -1244,6 +1324,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+
+    selected_views = parse_camera_views(getattr(cfg.policy, "camera_views", "agentview"))
+    selected_rgb_views = parse_camera_views(getattr(cfg.policy, "rgb_camera_views", "agentview"))
+    expected_image_keys = {f"observation.images.{view}" for view in selected_rgb_views}
+    actual_image_keys = set(getattr(policy.config, "image_features", {}))
+    missing_image_keys = sorted(expected_image_keys - actual_image_keys)
+    if missing_image_keys and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
+        raise ValueError(
+            f"Selected RGB camera views {selected_rgb_views} require image features {missing_image_keys}, "
+            f"but policy image features are {sorted(actual_image_keys)}."
+        )
+    if is_main_process:
+        logging.info(
+            "Training point-cloud camera_views=%s; rgb_camera_views=%s; image_features=%s",
+            selected_views,
+            selected_rgb_views,
+            sorted(actual_image_keys),
+        )
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")

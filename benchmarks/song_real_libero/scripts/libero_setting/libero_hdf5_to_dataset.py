@@ -88,28 +88,85 @@ def image_feature_key(camera: str) -> str:
     return f"observation.images.{str(camera).strip()}"
 
 
+def selected_camera_names(cfg: dict[str, Any]) -> list[str]:
+    value = cfg.get("selected_cameras")
+    if value is None:
+        value = pointcloud_camera_names_from_config(cfg)
+    if isinstance(value, str):
+        value = [value]
+    cameras: list[str] = []
+    for camera in value or []:
+        name = normalize_camera_name(str(camera))
+        if name and name not in cameras:
+            cameras.append(name)
+    if not cameras:
+        raise ValueError("At least one camera must be selected.")
+    return cameras
+
+
+def image_feature_cameras(cfg: dict[str, Any]) -> list[str]:
+    if not bool(cfg.get("save_rgb_images", True)):
+        return []
+    value = cfg.get("image_cameras")
+    if value is None:
+        value = selected_camera_names(cfg)
+    if isinstance(value, str):
+        value = [value]
+    cameras: list[str] = []
+    for camera in value or []:
+        name = normalize_camera_name(str(camera))
+        if name and name not in cameras:
+            cameras.append(name)
+    return cameras
+
+
 def image_feature_camera(cfg: dict[str, Any]) -> str:
-    value = cfg.get("image_camera")
-    return str(value) if value is not None else pointcloud_camera_names_from_config(cfg)[0]
+    return image_feature_cameras(cfg)[0]
+
+
+def camera_token(camera: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_camera_name(camera))
+
+
+def point_cloud_dir_name(camera: str, primary_camera: str) -> str:
+    return POINT_CLOUD_DIR_NAME if normalize_camera_name(camera) == normalize_camera_name(primary_camera) else f"point_clouds_{camera_token(camera)}"
+
+
+def point_cloud_artifact_name(camera: str, primary_camera: str, storage: str) -> str:
+    suffix = "zarr" if storage == "zarr" else "npy"
+    return f"{point_cloud_dir_name(camera, primary_camera)}.{suffix}"
+
+
+def image_artifact_name(camera: str) -> str:
+    return f"images_{camera_token(camera)}.npy"
+
+
+def rendered_camera_names(cfg: dict[str, Any]) -> list[str]:
+    names = [normalize_camera_name(name) for name in render_camera_names_from_config(cfg)]
+    for camera in [*selected_camera_names(cfg), *image_feature_cameras(cfg)]:
+        if camera not in names:
+            names.append(camera)
+    return names
 
 
 def ensure_image_camera_rendered(cfg: dict[str, Any]) -> None:
-    if not bool(cfg.get("save_rgb_images", True)):
-        return
-    image_camera = normalize_camera_name(image_feature_camera(cfg))
-    camera_names = [normalize_camera_name(name) for name in list(cfg.get("camera_names") or [])]
-    pointcloud_cameras = pointcloud_camera_names_from_config(cfg)
-    if image_camera not in camera_names and image_camera not in pointcloud_cameras:
-        camera_names.append(image_camera)
-        cfg["camera_names"] = camera_names
+    # Kept for compatibility with existing call sites. rendered_camera_names()
+    # performs the actual de-duplicated resolution used by workers.
+    if bool(cfg.get("save_rgb_images", True)):
+        cfg["image_cameras"] = image_feature_cameras(cfg)
 
 
 def dataset_features_with_image(cfg: dict[str, Any]) -> dict[str, Any]:
     features = dict(DATASET_FEATURES)
-    if bool(cfg.get("save_rgb_images", True)):
-        features[image_feature_key(image_feature_camera(cfg))] = {
+    shape = (
+        int(cfg.get("observation_height", 128)),
+        int(cfg.get("observation_width", 128)),
+        3,
+    )
+    for camera in image_feature_cameras(cfg):
+        features[image_feature_key(camera)] = {
             "dtype": "image",
-            "shape": (int(cfg.get("observation_height", 128)), int(cfg.get("observation_width", 128)), 3),
+            "shape": shape,
             "names": ["height", "width", "channels"],
         }
     return features
@@ -128,6 +185,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-frames-per-demo", type=int, default=None)
     parser.add_argument("--num-points", type=int, default=None)
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=None,
+        help=(
+            "Camera to store as a point cloud. Repeat for multiple views. Unless "
+            "--image-camera is set, the same cameras are also stored as RGB. The "
+            "first camera keeps the legacy point_clouds/ directory."
+        ),
+    )
     parser.add_argument("--point-cloud-storage", choices=("zarr", "npy"), default=None)
     parser.add_argument("--zarr-compression-level", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
@@ -165,7 +232,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vis-stride", type=int, default=None)
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save-rgb-images", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--image-camera", default=None)
+    parser.add_argument(
+        "--image-camera",
+        action="append",
+        default=None,
+        help=(
+            "Camera to store as RGB. Repeat for multiple RGB views. This is independent "
+            "of --camera, so two point-cloud views can share one RGB model input."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
@@ -329,6 +404,19 @@ def point_cloud_storage_path(root: Path, episode_index: int, storage: str) -> Pa
     return point_cloud_file(root, episode_index)
 
 
+def point_cloud_storage_path_for_camera(
+    root: Path,
+    camera: str,
+    primary_camera: str,
+    episode_index: int,
+    storage: str,
+) -> Path:
+    directory = root / point_cloud_dir_name(camera, primary_camera)
+    if storage == "zarr":
+        return episode_point_cloud_zarr_path(directory, episode_index)
+    return episode_point_cloud_npy_path(directory, episode_index)
+
+
 def world_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / WORLD_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
@@ -337,25 +425,58 @@ def action_target_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / ACTION_TARGET_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
-def write_point_cloud_meta(root: Path, storage: str = "zarr") -> None:
-    pc_dir = root / POINT_CLOUD_DIR_NAME
-    pc_dir.mkdir(parents=True, exist_ok=True)
+def write_point_cloud_meta(
+    root: Path,
+    storage: str = "zarr",
+    *,
+    cameras: list[str] | None = None,
+    gripper_points: int = 500,
+) -> None:
+    cameras = list(cameras or ["agentview"])
+    primary_camera = cameras[0]
     suffix = "zarr" if storage == "zarr" else "npy"
-    meta = {
-        "key": "observation.point_cloud",
-        "dtype": "float32",
-        "shape": [None, POINT_CLOUD_CHANNELS],
-        "variable_num_points": True,
-        "layout": "episode_array",
-        "storage_format": storage,
-        "path_format": f"{POINT_CLOUD_DIR_NAME}/episode_{{episode_index:06d}}.{suffix}",
-        "coordinate_frame": "current_eff",
-        "source_reference_frame": "overview_camera",
-    }
-    if storage == "zarr":
-        meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
-    with open(pc_dir / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    view_dirs: dict[str, str] = {}
+    for camera in cameras:
+        directory_name = point_cloud_dir_name(camera, primary_camera)
+        view_dirs[camera] = directory_name
+        pc_dir = root / directory_name
+        pc_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "key": (
+                "observation.point_cloud"
+                if camera == primary_camera
+                else f"observation.point_cloud_views.{camera}"
+            ),
+            "camera": camera,
+            "dtype": "float32",
+            "shape": [None, POINT_CLOUD_CHANNELS],
+            "variable_num_points": True,
+            "layout": "episode_array",
+            "storage_format": storage,
+            "path_format": f"{directory_name}/episode_{{episode_index:06d}}.{suffix}",
+            "coordinate_frame": "current_eff",
+            "contains_gripper_template": True,
+            "gripper_points": int(gripper_points),
+            "gripper_at_tail": True,
+        }
+        if storage == "zarr":
+            meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
+        with open(pc_dir / "meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    with open(root / "point_cloud_views.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "primary_camera": primary_camera,
+                "camera_directories": view_dirs,
+                "gripper_points": int(gripper_points),
+                "fused_training": (
+                    "split the non-gripper budget equally across selected cameras "
+                    "and append one gripper tail"
+                ),
+            },
+            f,
+            indent=2,
+        )
 
 
 def write_worldflow_meta(root: Path) -> None:
@@ -511,8 +632,7 @@ def make_episode_buffer(
     actions: np.ndarray,
     observation_states: np.ndarray,
     timestamps: np.ndarray,
-    images: np.ndarray | None = None,
-    image_key: str | None = None,
+    images_by_camera: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     actions = np.ascontiguousarray(actions, dtype=np.float32)
     observation_states = np.ascontiguousarray(observation_states, dtype=np.float32)
@@ -529,14 +649,16 @@ def make_episode_buffer(
     episode_buffer["timestamp"] = timestamps
     episode_buffer["action"] = actions
     episode_buffer["observation.state"] = observation_states
-    if images is not None and image_key is not None:
+    for camera, images in (images_by_camera or {}).items():
+        images = np.asarray(images, dtype=np.uint8)
         if len(images) != len(actions):
-            raise ValueError(f"Image frame count {len(images)} does not match actions {len(actions)}.")
-        episode_buffer[image_key] = save_episode_images_to_paths(
-            dataset,
-            images,
-            image_key,
-            int(episode_buffer["episode_index"]),
+            raise ValueError(
+                f"Image frame count for {camera!r} is {len(images)}, "
+                f"but actions contain {len(actions)} frames."
+            )
+        key = image_feature_key(camera)
+        episode_buffer[key] = save_episode_images_to_paths(
+            dataset, images, key, int(episode_buffer["episode_index"])
         )
     return episode_buffer
 
@@ -557,6 +679,7 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict[str, Any]) -> 
             episode["actions"],
             episode["observation_states"],
             episode["timestamps"],
+            images_by_camera=episode.get("images_by_camera"),
         )
     )
 
@@ -574,14 +697,19 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    if str(cfg.get("point_cloud_storage", "zarr")) == "zarr":
-        save_point_clouds_zarr(
-            artifact_dir / "point_clouds.zarr",
-            episode["point_clouds"],
-            compression_level=int(cfg.get("zarr_compression_level", 3)),
-        )
-    else:
-        np.save(artifact_dir / "point_clouds.npy", np.ascontiguousarray(episode["point_clouds"], dtype=np.float32))
+    storage = str(cfg.get("point_cloud_storage", "zarr"))
+    primary_camera = selected_camera_names(cfg)[0]
+    point_clouds_by_camera = dict(episode.get("point_clouds_by_camera") or {primary_camera: episode["point_clouds"]})
+    for camera, point_clouds in point_clouds_by_camera.items():
+        artifact_path = artifact_dir / point_cloud_artifact_name(camera, primary_camera, storage)
+        if storage == "zarr":
+            save_point_clouds_zarr(
+                artifact_path,
+                point_clouds,
+                compression_level=int(cfg.get("zarr_compression_level", 3)),
+            )
+        else:
+            np.save(artifact_path, np.ascontiguousarray(point_clouds, dtype=np.float32))
     np.save(artifact_dir / "world_ee_poses.npy", np.ascontiguousarray(episode["world_ee_poses"], dtype=np.float32))
     np.save(
         artifact_dir / "action_target_ee_poses.npy",
@@ -593,8 +721,8 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
         np.ascontiguousarray(episode["observation_states"], dtype=np.float32),
     )
     np.save(artifact_dir / "timestamps.npy", np.asarray(episode["timestamps"], dtype=np.float32))
-    if "images" in episode:
-        np.save(artifact_dir / "images.npy", np.ascontiguousarray(episode["images"], dtype=np.uint8))
+    for camera, images in (episode.get("images_by_camera") or {}).items():
+        np.save(artifact_dir / image_artifact_name(camera), np.ascontiguousarray(images, dtype=np.uint8))
     with open(artifact_dir / "record.json", "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False)
     if cfg.get("save_video", False):
@@ -697,43 +825,51 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
     ):
         shape_errors.append("timestamps do not match frame_index / fps")
 
-    point_cloud_npy = artifact_dir / "point_clouds.npy"
-    point_cloud_zarr = artifact_dir / "point_clouds.zarr"
-    if point_cloud_npy.is_file():
-        point_cloud_shape = tuple(np.load(point_cloud_npy, mmap_mode="r").shape)
-    elif point_cloud_zarr.is_dir() and (point_cloud_zarr / ".zattrs").is_file():
-        with open(point_cloud_zarr / ".zattrs", "r", encoding="utf-8") as f:
-            point_cloud_shape = tuple(json.load(f).get("shape", ()))
-    else:
-        point_cloud_shape = ()
-        shape_errors.append("point-cloud artifact is missing")
     expected_point_cloud_shape = (
         frames,
         int(episode_job["cfg"]["num_points"]),
         POINT_CLOUD_CHANNELS,
     )
-    if point_cloud_shape and point_cloud_shape != expected_point_cloud_shape:
-        shape_errors.append(
-            f"point_clouds shape={point_cloud_shape}, expected {expected_point_cloud_shape}"
-        )
-
-    images_path = artifact_dir / "images.npy"
-    save_rgb_images = bool(episode_job["cfg"].get("save_rgb_images", True))
-    if save_rgb_images:
-        if not images_path.is_file():
-            shape_errors.append("RGB image artifact is missing")
+    storage = str(episode_job["cfg"].get("point_cloud_storage", "zarr"))
+    cameras = selected_camera_names(episode_job["cfg"])
+    primary_camera = cameras[0]
+    for camera in cameras:
+        artifact_path = artifact_dir / point_cloud_artifact_name(camera, primary_camera, storage)
+        if storage == "npy" and artifact_path.is_file():
+            point_cloud_shape = tuple(np.load(artifact_path, mmap_mode="r").shape)
+        elif storage == "zarr" and artifact_path.is_dir() and (artifact_path / ".zattrs").is_file():
+            with open(artifact_path / ".zattrs", "r", encoding="utf-8") as f:
+                point_cloud_shape = tuple(json.load(f).get("shape", ()))
         else:
-            images = np.load(images_path, mmap_mode="r")
-            expected_image_shape = (
-                frames,
-                int(episode_job["cfg"]["observation_height"]),
-                int(episode_job["cfg"]["observation_width"]),
-                3,
+            point_cloud_shape = ()
+            shape_errors.append(f"point-cloud artifact for camera {camera!r} is missing")
+        if point_cloud_shape and point_cloud_shape != expected_point_cloud_shape:
+            shape_errors.append(
+                f"point cloud {camera!r} shape={point_cloud_shape}, expected {expected_point_cloud_shape}"
             )
-            if images.shape != expected_image_shape:
-                shape_errors.append(f"images shape={images.shape}, expected {expected_image_shape}")
-    elif images_path.exists():
-        shape_errors.append("unexpected RGB image artifact while save_rgb_images is disabled")
+
+    save_rgb_images = bool(episode_job["cfg"].get("save_rgb_images", True))
+    expected_image_shape = (
+        frames,
+        int(episode_job["cfg"]["observation_height"]),
+        int(episode_job["cfg"]["observation_width"]),
+        3,
+    )
+    for camera in image_feature_cameras(episode_job["cfg"]):
+        images_path = artifact_dir / image_artifact_name(camera)
+        if save_rgb_images:
+            if not images_path.is_file():
+                shape_errors.append(f"RGB image artifact for camera {camera!r} is missing")
+            else:
+                images = np.load(images_path, mmap_mode="r")
+                if images.shape != expected_image_shape:
+                    shape_errors.append(
+                        f"images {camera!r} shape={images.shape}, expected {expected_image_shape}"
+                    )
+        elif images_path.exists():
+            shape_errors.append(
+                f"unexpected RGB image artifact for camera {camera!r} while saving is disabled"
+            )
 
     if shape_errors:
         raise RuntimeError(
@@ -886,8 +1022,8 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         **record,
         "frame_indices": [int(idx) for idx in frame_indices],
         "camera_names": list(cfg.get("camera_names", [])),
-        "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
-        "render_camera_names": render_camera_names_from_config(cfg),
+        "pointcloud_camera_names": selected_camera_names(cfg),
+        "render_camera_names": rendered_camera_names(cfg),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
         "gripper_template": str(cfg.get("gripper_template", "reap")),
@@ -1441,19 +1577,27 @@ def collect_demo_episode(
     observation_height = int(cfg["observation_height"])
     observation_width = int(cfg["observation_width"])
     save_video = bool(cfg.get("save_video", False))
-    point_clouds_reference = np.empty(
-        (frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32
-    )
-    reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
+    pc_camera_names = selected_camera_names(cfg)
+    reference_camera = pc_camera_names[0]
+    point_clouds_reference_by_camera = {
+        camera: np.empty(
+            (frame_count, num_points, POINT_CLOUD_CHANNELS), dtype=np.float32
+        )
+        for camera in pc_camera_names
+    }
+    reference_ee_poses_by_camera = {
+        camera: np.empty((frame_count, 9), dtype=np.float32)
+        for camera in pc_camera_names
+    }
+    reference_ee_poses = reference_ee_poses_by_camera[reference_camera]
     action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     observation_grippers = np.empty((frame_count, 1), dtype=np.float32)
     action_grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
-    image_frames: list[np.ndarray] = []
     save_rgb_images = bool(cfg.get("save_rgb_images", True))
-    image_camera = image_feature_camera(cfg) if save_rgb_images else None
-    pc_camera_names = pointcloud_camera_names_from_config(cfg)
-    reference_camera = pc_camera_names[0]
+    image_frames_by_camera: dict[str, list[np.ndarray]] = {
+        camera: [] for camera in image_feature_cameras(cfg)
+    }
 
     def collect_observation_frame(
         frame_idx: int,
@@ -1462,30 +1606,37 @@ def collect_demo_episode(
         """Store one pre-action observation and return its model-EEF world pose."""
 
         if save_video:
-            append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
-        if save_rgb_images and image_camera is not None:
-            image = dataset_image_from_raw_obs(raw_obs, image_camera)
-            if image is None:
-                raise KeyError(
-                    f"Missing RGB image for camera {image_camera!r} in LIBERO observation."
+            append_video_frames(video_frames, raw_obs, rendered_camera_names(cfg))
+        if save_rgb_images:
+            for image_camera, frames_for_camera in image_frames_by_camera.items():
+                image = dataset_image_from_raw_obs(raw_obs, image_camera)
+                if image is None:
+                    raise KeyError(
+                        f"Missing RGB image for camera {image_camera!r} in LIBERO observation."
+                    )
+                frames_for_camera.append(image)
+
+        primary_world_pose = None
+        for camera_index, camera in enumerate(pc_camera_names):
+            point_cloud_reference, pose9_gripper_reference, pose9_gripper_sim_world = (
+                observation_to_camera_point_cloud(
+                    env,
+                    raw_obs,
+                    [camera],
+                    observation_height,
+                    observation_width,
+                    num_points,
+                    seed=episode_seed + frame_idx + camera_index * 1_000_003,
                 )
-            image_frames.append(image)
-        point_cloud_reference, pose9_gripper_reference, pose9_gripper_sim_world = (
-            observation_to_camera_point_cloud(
-                env,
-                raw_obs,
-                pc_camera_names,
-                observation_height,
-                observation_width,
-                num_points,
-                seed=episode_seed + frame_idx,
             )
-        )
-        point_clouds_reference[frame_idx] = point_cloud_reference
-        reference_ee_poses[frame_idx] = pose9_gripper_reference[:9]
-        observation_grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+            point_clouds_reference_by_camera[camera][frame_idx] = point_cloud_reference
+            reference_ee_poses_by_camera[camera][frame_idx] = pose9_gripper_reference[:9]
+            if camera == reference_camera:
+                observation_grippers[frame_idx, 0] = pose9_gripper_reference[-1]
+                primary_world_pose = pose9_gripper_sim_world
+        assert primary_world_pose is not None
         return pose9_to_homo_np(
-            np.asarray(pose9_gripper_sim_world, dtype=np.float32)[:9]
+            np.asarray(primary_world_pose, dtype=np.float32)[:9]
         ).astype(np.float64)
 
     def gripper_width_from_obs(raw_obs: dict[str, Any]) -> float:
@@ -1575,24 +1726,33 @@ def collect_demo_episode(
             action_grippers[frame_idx, 0] = gripper_width_from_obs(next_obs)
 
     if cfg.get("add_gripper_cloud", True):
-        point_clouds_reference = add_reference_gripper_clouds_to_episode(
-            point_clouds_reference,
-            reference_ee_poses,
-            observation_grippers.reshape(-1),
-            total_points=int(cfg["num_points"]),
-            gripper_points=int(cfg.get("gripper_points", 500)),
-            gripper_len=float(cfg.get("gripper_len", 0.06)),
-            gripper_template=str(cfg.get("gripper_template", "reap")),
-            seed=episode_seed,
-            drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-            shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-            widths_are_normalized=False,
-            gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
-        )
+        for camera in pc_camera_names:
+            point_clouds_reference_by_camera[camera] = (
+                add_reference_gripper_clouds_to_episode(
+                    point_clouds_reference_by_camera[camera],
+                    reference_ee_poses_by_camera[camera],
+                    observation_grippers.reshape(-1),
+                    total_points=int(cfg["num_points"]),
+                    gripper_points=int(cfg.get("gripper_points", 500)),
+                    gripper_len=float(cfg.get("gripper_len", 0.06)),
+                    gripper_template=str(cfg.get("gripper_template", "reap")),
+                    seed=episode_seed,
+                    # Multi-view composition relies on one addressable gripper tail.
+                    drop_strategy="tail",
+                    shuffle_points=False,
+                    widths_are_normalized=False,
+                    gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
+                )
+            )
 
-    point_clouds = reference_point_cloud_to_current_eff(
-        point_clouds_reference, reference_ee_poses
-    )
+    point_clouds_by_camera = {
+        camera: reference_point_cloud_to_current_eff(
+            point_clouds_reference_by_camera[camera],
+            reference_ee_poses_by_camera[camera],
+        )
+        for camera in pc_camera_names
+    }
+    point_clouds = point_clouds_by_camera[reference_camera]
     episode_origin_pose = reference_ee_poses[0]
     observation_umi_poses = from_reference_to_umi_tra_pose9(
         reference_ee_poses,
@@ -1648,6 +1808,7 @@ def collect_demo_episode(
         "actions": episode_actions,
         "observation_states": observation_states,
         "point_clouds": point_clouds,
+        "point_clouds_by_camera": point_clouds_by_camera,
         # Legacy key/path retained for the existing WorldFlow dataset wrapper.
         # Values are expressed in the fixed Overview-camera reference frame.
         "world_ee_poses": reference_ee_poses,
@@ -1669,12 +1830,15 @@ def collect_demo_episode(
         "target_residual_translation_m_max": float(target_residual_m.max()),
     }
     if save_rgb_images:
-        if len(image_frames) != len(episode_actions):
-            raise ValueError(
-                f"Collected {len(image_frames)} RGB frames for "
-                f"{len(episode_actions)} actions."
-            )
-        episode["images"] = np.asarray(image_frames, dtype=np.uint8)
+        images_by_camera: dict[str, np.ndarray] = {}
+        for camera, frames_for_camera in image_frames_by_camera.items():
+            if len(frames_for_camera) != len(episode_actions):
+                raise ValueError(
+                    f"Collected {len(frames_for_camera)} RGB frames for camera {camera!r}, "
+                    f"but there are {len(episode_actions)} actions."
+                )
+            images_by_camera[camera] = np.asarray(frames_for_camera, dtype=np.uint8)
+        episode["images_by_camera"] = images_by_camera
     return episode
 
 
@@ -1759,7 +1923,7 @@ def collect_episode_worker(job: dict[str, Any]) -> dict[str, Any]:
         task_id,
         int(cfg["observation_height"]),
         int(cfg["observation_width"]),
-        render_camera_names_from_config(cfg),
+        rendered_camera_names(cfg),
     )
     try:
         model_sha256 = (
@@ -1813,7 +1977,7 @@ def collect_task_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
         task_id,
         int(cfg["observation_height"]),
         int(cfg["observation_width"]),
-        render_camera_names_from_config(cfg),
+        rendered_camera_names(cfg),
     )
 
     results: list[dict[str, Any]] = []
@@ -1877,33 +2041,44 @@ def save_collected_temp_episode(
     actions = np.load(artifact_dir / "actions.npy")
     observation_states = np.load(artifact_dir / "observation_states.npy")
     timestamps = np.load(artifact_dir / "timestamps.npy")
-    images_path = artifact_dir / "images.npy"
-    images = np.load(images_path, mmap_mode="r") if images_path.exists() else None
+    images_by_camera = {
+        camera: np.load(artifact_dir / image_artifact_name(camera), mmap_mode="r")
+        for camera in image_feature_cameras(cfg)
+        if (artifact_dir / image_artifact_name(camera)).exists()
+    }
     episode_index = int(dataset.meta.total_episodes)
 
     point_cloud_storage = str(cfg.get("point_cloud_storage", "zarr"))
-    final_point_cloud_path = point_cloud_storage_path(dataset.root, episode_index, point_cloud_storage)
-    final_world_ee_pose_path = world_ee_pose_file(dataset.root, episode_index)
-    final_action_target_ee_pose_path = action_target_ee_pose_file(
-        dataset.root, episode_index
-    )
-    artifact_point_cloud_path = artifact_dir / "point_clouds.npy"
-    artifact_point_cloud_zarr_path = artifact_dir / "point_clouds.zarr"
-    if point_cloud_storage == "zarr":
-        if artifact_point_cloud_zarr_path.exists():
-            move_episode_array(artifact_point_cloud_zarr_path, final_point_cloud_path)
-        elif artifact_point_cloud_path.exists():
-            save_episode_point_clouds_zarr(
-                dataset.root / POINT_CLOUD_DIR_NAME,
-                episode_index,
-                np.load(artifact_point_cloud_path, mmap_mode="r"),
-                compression_level=int(cfg.get("zarr_compression_level", 3)),
-            )
-            artifact_point_cloud_path.unlink(missing_ok=True)
+    cameras = selected_camera_names(cfg)
+    primary_camera = cameras[0]
+    for camera in cameras:
+        final_path = point_cloud_storage_path_for_camera(
+            dataset.root, camera, primary_camera, episode_index, point_cloud_storage
+        )
+        artifact_path = artifact_dir / point_cloud_artifact_name(
+            camera, primary_camera, point_cloud_storage
+        )
+        if point_cloud_storage == "zarr":
+            if artifact_path.exists():
+                move_episode_array(artifact_path, final_path)
+            else:
+                npy_fallback = artifact_dir / point_cloud_artifact_name(camera, primary_camera, "npy")
+                if not npy_fallback.exists():
+                    raise FileNotFoundError(
+                        f"Missing point-cloud artifact for camera {camera!r} under {artifact_dir}"
+                    )
+                save_episode_point_clouds_zarr(
+                    dataset.root / point_cloud_dir_name(camera, primary_camera),
+                    episode_index,
+                    np.load(npy_fallback, mmap_mode="r"),
+                    compression_level=int(cfg.get("zarr_compression_level", 3)),
+                )
+                npy_fallback.unlink(missing_ok=True)
         else:
-            raise FileNotFoundError(f"Missing point cloud artifact under {artifact_dir}")
-    else:
-        move_episode_array(artifact_point_cloud_path, final_point_cloud_path)
+            move_episode_array(artifact_path, final_path)
+
+    final_world_ee_pose_path = world_ee_pose_file(dataset.root, episode_index)
+    final_action_target_ee_pose_path = action_target_ee_pose_file(dataset.root, episode_index)
     move_episode_array(artifact_dir / "world_ee_poses.npy", final_world_ee_pose_path)
     move_episode_array(
         artifact_dir / "action_target_ee_poses.npy",
@@ -1916,8 +2091,7 @@ def save_collected_temp_episode(
             actions,
             observation_states,
             timestamps,
-            images=images,
-            image_key=cfg.get("image_feature_key"),
+            images_by_camera=images_by_camera,
         )
     )
     record["episode_index"] = episode_index
@@ -1925,7 +2099,9 @@ def save_collected_temp_episode(
         preview_episode = {
             "actions": actions,
             "observation_states": observation_states,
-            "point_clouds": open_episode_point_clouds(dataset.root / POINT_CLOUD_DIR_NAME, episode_index),
+            "point_clouds": open_episode_point_clouds(
+                dataset.root / POINT_CLOUD_DIR_NAME, episode_index
+            ),
             "world_ee_poses": np.load(final_world_ee_pose_path, mmap_mode="r"),
             "action_target_ee_poses": np.load(
                 final_action_target_ee_pose_path, mmap_mode="r"
@@ -1945,6 +2121,10 @@ def main() -> None:
     cfg["task_ids"] = args.task_id if args.task_id is not None else cfg.get("task_ids")
     cfg["episodes"] = int(cfg_get(cfg, args.episodes, "episodes", 1))
     cfg["num_points"] = int(cfg_get(cfg, args.num_points, "num_points", 10000))
+    if args.camera is not None:
+        cfg["selected_cameras"] = [normalize_camera_name(camera) for camera in args.camera]
+    else:
+        cfg["selected_cameras"] = selected_camera_names(cfg)
     cfg["point_cloud_storage"] = str(cfg_get(cfg, args.point_cloud_storage, "point_cloud_storage", "zarr"))
     cfg["zarr_compression_level"] = int(cfg_get(cfg, args.zarr_compression_level, "zarr_compression_level", 3))
     cfg["fps"] = int(cfg_get(cfg, args.fps, "fps", 20))
@@ -1975,9 +2155,16 @@ def main() -> None:
     cfg["vis_stride"] = int(cfg_get(cfg, args.vis_stride, "vis_stride", 1) or 1)
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", False))
     cfg["save_rgb_images"] = bool(cfg_get(cfg, args.save_rgb_images, "save_rgb_images", True))
-    image_camera_value = cfg_get(cfg, args.image_camera, "image_camera")
+    image_camera_value = args.image_camera
+    if image_camera_value is None:
+        image_camera_value = cfg.get("image_cameras", cfg.get("image_camera"))
     if image_camera_value is not None:
-        cfg["image_camera"] = str(image_camera_value)
+        values = image_camera_value if isinstance(image_camera_value, (list, tuple)) else [image_camera_value]
+        cfg["image_cameras"] = [normalize_camera_name(str(value)) for value in values]
+    elif args.camera is not None:
+        cfg["image_cameras"] = list(cfg["selected_cameras"])
+    else:
+        cfg["image_cameras"] = image_feature_cameras(cfg)
     ensure_image_camera_rendered(cfg)
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
@@ -1992,9 +2179,10 @@ def main() -> None:
     repo_id = cfg_get(cfg, args.repo_id, "dataset_repo_id", "song_libero_pointcloud")
     demo_root = get_libero_dataset_root(args.demo_root, cfg)
     cfg["demo_root"] = str(demo_root)
-    cfg["image_feature_key"] = (
-        image_feature_key(image_feature_camera(cfg)) if bool(cfg.get("save_rgb_images", True)) else None
-    )
+    cfg["image_feature_keys"] = [
+        image_feature_key(camera) for camera in image_feature_cameras(cfg)
+    ]
+    cfg["image_feature_key"] = cfg["image_feature_keys"][0] if cfg["image_feature_keys"] else None
     vis_dir_value = cfg_get(cfg, args.vis_dir, "vis_dir")
     vis_dir = Path(vis_dir_value).expanduser().resolve() if vis_dir_value else output_root / "visualizations"
     tmp_dir = (
@@ -2021,7 +2209,12 @@ def main() -> None:
         root=output_root,
         use_videos=False,
     )
-    write_point_cloud_meta(dataset.root, storage=str(cfg["point_cloud_storage"]))
+    write_point_cloud_meta(
+        dataset.root,
+        storage=str(cfg["point_cloud_storage"]),
+        cameras=selected_camera_names(cfg),
+        gripper_points=int(cfg.get("gripper_points", 500)),
+    )
     write_worldflow_meta(dataset.root)
     write_action_target_meta(dataset.root)
 
@@ -2031,13 +2224,13 @@ def main() -> None:
         "demo_root": str(demo_root),
         "output_root": str(output_root),
         "camera_names": list(cfg.get("camera_names", [])),
-        "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
+        "pointcloud_camera_names": selected_camera_names(cfg),
         "reference_frame": "overview_camera",
-        "reference_camera": pointcloud_camera_names_from_config(cfg)[0],
+        "reference_camera": selected_camera_names(cfg)[0],
         "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
-        "render_camera_names": render_camera_names_from_config(cfg),
-        "image_camera": image_feature_camera(cfg) if bool(cfg.get("save_rgb_images", True)) else None,
-        "image_feature_key": cfg.get("image_feature_key"),
+        "render_camera_names": rendered_camera_names(cfg),
+        "image_cameras": image_feature_cameras(cfg),
+        "image_feature_keys": cfg.get("image_feature_keys", []),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
         "gripper_template": str(cfg.get("gripper_template", "reap")),

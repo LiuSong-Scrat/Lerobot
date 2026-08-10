@@ -682,6 +682,8 @@ def cache_samples(args: argparse.Namespace) -> None:
             "trajectory_samples": full_dataset.trajectory_samples,
             "current_points": args.current_points,
             "future_points": args.future_points,
+            "camera_views": list(full_dataset.camera_views),
+            "gripper_points": full_dataset.gripper_points,
             "variable_num_points": True,
             "point_count_policy": "cap_without_repeat",
             "pseudo_label_policy": "soft_binary_trajectory_v1",

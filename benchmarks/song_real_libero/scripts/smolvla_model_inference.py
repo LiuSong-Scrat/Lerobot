@@ -20,7 +20,12 @@ from torch.utils.data import default_collate
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.policies.smolvla.song_pointseg import open_episode_point_clouds
+from lerobot.policies.smolvla.song_pointseg import (
+    compose_point_cloud_views,
+    open_episode_point_clouds,
+    parse_camera_views,
+    point_cloud_dir_for_view,
+)
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.inference_diagnostics import (
@@ -59,7 +64,7 @@ DEFAULT_POLICY_REPO_ID = "/home/liusong/scp_receive/smolvla"
 
 
 class PointCloudMemmapDataset(torch.utils.data.Dataset):
-    """Inject point clouds from per-episode zarr/npy arrays into a LeRobotDataset item."""
+    """Inject one selected single/multi-view point cloud into a dataset item."""
 
     def __init__(
         self,
@@ -67,12 +72,25 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         point_cloud_dir: str | Path,
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
+        camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        gripper_points: int = 500,
     ) -> None:
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
+        self.dataset_root = self.point_cloud_dir.parent
+        self.camera_views = parse_camera_views(camera_views)
+        self.point_cloud_dirs = {
+            view: (
+                self.point_cloud_dir
+                if view == "agentview"
+                else point_cloud_dir_for_view(self.dataset_root, view)
+            )
+            for view in self.camera_views
+        }
+        self.gripper_points = int(gripper_points)
         self.key = key
         self.mmap_mode = mmap_mode
-        self._point_cloud_cache: dict[int, np.ndarray] = {}
+        self._point_cloud_cache: dict[tuple[str, int], np.ndarray] = {}
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -93,27 +111,42 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_point_clouds(self, episode_index: int) -> np.ndarray:
-        point_clouds = self._point_cloud_cache.get(episode_index)
+    def _episode_point_clouds(self, view: str, episode_index: int) -> np.ndarray:
+        cache_key = (str(view), int(episode_index))
+        point_clouds = self._point_cloud_cache.get(cache_key)
         if point_clouds is None:
             point_clouds = open_episode_point_clouds(
-                self.point_cloud_dir,
+                self.point_cloud_dirs[str(view)],
                 episode_index,
                 mmap_mode=self.mmap_mode,
             )
-            self._point_cloud_cache[episode_index] = point_clouds
+            self._point_cloud_cache[cache_key] = point_clouds
         return point_clouds
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
-        point_cloud = self._episode_point_clouds(episode_index)[frame_index]
+        clouds = [
+            np.asarray(self._episode_point_clouds(view, episode_index)[frame_index], dtype=np.float32)
+            for view in self.camera_views
+        ]
+        seed = 1000 + episode_index * 1_000_003 + frame_index * 97
+        point_cloud = compose_point_cloud_views(
+            clouds,
+            gripper_points=self.gripper_points,
+            seed=seed,
+        ).copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
 
 
-def maybe_wrap_point_cloud_memmap_dataset(dataset):
+def maybe_wrap_point_cloud_memmap_dataset(
+    dataset,
+    *,
+    camera_views: str | tuple[str, ...] | list[str] = "agentview",
+    gripper_points: int = 500,
+):
     root_value = getattr(dataset, "root", None)
     if root_value is None:
         root_value = dataset.meta.root
@@ -121,8 +154,24 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset):
     point_cloud_dir = root / "point_clouds"
     if not point_cloud_dir.is_dir():
         return dataset
+    views = parse_camera_views(camera_views)
+    missing = [
+        str(point_cloud_dir_for_view(root, view))
+        for view in views
+        if not point_cloud_dir_for_view(root, view).is_dir()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Selected camera_views={views} require missing point-cloud directories: {missing}."
+        )
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
-    return PointCloudMemmapDataset(dataset, point_cloud_dir=point_cloud_dir, mmap_mode=mmap_mode)
+    return PointCloudMemmapDataset(
+        dataset,
+        point_cloud_dir=point_cloud_dir,
+        mmap_mode=mmap_mode,
+        camera_views=views,
+        gripper_points=int(gripper_points),
+    )
 
 import open3d as o3d
 def create_frame(position, rot_matrix, scale=0.03):
@@ -237,18 +286,24 @@ class SmolVLA_ModelInference:
         local_files_only: bool = True,
         visualize_foreground: bool | None = None,
         foreground_visualizer_max_points: int = 50000,
+        camera_views: str | tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self.policy_path = str(policy_path)
         self.policy_repo_id = str(policy_repo_id) if policy_repo_id is not None else None
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
+        cli_overrides = [f"--device={self.device}"]
+        if camera_views is not None:
+            selected_override = ",".join(parse_camera_views(camera_views))
+            cli_overrides.append(f"--camera_views={selected_override}")
         config = PreTrainedConfig.from_pretrained(
             self.policy_path,
-            cli_overrides=[f"--device={self.device}"],
+            cli_overrides=cli_overrides,
             local_files_only=local_files_only,
         )
         if not isinstance(config, SmolVLAConfig):
             raise TypeError(f"Expected SmolVLAConfig, got {type(config).__name__}.")
+        self.camera_views = parse_camera_views(getattr(config, "camera_views", "agentview"))
         self.policy = SmolVLAPolicy.from_pretrained(
             self.policy_path,
             config=config,
@@ -397,7 +452,11 @@ class SmolVLA_ModelInference:
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
-        self.dataset = maybe_wrap_point_cloud_memmap_dataset(dataset)
+        self.dataset = maybe_wrap_point_cloud_memmap_dataset(
+            dataset,
+            camera_views=self.camera_views,
+            gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
+        )
         return self.dataset
 
     @torch.inference_mode()
@@ -724,10 +783,10 @@ class SmolVLA_ModelInference:
         short_key = image_key[len(f"{OBS_IMAGES}.") :] if image_key.startswith(f"{OBS_IMAGES}.") else image_key
         candidates = [short_key, short_key.replace(".", "_"), short_key.replace("_rgb", "")]
         lowered = image_key.lower()
-        if any(name in lowered for name in ("overhead", "overview", "top")):
-            candidates += ["overhead", "overview", "top"]
-        if any(name in lowered for name in ("hand", "wrist")):
-            candidates += ["hand", "wrist"]
+        if any(name in lowered for name in ("agentview", "overhead", "overview", "top", "external")):
+            candidates += ["agentview", "overhead", "overview", "top", "external"]
+        if any(name in lowered for name in ("robot0_eye_in_hand", "eye_in_hand", "hand", "wrist")):
+            candidates += ["robot0_eye_in_hand", "hand", "wrist"]
         return next((observation[key] for key in candidates if key in observation), None)
 
     def _prepare_image_tensor(self, image: Any, batch_size: int, image_key: str) -> torch.Tensor:
