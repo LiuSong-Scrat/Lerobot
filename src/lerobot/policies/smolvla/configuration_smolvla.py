@@ -32,6 +32,11 @@ class SmolVLAConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 32 #50
     n_action_steps: int = 16 #50
+    # Some recorder formats store observation[i] after action[i] has already
+    # been applied.  Their first causal control target is therefore
+    # action[i + 1].  Shift action chunk lookup at the dataset boundary rather
+    # than training a stale token and compensating with action_index at runtime.
+    action_chunk_start_offset: int = 0
 
     # Shorter state and action vectors will be padded
     max_state_dim: int = 10
@@ -49,12 +54,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
-    # Comma-separated point-cloud views used by training/cache/inference.
+    # Point-cloud and RGB views are independently selectable. None preserves
+    # legacy checkpoints by coupling RGB selection to point-cloud selection.
     camera_views: str = "agentview"
-
-    # Comma-separated RGB views consumed by the VLM. This is deliberately
-    # independent from camera_views so multiple point clouds can be fused while
-    # the policy consumes only one RGB stream. The default preserves old models.
     rgb_camera_views: str | None = None
 
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
@@ -76,6 +78,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # Number of denoising steps during flow matching inference.
     # Recommended values: 8-10 (fast), 20-30 (balanced), 50+ (high-quality)
     num_steps: int = 10
+    # The official large-data recipe samples continuous times from
+    # Beta(1.5, 1). For small-data fitting, ``integration_grid`` instead
+    # trains exactly the Euler times used by sample_actions:
+    # {0, 1/num_steps, ..., (num_steps-1)/num_steps}.
+    flow_time_sampling: str = "beta"
+    # Optional small-data emphasis on the first Euler evaluation. At t=0 the
+    # noisy action contains no ground-truth trajectory information, so this is
+    # the only grid point that must infer the whole chunk from observations.
+    # Zero preserves uniform integration-grid sampling.
+    flow_time_zero_probability: float = 0.0
 
     # Attention utils
     use_cache: bool = True
@@ -111,7 +123,29 @@ class SmolVLAConfig(PreTrainedConfig):
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
 
-    # World-frame trajectory auxiliary supervision.
+    # Relative importance of the physical pose9 + gripper action groups in the
+    # standard flow-matching objective. Values are normalized to preserve the
+    # overall loss scale. Defaults reproduce the original per-dimension MSE.
+    action_loss_translation_weight: float = 1.0
+    action_loss_rotation_weight: float = 1.0
+    action_loss_gripper_weight: float = 1.0
+    # Standard SmolVLA assumes normalized Euclidean action channels. Song's
+    # identity-normalized pose9 instead contains a 6D rotation representation,
+    # so zero-centred Gaussian vectors are not valid rotation states. This
+    # option samples a valid SE(3) pose9 in both training and inference while
+    # retaining the standard Euclidean flow-matching objective.
+    pose9_action_noise_enable: bool = False
+    pose9_action_noise_trans_scale: float = 0.15
+    pose9_action_noise_rot_scale: float = 0.35
+    pose9_action_noise_gripper_scale: float = 0.05
+
+    # Joint World–Ego trajectory branch. PointSeg selects foreground XYZRGB in
+    # the Ego/body frame, then the current EEF pose analytically maps those
+    # exact points into World. World owns an independent LitePT + PointAction
+    # front-end, but both streams share the official Action Expert. One
+    # attention-pooled global scene token per stream forms the causal-prefix
+    # scene block; all World/Ego action tokens form one bidirectional block.
+    # The branch is active in training and inference.
     worldflow_enable: bool = False
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
@@ -122,14 +156,53 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_rot_weight: float = 1.0
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
-    worldflow_max_points: int = 2048
+    # 0 keeps the complete predicted foreground. A positive value is an
+    # optional memory cap applied after PointSeg foreground selection.
+    worldflow_max_points: int = 0
+    # Legacy v0.5 CLI fields. v0.5.1+ shares the Ego Action Expert, so these
+    # values are parsed for old commands but do not instantiate another expert.
+    worldflow_action_expert_layers: int = -1
+    worldflow_action_expert_dropout: float = 0.0
+    # WorldFlow denoises an SE(3) spatial transform. Unit Gaussian twists
+    # correspond to metre-scale translations and roughly 90 degree rotations,
+    # which is far outside a tabletop robot's action distribution. Keep the
+    # noise on the same physical scale as the reachable trajectory.
+    worldflow_noise_trans_scale: float = 0.15
+    worldflow_noise_rot_scale: float = 0.20
+    # Noise relationship between the two action streams.
+    #
+    # ``independent`` reproduces the original experimental implementation:
+    # Ego body motion and World spatial motion start from unrelated random
+    # transforms. ``conjugate_ego`` samples one physically valid Ego SE(3)
+    # prior B_0 and derives the World prior exactly as G_0 = C B_0 C^{-1},
+    # where C is the current EEF-to-World pose.  The latter is the recommended
+    # stochastic double-flow contract.  It requires either the valid-pose9
+    # prior or the complete manifold SE(3) flow because legacy Euclidean
+    # Gaussian rotation-6D vectors are not elements of SE(3) and therefore
+    # cannot be conjugated safely.
+    worldflow_noise_coupling: str = "independent"
+    worldflow_augmentation_trans_scale: float = 0.20
+    worldflow_augmentation_rot_scale: float = 0.75
+    # Legacy Dense-ObjectFlow options retained only so old command lines and
+    # configs remain parseable. The independent branch does not consume role
+    # scores, predict point flow, or run Kabsch.
     worldflow_min_transport_points: int = 3
     worldflow_transport_score_threshold: float = 0.05
 
     # ET-SEED-style SE(3) action generation.
     se3_enable: bool = False
+    # ``direct_twist`` uses dedicated randomly initialized 7D Ego / 6D World
+    # heads. ``projected_pose9`` reuses the pretrained pose9 velocity heads and
+    # analytically projects their instantaneous rigid-body derivative onto a
+    # spatial SE(3) twist. ``pose9_endpoint`` instead preserves the old flow
+    # head's endpoint semantics: x_t + (1-t) v_pose9 is projected to SE(3), then
+    # converted to the exact left-trivialized geodesic velocity from x_t. All
+    # modes use the same manifold-valued prior, geodesic training path and
+    # group integration; only the output parameterization differs.
+    se3_twist_head_mode: str = "direct_twist"
     se3_noise_trans_scale: float = 0.15
     se3_noise_rot_scale: float = 0.75
+    se3_noise_gripper_scale: float = 0.05
     se3_pose_loss_weight: float = 1.0
     se3_gripper_loss_weight: float = 1.0
     se3_endpoint_loss_weight: float = 0.25
@@ -154,6 +227,17 @@ class SmolVLAConfig(PreTrainedConfig):
     # source of the architecture and processor when a policy checkpoint is used.
     vlm_weights_path: str | None = None
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    # One-shot initialization used only when make_policy creates a fresh
+    # `--policy.type=smolvla` model. Full checkpoints loaded through
+    # `--policy.path` already contain these tensors and are never overwritten.
+    load_action_expert_weights: bool = False
+    # Defaults to vlm_weights_path when omitted. The source must be a complete
+    # SmolVLA policy checkpoint, not a raw SmolVLM repository.
+    action_expert_weights_path: str | None = None
+    # The official 32 action channels need not share semantics with Song's
+    # physical pose9 + gripper channels. Keep the task-specific projections
+    # random by default while reusing the transformer and timestep MLP.
+    load_action_expert_projection_weights: bool = False
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 
@@ -186,6 +270,30 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if int(self.action_chunk_start_offset) < 0:
+            raise ValueError("action_chunk_start_offset must be non-negative.")
+        if int(self.action_chunk_start_offset) > 0:
+            warnings.warn(
+                "ACTION TEMPORAL CONTRACT: action_chunk_start_offset="
+                f"{int(self.action_chunk_start_offset)} means predicted token 0 is trained from "
+                f"dataset action[i+{int(self.action_chunk_start_offset)}]. Online inference must "
+                "execute predicted token 0 (action_index=0); do not apply the offset a second time.",
+                stacklevel=2,
+            )
+        if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
+            raise ValueError(
+                "flow_time_sampling must be one of beta, uniform, integration_grid; "
+                f"got {self.flow_time_sampling!r}."
+            )
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive.")
+        if not 0.0 <= float(self.flow_time_zero_probability) < 1.0:
+            raise ValueError("flow_time_zero_probability must be in [0, 1).")
+        if self.flow_time_zero_probability > 0 and self.flow_time_sampling != "integration_grid":
+            raise ValueError(
+                "flow_time_zero_probability is only supported with "
+                "flow_time_sampling='integration_grid'."
+            )
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
@@ -194,14 +302,139 @@ class SmolVLAConfig(PreTrainedConfig):
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError("se3_enable=True requires ACTION normalization to be IDENTITY.")
+            if self.max_action_dim < 10:
+                raise ValueError("se3_enable=True requires max_action_dim >= 10.")
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
+            if self.se3_twist_head_mode not in {
+                "direct_twist",
+                "projected_pose9",
+                "pose9_endpoint",
+            }:
+                raise ValueError(
+                    "se3_twist_head_mode must be 'direct_twist', 'projected_pose9', "
+                    "or 'pose9_endpoint'; "
+                    f"got {self.se3_twist_head_mode!r}."
+                )
+            for name in (
+                "se3_noise_trans_scale",
+                "se3_noise_rot_scale",
+                "se3_noise_gripper_scale",
+            ):
+                if float(getattr(self, name)) < 0:
+                    raise ValueError(f"{name} must be non-negative.")
+        if self.se3_enable and self.pose9_action_noise_enable:
+            raise ValueError(
+                "se3_enable and pose9_action_noise_enable are mutually exclusive: "
+                "se3_enable already supplies the complete manifold-valued SE(3) prior and flow."
+            )
+        for name in (
+            "action_loss_translation_weight",
+            "action_loss_rotation_weight",
+            "action_loss_gripper_weight",
+        ):
+            if float(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.pose9_action_noise_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError(
+                    "pose9_action_noise_enable=True requires ACTION normalization to be IDENTITY."
+                )
+            if self.max_action_dim < 10:
+                raise ValueError("pose9_action_noise_enable=True requires max_action_dim >= 10.")
+            for name in (
+                "pose9_action_noise_trans_scale",
+                "pose9_action_noise_rot_scale",
+                "pose9_action_noise_gripper_scale",
+            ):
+                if float(getattr(self, name)) < 0:
+                    raise ValueError(f"{name} must be non-negative.")
         if self.worldflow_se3_head_enable:
             warnings.warn(
                 "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "World-Ego now uses dense automatic ObjectFlow + weighted Kabsch, not a PCA canonical SE(3) head.",
+                "WorldFlow directly flow-matches an SE(3) spatial transform through its "
+                "LitePT/PointAction front-end and the shared World–Ego Action Expert.",
                 stacklevel=2,
             )
+        if self.worldflow_enable:
+            action_norm = self.normalization_mapping.get("ACTION")
+            if action_norm is not NormalizationMode.IDENTITY:
+                raise ValueError(
+                    "worldflow_enable=True requires ACTION normalization to be IDENTITY because "
+                    "the World-Ego bridge interprets Ego pose9 predictions as physical SE(3) transforms."
+                )
+            if self.worldflow_feature_dim <= 0:
+                raise ValueError("worldflow_feature_dim must be positive.")
+            if not self.point_action_fusion_enable:
+                raise ValueError(
+                    "worldflow_enable=True requires point_action_fusion_enable=True so both "
+                    "coordinate streams provide point-fused action tokens to the shared expert."
+                )
+            if self.worldflow_max_points < 0:
+                raise ValueError("worldflow_max_points must be non-negative.")
+            if self.worldflow_noise_trans_scale < 0:
+                raise ValueError("worldflow_noise_trans_scale must be non-negative.")
+            if self.worldflow_noise_rot_scale < 0:
+                raise ValueError("worldflow_noise_rot_scale must be non-negative.")
+            if self.worldflow_noise_coupling not in {"independent", "conjugate_ego"}:
+                raise ValueError(
+                    "worldflow_noise_coupling must be 'independent' or 'conjugate_ego'; "
+                    f"got {self.worldflow_noise_coupling!r}."
+                )
+            if self.worldflow_noise_coupling == "conjugate_ego" and not (
+                self.pose9_action_noise_enable or self.se3_enable
+            ):
+                raise ValueError(
+                    "worldflow_noise_coupling='conjugate_ego' requires "
+                    "pose9_action_noise_enable=True or se3_enable=True so the Ego prior is a valid "
+                    "SE(3) transform."
+                )
+            if self.worldflow_noise_coupling == "conjugate_ego" and (
+                self.worldflow_noise_trans_scale != 0.15 or self.worldflow_noise_rot_scale != 0.20
+            ):
+                warnings.warn(
+                    "worldflow_noise_trans_scale/rot_scale are ignored when "
+                    "worldflow_noise_coupling='conjugate_ego'; the World prior is derived from "
+                    "the Ego prior and current pose by exact conjugation.",
+                    stacklevel=2,
+                )
+            ego_random_prior = (
+                any(
+                    float(getattr(self, name)) > 0.0
+                    for name in (
+                        "se3_noise_trans_scale",
+                        "se3_noise_rot_scale",
+                        "se3_noise_gripper_scale",
+                    )
+                )
+                if self.se3_enable
+                else self.pose9_action_noise_enable
+                and any(
+                    float(getattr(self, name)) > 0.0
+                    for name in (
+                        "pose9_action_noise_trans_scale",
+                        "pose9_action_noise_rot_scale",
+                        "pose9_action_noise_gripper_scale",
+                    )
+                )
+            )
+            if self.worldflow_noise_coupling == "independent" and ego_random_prior:
+                warnings.warn(
+                    "WorldFlow and Ego use independent random priors. This preserves legacy behavior "
+                    "but does not satisfy G_0=C B_0 C^{-1}; use "
+                    "worldflow_noise_coupling='conjugate_ego' for stochastic double-flow training.",
+                    stacklevel=2,
+                )
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError("worldflow_enable=True is not compatible with RTC.")
+            if self.worldflow_action_expert_layers != -1 or self.worldflow_action_expert_dropout != 0.0:
+                warnings.warn(
+                    "worldflow_action_expert_layers/dropout are legacy v0.5 options and are ignored "
+                    "because World and Ego now share one Action Expert.",
+                    stacklevel=2,
+                )
+
         if self.se3_final_correction_enable:
             warnings.warn(
                 "se3_final_correction_enable is kept only for CLI compatibility and is ignored. "
@@ -215,6 +448,19 @@ class SmolVLAConfig(PreTrainedConfig):
                 stacklevel=2,
             )
             self.load_vlm_weights = True
+        if self.load_action_expert_weights:
+            action_expert_source = self.action_expert_weights_path or self.vlm_weights_path
+            if action_expert_source is None or str(action_expert_source).strip().lower() in {
+                "",
+                "0",
+                "false",
+                "none",
+                "off",
+            }:
+                raise ValueError(
+                    "load_action_expert_weights=True requires action_expert_weights_path "
+                    "or vlm_weights_path pointing to a complete SmolVLA policy checkpoint."
+                )
         if self.vla_adapter_enable and self.vla_adapter_freeze_vlm:
             if not self.train_expert_only:
                 warnings.warn(
@@ -225,47 +471,40 @@ class SmolVLAConfig(PreTrainedConfig):
                 self.train_expert_only = True
             self.freeze_vision_encoder = True
 
-    @property
-    def selected_camera_views(self) -> tuple[str, ...]:
-        value = self.camera_views
-        if isinstance(value, (list, tuple)):
-            parts = [str(part).strip() for part in value]
-        else:
-            text = str(value).strip().strip("[]")
-            parts = [part.strip().strip("\"'") for part in text.split(",")]
-        views = tuple(part for part in parts if part)
-        if not views:
-            views = ("agentview",)
-        supported = {"agentview", "robot0_eye_in_hand"}
-        unknown = [view for view in views if view not in supported]
-        if unknown:
-            raise ValueError(
-                f"Unsupported camera view(s) {unknown}; supported views are {sorted(supported)}."
-            )
-        if len(set(views)) != len(views):
-            raise ValueError(f"camera_views contains duplicates: {views}.")
-        return views
+    def flow_contract_summary(self) -> str:
+        """Describe the final resolved temporal and flow-origin contract."""
 
-    @property
-    def selected_rgb_camera_views(self) -> tuple[str, ...]:
-        # Checkpoints created by the original multiview branch do not contain
-        # rgb_camera_views; for those, preserve the old coupled behavior.
-        value = self.camera_views if self.rgb_camera_views is None else self.rgb_camera_views
-        if isinstance(value, (list, tuple)):
-            parts = [str(part).strip() for part in value]
-        else:
-            text = str(value).strip().strip("[]")
-            parts = [part.strip().strip("\"'") for part in text.split(",")]
-        views = tuple(part for part in parts if part) or ("agentview",)
-        supported = {"agentview", "robot0_eye_in_hand"}
-        unknown = [view for view in views if view not in supported]
-        if unknown:
-            raise ValueError(
-                f"Unsupported RGB camera view(s) {unknown}; supported views are {sorted(supported)}."
+        if self.se3_enable:
+            scales = (
+                float(self.se3_noise_trans_scale),
+                float(self.se3_noise_rot_scale),
+                float(self.se3_noise_gripper_scale),
             )
-        if len(set(views)) != len(views):
-            raise ValueError(f"rgb_camera_views contains duplicates: {views}.")
-        return views
+            origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
+            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            flow = f"se3_geodesic_left_trivialized(head={self.se3_twist_head_mode})"
+        elif self.pose9_action_noise_enable:
+            scales = (
+                float(self.pose9_action_noise_trans_scale),
+                float(self.pose9_action_noise_rot_scale),
+                float(self.pose9_action_noise_gripper_scale),
+            )
+            origin = "pose9_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "pose9_valid_se3_random"
+            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            flow = "pose9_euclidean"
+        else:
+            origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
+            flow = "channel_euclidean"
+        world = (
+            f",worldflow={self.worldflow_noise_coupling}"
+            if self.worldflow_enable
+            else ",worldflow=disabled"
+        )
+        return (
+            f"action_chunk_start_offset={int(self.action_chunk_start_offset)},"
+            f"online_action_index=0,ego_origin={origin},ego_flow={flow}{world},"
+            f"num_steps={int(self.num_steps)}"
+        )
 
     def validate_features(self) -> None:
         selected = set(self.selected_rgb_camera_views)
@@ -283,6 +522,33 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+
+    @staticmethod
+    def _parse_camera_views(value, *, field_name: str) -> tuple[str, ...]:
+        if isinstance(value, (list, tuple)):
+            parts = [str(part).strip() for part in value]
+        else:
+            text = str(value).strip().strip("[]")
+            parts = [part.strip().strip("\"'") for part in text.split(",")]
+        views = tuple(part for part in parts if part) or ("agentview",)
+        supported = {"agentview", "robot0_eye_in_hand"}
+        unknown = [view for view in views if view not in supported]
+        if unknown:
+            raise ValueError(
+                f"Unsupported {field_name} view(s) {unknown}; supported views are {sorted(supported)}."
+            )
+        if len(set(views)) != len(views):
+            raise ValueError(f"{field_name} contains duplicates: {views}.")
+        return views
+
+    @property
+    def selected_camera_views(self) -> tuple[str, ...]:
+        return self._parse_camera_views(self.camera_views, field_name="camera_views")
+
+    @property
+    def selected_rgb_camera_views(self) -> tuple[str, ...]:
+        value = self.camera_views if self.rgb_camera_views is None else self.rgb_camera_views
+        return self._parse_camera_views(value, field_name="rgb_camera_views")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -307,7 +573,8 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        start = int(self.action_chunk_start_offset)
+        return list(range(start, start + self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

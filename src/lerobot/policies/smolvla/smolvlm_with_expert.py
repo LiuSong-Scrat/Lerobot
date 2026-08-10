@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
 from transformers import (
@@ -125,6 +126,158 @@ def _load_vlm_policy_weights(vlm: nn.Module, model_file: str, num_vlm_layers: in
         f"{model_file} (ignored_missing={len(missing_keys) - len(required_missing)}, "
         f"unexpected={len(unexpected_keys)})."
     )
+
+
+def _policy_tensor_key(
+    target_key: str,
+    source_keys: set[str],
+) -> str | None:
+    for prefix in ("module.model.", "model.", ""):
+        candidate = f"{prefix}{target_key}"
+        if candidate in source_keys:
+            return candidate
+    return None
+
+
+def load_pretrained_action_expert_weights(
+    target: nn.Module,
+    source: str,
+    *,
+    load_action_projections: bool = False,
+) -> dict[str, int | str]:
+    """Initialize a fresh Song SmolVLA Action Expert from a full SmolVLA policy.
+
+    `target` is the inner VLAFlowMatching module, whose state-dict keys do not
+    include the outer ``model.`` prefix. Transformer and timestep-conditioning
+    tensors must match exactly. The official action head has 32 channels whose
+    semantics need not match Song pose9 policies, so its projections remain
+    task-specific by default. If explicitly requested, they are copied over the
+    shared leading channels.
+
+    This function validates every tensor before mutating the target, preventing
+    a malformed or raw SmolVLM checkpoint from partially initializing a model.
+    """
+
+    _policy_config, model_file = _resolve_smolvla_policy_checkpoint(source)
+    if model_file is None:
+        raise ValueError(
+            "Action Expert initialization requires a complete SmolVLA policy checkpoint "
+            f"containing {SAFETENSORS_SINGLE_FILE}; got {source!r}."
+        )
+
+    target_state = target.state_dict()
+    exact_keys = [
+        key
+        for key in target_state
+        if key.startswith("vlm_with_expert.lm_expert.")
+        or key.startswith("action_time_mlp_in.")
+        or key.startswith("action_time_mlp_out.")
+    ]
+    projection_keys = (
+        [
+            key
+            for key in (
+                "action_in_proj.weight",
+                "action_in_proj.bias",
+                "action_out_proj.weight",
+                "action_out_proj.bias",
+            )
+            if key in target_state
+        ]
+        if load_action_projections
+        else []
+    )
+    if not exact_keys:
+        raise RuntimeError("Target model has no Action Expert parameters to initialize.")
+
+    assignments: list[tuple[str, torch.Tensor]] = []
+    missing_keys: list[str] = []
+    shape_errors: list[str] = []
+    with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+        source_keys = set(checkpoint.keys())
+
+        for target_key in exact_keys:
+            source_key = _policy_tensor_key(target_key, source_keys)
+            if source_key is None:
+                missing_keys.append(target_key)
+                continue
+            source_tensor = checkpoint.get_tensor(source_key)
+            if source_tensor.shape != target_state[target_key].shape:
+                shape_errors.append(
+                    f"{target_key}: source={tuple(source_tensor.shape)} "
+                    f"target={tuple(target_state[target_key].shape)}"
+                )
+                continue
+            assignments.append((target_key, source_tensor))
+
+        for target_key in projection_keys:
+            source_key = _policy_tensor_key(target_key, source_keys)
+            if source_key is None:
+                missing_keys.append(target_key)
+                continue
+            source_tensor = checkpoint.get_tensor(source_key)
+            target_tensor = target_state[target_key]
+
+            if target_key == "action_in_proj.weight":
+                compatible = (
+                    source_tensor.ndim == 2
+                    and source_tensor.shape[0] == target_tensor.shape[0]
+                    and source_tensor.shape[1] >= target_tensor.shape[1]
+                )
+                adapted = source_tensor[:, : target_tensor.shape[1]] if compatible else source_tensor
+            elif target_key == "action_out_proj.weight":
+                compatible = (
+                    source_tensor.ndim == 2
+                    and source_tensor.shape[0] >= target_tensor.shape[0]
+                    and source_tensor.shape[1] == target_tensor.shape[1]
+                )
+                adapted = source_tensor[: target_tensor.shape[0], :] if compatible else source_tensor
+            elif target_key == "action_out_proj.bias":
+                compatible = source_tensor.ndim == 1 and source_tensor.shape[0] >= target_tensor.shape[0]
+                adapted = source_tensor[: target_tensor.shape[0]] if compatible else source_tensor
+            else:
+                compatible = source_tensor.shape == target_tensor.shape
+                adapted = source_tensor
+
+            if not compatible or adapted.shape != target_tensor.shape:
+                shape_errors.append(
+                    f"{target_key}: source={tuple(source_tensor.shape)} "
+                    f"target={tuple(target_tensor.shape)}"
+                )
+                continue
+            assignments.append((target_key, adapted))
+
+    if missing_keys or shape_errors:
+        details = []
+        if missing_keys:
+            details.append(f"missing={missing_keys[:8]}")
+        if shape_errors:
+            details.append(f"shape_mismatch={shape_errors[:8]}")
+        raise RuntimeError(
+            "The supplied SmolVLA checkpoint is incompatible with the current Action Expert: "
+            + "; ".join(details)
+        )
+
+    with torch.no_grad():
+        for target_key, source_tensor in assignments:
+            target_state[target_key].copy_(
+                source_tensor.to(
+                    device=target_state[target_key].device,
+                    dtype=target_state[target_key].dtype,
+                )
+            )
+
+    report: dict[str, int | str] = {
+        "source": model_file,
+        "expert_and_time_tensors": len(exact_keys),
+        "projection_tensors": len(projection_keys),
+        "total_tensors": len(assignments),
+    }
+    print(
+        "Initialized Action Expert from SmolVLA policy "
+        f"{model_file} (expert/time={len(exact_keys)}, projections={len(projection_keys)})."
+    )
+    return report
 
 
 def apply_rope(x, positions, max_wavelength=10_000):

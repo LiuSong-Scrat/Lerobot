@@ -69,6 +69,10 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Number of micro-batches accumulated before one optimizer update.  ``steps``
+    # continues to count optimizer updates, so enabling accumulation does not
+    # silently change checkpoint or scheduler semantics.
+    gradient_accumulation_steps: int = 1
     steps: int = 100_000
     pointseg_sample_cache_dir: str = ""
     eval_freq: int = 20_000
@@ -96,6 +100,11 @@ class TrainPipelineConfig(HubMixin):
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
+        if int(self.gradient_accumulation_steps) < 1:
+            raise ValueError(
+                "gradient_accumulation_steps must be at least 1, "
+                f"got {self.gradient_accumulation_steps}."
+            )
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:

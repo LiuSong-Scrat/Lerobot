@@ -129,8 +129,10 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
     """Inject fixed-reference EEF poses for WorldFlow supervision.
 
-    ``world_ee_poses`` is a compatibility path; camera-reference datasets store
-    overhead-camera-frame poses there and treat that fixed frame as model world.
+    The current pose is the achieved observation pose. Future World targets use
+    ``action_target_ee_poses`` when present so they describe the same controller
+    targets as the Ego action chunk. Legacy datasets without that sidecar fall
+    back to achieved future poses.
     """
 
     def __init__(
@@ -139,18 +141,31 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
+        action_start_offset: int = 0,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
         self.root = Path(root)
         self.pose_dir = self.root / "world_ee_poses"
+        command_target_dir = self.root / "action_target_ee_poses"
+        self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
+        self.action_start_offset = int(action_start_offset)
+        if self.action_start_offset < 0:
+            raise ValueError("WorldFlow action_start_offset must be non-negative.")
         self.mmap_mode = mmap_mode
         self._pose_cache: dict[int, np.ndarray] = {}
+        self._target_pose_cache: dict[int, np.ndarray] = {}
 
         if not self.pose_dir.is_dir():
             raise FileNotFoundError(
                 f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
+            )
+        if self.target_pose_dir == self.pose_dir:
+            logging.warning(
+                "WorldFlow command-target sidecar is absent at %s; falling back to achieved future poses. "
+                "The World--Ego bridge is exactly label-consistent only when action_target_ee_poses is present.",
+                command_target_dir,
             )
 
     def __getattr__(self, name):
@@ -159,6 +174,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_pose_cache"] = {}
+        state["_target_pose_cache"] = {}
         return state
 
     def __len__(self):
@@ -172,26 +188,55 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             return int(value.reshape(-1)[0].item())
         return int(value)
 
-    def _episode_poses(self, episode_index: int) -> np.ndarray:
-        poses = self._pose_cache.get(episode_index)
+    def _load_episode_poses(
+        self,
+        episode_index: int,
+        *,
+        directory: Path,
+        cache: dict[int, np.ndarray],
+        description: str,
+    ) -> np.ndarray:
+        poses = cache.get(episode_index)
         if poses is None:
-            path = self.pose_dir / f"episode_{episode_index:06d}.npy"
+            path = directory / f"episode_{episode_index:06d}.npy"
             if not path.exists():
-                raise FileNotFoundError(f"WorldFlow reference-frame ee pose memmap file is missing: {path}")
+                raise FileNotFoundError(f"WorldFlow {description} pose memmap file is missing: {path}")
             poses = np.load(path, mmap_mode=self.mmap_mode)
             if poses.ndim != 2 or poses.shape[-1] != 9:
-                raise ValueError(f"Expected reference-frame ee poses shape (T,9), got {poses.shape}.")
-            self._pose_cache[episode_index] = poses
+                raise ValueError(f"Expected WorldFlow {description} poses shape (T,9), got {poses.shape}.")
+            cache[episode_index] = poses
         return poses
+
+    def _episode_poses(self, episode_index: int) -> np.ndarray:
+        return self._load_episode_poses(
+            episode_index,
+            directory=self.pose_dir,
+            cache=self._pose_cache,
+            description="achieved current",
+        )
+
+    def _episode_target_poses(self, episode_index: int) -> np.ndarray:
+        return self._load_episode_poses(
+            episode_index,
+            directory=self.target_pose_dir,
+            cache=self._target_pose_cache,
+            description="command target",
+        )
 
     def __getitem__(self, idx):
         item = dict(self.dataset[idx])
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         poses = self._episode_poses(episode_index)
+        target_poses = self._episode_target_poses(episode_index)
         episode_len = int(len(poses))
         if episode_len <= 0:
             raise ValueError(f"Worldflow episode {episode_index} is empty.")
+        if len(target_poses) != episode_len:
+            raise ValueError(
+                f"WorldFlow episode {episode_index} achieved/target lengths differ: "
+                f"{episode_len} != {len(target_poses)}."
+            )
 
         current_index = min(max(frame_index, 0), episode_len - 1)
         current_pose = np.array(poses[current_index], dtype=np.float32, copy=True)
@@ -204,10 +249,14 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             chunk_size = int(action.shape[0])
         else:
             chunk_size = self.chunk_size
-        frame_indices = frame_index + np.arange(chunk_size, dtype=np.int64)
+        frame_indices = (
+            frame_index
+            + self.action_start_offset
+            + np.arange(chunk_size, dtype=np.int64)
+        )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
         item["worldflow.ee_poses"] = torch.from_numpy(
-            np.array(poses[clamped_indices], dtype=np.float32, copy=True)
+            np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
         )
         item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
         return item
@@ -483,21 +532,11 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
             logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
             return dataset
         if os.environ.get("SONG_POINTSEG_ONLINE", "1").lower() in {"0", "false", "no"}:
-            if bool(getattr(policy_cfg, "worldflow_enable", False)):
-                raise ValueError(
-                    f"{reason}; Dense ObjectFlow requires pointseg.role_scores. "
-                    "Provide a current PointSeg cache or enable SONG_POINTSEG_ONLINE=1."
-                )
             logging.info(f"{reason}; online pointseg pseudo labels are disabled by SONG_POINTSEG_ONLINE=0.")
             return dataset
         root = Path(getattr(dataset, "root", dataset.meta.root))
         point_cloud_dir = root / "point_clouds"
         if not point_cloud_dir.is_dir():
-            if bool(getattr(policy_cfg, "worldflow_enable", False)):
-                raise FileNotFoundError(
-                    f"{reason}; Dense ObjectFlow requires point clouds for online role_scores, "
-                    f"but point cloud dir is missing: {point_cloud_dir}"
-                )
             logging.info(f"{reason}; point cloud dir not found at {point_cloud_dir}, using fallback point cloud loader.")
             return dataset
         mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
@@ -578,6 +617,7 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         mmap_mode=mmap_mode,
     )
 
@@ -1217,6 +1257,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -1431,6 +1473,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if output_dict:
                 debug_keys = (
                     "loss_action",
+                    "loss_action_translation",
+                    "loss_action_rotation6d",
+                    "loss_action_gripper",
+                    "action_endpoint_trans_err",
+                    "action_endpoint_rot_err_deg",
+                    "action_endpoint_gripper_err",
                     "loss_pointseg_aux",
                     "loss_se3_twist",
                     "loss_se3_endpoint",
@@ -1439,14 +1487,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "se3_action_trans_err",
                     "se3_action_rot_err_deg",
                     "loss_worldflow_flow",
-                    "loss_worldflow_rigid",
+                    "loss_worldflow_geo",
                     "loss_worldflow_bridge",
                     "loss_worldflow_equiv",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
                     "worldflow_valid_ratio",
-                    "worldflow_object_point_ratio",
-                    "worldflow_transport_point_ratio",
+                    "worldflow_foreground_points",
+                    "worldflow_noise_conjugacy_error",
+                    "worldflow_path_conjugacy_error",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

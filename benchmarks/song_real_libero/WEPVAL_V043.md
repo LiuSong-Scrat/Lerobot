@@ -89,3 +89,38 @@ python benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.worldflow_se3_head_enable=false \
   --policy.se3_enable=false \
   --policy.se3_final_correction_enable=false
+
+
+# Optional: enable joint World/Ego double flow
+# Leave --policy.worldflow_enable=false above to keep the original v0.4.3
+# module structure and checkpoint path. Enabling it adds an independent World
+# LitePT + PointAction adapter; Ego and World action tokens then share the
+# existing Action Expert.
+#
+# The dataset must contain world_ee_poses/ and, preferably,
+# action_target_ee_poses/ sidecars produced by the current converters.
+# Replace the WorldFlow flags in the training command with:
+#
+#   --policy.point_action_fusion_enable=true \
+#   --policy.worldflow_enable=true \
+#   --policy.worldflow_feature_dim=64 \
+#   --policy.worldflow_grid_size=0.01 \
+#   --policy.worldflow_loss_weight=0.01 \
+#   --policy.worldflow_geo_loss_weight=0.002 \
+#   --policy.worldflow_bridge_loss_weight=0.005 \
+#   --policy.worldflow_equiv_loss_weight=0.002 \
+#   --policy.worldflow_trans_weight=1.0 \
+#   --policy.worldflow_rot_weight=1.0 \
+#   --policy.worldflow_max_points=0 \
+#   --policy.worldflow_noise_coupling=independent \
+#   --policy.worldflow_augmentation_trans_scale=0.05 \
+#   --policy.worldflow_augmentation_rot_scale=0.2 \
+#   --policy.worldflow_se3_head_enable=false \
+#   --policy.se3_enable=false \
+#   --policy.se3_final_correction_enable=false
+
+
+# Real RGB-D collection and moving-camera processing
+# See scripts/real_setting/README_CAMERA_MOTION.md. Main entrypoint:
+#
+#   bash benchmarks/song_real_libero/scripts/real_setting/song_rgbd_pipeline.sh --help

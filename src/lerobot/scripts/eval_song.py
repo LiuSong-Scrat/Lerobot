@@ -67,6 +67,12 @@ from lerobot.utils.utils import init_logging, inside_slurm
 EVAL_METRIC_KEYS = (
     "loss",
     "loss_action",
+    "loss_action_translation",
+    "loss_action_rotation6d",
+    "loss_action_gripper",
+    "action_endpoint_trans_err",
+    "action_endpoint_rot_err_deg",
+    "action_endpoint_gripper_err",
     "loss_pointseg_aux",
     "loss_se3_twist",
     "loss_se3_endpoint",
@@ -75,14 +81,15 @@ EVAL_METRIC_KEYS = (
     "se3_action_trans_err",
     "se3_action_rot_err_deg",
     "loss_worldflow_flow",
-    "loss_worldflow_rigid",
+    "loss_worldflow_geo",
     "loss_worldflow_bridge",
     "loss_worldflow_equiv",
     "worldflow_trans_err",
     "worldflow_rot_err_deg",
     "worldflow_valid_ratio",
-    "worldflow_object_point_ratio",
-    "worldflow_transport_point_ratio",
+    "worldflow_foreground_points",
+    "worldflow_noise_conjugacy_error",
+    "worldflow_path_conjugacy_error",
     "pointseg_foreground_ratio",
     "pointseg_operation_prob_mean",
     "pointseg_selection_score_mean",
@@ -93,6 +100,23 @@ EVAL_METRIC_KEYS = (
     "pseudo_foreground_ratio",
     "pseudo_soft_foreground_mean",
     "pred_foreground_ratio",
+    "sample_action_mse",
+    "sample_action_translation_l2_m",
+    "sample_action_rot6d_mse",
+    "sample_action_gripper_mae_m",
+)
+
+FLOW_TIME_SWEEP_VALUES = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.999)
+FLOW_TIME_SWEEP_METRICS = (
+    "loss_action",
+    "action_endpoint_trans_err",
+    "action_endpoint_rot_err_deg",
+    "action_endpoint_gripper_err",
+)
+EVAL_METRIC_KEYS = EVAL_METRIC_KEYS + tuple(
+    f"flow_t{round(time_value * 1000):03d}_{metric_name}"
+    for time_value in FLOW_TIME_SWEEP_VALUES
+    for metric_name in FLOW_TIME_SWEEP_METRICS
 )
 
 
@@ -103,6 +127,9 @@ class SongEvalPipelineConfig(TrainPipelineConfig):
     libero_dataset_domain_action_mse: bool = False
     libero_suite: str | None = None
     libero_task_id: int | None = None
+    sample_action_mse: bool = False
+    sample_action_noise_mode: str = "policy"
+    flow_time_sweep: bool = False
 
 
 class EvalFrameSubset(torch.utils.data.Dataset):
@@ -339,6 +366,149 @@ def _format_metrics(metrics: dict[str, float]) -> str:
     return " ".join(parts)
 
 
+def _sampled_action_metrics(
+    policy,
+    batch: dict[str, torch.Tensor],
+    noise_mode: str = "policy",
+) -> dict[str, torch.Tensor]:
+    """Compare one complete flow-matching sample with its ground-truth chunk.
+
+    The normal ``loss_action`` is a velocity-field objective at one random
+    diffusion time.  It is useful for optimization, but it does not directly
+    measure the trajectory returned by all denoising steps.  These optional
+    metrics expose that distinction without changing parameters or gradients.
+    """
+
+    policy.reset()
+    if noise_mode not in {"policy", "zero", "pose9_identity"}:
+        raise ValueError(
+            "sample_action_noise_mode must be one of policy, zero, pose9_identity; "
+            f"got {noise_mode!r}."
+        )
+    predict_kwargs: dict[str, torch.Tensor] = {}
+    if noise_mode != "policy":
+        batch_size = int(batch[ACTION].shape[0])
+        chunk_size = int(policy.config.chunk_size)
+        action_dim = int(policy.config.max_action_dim)
+        noise = torch.zeros(
+            batch_size,
+            chunk_size,
+            action_dim,
+            device=batch[ACTION].device,
+            dtype=torch.float32,
+        )
+        if noise_mode == "pose9_identity":
+            if action_dim < 10:
+                raise ValueError("pose9_identity noise requires max_action_dim >= 10.")
+            noise[..., 3] = 1.0
+            noise[..., 7] = 1.0
+        predict_kwargs["noise"] = noise
+        if policy.config.worldflow_enable:
+            world_noise = torch.zeros(
+                batch_size,
+                chunk_size,
+                9,
+                device=batch[ACTION].device,
+                dtype=torch.float32,
+            )
+            world_noise[..., 3] = 1.0
+            world_noise[..., 7] = 1.0
+            predict_kwargs["worldflow_noise"] = world_noise
+    predicted = policy.predict_action_chunk(batch, **predict_kwargs)
+    target = batch[ACTION][..., : predicted.shape[-1]]
+    if predicted.shape != target.shape:
+        raise ValueError(
+            f"Sampled/target action chunk shapes differ: {predicted.shape} != {target.shape}."
+        )
+    actions_is_pad = batch.get(f"{ACTION}_is_pad")
+    if torch.is_tensor(actions_is_pad):
+        valid = ~actions_is_pad.to(device=predicted.device, dtype=torch.bool)
+    else:
+        valid = torch.ones(predicted.shape[:2], device=predicted.device, dtype=torch.bool)
+    valid_f = valid.to(dtype=predicted.dtype)
+    valid_count = valid_f.sum().clamp_min(1.0)
+    error = predicted - target
+    metrics = {
+        "sample_action_mse": (
+            error.square().mean(dim=-1) * valid_f
+        ).sum()
+        / valid_count,
+        "sample_action_translation_l2_m": (
+            torch.linalg.norm(error[..., :3], dim=-1) * valid_f
+        ).sum()
+        / valid_count,
+        "sample_action_rot6d_mse": (
+            error[..., 3:9].square().mean(dim=-1) * valid_f
+        ).sum()
+        / valid_count,
+    }
+    if predicted.shape[-1] >= 10:
+        metrics["sample_action_gripper_mae_m"] = (
+            error[..., 9].abs() * valid_f
+        ).sum() / valid_count
+    return metrics
+
+
+def _flow_time_sweep_metrics(
+    policy,
+    batch: dict[str, torch.Tensor],
+    *,
+    seed: int,
+) -> dict[str, torch.Tensor]:
+    """Measure velocity/endpoint error across the complete integration interval.
+
+    Standard SmolVLA samples training time from ``Beta(1.5, 1)``. On very small
+    datasets this can leave the beginning of the inference ODE under-trained.
+    Reusing the same Ego/World noise and point-operation RNG state at every
+    requested time isolates that coverage issue from ordinary sampling noise.
+    """
+
+    action = batch[ACTION]
+    if not torch.is_tensor(action):
+        raise TypeError("Flow-time sweep requires a tensor action chunk.")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Use the exact training/inference prior saved in the checkpoint.  A
+    # hard-coded Gaussian makes the sweep an out-of-distribution diagnostic
+    # whenever pose9_action_noise_enable is active, and even the legacy prior
+    # is unit Gaussian rather than N(0, 0.1).
+    model = getattr(policy, "model", None)
+    if model is None:
+        raise AttributeError("Flow-time sweep requires policy.model.")
+    if bool(getattr(policy.config, "se3_enable", False)):
+        _noise_transform, _gripper_noise, fixed_noise = model.sample_se3_action_noise(action)
+    elif bool(getattr(policy.config, "pose9_action_noise_enable", False)):
+        fixed_noise = model.sample_pose9_action_noise(tuple(action.shape), action.device)
+    else:
+        fixed_noise = model.sample_noise(action.shape, action.device)
+    fixed_noise = fixed_noise.to(dtype=torch.float32)
+    metrics: dict[str, torch.Tensor] = {}
+    for time_value in FLOW_TIME_SWEEP_VALUES:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        time = torch.full(
+            (action.shape[0],),
+            float(time_value),
+            device=action.device,
+            dtype=torch.float32,
+        )
+        loss, output = policy(batch, noise=fixed_noise, time=time)
+        output = dict(output or {})
+        output.setdefault("loss_action", loss)
+        prefix = f"flow_t{round(time_value * 1000):03d}_"
+        for metric_name in FLOW_TIME_SWEEP_METRICS:
+            value = output.get(metric_name)
+            if torch.is_tensor(value):
+                metrics[prefix + metric_name] = value.detach()
+            else:
+                scalar = _to_scalar(value)
+                if scalar is not None:
+                    metrics[prefix + metric_name] = action.new_tensor(scalar)
+    return metrics
+
+
 @parser.wrap()
 def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None) -> dict[str, Any]:
     # TrainPipelineConfig normally rejects an output directory containing prior
@@ -397,6 +567,8 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     if is_main_process:
         logging.info("Loading evaluation policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta, rename_map=cfg.rename_map)
+    if is_main_process and hasattr(policy.config, "flow_contract_summary"):
+        logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
     ensure_ddp_parameters_initialized(policy, accelerator)
     preprocessor = _make_eval_preprocessor(cfg, policy, dataset, device)
     dataloader = _make_eval_dataloader(cfg, dataset, device)
@@ -462,6 +634,31 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
 
         local_metrics = dict(output_dict or {})
         local_metrics["loss"] = loss.detach()
+        if cfg.sample_action_mse:
+            # Use a separate deterministic seed so this diagnostic neither
+            # depends on nor perturbs the native loss sampling above.
+            sample_seed = int(cfg.seed or 0) + 1_000_000 + eval_step
+            torch.manual_seed(sample_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(sample_seed)
+            with torch.inference_mode(), accelerator.autocast():
+                local_metrics.update(
+                    _sampled_action_metrics(
+                        accelerator.unwrap_model(policy),
+                        batch,
+                        noise_mode=cfg.sample_action_noise_mode,
+                    )
+                )
+        if cfg.flow_time_sweep:
+            sweep_seed = int(cfg.seed or 0) + 2_000_000 + eval_step
+            with torch.inference_mode(), accelerator.autocast():
+                local_metrics.update(
+                    _flow_time_sweep_metrics(
+                        policy,
+                        batch,
+                        seed=sweep_seed,
+                    )
+                )
         batch_sums, batch_counts = _gather_metric_sums(
             accelerator,
             local_metrics,
@@ -515,7 +712,16 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
                 "The checkpoint's native flow-matching action velocity MSE, "
                 "computed by policy(batch) with the same preprocessing, action chunks, "
                 "padding masks, and PointSeg cache path as training."
-            )
+            ),
+            "sample_action_mse": (
+                "Optional MSE between the fully denoised action chunk returned by "
+                "predict_action_chunk and the ground-truth action chunk. Noise mode: "
+                f"{cfg.sample_action_noise_mode}."
+            ),
+            "flow_time_sweep": (
+                "Optional fixed-noise velocity and one-step endpoint diagnostics at "
+                f"times {FLOW_TIME_SWEEP_VALUES}; this does not update parameters."
+            ),
         },
     }
 
