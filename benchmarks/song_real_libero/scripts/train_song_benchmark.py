@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import json
 import logging
 import os
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -72,6 +74,117 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def validate_policy_camera_cli_overrides(cfg: TrainPipelineConfig) -> dict[str, Any]:
+    """Fail before training if an explicit camera CLI override was not applied.
+
+    ``--policy.path`` is handled by a second configuration parse in
+    ``TrainPipelineConfig.validate``.  Camera selection is too consequential to
+    trust silently: a cache may contain several views while the dataset wrapper
+    consumes only the views stored in the resolved policy configuration.
+    """
+
+    provenance: dict[str, Any] = {}
+    for field_name in ("camera_views", "rgb_camera_views"):
+        raw_value = parser.parse_arg(f"policy.{field_name}")
+        if raw_value is None:
+            continue
+        expected = tuple(parse_camera_views(raw_value))
+        resolved_value = getattr(cfg.policy, field_name, None)
+        resolved = tuple(parse_camera_views(resolved_value))
+        provenance[field_name] = {
+            "cli_raw": raw_value,
+            "cli_parsed": list(expected),
+            "resolved_raw": resolved_value,
+            "resolved_parsed": list(resolved),
+        }
+        if resolved != expected:
+            raise RuntimeError(
+                f"Explicit --policy.{field_name}={raw_value!r} was not applied: "
+                f"resolved cfg.policy.{field_name}={resolved_value!r}. "
+                "Refusing to train with an unintended camera modality."
+            )
+    return provenance
+
+
+def validate_policy_camera_config_matches_training_config(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+) -> None:
+    """Require the model config saved as config.json to match train_config.json."""
+
+    for field_name in ("camera_views", "rgb_camera_views"):
+        train_value = getattr(cfg.policy, field_name, None)
+        model_value = getattr(policy.config, field_name, None)
+        train_views = tuple(parse_camera_views(train_value))
+        model_views = tuple(parse_camera_views(model_value))
+        if train_views != model_views:
+            raise RuntimeError(
+                f"Camera configuration diverged while loading the policy: "
+                f"cfg.policy.{field_name}={train_value!r}, "
+                f"policy.config.{field_name}={model_value!r}. "
+                "Refusing to create a checkpoint with contradictory metadata."
+            )
+
+
+def write_training_camera_provenance(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    cli_provenance: dict[str, Any],
+) -> Path:
+    """Record the exact launch and resolved modalities beside the run."""
+
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_summary: dict[str, Any] | None = None
+    # The active memmap wrapper reads point clouds from dataset.root. Retain a
+    # compatibility fallback for older launch configs that exposed a separate
+    # point_cloud_memmap_dir field.
+    cache_dir = getattr(cfg, "point_cloud_memmap_dir", None) or getattr(
+        cfg.dataset, "root", None
+    )
+    manifest_path = Path(cache_dir) / "manifest.json" if cache_dir else None
+    if manifest_path is not None and manifest_path.is_file():
+        with open(manifest_path, encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        manifest_summary = {
+            key: manifest.get(key)
+            for key in (
+                "camera_views",
+                "gripper_points",
+                "current_points",
+                "future_points",
+            )
+        }
+
+    payload = {
+        "created_unix_s": time.time(),
+        "hostname": os.uname().nodename,
+        "cwd": os.getcwd(),
+        "argv": list(sys.argv),
+        "policy_path": str(getattr(cfg.policy, "pretrained_path", None)),
+        "cli_camera_overrides": cli_provenance,
+        "resolved_train_config": {
+            "camera_views": getattr(cfg.policy, "camera_views", None),
+            "rgb_camera_views": getattr(cfg.policy, "rgb_camera_views", None),
+        },
+        "resolved_policy_config": {
+            "camera_views": getattr(policy.config, "camera_views", None),
+            "rgb_camera_views": getattr(policy.config, "rgb_camera_views", None),
+            "image_features": sorted(getattr(policy.config, "image_features", {})),
+        },
+        "point_cloud_cache_manifest_path": (
+            None if manifest_path is None else str(manifest_path)
+        ),
+        "point_cloud_cache_manifest": manifest_summary,
+    }
+    path = output_dir / "camera_training_provenance.json"
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary_path, "w", encoding="utf-8") as provenance_file:
+        json.dump(payload, provenance_file, indent=2, ensure_ascii=False, default=str)
+    temporary_path.replace(path)
+    return path
 
 
 class PointCloudMemmapDataset(torch.utils.data.Dataset):
@@ -1311,6 +1424,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
     cfg.validate()
+    camera_cli_provenance = validate_policy_camera_cli_overrides(cfg)
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -1387,6 +1501,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    validate_policy_camera_config_matches_training_config(cfg, policy)
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
@@ -1408,6 +1523,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             selected_rgb_views,
             sorted(actual_image_keys),
         )
+        provenance_path = write_training_camera_provenance(
+            cfg,
+            policy,
+            camera_cli_provenance,
+        )
+        logging.info("Saved camera training provenance to %s", provenance_path)
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")

@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "strict_official_delta_width_initial_sync_v11_20260810"
+EVAL_BUILD_TAG = "strict_official_multiview_camera_selection_v13_20260811"
 
 import argparse
 import atexit
@@ -182,7 +182,6 @@ if __package__ and __package__.startswith("benchmarks."):
         SmolVLA_ModelInference = Any
         identity_pose9_gripper = _identity_pose9_gripper
     from .libero_pointcloud_utils import (
-        add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
         ensure_libero_config,
@@ -192,7 +191,7 @@ if __package__ and __package__.startswith("benchmarks."):
         gripper_width_percent_from_scalar,
         make_libero_env,
         normalize_render_camera_name,
-        observation_to_point_clouds,
+        observation_to_model_point_cloud,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
         render_camera_names_from_config,
@@ -201,7 +200,6 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
     from libero_setting.libero_pointcloud_utils import (
-        add_world_gripper_cloud_to_point_cloud,
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
         ensure_libero_config,
@@ -211,7 +209,7 @@ else:
         gripper_width_percent_from_scalar,
         make_libero_env,
         normalize_render_camera_name,
-        observation_to_point_clouds,
+        observation_to_model_point_cloud,
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
         render_camera_names_from_config,
@@ -255,6 +253,7 @@ def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any
     resolved_policy = policy.resolve() if policy is not None and policy.exists() else policy
     model_path = resolved_policy / "model.safetensors" if resolved_policy is not None else None
     config_path = resolved_policy / "config.json" if resolved_policy is not None else None
+    train_config_path = resolved_policy / "train_config.json" if resolved_policy is not None else None
 
     identity: dict[str, Any] = {
         "hostname": os.uname().nodename,
@@ -267,6 +266,8 @@ def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any
         "eval_script_sha256": _sha256_file(script_path),
         "inference_wrapper_sha256": _sha256_file(script_path.parent.parent / "smolvla_model_inference.py"),
         "pointcloud_utils_sha256": _sha256_file(script_path.with_name("libero_pointcloud_utils.py")),
+        "train_config_path": None if train_config_path is None else str(train_config_path),
+        "train_config_sha256": _sha256_file(train_config_path) if train_config_path is not None else None,
         "modeling_smolvla_sha256": _sha256_file(
             repo_root / "src" / "lerobot" / "policies" / "smolvla" / "modeling_smolvla.py"
         ),
@@ -591,6 +592,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-points", type=int, default=None)
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=None,
+        help=(
+            "Camera used to build the model point cloud. Repeat for multiple views; "
+            "the clouds are transformed into the first camera frame, fused, sampled, "
+            "and finally expressed in the current EEF frame."
+        ),
+    )
+    parser.add_argument(
+        "--image-camera",
+        action="append",
+        default=None,
+        help=(
+            "Camera used as model RGB input. Repeat for multiple RGB views. This is "
+            "independent of --camera, so two point-cloud views can use one RGB view."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default="outputs/temp")
 
     parser.add_argument("--observation-height", type=int, default=None)
@@ -3496,6 +3516,10 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "suites": suite_names,
         "camera_names": list(cfg.get("camera_names", [])),
         "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
+        "image_camera_names": image_camera_names_from_config(cfg),
+        "camera_selection_source": cfg.get("camera_selection_source"),
+        "image_camera_selection_source": cfg.get("image_camera_selection_source"),
+        "checkpoint_camera_selection": cfg.get("checkpoint_camera_selection", {}),
         "render_mode": str(cfg.get("render_mode", "offscreen")),
         "evaluation_identity": cfg.get("evaluation_identity", {}),
         "env_seed": int(cfg.get("env_seed", 0)),
@@ -4062,37 +4086,208 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
     to the inference wrapper.  The current world_pose9 is kept only for converting
     the predicted UMI trajectory back to world/controller targets.
     """
-    pc_eff, pc_world, pose9_gripper = observation_to_point_clouds(
+    camera_names = pointcloud_camera_names_from_config(cfg)
+    pc_eff, pose9_gripper = observation_to_model_point_cloud(
         env,
         raw_obs,
-        pointcloud_camera_names_from_config(cfg),
+        camera_names,
         int(cfg["observation_height"]),
         int(cfg["observation_width"]),
         int(cfg["num_points"]),
+        add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
+        gripper_points=int(cfg.get("gripper_points", 500)),
+        gripper_len=float(cfg.get("gripper_len", 0.06)),
+        gripper_template=str(cfg.get("gripper_template", "reap")),
+        gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
+        # Multi-view training relies on a single addressable gripper tail.
+        gripper_drop_strategy=(
+            "tail" if len(camera_names) > 1 else str(cfg.get("gripper_drop_strategy", "tail"))
+        ),
+        gripper_shuffle_points=(
+            False if len(camera_names) > 1 else bool(cfg.get("gripper_shuffle_points", False))
+        ),
         seed=int(seed),
     )
     world_pose9 = np.asarray(pose9_gripper[:9], dtype=np.float32)
     gripper = float(pose9_gripper[-1])
-    if bool(cfg.get("add_gripper_cloud", True)):
-        gripper_max_width = float(cfg.get("gripper_qpos_max_width", 0.08))
-        pc_eff = add_world_gripper_cloud_to_point_cloud(
-            pc_world,
-            pose9_gripper,
-            gripper_width_percent_from_scalar(gripper, max_physical_width=gripper_max_width),
-            total_points=int(cfg["num_points"]),
-            gripper_points=int(cfg.get("gripper_points", 500)),
-            gripper_len=float(cfg.get("gripper_len", 0.06)),
-            gripper_template=str(cfg.get("gripper_template", "reap")),
-            seed=int(seed),
-            drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-            shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-        )
     return np.ascontiguousarray(pc_eff, dtype=np.float32), world_pose9, gripper
 
 
 def _normalized_camera_name(camera_name: Any) -> str:
     camera_name = str(camera_name).strip()
     return camera_name[: -len("_image")] if camera_name.endswith("_image") else camera_name
+
+
+def _unique_camera_names(camera_names: Any, *, field_name: str) -> list[str]:
+    if isinstance(camera_names, str):
+        camera_names = [camera_names]
+    normalized: list[str] = []
+    for camera_name in camera_names or []:
+        name = _normalized_camera_name(camera_name)
+        if not name:
+            raise ValueError(f"{field_name} contains an empty camera name.")
+        if name not in normalized:
+            normalized.append(name)
+    if not normalized:
+        raise ValueError(f"{field_name} requires at least one camera.")
+    return normalized
+
+
+def image_camera_names_from_config(cfg: dict[str, Any]) -> list[str]:
+    value = cfg.get("image_cameras", cfg.get("image_camera"))
+    if value is None:
+        return []
+    return _unique_camera_names(value, field_name="image_cameras")
+
+
+def _camera_names_from_input_features(policy_cfg: dict[str, Any]) -> list[str]:
+    input_features = policy_cfg.get("input_features") or {}
+    if not isinstance(input_features, dict):
+        return []
+    cameras: list[str] = []
+    for feature_key in input_features:
+        if not str(feature_key).startswith("observation.images."):
+            continue
+        camera_name = str(feature_key).removeprefix("observation.images.")
+        if camera_name.startswith("empty_camera_"):
+            continue
+        canonical_name = _canonical_policy_camera_name(camera_name)
+        if canonical_name not in cameras:
+            cameras.append(canonical_name)
+    return cameras
+
+
+def load_checkpoint_camera_selection(policy_path: str | Path | None) -> dict[str, Any]:
+    """Read point-cloud/RGB view selections saved beside checkpoint weights.
+
+    ``train_config.json`` is authoritative. ``config.json`` fills fields that
+    are absent in older training configs. For legacy configs where
+    ``rgb_camera_views`` is null, the serialized image features are the most
+    reliable record of the RGB modalities actually used during training.
+    """
+
+    selection: dict[str, Any] = {"pointcloud": None, "rgb": None, "sources": {}}
+    if policy_path is None:
+        return selection
+    checkpoint_dir = Path(policy_path).expanduser()
+    if not checkpoint_dir.is_dir():
+        return selection
+
+    for config_name in ("train_config.json", "config.json"):
+        config_path = checkpoint_dir / config_name
+        if not config_path.is_file():
+            continue
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                document = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read checkpoint camera config {config_path}: {exc}") from exc
+        if not isinstance(document, dict):
+            raise TypeError(f"Checkpoint camera config must be a JSON object: {config_path}")
+        policy_cfg = document.get("policy", document)
+        if not isinstance(policy_cfg, dict):
+            continue
+
+        if selection["pointcloud"] is None and policy_cfg.get("camera_views") is not None:
+            selection["pointcloud"] = list(
+                _camera_names_from_policy_value(policy_cfg["camera_views"])
+            )
+            selection["sources"]["pointcloud"] = str(config_path)
+
+        if selection["rgb"] is None:
+            configured_rgb = policy_cfg.get("rgb_camera_views")
+            if configured_rgb is not None:
+                selection["rgb"] = list(_camera_names_from_policy_value(configured_rgb))
+                selection["sources"]["rgb"] = f"{config_path}:rgb_camera_views"
+            else:
+                feature_cameras = _camera_names_from_input_features(policy_cfg)
+                if feature_cameras:
+                    selection["rgb"] = feature_cameras
+                    selection["sources"]["rgb"] = f"{config_path}:input_features"
+
+    return selection
+
+
+def configure_eval_camera_views(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    checkpoint_selection: dict[str, Any] | None = None,
+) -> None:
+    """Resolve cameras with CLI > checkpoint metadata > eval config priority."""
+
+    cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
+    checkpoint_selection = checkpoint_selection or {}
+    pointcloud_override = getattr(args, "camera", None)
+    image_override = getattr(args, "image_camera", None)
+
+    if pointcloud_override is not None:
+        pointcloud_cameras = _unique_camera_names(
+            pointcloud_override,
+            field_name="--camera",
+        )
+        pointcloud_source = "cli"
+    elif checkpoint_selection.get("pointcloud") is not None:
+        pointcloud_cameras = _unique_camera_names(
+            checkpoint_selection["pointcloud"],
+            field_name="checkpoint camera_views",
+        )
+        pointcloud_source = str(
+            checkpoint_selection.get("sources", {}).get("pointcloud", "checkpoint")
+        )
+    else:
+        pointcloud_cameras = pointcloud_camera_names_from_config(cfg)
+        pointcloud_source = "eval_config"
+    cfg["pointcloud_camera_names"] = pointcloud_cameras
+    # Keep the first-view reference convention used by dataset generation.
+    cfg["pointcloud_reference_camera"] = pointcloud_cameras[0]
+
+    if image_override is not None:
+        image_cameras = _unique_camera_names(
+            image_override,
+            field_name="--image-camera",
+        )
+        image_source = "cli"
+    elif checkpoint_selection.get("rgb") is not None:
+        image_cameras = _unique_camera_names(
+            checkpoint_selection["rgb"],
+            field_name="checkpoint rgb_camera_views/input_features",
+        )
+        image_source = str(
+            checkpoint_selection.get("sources", {}).get("rgb", "checkpoint")
+        )
+    else:
+        image_cameras = image_camera_names_from_config(cfg)
+        if image_cameras:
+            image_source = "eval_config"
+        elif pointcloud_override is not None:
+            # Compatibility for checkpoints without modality metadata.
+            image_cameras = list(pointcloud_cameras)
+            image_source = "cli_camera_fallback"
+        else:
+            image_source = "unresolved"
+
+    if image_cameras:
+        cfg["image_cameras"] = image_cameras
+        # Preserve the legacy single-image checkpoint mapping path.
+        cfg["image_camera"] = image_cameras[0]
+
+    if (
+        pointcloud_override is not None
+        or image_override is not None
+        or checkpoint_selection.get("pointcloud") is not None
+        or checkpoint_selection.get("rgb") is not None
+    ):
+        # MuJoCo must render every camera consumed by either modality. Do not
+        # retain unrelated config cameras when the CLI explicitly selects views.
+        cfg["camera_names"] = list(
+            dict.fromkeys([*pointcloud_cameras, *image_cameras])
+        )
+
+    cfg["camera_selection_explicit"] = pointcloud_override is not None
+    cfg["image_camera_selection_explicit"] = image_override is not None
+    cfg["camera_selection_source"] = pointcloud_source
+    cfg["image_camera_selection_source"] = image_source
+    cfg["checkpoint_camera_selection"] = checkpoint_selection
 
 
 def _append_camera_candidate(candidates: list[str], camera_name: Any) -> None:
@@ -4170,6 +4365,8 @@ def resolve_policy_rgb_cameras(
 ) -> dict[str, str]:
     """Resolve canonical adapter image features to concrete LIBERO raw-observation cameras."""
     image_keys = list(infer.policy.config.image_features)
+    allowed_cameras = image_camera_names_from_config(cfg)
+    restrict_to_selected_cameras = bool(allowed_cameras)
     resolved: dict[str, str] = {}
     for image_key in image_keys:
         candidates = _policy_image_camera_candidates(
@@ -4178,6 +4375,11 @@ def resolve_policy_rgb_cameras(
             single_image_feature=len(image_keys) == 1,
         )
         for camera_name in candidates:
+            if (
+                restrict_to_selected_cameras
+                and _normalized_camera_name(camera_name) not in allowed_cameras
+            ):
+                continue
             if dataset_image_from_raw_obs(raw_obs, camera_name) is not None:
                 resolved[image_key] = camera_name
                 break
@@ -4187,10 +4389,191 @@ def resolve_policy_rgb_cameras(
             )
             raise KeyError(
                 f"Adapter checkpoint requires {image_key!r}, but no matching LIBERO image was found. "
-                f"Tried cameras={candidates!r}; available image keys={available!r}. "
+                f"Tried cameras={candidates!r}; selected RGB cameras={allowed_cameras!r}; "
+                f"available image keys={available!r}. "
                 "Set policy_image_camera_map in the eval config when using a custom camera alias."
             )
     return resolved
+
+
+def _canonical_policy_camera_name(camera_name: Any) -> str:
+    name = _normalized_camera_name(camera_name).lower().replace("-", "_")
+    if name in {
+        "agentview",
+        "external",
+        "external_camera",
+        "overhead",
+        "overhead_camera",
+        "overview",
+        "overview_camera",
+    }:
+        return "agentview"
+    if name in {
+        "eye_in_hand",
+        "hand",
+        "hand_camera",
+        "robot0_eye_in_hand",
+        "wrist",
+        "wrist_camera",
+    }:
+        return "robot0_eye_in_hand"
+    return name
+
+
+def _camera_names_from_policy_value(value: Any) -> tuple[str, ...]:
+    parts = value if isinstance(value, list | tuple) else str(value).strip().strip("[]").split(",")
+    return tuple(
+        _canonical_policy_camera_name(str(part).strip().strip("\"'"))
+        for part in parts
+        if str(part).strip().strip("\"'")
+    )
+
+
+def inspect_policy_camera_alignment(
+    infer: SmolVLA_ModelInference,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe the resolved eval cameras and the policy metadata relationship."""
+
+    eval_pointcloud_cameras = tuple(
+        _canonical_policy_camera_name(name)
+        for name in pointcloud_camera_names_from_config(cfg)
+    )
+    policy_pointcloud_cameras = tuple(
+        _canonical_policy_camera_name(name)
+        for name in getattr(infer, "camera_views", ())
+    )
+    pointcloud_matches_checkpoint = (
+        not policy_pointcloud_cameras
+        or policy_pointcloud_cameras == eval_pointcloud_cameras
+    )
+
+    eval_rgb_cameras = tuple(
+        _canonical_policy_camera_name(name)
+        for name in image_camera_names_from_config(cfg)
+    )
+    policy_rgb_cameras: tuple[str, ...] = ()
+    policy_cfg = infer.policy.config
+    if bool(getattr(policy_cfg, "vla_adapter_enable", False)):
+        configured_rgb = getattr(policy_cfg, "rgb_camera_views", None)
+        if configured_rgb is not None:
+            policy_rgb_cameras = _camera_names_from_policy_value(configured_rgb)
+        else:
+            image_feature_cameras = [
+                key.removeprefix("observation.images.")
+                for key in policy_cfg.image_features
+                if not key.removeprefix("observation.images.").startswith("empty_camera_")
+            ]
+            policy_rgb_cameras = tuple(
+                _canonical_policy_camera_name(name)
+                for name in image_feature_cameras
+            )
+    rgb_matches_checkpoint = (
+        not policy_rgb_cameras
+        or policy_rgb_cameras == eval_rgb_cameras
+    )
+
+    return {
+        "pointcloud": eval_pointcloud_cameras,
+        "rgb": eval_rgb_cameras,
+        "checkpoint_pointcloud": policy_pointcloud_cameras,
+        "checkpoint_rgb": policy_rgb_cameras,
+        "pointcloud_matches_checkpoint": pointcloud_matches_checkpoint,
+        "rgb_matches_checkpoint": rgb_matches_checkpoint,
+    }
+
+
+def reconcile_eval_camera_views_with_loaded_policy(
+    infer: SmolVLA_ModelInference,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Make automatic camera selection authoritative after loading the policy.
+
+    The early configuration pass reads checkpoint JSON so MuJoCo cameras can be
+    planned without loading CUDA.  The loaded policy is nevertheless the final
+    authority: config migration, legacy train_config files, or stale metadata
+    can otherwise make an automatic run observe different modalities from an
+    equivalent run with explicit ``--camera`` / ``--image-camera`` arguments.
+
+    Explicit CLI selections remain untouched because they are also used for
+    intentional modality ablations.  Automatic selections are replaced with
+    the values actually exposed by the loaded inference policy.
+    """
+
+    loaded_pointcloud = _unique_camera_names(
+        list(getattr(infer, "camera_views", ())),
+        field_name="loaded policy camera_views",
+    )
+    policy_cfg = infer.policy.config
+    loaded_rgb: list[str] = []
+    loaded_rgb_source: str | None = None
+    if bool(getattr(policy_cfg, "vla_adapter_enable", False)):
+        configured_rgb = getattr(policy_cfg, "rgb_camera_views", None)
+        if configured_rgb is not None:
+            parsed_rgb = list(_camera_names_from_policy_value(configured_rgb))
+            if parsed_rgb:
+                loaded_rgb = _unique_camera_names(
+                    parsed_rgb,
+                    field_name="loaded policy rgb_camera_views",
+                )
+                loaded_rgb_source = "loaded_policy.config.rgb_camera_views"
+        if not loaded_rgb:
+            image_feature_cameras = [
+                key.removeprefix("observation.images.")
+                for key in policy_cfg.image_features
+                if not key.removeprefix("observation.images.").startswith("empty_camera_")
+            ]
+            if image_feature_cameras:
+                loaded_rgb = _unique_camera_names(
+                    [
+                        _canonical_policy_camera_name(camera_name)
+                        for camera_name in image_feature_cameras
+                    ],
+                    field_name="loaded policy image_features",
+                )
+                loaded_rgb_source = "loaded_policy.config.image_features"
+        if not loaded_rgb:
+            raise ValueError(
+                "The loaded VLA-adapter policy exposes no usable RGB camera in "
+                "rgb_camera_views or image_features."
+            )
+
+    if not bool(cfg.get("camera_selection_explicit", False)):
+        previous = pointcloud_camera_names_from_config(cfg)
+        cfg["pointcloud_camera_names"] = list(loaded_pointcloud)
+        cfg["pointcloud_reference_camera"] = loaded_pointcloud[0]
+        cfg["camera_selection_source"] = "loaded_policy.config.camera_views"
+        if previous != loaded_pointcloud:
+            print(
+                "[warn] corrected automatic point-cloud cameras from checkpoint-file metadata: "
+                f"previous={previous} loaded_policy={loaded_pointcloud}",
+                flush=True,
+            )
+
+    if loaded_rgb and not bool(cfg.get("image_camera_selection_explicit", False)):
+        previous_rgb = image_camera_names_from_config(cfg)
+        cfg["image_cameras"] = list(loaded_rgb)
+        cfg["image_camera"] = loaded_rgb[0]
+        cfg["image_camera_selection_source"] = loaded_rgb_source
+        if previous_rgb != loaded_rgb:
+            print(
+                "[warn] corrected automatic RGB cameras from checkpoint-file metadata: "
+                f"previous={previous_rgb} loaded_policy={loaded_rgb}",
+                flush=True,
+            )
+
+    # Recompute the rendered-camera union after either automatic correction.
+    # This happens before any task environment is created in every model-owning
+    # process, so raw_obs contains exactly the modalities selected above.
+    selected_pointcloud = pointcloud_camera_names_from_config(cfg)
+    selected_rgb = image_camera_names_from_config(cfg) if loaded_rgb else []
+    cfg["camera_names"] = list(dict.fromkeys([*selected_pointcloud, *selected_rgb]))
+    cfg["loaded_policy_camera_selection"] = {
+        "pointcloud": list(loaded_pointcloud),
+        "rgb": list(loaded_rgb),
+        "rgb_source": loaded_rgb_source,
+    }
+    return inspect_policy_camera_alignment(infer, cfg)
 
 
 def build_policy_rgb_observation(
@@ -5769,7 +6152,10 @@ def run_episode(
     policy_rgb_camera_map: dict[str, str] = {}
     if infer.policy.config.vla_adapter_enable:
         policy_rgb_camera_map = resolve_policy_rgb_cameras(infer, raw_obs, cfg)
-        # print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
+        mapping_signature = tuple(sorted(policy_rgb_camera_map.items()))
+        if cfg.get("_reported_policy_rgb_camera_mapping") != mapping_signature:
+            print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
+            cfg["_reported_policy_rgb_camera_mapping"] = mapping_signature
 
     object_pose_names = observable_object_pose_names(raw_obs)
     initial_object_positions, initial_object_quaternions = capture_observable_object_poses(
@@ -6191,28 +6577,32 @@ def run_episode(
                     break
                 continue
 
-            point_cloud, point_cloud_world, eef_pose = observation_to_point_clouds(
+            point_cloud, eef_pose = observation_to_model_point_cloud(
                 env,
                 raw_obs,
                 pc_camera_names,
                 int(cfg["observation_height"]),
                 int(cfg["observation_width"]),
                 int(cfg["num_points"]),
+                add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
+                gripper_points=int(cfg.get("gripper_points", 500)),
+                gripper_len=float(cfg.get("gripper_len", 0.06)),
+                gripper_template=str(cfg.get("gripper_template", "reap")),
+                gripper_max_width=gripper_max_width,
+                # compose_point_cloud_views() and dataset generation both
+                # require scene-first / gripper-tail layout in multi-view mode.
+                gripper_drop_strategy=(
+                    "tail"
+                    if len(pc_camera_names) > 1
+                    else str(cfg.get("gripper_drop_strategy", "tail"))
+                ),
+                gripper_shuffle_points=(
+                    False
+                    if len(pc_camera_names) > 1
+                    else bool(cfg.get("gripper_shuffle_points", False))
+                ),
                 seed=steps,
             )
-            if bool(cfg.get("add_gripper_cloud", True)):
-                point_cloud = add_world_gripper_cloud_to_point_cloud(
-                    point_cloud_world,
-                    eef_pose,
-                    gripper_width_percent_from_scalar(float(eef_pose[-1]), max_physical_width=gripper_max_width),
-                    total_points=int(cfg["num_points"]),
-                    gripper_points=int(cfg.get("gripper_points", 500)),
-                    gripper_len=float(cfg.get("gripper_len", 0.06)),
-                    gripper_template=str(cfg.get("gripper_template", "reap")),
-                    seed=steps,
-                    drop_strategy=str(cfg.get("gripper_drop_strategy", "tail")),
-                    shuffle_points=bool(cfg.get("gripper_shuffle_points", False)),
-                )
 
             transported_grasp = update_grasp_transport_state(eef_pose)
 
@@ -7992,6 +8382,7 @@ def _isolated_policy_worker_entry(
             visualize_foreground=False,
             foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
         )
+        reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
         suite = benchmark.get_benchmark_dict()[suite_name]()
         summaries: list[dict[str, Any]] = []
         for task_id in task_ids:
@@ -8180,6 +8571,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
 
     cfg["policy_path"] = cfg_get(cfg, args.policy_path, "policy_path")
     cfg["policy_repo_id"] = cfg_get(cfg, args.policy_repo_id, "policy_repo_id")
+    checkpoint_camera_selection = load_checkpoint_camera_selection(cfg["policy_path"])
     cfg["evaluation_identity"] = collect_evaluation_identity(cfg["policy_path"])
     config_path = Path(args.config).expanduser().resolve()
     cfg["evaluation_identity"]["eval_config_path"] = str(config_path)
@@ -8326,7 +8718,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["add_gripper_cloud"] = bool(cfg_get(cfg, args.add_gripper_cloud, "add_gripper_cloud", True))
     if args.gripper_points is not None:
         cfg["gripper_points"] = int(args.gripper_points)
-    cfg.setdefault("camera_names", ["agentview", "robot0_eye_in_hand"])
+    configure_eval_camera_views(cfg, args, checkpoint_camera_selection)
 
     cfg["control"]["control_freq"] = float(
         cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 20.0))
@@ -8957,6 +9349,33 @@ def main() -> None:
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
     )
+    camera_alignment = reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
+    print(
+        "[info] model camera alignment: "
+        f"pointcloud={camera_alignment['pointcloud']} "
+        f"source={cfg.get('camera_selection_source')} "
+        f"rgb={camera_alignment['rgb']} "
+        f"rgb_source={cfg.get('image_camera_selection_source')} "
+        f"checkpoint_pointcloud={camera_alignment['checkpoint_pointcloud']} "
+        f"checkpoint_rgb={camera_alignment['checkpoint_rgb']}",
+        flush=True,
+    )
+    if bool(cfg.get("camera_selection_explicit", False)) and not bool(
+        camera_alignment["pointcloud_matches_checkpoint"]
+    ):
+        print(
+            "[warn] manual --camera overrides checkpoint camera_views; "
+            "this is an intentional point-cloud modality ablation.",
+            flush=True,
+        )
+    if bool(cfg.get("image_camera_selection_explicit", False)) and not bool(
+        camera_alignment["rgb_matches_checkpoint"]
+    ):
+        print(
+            "[warn] manual --image-camera differs from checkpoint RGB features; "
+            "inference requires every configured checkpoint image feature to remain resolvable.",
+            flush=True,
+        )
 
     print(
         "[info] clean absolute-pose eval: "
