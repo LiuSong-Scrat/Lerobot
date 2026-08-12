@@ -3,6 +3,7 @@
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.policies.smolvla.song_pointseg import (
@@ -19,14 +20,23 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
     compose_point_cloud_views,
+    fps_sample_fused_point_cloud,
+    voxel_fps_sample_fused_point_cloud,
+    voxel_cover_fps_sample_fused_point_cloud,
+    novelty_union_sample_fused_point_cloud,
+    transport_novelty_union_sample_fused_point_cloud,
     force_small_current_clouds_foreground,
     generate_pseudo_labels,
     generate_pseudo_labels_from_priors,
     matrix_to_pose9,
     parse_camera_views,
+    parse_camera_view_weights,
+    paired_view_augmentation_index,
     pose9_to_matrix,
     refine_pseudo_labels_with_teacher,
     relative_poses_to_first,
+    song_pointseg_collate,
+    use_primary_view_for_training_index,
 )
 
 
@@ -44,11 +54,278 @@ def test_multiview_point_cloud_composition_keeps_one_gripper_tail():
     assert np.any(np.all(fused[:-2] == 1.0, axis=1))
 
 
+def test_multiview_point_cloud_composition_respects_primary_view_weight():
+    first = np.zeros((12, 6), dtype=np.float32)
+    second = np.ones((12, 6), dtype=np.float32)
+    first[-2:, :3] = 7.0
+
+    fused = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        seed=11,
+        view_weights="9,1",
+    )
+
+    assert np.count_nonzero(np.all(fused[:-2] == 0.0, axis=1)) == 9
+    assert np.count_nonzero(np.all(fused[:-2] == 1.0, axis=1)) == 1
+    assert np.all(fused[-2:, :3] == 7.0)
+
+
+def test_fps_multiview_composition_uses_equal_union_and_one_gripper_tail():
+    first = np.zeros((8, 6), dtype=np.float32)
+    second = np.ones((8, 6), dtype=np.float32)
+    first[:6, 0] = np.arange(6, dtype=np.float32)
+    second[:6, 0] = np.arange(6, dtype=np.float32) + 20.0
+    first[-2:, :3] = 7.0
+    second[-2:, :3] = 9.0
+
+    union = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        fusion="fps",
+    )
+
+    assert union.shape == (14, 6)
+    np.testing.assert_array_equal(union[:6], first[:6])
+    np.testing.assert_array_equal(union[6:12], second[:6])
+    np.testing.assert_array_equal(union[-2:], first[-2:])
+
+
+def test_full_union_preserves_every_scene_point_and_one_primary_gripper_tail():
+    first = np.arange(48, dtype=np.float32).reshape(8, 6)
+    second = first + 100.0
+
+    union = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        fusion="full_union",
+    )
+
+    assert union.shape == (14, 6)
+    np.testing.assert_array_equal(union[:6], first[:6])
+    np.testing.assert_array_equal(union[6:12], second[:6])
+    np.testing.assert_array_equal(union[-2:], first[-2:])
+
+
+def test_uniform_union_samples_joint_scene_without_fixed_view_quota_and_keeps_primary_gripper():
+    first = np.zeros((102, 6), dtype=np.float32)
+    second = np.ones((102, 6), dtype=np.float32)
+    first[-2:, :3] = 7.0
+    second[-2:, :3] = 9.0
+
+    fused = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        seed=17,
+        fusion="uniform_union",
+    )
+    repeated = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        seed=17,
+        fusion="random_union",
+    )
+
+    assert fused.shape == first.shape
+    np.testing.assert_array_equal(fused, repeated)
+    np.testing.assert_array_equal(fused[-2:], first[-2:])
+    primary_count = int(np.count_nonzero(np.all(fused[:-2] == 0.0, axis=1)))
+    secondary_count = int(np.count_nonzero(np.all(fused[:-2] == 1.0, axis=1)))
+    assert primary_count + secondary_count == 100
+    assert primary_count != 50  # no per-view quota; this seed draws a stochastic split
+
+
+def test_paired_primary_and_full_union_collate_masks_only_the_padded_primary_tail():
+    primary = torch.arange(48, dtype=torch.float32).reshape(8, 6)
+    full_union = torch.arange(84, dtype=torch.float32).reshape(14, 6)
+    batch = song_pointseg_collate(
+        [
+            {"observation.point_cloud": primary},
+            {"observation.point_cloud": full_union},
+        ]
+    )
+
+    assert batch["observation.point_cloud"].shape == (2, 14, 6)
+    assert not batch["observation.point_cloud_is_pad"][0, :8].any()
+    assert batch["observation.point_cloud_is_pad"][0, 8:].all()
+    assert not batch["observation.point_cloud_is_pad"][1].any()
+    torch.testing.assert_close(batch["observation.point_cloud"][0, :8], primary)
+
+
+def test_primary_residual_composition_preserves_ordered_views_and_primary_gripper():
+    first = np.arange(48, dtype=np.float32).reshape(8, 6)
+    second = first + 100.0
+
+    union = compose_point_cloud_views(
+        [first, second],
+        gripper_points=2,
+        fusion="primary_residual",
+    )
+
+    assert union.shape == (14, 6)
+    np.testing.assert_array_equal(union[:6], first[:6])
+    np.testing.assert_array_equal(union[6:12], second[:6])
+    np.testing.assert_array_equal(union[-2:], first[-2:])
+
+
+def test_fps_sampler_is_deterministic_and_preserves_gripper_indices():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor([0, 1, 2, 3, 4, 5, 20, 21, 22, 23, 24, 25])
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2
+    )
+    repeated, _, repeated_indices = fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2
+    )
+
+    assert sampled_pad is None
+    assert sampled.shape == (1, 8, 6)
+    assert indices[0, -2:].tolist() == [12, 13]
+    assert torch.equal(indices, repeated_indices)
+    assert torch.equal(sampled, repeated)
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+
+
+def test_voxel_fps_deduplicates_overlap_and_preserves_gripper_indices():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.0, 0.001, 0.010, 0.020, 0.030, 0.040, 0.0005, 0.0015, 0.011, 0.021, 0.031, 0.050]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = voxel_fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.005
+    )
+    repeated, _, repeated_indices = voxel_fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.005
+    )
+
+    assert sampled_pad is None
+    assert sampled.shape == (1, 8, 6)
+    assert indices[0, -2:].tolist() == [12, 13]
+    assert torch.equal(indices, repeated_indices)
+    assert torch.equal(sampled, repeated)
+    # The first configured view is the deterministic representative for the
+    # occupied overlap voxels; duplicate wrist samples are not candidates.
+    assert not ({6, 7, 8, 9, 10} & set(indices[0, :-2].tolist()))
+
+
+def test_voxel_cover_fps_keeps_voxel_cover_then_adds_fps_detail():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.0, 0.001, 0.011, 0.021, 0.0005, 0.012, 0.022, 0.031, 0.032, 0.033, 0.034, 0.035]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = voxel_cover_fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+    repeated, _, repeated_indices = voxel_cover_fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert sampled.shape == (1, 8, 6)
+    assert indices[0, -2:].tolist() == [12, 13]
+    assert {0, 2, 3, 7}.issubset(set(indices[0, :-2].tolist()))
+    assert len(set(indices[0, :-2].tolist())) == 6
+    assert torch.equal(indices, repeated_indices)
+    assert torch.equal(sampled, repeated)
+
+
+def test_voxel_cover_fps_is_identity_for_target_sized_single_view():
+    cloud = torch.randn(2, 8, 6)
+    sampled, sampled_pad, indices = voxel_cover_fps_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert torch.equal(sampled, cloud)
+    assert indices.tolist() == [list(range(8)), list(range(8))]
+
+
+def test_novelty_union_replaces_only_redundant_primary_voxel_points():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.0, 0.001, 0.010, 0.020, 0.030, 0.040, 0.0005, 0.011, 0.021, 0.031, 0.050, 0.060]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.005
+    )
+
+    assert sampled_pad is None
+    assert indices.tolist() == [[0, 10, 2, 3, 4, 5, 12, 13]]
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+
+
+def test_transport_novelty_union_uses_local_one_to_one_replacements():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.0, 0.001, 0.100, 0.101, 0.200, 0.201,
+         0.002, 0.102, 0.202, 0.215, 0.015, 0.115]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = transport_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert indices.tolist() == [[0, 10, 2, 11, 4, 9, 12, 13]]
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+
+
+
+def test_parse_camera_view_weights_requires_one_positive_weight_per_view():
+    assert parse_camera_view_weights("9,1", num_views=2) == (9.0, 1.0)
+    with pytest.raises(ValueError, match="one value per view"):
+        parse_camera_view_weights("1", num_views=2)
+    with pytest.raises(ValueError, match="finite and positive"):
+        parse_camera_view_weights("1,0", num_views=2)
+
+
 def test_parse_camera_views_accepts_overhead_and_hand_pair():
     assert parse_camera_views("agentview,robot0_eye_in_hand") == (
         "agentview",
         "robot0_eye_in_hand",
     )
+
+
+def test_training_view_dropout_assignment_is_balanced_and_worker_independent():
+    first = [use_primary_view_for_training_index(index, seed=17) for index in range(1000)]
+    repeated = [use_primary_view_for_training_index(index, seed=17) for index in range(1000)]
+
+    assert first == repeated
+    assert 450 <= sum(first) <= 550
+    assert first != [use_primary_view_for_training_index(index, seed=18) for index in range(1000)]
+
+
+def test_paired_view_augmentation_covers_both_modes_for_every_frame():
+    num_samples = 101
+    assignments = [
+        paired_view_augmentation_index(index, num_samples, seed=17)
+        for index in range(2 * num_samples)
+    ]
+
+    for base_index in range(num_samples):
+        modes = [mode for index, mode in assignments if index == base_index]
+        assert sorted(modes) == [False, True]
+
+    with pytest.raises(IndexError):
+        paired_view_augmentation_index(2 * num_samples, num_samples, seed=17)
 
 
 def _pose_from_translation(xyz):
@@ -353,9 +630,24 @@ def test_temporal_point_cloud_motion_prior_uses_achieved_state_not_action_target
 
 
 def test_full_episode_pose_trajectory_extends_target_evidence_without_changing_local_motion():
-    current_xyz = torch.tensor([[[0.50, 0.0, 0.0], [0.80, 0.0, 0.0]]], dtype=torch.float32)
-    current_pc = torch.cat([current_xyz, torch.zeros(1, 2, 3)], dim=-1)
-    future_pc = current_pc[:, None].repeat(1, 2, 1, 1)
+    # One gripper-connected rigid point stays fixed in the Ego frame while two
+    # world-static targets shift by -0.10 m as the EEF advances.  This is the
+    # minimum physically consistent fixture for a conditioned-tool sweep.
+    current_xyz = torch.tensor(
+        [[[0.05, 0.0, 0.0], [0.50, 0.0, 0.0], [0.80, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    current_pc = torch.cat([current_xyz, torch.zeros(1, 3, 3)], dim=-1)
+    future_xyz = torch.tensor(
+        [
+            [
+                [[0.05, 0.0, 0.0], [0.50, 0.0, 0.0], [0.80, 0.0, 0.0]],
+                [[0.05, 0.0, 0.0], [0.40, 0.0, 0.0], [0.70, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    future_pc = torch.cat([future_xyz, torch.zeros(1, 2, 3, 3)], dim=-1)
     future_poses = torch.stack(
         [_pose_from_translation([0.0, 0.0, 0.0]), _pose_from_translation([0.10, 0.0, 0.0])]
     ).unsqueeze(0)
@@ -375,13 +667,15 @@ def test_full_episode_pose_trajectory_extends_target_evidence_without_changing_l
         future_poses,
         future_is_pad,
         trajectory_poses=trajectory_poses,
+        trajectory_offsets=torch.tensor([[0, 1, 2]], dtype=torch.long),
     )
 
     assert torch.allclose(local["held_residual"], full["held_residual"])
     assert torch.allclose(local["static_residual"], full["static_residual"])
-    assert full["min_traj_dist"][0, 0] < local["min_traj_dist"][0, 0]
-    assert full["foreground_score"][0, 0] > local["foreground_score"][0, 0]
-    assert full["foreground_score"][0, 0] > full["foreground_score"][0, 1]
+    assert torch.allclose(local["min_traj_dist"], full["min_traj_dist"])
+    assert full["tool_sweep_dist"][0, 1] < local["tool_sweep_dist"][0, 1]
+    assert full["foreground_score"][0, 1] > local["foreground_score"][0, 1]
+    assert full["foreground_score"][0, 1] > full["foreground_score"][0, 2]
 
 
 def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):

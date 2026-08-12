@@ -6,6 +6,7 @@ import torch
 
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
+    _paired_pointseg_cache_contract_mismatches,
 )
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
 from lerobot.scripts.train_song_libero import (
@@ -128,3 +129,52 @@ def test_worldflow_dataset_can_require_command_target_sidecar(tmp_path, dataset_
             chunk_size=4,
             require_action_target_sidecar=True,
         )
+
+
+def _pointseg_manifest(points: int, *, nn_chunk_size: int = 512) -> dict:
+    return {
+        "version": 7,
+        "num_samples": 20_744,
+        "future_offsets": [1, 2, 4, 8, 16, 31],
+        "temporal_offsets": [0, 1, 2, 4, 8, 16, 31],
+        "trajectory_mode": "full_episode",
+        "trajectory_offset_filtering": "future_only",
+        "current_points": points,
+        "future_points": points,
+        "gripper_points": 500,
+        "pseudo_label_policy": "soft_geometric_prior",
+        "pseudo_label_config": {"held_sigma": 0.025, "nn_chunk_size": nn_chunk_size},
+    }
+
+
+def test_full_union_paired_cache_contract_allows_native_primary_point_count_and_compute_chunking():
+    all_view = _pointseg_manifest(19_500, nn_chunk_size=512)
+    primary = _pointseg_manifest(10_000, nn_chunk_size=1024)
+
+    mismatches = _paired_pointseg_cache_contract_mismatches(
+        all_view,
+        primary,
+        camera_view_fusion="full_union",
+        num_views=2,
+        gripper_points=500,
+    )
+
+    assert mismatches == {}
+
+
+def test_full_union_paired_cache_contract_rejects_point_loss_or_semantic_prior_drift():
+    all_view = _pointseg_manifest(19_499, nn_chunk_size=512)
+    primary = _pointseg_manifest(10_000, nn_chunk_size=1024)
+    primary["pseudo_label_config"]["held_sigma"] = 0.03
+
+    mismatches = _paired_pointseg_cache_contract_mismatches(
+        all_view,
+        primary,
+        camera_view_fusion="full_union",
+        num_views=2,
+        gripper_points=500,
+    )
+
+    assert mismatches["current_points"] == (19_499, 10_000)
+    assert mismatches["future_points"] == (19_499, 10_000)
+    assert "pseudo_label_config" in mismatches

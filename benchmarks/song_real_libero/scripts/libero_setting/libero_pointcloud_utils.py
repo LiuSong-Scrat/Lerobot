@@ -845,15 +845,18 @@ def observation_to_model_point_cloud(
     gripper_drop_strategy: str = "tail",
     gripper_shuffle_points: bool = False,
     seed: int = 0,
+    camera_view_weights: Any = None,
+    camera_view_fusion: Any = "legacy_budget",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build the exact fixed-size point cloud expected by single/multi-view training.
+    """Build the point cloud expected by the selected training fusion policy.
 
     Each selected camera first produces its own ``num_points`` cloud.  When the
     gripper cloud is enabled, every per-camera cloud keeps the training layout:
     scene points first and one addressable gripper tail.  The shared training
-    composition helper then returns either the unchanged single-view cloud or a
-    fixed-size multi-view cloud with an equal non-gripper budget per camera and
-    the first camera's gripper tail appended exactly once.
+    composition helper then returns either the unchanged single-view cloud, a
+    fixed-size legacy-budget cloud, or the full multi-view scene union consumed
+    by the shared FPS sampler or primary-residual splitter. The first camera's
+    gripper tail is appended once.
 
     Returns:
       model_point_cloud: xyzrgb in the current end-effector frame.
@@ -864,6 +867,7 @@ def observation_to_model_point_cloud(
     # tools that do not initialize the policy package.
     from lerobot.policies.smolvla.song_pointseg import (
         compose_point_cloud_views,
+        parse_camera_view_fusion,
         parse_camera_views,
     )
 
@@ -911,8 +915,23 @@ def observation_to_model_point_cloud(
         stored_view_clouds,
         gripper_points=gripper_points if bool(add_gripper_cloud) else 0,
         seed=int(seed),
+        view_weights=camera_view_weights,
+        fusion=camera_view_fusion,
     )
-    expected_shape = (total_points, 6)
+    expected_points = total_points
+    fusion_mode = parse_camera_view_fusion(camera_view_fusion)
+    if fusion_mode in {
+        "fps",
+        "voxel_fps",
+        "voxel_cover_fps",
+        "novelty_union",
+        "transport_novelty_union",
+        "full_union",
+        "primary_residual",
+    } and len(views) > 1:
+        scene_points = total_points - (gripper_points if bool(add_gripper_cloud) else 0)
+        expected_points = len(views) * scene_points + (gripper_points if bool(add_gripper_cloud) else 0)
+    expected_shape = (expected_points, 6)
     if model_point_cloud.shape != expected_shape:
         raise RuntimeError(
             f"Expected composed model point cloud shape {expected_shape}, got {model_point_cloud.shape}."

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -58,7 +59,46 @@ class SmolVLAConfig(PreTrainedConfig):
     # legacy checkpoints by coupling RGB selection to point-cloud selection.
     camera_views: str = "agentview"
     rgb_camera_views: str | None = None
-
+    # Optional scene-point budget ratios in camera_views order. None preserves
+    # the legacy equal split, so existing multi-view checkpoints keep the exact
+    # composition they were trained with. Example: "9,1" retains 90% of the
+    # agentview scene budget while adding 10% eye-in-hand coverage.
+    camera_view_weights: str | None = None
+    # Multi-view composition policy. ``legacy_budget`` preserves every old
+    # checkpoint exactly. ``fps`` forms an equal union of every view's scene
+    # points, keeps one gripper tail, and downsamples on-device with FPS.
+    # ``voxel_fps`` first removes repeated occupied voxels from the shared
+    # spatial union, then applies the same FPS contract.
+    # ``voxel_cover_fps`` retains one representative of every occupied voxel
+    # when possible, then fills remaining detail slots in union-FPS order.
+    # ``transport_novelty_union`` preserves every primary occupied voxel and
+    # inserts secondary novel voxels through local one-to-one replacements.
+    # ``full_union`` preserves every scene point from every selected view and
+    # appends the primary gripper tail once. It changes only the input length;
+    # no model module or checkpoint parameter is added.
+    # ``primary_residual`` keeps the primary cloud byte-identical and encodes
+    # the second view through a zero-initialized matrix residual.
+    camera_view_fusion: str = "legacy_budget"
+    camera_view_fps_target_points: int = 10_000
+    camera_view_fps_gripper_points: int = 500
+    camera_view_voxel_size: float = 0.005
+    multiview_pretrained_lr_multiplier: float = 1.0
+    multiview_residual_lr_multiplier: float = 1.0
+    # Discriminative fine-tuning for input-layer multi-view fusion. All
+    # parameters remain trainable; the point-input path can adapt faster than
+    # the pretrained action path to reduce catastrophic forgetting.
+    multiview_input_pretrained_lr_multiplier: float = 1.0
+    multiview_input_point_lr_multiplier: float = 1.0
+    # Training-only input augmentation: deterministically expose roughly half
+    # the frames as the original primary view and half as the all-view fused
+    # cloud. Inference still uses every configured view. No model module or
+    # learned gate is introduced.
+    multiview_input_view_dropout_enable: bool = False
+    multiview_input_view_dropout_seed: int = 20260812
+    # Expand training to two complementary entries per frame: primary-only
+    # and all-view input. This gives both input domains full data coverage
+    # without changing model layers or inference behavior.
+    multiview_input_view_dropout_paired_coverage: bool = False
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
@@ -119,6 +159,9 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_aux_loss_weight: float = 0.20
     pointseg_use_temporal_priors_as_input: bool = False
     pointseg_use_pseudo_selection: bool = True
+    # Preserve pretrained LitePT/PointSeg population statistics during
+    # small-data fine-tuning. BatchNorm affine parameters remain trainable.
+    pointseg_freeze_batchnorm_stats: bool = False
     point_action_fusion_enable: bool = True
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
@@ -156,6 +199,23 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_rot_weight: float = 1.0
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
+    # Two-timescale fine-tuning keeps the pretrained Ego/shared path plastic
+    # while allowing randomly initialized World/fusion modules to catch up.
+    # Both multipliers must stay positive: zero would silently freeze a branch.
+    # Defaults preserve the historical single-learning-rate optimizer exactly.
+    worldflow_pretrained_lr_multiplier: float = 1.0
+    worldflow_new_lr_multiplier: float = 1.0
+    # Optional one-shot initialization used when adapting an Ego checkpoint:
+    # copy shape-compatible Ego action/point modules into the World stream,
+    # while keeping both streams trainable. This is not applied when loading a
+    # trained WorldFlow checkpoint unless explicitly requested by the caller.
+    worldflow_bootstrap_from_ego: bool = False
+    # Optional bounded residual gate from the joint World--Ego prediction back
+    # into the Ego action velocity. None preserves legacy WorldFlow checkpoint
+    # behavior (full joint prediction). New baseline-guarded experiments use
+    # 0.0, which is exactly the original Ego policy at initialization while the
+    # World branch learns from its own auxiliary losses.
+    worldflow_ego_residual_gate_init: float | None = None
     # 0 keeps the complete predicted foreground. A positive value is an
     # optional memory cap applied after PointSeg foreground selection.
     worldflow_max_points: int = 0
@@ -185,6 +245,25 @@ class SmolVLAConfig(PreTrainedConfig):
     # Gaussian rotation-6D vectors are not elements of SE(3) and therefore
     # cannot be conjugated safely.
     worldflow_noise_coupling: str = "independent"
+    # ``global`` is the historical spatial-transform frame G=CBC^-1. Its
+    # translation contains a world-origin lever-arm term. ``current_ee`` keeps
+    # world-aligned axes but places the origin at the current EEF, yielding an
+    # exactly invertible, better-conditioned conjugacy without that term.
+    worldflow_frame_origin: str = "global"
+    # ``cross_attention`` preserves historical checkpoints: World affects the
+    # Ego head only through token exchange. ``symmetric_twist`` additionally
+    # maps the World spatial twist back to Ego coordinates with the exact SE(3)
+    # adjoint and averages the two physical predictions with fixed 1:1 weight.
+    # ``conjugate_residual`` derives an exact World baseline from Ego and lets
+    # a zero-initialized World head predict a residual correction. The
+    # checkpoint-compatible ``conjugate_residual_consensus`` splits that
+    # correction equally between the two coordinate descriptions, then derives
+    # World exactly from the corrected Ego twist. ``conjugate_residual_boosting``
+    # has the same forward contract but stops the direct Ego-score gradient in
+    # the World auxiliary objective. This makes the World residual learn the
+    # remaining Ego error instead of allowing the two predictors to cancel.
+    # These are deterministic geometry/fixed fusion contracts, not learned gates.
+    worldflow_action_fusion: str = "cross_attention"
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -200,9 +279,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # analytically projects their instantaneous rigid-body derivative onto a
     # spatial SE(3) twist. ``pose9_endpoint`` instead preserves the old flow
     # head's endpoint semantics: x_t + (1-t) v_pose9 is projected to SE(3), then
-    # converted to the exact left-trivialized geodesic velocity from x_t. All
-    # modes use the same manifold-valued prior, geodesic training path and
-    # group integration; only the output parameterization differs.
+    # converted to the exact left-trivialized geodesic velocity from x_t.
+    # ``pose9_chart_endpoint`` additionally keeps the original v0.4.2
+    # Euclidean pose9 chart as the Action Expert input while carrying a
+    # separate physical state on SE(3). This preserves checkpoint input and
+    # endpoint semantics without giving up group integration or World/Ego
+    # conjugacy. All modes use a manifold-valued physical state.
     se3_twist_head_mode: str = "direct_twist"
     se3_noise_trans_scale: float = 0.15
     se3_noise_rot_scale: float = 0.75
@@ -269,6 +351,82 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.camera_view_fusion not in {
+            "legacy_budget",
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+            "primary_residual",
+        }:
+            raise ValueError(
+                "camera_view_fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
+                "'voxel_cover_fps', 'novelty_union', 'transport_novelty_union', "
+                "'uniform_union', 'full_union', "
+                "or 'primary_residual'; "
+                f"got {self.camera_view_fusion!r}."
+            )
+        if int(self.camera_view_fps_target_points) <= 0:
+            raise ValueError("camera_view_fps_target_points must be positive.")
+        if not 0 <= int(self.camera_view_fps_gripper_points) < int(self.camera_view_fps_target_points):
+            raise ValueError(
+                "camera_view_fps_gripper_points must be in [0, camera_view_fps_target_points)."
+            )
+        if not math.isfinite(float(self.camera_view_voxel_size)) or float(self.camera_view_voxel_size) <= 0.0:
+            raise ValueError("camera_view_voxel_size must be finite and positive.")
+        if self.camera_view_fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+            "primary_residual",
+        } and self.camera_view_weights not in {None, ""}:
+            raise ValueError(
+                f"camera_view_weights cannot be combined with camera_view_fusion={self.camera_view_fusion!r}; "
+                "equal-union fusion does not use a hand-chosen view ratio."
+            )
+        if float(self.multiview_input_pretrained_lr_multiplier) <= 0:
+            raise ValueError("multiview_input_pretrained_lr_multiplier must be positive; zero would freeze parameters.")
+        if float(self.multiview_input_point_lr_multiplier) <= 0:
+            raise ValueError("multiview_input_point_lr_multiplier must be positive; zero would freeze parameters.")
+        if self.multiview_input_view_dropout_enable:
+            if self.camera_view_fusion not in {
+                "fps",
+                "novelty_union",
+                "transport_novelty_union",
+                "uniform_union",
+                "full_union",
+            }:
+                raise ValueError(
+                    "multiview_input_view_dropout_enable currently requires "
+                    "camera_view_fusion='fps', 'novelty_union', "
+                    "'transport_novelty_union', 'uniform_union', or 'full_union'."
+                )
+            views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())
+            if len(views) < 2:
+                raise ValueError("multiview_input_view_dropout_enable requires at least two camera_views.")
+        elif self.multiview_input_view_dropout_paired_coverage:
+            raise ValueError(
+                "multiview_input_view_dropout_paired_coverage requires "
+                "multiview_input_view_dropout_enable=true."
+            )
+        if self.camera_view_fusion == "primary_residual":
+            views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())
+            if len(views) != 2:
+                raise ValueError(
+                    "camera_view_fusion='primary_residual' requires exactly two camera_views; "
+                    f"got {views}."
+                )
+            if float(self.multiview_pretrained_lr_multiplier) <= 0:
+                raise ValueError("multiview_pretrained_lr_multiplier must be positive.")
+            if float(self.multiview_residual_lr_multiplier) <= 0:
+                raise ValueError("multiview_residual_lr_multiplier must be positive.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -314,10 +472,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "direct_twist",
                 "projected_pose9",
                 "pose9_endpoint",
+                "pose9_chart_endpoint",
             }:
                 raise ValueError(
                     "se3_twist_head_mode must be 'direct_twist', 'projected_pose9', "
-                    "or 'pose9_endpoint'; "
+                    "'pose9_endpoint', or 'pose9_chart_endpoint'; "
                     f"got {self.se3_twist_head_mode!r}."
                 )
             for name in (
@@ -355,13 +514,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 if float(getattr(self, name)) < 0:
                     raise ValueError(f"{name} must be non-negative.")
         if self.worldflow_se3_head_enable:
-            warnings.warn(
-                "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "WorldFlow directly flow-matches an SE(3) spatial transform through its "
-                "LitePT/PointAction front-end and the shared World–Ego Action Expert.",
-                stacklevel=2,
-            )
+            if not self.worldflow_enable:
+                raise ValueError("worldflow_se3_head_enable=True requires worldflow_enable=True.")
+            if not self.se3_enable:
+                raise ValueError("worldflow_se3_head_enable=True requires se3_enable=True.")
         if self.worldflow_enable:
+            if self.worldflow_pretrained_lr_multiplier <= 0:
+                raise ValueError("worldflow_pretrained_lr_multiplier must be positive; zero would freeze Ego.")
+            if self.worldflow_new_lr_multiplier <= 0:
+                raise ValueError("worldflow_new_lr_multiplier must be positive; zero would freeze World.")
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError(
@@ -386,6 +547,31 @@ class SmolVLAConfig(PreTrainedConfig):
                     "worldflow_noise_coupling must be 'independent' or 'conjugate_ego'; "
                     f"got {self.worldflow_noise_coupling!r}."
                 )
+            if self.worldflow_frame_origin not in {"global", "current_ee"}:
+                raise ValueError(
+                    "worldflow_frame_origin must be 'global' or 'current_ee'; "
+                    f"got {self.worldflow_frame_origin!r}."
+                )
+            if self.worldflow_action_fusion not in {
+                "cross_attention",
+                "symmetric_twist",
+                "conjugate_residual",
+                "conjugate_residual_consensus",
+                "conjugate_residual_boosting",
+            }:
+                raise ValueError(
+                    "worldflow_action_fusion must be 'cross_attention', 'symmetric_twist', "
+                    "'conjugate_residual', 'conjugate_residual_consensus', or "
+                    "'conjugate_residual_boosting'; "
+                    f"got {self.worldflow_action_fusion!r}."
+                )
+            if self.worldflow_action_fusion in {
+                "symmetric_twist",
+                "conjugate_residual",
+                "conjugate_residual_consensus",
+                "conjugate_residual_boosting",
+            } and not self.se3_enable:
+                raise ValueError(f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires se3_enable=True.")
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable
             ):
@@ -492,8 +678,19 @@ class SmolVLAConfig(PreTrainedConfig):
                 float(self.se3_noise_rot_scale),
                 float(self.se3_noise_gripper_scale),
             )
-            origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
-            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            if self.se3_twist_head_mode == "pose9_chart_endpoint":
+                origin = (
+                    "pose9_chart_zero_projected_to_se3"
+                    if scales == (0.0, 0.0, 0.0)
+                    else "v0.4.2_pose9_chart_gaussian_projected_to_se3"
+                )
+                origin = (
+                    f"{origin}(trans={scales[0]},rot6d={scales[1]},"
+                    f"gripper={scales[2]})"
+                )
+            else:
+                origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
+                origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
             flow = f"se3_geodesic_left_trivialized(head={self.se3_twist_head_mode})"
         elif self.pose9_action_noise_enable:
             scales = (

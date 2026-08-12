@@ -49,11 +49,20 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
     compose_point_cloud_views,
+    fps_sample_fused_point_cloud,
+    voxel_fps_sample_fused_point_cloud,
+    voxel_cover_fps_sample_fused_point_cloud,
+    novelty_union_sample_fused_point_cloud,
+    transport_novelty_union_sample_fused_point_cloud,
     generate_pseudo_labels,
     open_episode_point_clouds,
     parse_camera_views,
+    parse_camera_view_fusion,
+    parse_camera_view_weights,
+    paired_view_augmentation_index,
     point_cloud_dir_for_view,
     song_pointseg_collate,
+    use_primary_view_for_training_index,
     write_role_ply,
 )
 from lerobot.rl.wandb_utils import WandBLogger
@@ -105,6 +114,41 @@ def validate_policy_camera_cli_overrides(cfg: TrainPipelineConfig) -> dict[str, 
                 f"resolved cfg.policy.{field_name}={resolved_value!r}. "
                 "Refusing to train with an unintended camera modality."
             )
+    raw_weights = parser.parse_arg("policy.camera_view_weights")
+    if raw_weights is not None:
+        num_views = len(parse_camera_views(getattr(cfg.policy, "camera_views", "agentview")))
+        expected_weights = parse_camera_view_weights(raw_weights, num_views=num_views)
+        resolved_raw = getattr(cfg.policy, "camera_view_weights", None)
+        resolved_weights = parse_camera_view_weights(resolved_raw, num_views=num_views)
+        provenance["camera_view_weights"] = {
+            "cli_raw": raw_weights,
+            "cli_parsed": list(expected_weights or ()),
+            "resolved_raw": resolved_raw,
+            "resolved_parsed": list(resolved_weights or ()),
+        }
+        if resolved_weights != expected_weights:
+            raise RuntimeError(
+                f"Explicit --policy.camera_view_weights={raw_weights!r} was not applied: "
+                f"resolved value={resolved_raw!r}. Refusing to train with an unintended "
+                "multi-view point budget."
+            )
+    raw_fusion = parser.parse_arg("policy.camera_view_fusion")
+    if raw_fusion is not None:
+        expected_fusion = parse_camera_view_fusion(raw_fusion)
+        resolved_raw = getattr(cfg.policy, "camera_view_fusion", "legacy_budget")
+        resolved_fusion = parse_camera_view_fusion(resolved_raw)
+        provenance["camera_view_fusion"] = {
+            "cli_raw": raw_fusion,
+            "cli_parsed": expected_fusion,
+            "resolved_raw": resolved_raw,
+            "resolved_parsed": resolved_fusion,
+        }
+        if resolved_fusion != expected_fusion:
+            raise RuntimeError(
+                f"Explicit --policy.camera_view_fusion={raw_fusion!r} was not applied: "
+                f"resolved value={resolved_raw!r}."
+            )
+
     return provenance
 
 
@@ -126,8 +170,29 @@ def validate_policy_camera_config_matches_training_config(
                 f"policy.config.{field_name}={model_value!r}. "
                 "Refusing to create a checkpoint with contradictory metadata."
             )
+    num_views = len(parse_camera_views(getattr(cfg.policy, "camera_views", "agentview")))
+    train_weights = parse_camera_view_weights(
+        getattr(cfg.policy, "camera_view_weights", None),
+        num_views=num_views,
+    )
+    model_weights = parse_camera_view_weights(
+        getattr(policy.config, "camera_view_weights", None),
+        num_views=num_views,
+    )
+    if train_weights != model_weights:
+        raise RuntimeError(
+            "Camera view weights diverged while loading the policy: "
+            f"training={train_weights}, model={model_weights}."
+        )
 
 
+    train_fusion = parse_camera_view_fusion(getattr(cfg.policy, "camera_view_fusion", None))
+    model_fusion = parse_camera_view_fusion(getattr(policy.config, "camera_view_fusion", None))
+    if train_fusion != model_fusion:
+        raise RuntimeError(
+            "Camera view fusion diverged while loading the policy: "
+            f"training={train_fusion!r}, model={model_fusion!r}."
+        )
 def write_training_camera_provenance(
     cfg: TrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -141,8 +206,10 @@ def write_training_camera_provenance(
     # The active memmap wrapper reads point clouds from dataset.root. Retain a
     # compatibility fallback for older launch configs that exposed a separate
     # point_cloud_memmap_dir field.
-    cache_dir = getattr(cfg, "point_cloud_memmap_dir", None) or getattr(
-        cfg.dataset, "root", None
+    cache_dir = (
+        getattr(cfg, "pointseg_sample_cache_dir", None)
+        or getattr(cfg, "point_cloud_memmap_dir", None)
+        or getattr(cfg.dataset, "root", None)
     )
     manifest_path = Path(cache_dir) / "manifest.json" if cache_dir else None
     if manifest_path is not None and manifest_path.is_file():
@@ -152,9 +219,30 @@ def write_training_camera_provenance(
             key: manifest.get(key)
             for key in (
                 "camera_views",
+                "camera_view_weights",
                 "gripper_points",
+                "camera_view_fusion",
                 "current_points",
                 "future_points",
+                "trajectory_offset_filtering",
+            )
+        }
+    primary_manifest_summary: dict[str, Any] | None = None
+    primary_cache_dir = getattr(cfg, "pointseg_primary_sample_cache_dir", None)
+    primary_manifest_path = Path(primary_cache_dir) / "manifest.json" if primary_cache_dir else None
+    if primary_manifest_path is not None and primary_manifest_path.is_file():
+        with open(primary_manifest_path, encoding="utf-8") as manifest_file:
+            primary_manifest = json.load(manifest_file)
+        primary_manifest_summary = {
+            key: primary_manifest.get(key)
+            for key in (
+                "camera_views",
+                "camera_view_weights",
+                "gripper_points",
+                "camera_view_fusion",
+                "current_points",
+                "future_points",
+                "trajectory_offset_filtering",
             )
         }
 
@@ -168,16 +256,42 @@ def write_training_camera_provenance(
         "resolved_train_config": {
             "camera_views": getattr(cfg.policy, "camera_views", None),
             "rgb_camera_views": getattr(cfg.policy, "rgb_camera_views", None),
+            "camera_view_weights": getattr(cfg.policy, "camera_view_weights", None),
+            "camera_view_fusion": getattr(cfg.policy, "camera_view_fusion", None),
+            "multiview_input_view_dropout_enable": getattr(
+                cfg.policy, "multiview_input_view_dropout_enable", False
+            ),
+            "multiview_input_view_dropout_seed": getattr(
+                cfg.policy, "multiview_input_view_dropout_seed", None
+            ),
+            "multiview_input_view_dropout_paired_coverage": getattr(
+                cfg.policy, "multiview_input_view_dropout_paired_coverage", False
+            ),
         },
         "resolved_policy_config": {
             "camera_views": getattr(policy.config, "camera_views", None),
             "rgb_camera_views": getattr(policy.config, "rgb_camera_views", None),
+            "camera_view_weights": getattr(policy.config, "camera_view_weights", None),
             "image_features": sorted(getattr(policy.config, "image_features", {})),
+            "camera_view_fusion": getattr(policy.config, "camera_view_fusion", None),
+            "multiview_input_view_dropout_enable": getattr(
+                policy.config, "multiview_input_view_dropout_enable", False
+            ),
+            "multiview_input_view_dropout_seed": getattr(
+                policy.config, "multiview_input_view_dropout_seed", None
+            ),
+            "multiview_input_view_dropout_paired_coverage": getattr(
+                policy.config, "multiview_input_view_dropout_paired_coverage", False
+            ),
         },
         "point_cloud_cache_manifest_path": (
             None if manifest_path is None else str(manifest_path)
         ),
         "point_cloud_cache_manifest": manifest_summary,
+        "primary_point_cloud_cache_manifest_path": (
+            None if primary_manifest_path is None else str(primary_manifest_path)
+        ),
+        "primary_point_cloud_cache_manifest": primary_manifest_summary,
     }
     path = output_dir / "camera_training_provenance.json"
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -197,12 +311,21 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        camera_view_weights: Any = None,
+        camera_view_fusion: Any = "legacy_budget",
+        camera_view_voxel_size: float = 0.005,
         gripper_points: int = 500,
     ):
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
         self.dataset_root = self.point_cloud_dir.parent
         self.camera_views = parse_camera_views(camera_views)
+        self.camera_view_weights = parse_camera_view_weights(
+            camera_view_weights,
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
+        self.camera_view_voxel_size = float(camera_view_voxel_size)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -257,6 +380,8 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
+            view_weights=self.camera_view_weights,
+            fusion=self.camera_view_fusion,
         )
 
     def __getitem__(self, idx):
@@ -264,6 +389,25 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         point_cloud = self._point_cloud_frame(episode_index, frame_index).copy()
+        if self.camera_view_fusion in {
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+        }:
+            # Raw/no-cache training still obeys the same input-adapter contract:
+            # the policy model never receives the multi-view union.
+            sampler = {
+                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
+                "novelty_union": novelty_union_sample_fused_point_cloud,
+                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
+            }[self.camera_view_fusion]
+            sampled, _point_is_pad, _indices = sampler(
+                torch.from_numpy(point_cloud).unsqueeze(0),
+                target_points=10_000,
+                gripper_points=self.gripper_points,
+                voxel_size=self.camera_view_voxel_size,
+            )
+            point_cloud = sampled.squeeze(0).numpy().copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
 
@@ -414,6 +558,71 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         return item
 
 
+def _paired_pointseg_cache_contract_mismatches(
+    all_view_manifest: dict[str, Any],
+    primary_manifest: dict[str, Any],
+    *,
+    camera_view_fusion: str,
+    num_views: int,
+    gripper_points: int,
+) -> dict[str, tuple[Any, Any]]:
+    """Compare semantic cache contracts for exact primary/all-view pairing.
+
+    ``full_union`` deliberately has a variable input length: every view keeps
+    all of its scene points while only the primary gripper tail is retained.
+    The primary replay therefore remains the checkpoint-native 10k cloud and
+    is padded by ``song_pointseg_collate`` next to the 19.5k two-view cloud.
+
+    ``nn_chunk_size`` only tiles exact nearest-neighbour computation.  It does
+    not change the pseudo-label definition and may differ between caches made
+    for different point counts.
+    """
+
+    matching_fields = (
+        "version",
+        "num_samples",
+        "future_offsets",
+        "temporal_offsets",
+        "trajectory_mode",
+        "trajectory_offset_filtering",
+        "gripper_points",
+        "pseudo_label_policy",
+    )
+    mismatches = {
+        key: (all_view_manifest.get(key), primary_manifest.get(key))
+        for key in matching_fields
+        if all_view_manifest.get(key) != primary_manifest.get(key)
+    }
+
+    def semantic_pseudo_config(manifest: dict[str, Any]) -> Any:
+        config = manifest.get("pseudo_label_config")
+        if not isinstance(config, dict):
+            return config
+        return {key: value for key, value in config.items() if key != "nn_chunk_size"}
+
+    all_pseudo_config = semantic_pseudo_config(all_view_manifest)
+    primary_pseudo_config = semantic_pseudo_config(primary_manifest)
+    if all_pseudo_config != primary_pseudo_config:
+        mismatches["pseudo_label_config"] = (all_pseudo_config, primary_pseudo_config)
+
+    for field in ("current_points", "future_points"):
+        all_points = all_view_manifest.get(field)
+        primary_points = primary_manifest.get(field)
+        if camera_view_fusion == "full_union":
+            try:
+                expected_all_points = (
+                    int(num_views) * (int(primary_points) - int(gripper_points))
+                    + int(gripper_points)
+                )
+            except (TypeError, ValueError):
+                expected_all_points = None
+            if int(num_views) < 1 or expected_all_points != all_points:
+                mismatches[field] = (all_points, primary_points)
+        elif all_points != primary_points:
+            mismatches[field] = (all_points, primary_points)
+    return mismatches
+
+
 class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
     """Inject offline temporal pointseg samples into the action-training dataset."""
 
@@ -436,16 +645,34 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         strict: bool = True,
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        camera_view_weights: Any = None,
+        camera_view_fusion: Any = "legacy_budget",
+        camera_view_voxel_size: float = 0.005,
         gripper_points: int = 500,
+        primary_cache_dir: str | Path | None = None,
+        view_dropout_enable: bool = False,
+        view_dropout_seed: int = 20260812,
+        view_dropout_paired_coverage: bool = False,
     ):
         self.dataset = dataset
         self.cache = SongPointSegCachedDataset(cache_dir)
+        self.primary_cache = (
+            SongPointSegCachedDataset(primary_cache_dir)
+            if primary_cache_dir is not None and str(primary_cache_dir).strip()
+            else None
+        )
         root_value = getattr(dataset, "root", None)
         if root_value is None:
             root_value = dataset.meta.root
         root = Path(root_value)
         self.point_cloud_dir = Path(point_cloud_dir) if point_cloud_dir is not None else root / "point_clouds"
         self.camera_views = parse_camera_views(camera_views)
+        self.camera_view_weights = parse_camera_view_weights(
+            camera_view_weights,
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
+        self.camera_view_voxel_size = float(camera_view_voxel_size)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -455,10 +682,77 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             for view in self.camera_views
         }
         self.gripper_points = int(gripper_points)
+        self.view_dropout_enable = bool(view_dropout_enable)
+        self.view_dropout_seed = int(view_dropout_seed)
+        self.view_dropout_paired_coverage = bool(view_dropout_paired_coverage)
+        if self.view_dropout_paired_coverage and not self.view_dropout_enable:
+            raise ValueError("Paired view coverage requires input-level view dropout.")
         cached_views = self.cache.manifest.get("camera_views")
         if cached_views is not None and tuple(cached_views) != self.camera_views:
             raise ValueError(
                 f"PointSeg cache views {tuple(cached_views)} do not match training views {self.camera_views}."
+            )
+        cached_fusion = parse_camera_view_fusion(self.cache.manifest.get("camera_view_fusion"))
+        if cached_fusion != self.camera_view_fusion:
+            raise ValueError(
+                f"PointSeg cache fusion {cached_fusion!r} does not match training fusion {self.camera_view_fusion!r}."
+            )
+        if self.camera_view_fusion in {
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+        }:
+            cached_voxel_size = float(self.cache.manifest.get("camera_view_voxel_size", -1.0))
+            if cached_voxel_size != self.camera_view_voxel_size:
+                raise ValueError(
+                    f"PointSeg cache voxel size {cached_voxel_size} does not match training "
+                    f"voxel size {self.camera_view_voxel_size}."
+                )
+        cached_weights = parse_camera_view_weights(
+            self.cache.manifest.get("camera_view_weights"),
+            num_views=len(self.camera_views),
+        )
+        if cached_weights != self.camera_view_weights:
+            raise ValueError(
+                "PointSeg cache camera_view_weights "
+                f"{cached_weights} do not match training weights {self.camera_view_weights}. "
+                "Rebuild the cache with the same per-view point budget."
+            )
+        if self.view_dropout_enable:
+            if self.primary_cache is None:
+                raise ValueError(
+                    "Input-level view dropout requires pointseg_primary_sample_cache_dir so "
+                    "primary-only inputs always use matching PointSeg labels."
+                )
+            primary_manifest = self.primary_cache.manifest
+            primary_views = tuple(primary_manifest.get("camera_views") or ("agentview",))
+            if primary_views != (self.camera_views[0],):
+                raise ValueError(
+                    f"Primary replay cache views {primary_views} must contain only "
+                    f"the first configured view {(self.camera_views[0],)}."
+                )
+            primary_fusion = parse_camera_view_fusion(primary_manifest.get("camera_view_fusion"))
+            if primary_fusion != "legacy_budget":
+                raise ValueError(
+                    f"Primary replay cache must use legacy_budget single-view identity, got {primary_fusion!r}."
+                )
+            mismatches = _paired_pointseg_cache_contract_mismatches(
+                self.cache.manifest,
+                primary_manifest,
+                camera_view_fusion=self.camera_view_fusion,
+                num_views=len(self.camera_views),
+                gripper_points=self.gripper_points,
+            )
+            if mismatches:
+                raise ValueError(
+                    "Primary and all-view PointSeg cache contracts differ: "
+                    f"{mismatches}. Rebuild them with identical temporal and pseudo-label settings."
+                )
+        elif self.primary_cache is not None:
+            raise ValueError(
+                "pointseg_primary_sample_cache_dir was provided but "
+                "multiview_input_view_dropout_enable is false."
             )
         self.strict = strict
         self.mmap_mode = mmap_mode
@@ -467,6 +761,11 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Song pointseg cache has {len(self.cache)} samples but action dataset has {len(self.dataset)}. "
                 "Rebuild the cache without --max-samples, or set SONG_POINTSEG_CACHE_STRICT=0 for debugging."
+            )
+        if self.strict and self.primary_cache is not None and len(self.primary_cache) < len(self.dataset):
+            raise ValueError(
+                f"Primary PointSeg cache has {len(self.primary_cache)} samples but action dataset has "
+                f"{len(self.dataset)}. Rebuild the paired primary cache for the same episodes."
             )
 
     def __getattr__(self, name):
@@ -478,7 +777,14 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         return state
 
     def __len__(self):
-        return len(self.dataset)
+        multiplier = 2 if self.view_dropout_paired_coverage else 1
+        return multiplier * len(self.dataset)
+
+    @property
+    def num_frames(self) -> int:
+        """Report augmented frame count so epoch metrics match paired coverage."""
+
+        return len(self)
 
     @staticmethod
     def _to_int(value) -> int:
@@ -510,6 +816,8 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
+            view_weights=self.camera_view_weights,
+            fusion=self.camera_view_fusion,
         )
 
     def _check_alignment(self, item: dict[str, Any], cache_item: dict[str, torch.Tensor], idx: int) -> None:
@@ -531,20 +839,43 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
                 )
 
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        if idx >= len(self.cache):
+        if self.view_dropout_paired_coverage:
+            base_idx, use_primary = paired_view_augmentation_index(
+                idx,
+                len(self.dataset),
+                self.view_dropout_seed,
+            )
+        else:
+            base_idx = int(idx)
+            use_primary = bool(
+                self.view_dropout_enable
+                and self.primary_cache is not None
+                and use_primary_view_for_training_index(base_idx, self.view_dropout_seed)
+            )
+        item = self.dataset[base_idx]
+        if base_idx >= len(self.cache):
             if self.strict:
-                raise IndexError(f"Song pointseg cache is missing dataset index {idx}.")
+                raise IndexError(f"Song pointseg cache is missing dataset index {base_idx}.")
             return item
 
-        cache_item = self.cache[idx]
-        self._check_alignment(item, cache_item, idx)
+        active_cache = self.primary_cache if use_primary else self.cache
+        assert active_cache is not None
+        cache_item = active_cache[base_idx]
+        self._check_alignment(item, cache_item, base_idx)
         if "observation.point_cloud" not in cache_item and "observation.point_cloud_indices" in cache_item:
             episode_index = self._to_int(cache_item["episode_index"])
             frame_index = self._to_int(cache_item["frame_index"])
             indices = cache_item["observation.point_cloud_indices"].detach().cpu().numpy().astype(np.int64)
+            full_point_cloud = (
+                np.asarray(
+                    self._episode_point_clouds(self.camera_views[0], episode_index)[frame_index],
+                    dtype=np.float32,
+                )
+                if use_primary
+                else self._point_cloud_frame(episode_index, frame_index)
+            )
             point_cloud = np.asarray(
-                self._point_cloud_frame(episode_index, frame_index)[indices],
+                full_point_cloud if self.camera_view_fusion == "primary_residual" and not use_primary else full_point_cloud[indices],
                 dtype=np.float32,
             ).copy()
             cache_item["observation.point_cloud"] = torch.from_numpy(point_cloud)
@@ -591,8 +922,13 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
             camera_views=getattr(policy_cfg, "camera_views", "agentview"),
+            camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
+            camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
             gripper_points=self._env_int("SONG_POINTCLOUD_GRIPPER_POINTS", 500),
             mmap_mode=mmap_mode,
+        )
+        self.dataset.camera_view_voxel_size = float(
+            getattr(policy_cfg, "camera_view_voxel_size", 0.005)
         )
         self.current_points = int(self.dataset.current_points)
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -638,6 +974,12 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
     def make_collate_fn(self):
         return OnlinePointSegBatchCollator(
             current_points=self.current_points,
+            future_points=int(self.dataset.future_points),
+            camera_view_fusion=self.dataset.camera_view_fusion,
+            camera_view_voxel_size=float(
+                getattr(self.dataset, "camera_view_voxel_size", 0.005)
+            ),
+            gripper_points=int(self.dataset.gripper_points),
             device=self.device,
             pseudo_config=self.pseudo_config,
         )
@@ -648,8 +990,22 @@ class OnlinePointSegBatchCollator:
 
     transient_keys = OnlinePointSegPseudoDataset.transient_keys
 
-    def __init__(self, *, current_points: int, device: torch.device, pseudo_config: PseudoLabelConfig):
+    def __init__(
+        self,
+        *,
+        current_points: int,
+        future_points: int,
+        camera_view_fusion: str,
+        camera_view_voxel_size: float,
+        gripper_points: int,
+        device: torch.device,
+        pseudo_config: PseudoLabelConfig,
+    ):
         self.current_points = int(current_points)
+        self.future_points = int(future_points)
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
+        self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.gripper_points = int(gripper_points)
         self.device = torch.device(device)
         self.pseudo_config = pseudo_config
         self.profile_freq = int(os.environ.get("SONG_POINTSEG_PROFILE_FREQ", "0") or 0)
@@ -676,6 +1032,67 @@ class OnlinePointSegBatchCollator:
                 if bool(future_point_is_pad.any().item())
                 else None
             )
+        if self.camera_view_fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+        }:
+            sampler = {
+                "fps": fps_sample_fused_point_cloud,
+                "voxel_fps": voxel_fps_sample_fused_point_cloud,
+                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
+                "novelty_union": novelty_union_sample_fused_point_cloud,
+                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
+            }[self.camera_view_fusion]
+            sampler_kwargs = (
+                {"voxel_size": self.camera_view_voxel_size}
+                if self.camera_view_fusion
+                in {
+                    "voxel_fps",
+                    "voxel_cover_fps",
+                    "novelty_union",
+                    "transport_novelty_union",
+                }
+                else {}
+            )
+            current_pc, current_is_pad, _ = sampler(
+                current_pc,
+                target_points=self.current_points,
+                gripper_points=self.gripper_points,
+                point_is_pad=current_is_pad,
+                **sampler_kwargs,
+            )
+            batch_size, time_steps, source_points, channels = future_pc.shape
+            future_pc, future_point_is_pad, _ = sampler(
+                future_pc.reshape(batch_size * time_steps, source_points, channels),
+                target_points=self.future_points,
+                gripper_points=self.gripper_points,
+                point_is_pad=(
+                    future_point_is_pad.reshape(batch_size * time_steps, source_points)
+                    if torch.is_tensor(future_point_is_pad)
+                    else None
+                ),
+                **sampler_kwargs,
+            )
+            future_pc = future_pc.reshape(
+                batch_size,
+                time_steps,
+                self.future_points,
+                channels,
+            )
+            if torch.is_tensor(future_point_is_pad):
+                future_point_is_pad = future_point_is_pad.reshape(
+                    batch_size,
+                    time_steps,
+                    self.future_points,
+                )
+            # Avoid running FPS a second time in SmolVLAPolicy and keep online
+            # pseudo-label tensors exactly aligned with the model input.
+            batch["observation.point_cloud"] = current_pc.detach().cpu()
+            if torch.is_tensor(current_is_pad):
+                batch["observation.point_cloud_is_pad"] = current_is_pad.detach().cpu()
         t2 = time.perf_counter()
         with torch.inference_mode():
             pseudo = generate_pseudo_labels(
@@ -687,6 +1104,9 @@ class OnlinePointSegBatchCollator:
                 future_point_is_pad=future_point_is_pad,
                 trajectory_poses=batch["pointseg_trajectory_ee_poses"].to(
                     device=self.device, dtype=torch.float32
+                ),
+                trajectory_offsets=batch["pointseg_trajectory_offsets"].to(
+                    device=self.device, dtype=torch.long
                 ),
                 config=self.pseudo_config,
             )
@@ -718,8 +1138,17 @@ class OnlinePointSegBatchCollator:
         return batch
 
 
-def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | None = None, policy_cfg=None):
+def maybe_wrap_pointseg_cache_dataset(
+    dataset,
+    cache_dir_value: str | Path | None = None,
+    policy_cfg=None,
+    primary_cache_dir_value: str | Path | None = None,
+):
     def maybe_online_fallback(reason: str):
+        if bool(getattr(policy_cfg, "multiview_input_view_dropout_enable", False)):
+            raise ValueError(
+                f"{reason}; input-level view dropout requires paired offline single/all-view caches."
+            )
         if not bool(getattr(policy_cfg, "pointseg_enable", False)):
             logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
             return dataset
@@ -759,6 +1188,29 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
     point_cloud_dir = root / "point_clouds"
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     logging.info(f"Injecting Song pointseg temporal cache from {cache_dir}")
+    view_dropout_enable = bool(
+        getattr(policy_cfg, "multiview_input_view_dropout_enable", False)
+    )
+    primary_cache_dir = (
+        Path(str(primary_cache_dir_value).strip())
+        if primary_cache_dir_value is not None and str(primary_cache_dir_value).strip()
+        else None
+    )
+    if view_dropout_enable:
+        if primary_cache_dir is None or not (primary_cache_dir / "manifest.json").is_file():
+            raise FileNotFoundError(
+                "multiview_input_view_dropout_enable requires a valid "
+                f"pointseg_primary_sample_cache_dir, got {primary_cache_dir_value!r}."
+            )
+        logging.info(
+            "Input-level auxiliary-view dropout is enabled with matching primary cache %s",
+            primary_cache_dir,
+        )
+    elif primary_cache_dir is not None:
+        raise ValueError(
+            "pointseg_primary_sample_cache_dir requires "
+            "policy.multiview_input_view_dropout_enable=true."
+        )
     return PointSegCacheInjectedDataset(
         dataset,
         cache_dir=cache_dir,
@@ -766,7 +1218,18 @@ def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | Non
         strict=strict,
         mmap_mode=mmap_mode,
         camera_views=getattr(policy_cfg, "camera_views", "agentview"),
+        camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
+        camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
+        camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
+        primary_cache_dir=primary_cache_dir,
+        view_dropout_enable=view_dropout_enable,
+        view_dropout_seed=int(
+            getattr(policy_cfg, "multiview_input_view_dropout_seed", 20260812)
+        ),
+        view_dropout_paired_coverage=bool(
+            getattr(policy_cfg, "multiview_input_view_dropout_paired_coverage", False)
+        ),
     )
 
 
@@ -793,6 +1256,9 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         point_cloud_dir=point_cloud_dir,
         mmap_mode=mmap_mode,
         camera_views=camera_views,
+        camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
+        camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
+        camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
     )
 
@@ -1473,7 +1939,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
+        dataset = maybe_wrap_pointseg_cache_dataset(
+            dataset,
+            cfg.pointseg_sample_cache_dir,
+            cfg.policy,
+            cfg.pointseg_primary_sample_cache_dir,
+        )
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -1482,7 +1953,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
+        dataset = maybe_wrap_pointseg_cache_dataset(
+            dataset,
+            cfg.pointseg_sample_cache_dir,
+            cfg.policy,
+            cfg.pointseg_primary_sample_cache_dir,
+        )
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -1501,6 +1977,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False)):
+        bootstrap = getattr(getattr(policy, "model", None), "bootstrap_worldflow_from_ego", None)
+        if not callable(bootstrap):
+            raise RuntimeError(
+                "worldflow_bootstrap_from_ego=True requires a policy model with "
+                "bootstrap_worldflow_from_ego()."
+            )
+        bootstrap_report = bootstrap()
+        if is_main_process:
+            logging.info("WorldFlow Ego bootstrap report: %s", bootstrap_report)
     validate_policy_camera_config_matches_training_config(cfg, policy)
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
@@ -1653,6 +2139,33 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
+    if (
+        isinstance(dataset, PointSegCacheInjectedDataset)
+        and dataset.view_dropout_paired_coverage
+        and is_main_process
+    ):
+        logging.info(
+            "Exact paired view coverage dataset: %d source frames x 2 complementary modes = %d samples.",
+            len(dataset.dataset),
+            len(dataset),
+        )
+
+    if (
+        isinstance(dataset, PointSegCacheInjectedDataset)
+        and dataset.view_dropout_paired_coverage
+        and sampler is not None
+    ):
+        base_num_samples = len(dataset.dataset)
+        base_indices = list(sampler.indices)
+        sampler.indices = base_indices + [index + base_num_samples for index in base_indices]
+        if is_main_process:
+            logging.info(
+                "Expanded EpisodeAwareSampler for exact paired view coverage: "
+                "%d eligible frames x 2 complementary modes = %d samples.",
+                len(base_indices),
+                len(sampler.indices),
+            )
+
     collate_fn = make_song_train_collate_fn(dataset)
     dataloader_num_workers = int(cfg.num_workers)
     if is_main_process and isinstance(collate_fn, OnlinePointSegBatchCollator):
@@ -1751,7 +2264,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        sparse_save_steps = {int(value) for value in cfg.save_steps}
+        is_saving_step = (
+            step % cfg.save_freq == 0
+            or step in sparse_save_steps
+            or step == cfg.steps
+        )
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
@@ -1782,6 +2300,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_foreground_points",
                     "worldflow_noise_conjugacy_error",
                     "worldflow_path_conjugacy_error",
+                    "worldflow_ego_residual_gate",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
@@ -1827,10 +2346,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     tag="train",
                     max_items=2,
                 )
-                try:
-                    ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
-                except Exception:
-                    logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
+                # try:
+                #     ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
+                # except Exception:
+                #     logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
 
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")

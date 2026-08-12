@@ -22,9 +22,16 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
+    fps_sample_fused_point_cloud,
+    novelty_union_sample_fused_point_cloud,
+    transport_novelty_union_sample_fused_point_cloud,
     open_episode_point_clouds,
     parse_camera_views,
+    parse_camera_view_weights,
+    parse_camera_view_fusion,
     point_cloud_dir_for_view,
+    voxel_fps_sample_fused_point_cloud,
+    voxel_cover_fps_sample_fused_point_cloud,
 )
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -73,12 +80,19 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        camera_view_weights: Any = None,
+        camera_view_fusion: Any = "legacy_budget",
         gripper_points: int = 500,
     ) -> None:
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
         self.dataset_root = self.point_cloud_dir.parent
         self.camera_views = parse_camera_views(camera_views)
+        self.camera_view_weights = parse_camera_view_weights(
+            camera_view_weights,
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -136,6 +150,8 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
+            view_weights=self.camera_view_weights,
+            fusion=self.camera_view_fusion,
         ).copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
@@ -145,6 +161,8 @@ def maybe_wrap_point_cloud_memmap_dataset(
     dataset,
     *,
     camera_views: str | tuple[str, ...] | list[str] = "agentview",
+    camera_view_weights: Any = None,
+    camera_view_fusion: Any = "legacy_budget",
     gripper_points: int = 500,
 ):
     root_value = getattr(dataset, "root", None)
@@ -170,6 +188,8 @@ def maybe_wrap_point_cloud_memmap_dataset(
         point_cloud_dir=point_cloud_dir,
         mmap_mode=mmap_mode,
         camera_views=views,
+        camera_view_weights=camera_view_weights,
+        camera_view_fusion=camera_view_fusion,
         gripper_points=int(gripper_points),
     )
 
@@ -304,6 +324,11 @@ class SmolVLA_ModelInference:
         if not isinstance(config, SmolVLAConfig):
             raise TypeError(f"Expected SmolVLAConfig, got {type(config).__name__}.")
         self.camera_views = parse_camera_views(getattr(config, "camera_views", "agentview"))
+        self.camera_view_weights = parse_camera_view_weights(
+            getattr(config, "camera_view_weights", None),
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(getattr(config, "camera_view_fusion", None))
         self.policy = SmolVLAPolicy.from_pretrained(
             self.policy_path,
             config=config,
@@ -455,6 +480,8 @@ class SmolVLA_ModelInference:
         self.dataset = maybe_wrap_point_cloud_memmap_dataset(
             dataset,
             camera_views=self.camera_views,
+            camera_view_weights=self.camera_view_weights,
+            camera_view_fusion=self.camera_view_fusion,
             gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
         )
         return self.dataset
@@ -833,6 +860,43 @@ class SmolVLA_ModelInference:
             pc = pc.squeeze(1)
         if pc.ndim != 3 or pc.shape[-1] != 6:
             raise ValueError(f"Expected point cloud shape (N, 6) or (B, N, 6), got {tuple(pc.shape)}")
+        pc = pc.to(self.device)
+        fusion = self.camera_view_fusion
+        if fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "transport_novelty_union",
+        }:
+            sampler = {
+                "fps": fps_sample_fused_point_cloud,
+                "voxel_fps": voxel_fps_sample_fused_point_cloud,
+                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
+                "novelty_union": novelty_union_sample_fused_point_cloud,
+                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
+            }[fusion]
+            sampler_kwargs = {}
+            if fusion in {
+                "voxel_fps",
+                "voxel_cover_fps",
+                "novelty_union",
+                "transport_novelty_union",
+            }:
+                sampler_kwargs["voxel_size"] = float(
+                    getattr(self.policy.config, "camera_view_voxel_size", 0.005)
+                )
+            pc, _point_is_pad, _indices = sampler(
+                pc,
+                target_points=int(
+                    getattr(self.policy.config, "camera_view_fps_target_points", 10_000)
+                ),
+                gripper_points=int(
+                    getattr(self.policy.config, "camera_view_fps_gripper_points", 500)
+                ),
+                point_is_pad=None,
+                **sampler_kwargs,
+            )
         batch_size = pc.shape[0]
 
         state_tensor = self._prepare_state_tensor(
@@ -872,7 +936,7 @@ class SmolVLA_ModelInference:
         language = self._tokenize_task(task, batch_size)
 
         batch = {
-            "observation.point_cloud": pc.to(self.device),
+            "observation.point_cloud": pc,
             OBS_STATE: state_tensor.to(self.device),
             OBS_LANGUAGE_TOKENS: language["input_ids"].to(self.device),
             OBS_LANGUAGE_ATTENTION_MASK: language["attention_mask"].to(self.device, dtype=torch.bool),

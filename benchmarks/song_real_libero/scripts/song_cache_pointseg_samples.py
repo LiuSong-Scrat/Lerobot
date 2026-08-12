@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -27,9 +28,17 @@ from lerobot.policies.smolvla.song_pointseg import (
     POINTSEG_CACHE_VERSION,
     ROLE_NAMES,
     PseudoLabelConfig,
+    fps_sample_fused_point_cloud,
+    voxel_fps_sample_fused_point_cloud,
+    voxel_cover_fps_sample_fused_point_cloud,
+    novelty_union_sample_fused_point_cloud,
+    transport_novelty_union_sample_fused_point_cloud,
+    parse_camera_view_fusion,
     SongTemporalPointCloudDataset,
     generate_pseudo_labels,
     move_batch_to_device,
+    parse_camera_view_weights,
+    parse_camera_views,
     parse_future_offsets,
     song_pointseg_collate,
 )
@@ -54,15 +63,49 @@ DEFAULT_CACHE_DIR = Path(
 )
 
 
+def parse_episode_selection(value: str) -> list[int]:
+    """Parse either a half-open range (400:450) or comma-separated indices."""
+    value = value.strip()
+    if ":" in value:
+        parts = value.split(":")
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError("Episode range must use START:END.")
+        start, end = (int(part) for part in parts)
+        if start < 0 or end <= start:
+            raise argparse.ArgumentTypeError("Episode range must satisfy 0 <= START < END.")
+        return list(range(start, end))
+    episodes = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not episodes or min(episodes) < 0 or len(set(episodes)) != len(episodes):
+        raise argparse.ArgumentTypeError("Episode indices must be unique non-negative integers.")
+    return episodes
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cache Song pointseg sampled points and pseudo labels offline.")
     parser.add_argument("--dataset.repo_id", dest="dataset_repo_id", type=str, default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument("--dataset.root", dest="dataset_root", type=str, default=None)
+    parser.add_argument("--episodes", type=parse_episode_selection, default=None)
     parser.add_argument("--point-cloud-dir", type=Path, default=None)
+    parser.add_argument(
+        "--camera-views",
+        type=parse_camera_views,
+        default=parse_camera_views(os.environ.get("SONG_CAMERA_VIEWS", "agentview")),
+    )
+    parser.add_argument(
+        "--camera-view-weights",
+        default=os.environ.get("SONG_CAMERA_VIEW_WEIGHTS"),
+        help="Comma-separated scene-point budget ratios in --camera-views order.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--future-offsets", type=parse_future_offsets, default=DEFAULT_FUTURE_OFFSETS)
     parser.add_argument("--current-points", type=int, default=10000)
     parser.add_argument("--future-points", type=int, default=10000)
+    parser.add_argument(
+        "--camera-view-fusion",
+        type=parse_camera_view_fusion,
+        default=parse_camera_view_fusion(os.environ.get("SONG_CAMERA_VIEW_FUSION")),
+    )
+    parser.add_argument("--camera-view-voxel-size", type=float, default=0.005)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=256)
@@ -75,7 +118,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--rank-wait-timeout-sec", type=int, default=0, help="Timeout while rank0 waits for rank done marker files. 0 means wait forever.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.camera_view_weights = parse_camera_view_weights(
+        args.camera_view_weights,
+        num_views=len(args.camera_views),
+    )
+    if args.camera_view_fusion in {
+        "fps",
+        "voxel_fps",
+        "voxel_cover_fps",
+        "novelty_union",
+        "transport_novelty_union",
+        "uniform_union",
+        "full_union",
+        "primary_residual",
+    } and args.camera_view_weights is not None:
+        parser.error(
+            f"--camera-view-fusion={args.camera_view_fusion} cannot be combined with --camera-view-weights"
+        )
+    if args.camera_view_fusion == "primary_residual" and args.current_points != args.future_points:
+        parser.error(
+            "--camera-view-fusion=primary_residual requires equal --current-points and --future-points"
+        )
+    return args
 
 
 def _jsonable(value: Any) -> Any:
@@ -97,6 +162,7 @@ def _make_lerobot_dataset(args: argparse.Namespace) -> LeRobotDataset:
     return LeRobotDataset(
         repo_id,
         root=root,
+        episodes=args.episodes,
         delta_timestamps={
             "action": [i / fps for i in range(max_offset + 1)],
             "observation.state": [0.0],
@@ -111,6 +177,9 @@ def make_dataset(args: argparse.Namespace) -> SongTemporalPointCloudDataset:
     return SongTemporalPointCloudDataset(
         dataset,
         point_cloud_dir=point_cloud_dir,
+        camera_views=args.camera_views,
+        camera_view_weights=args.camera_view_weights,
+        camera_view_fusion=args.camera_view_fusion,
         future_offsets=args.future_offsets,
         current_points=args.current_points,
         future_points=args.future_points,
@@ -123,7 +192,7 @@ def _prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
     if output_dir.exists() and any(output_dir.iterdir()):
         if not overwrite:
             raise FileExistsError(
-                f"Cache output dir is not empty: {output_dir}. Pass --overwrite to rebuild it."
+                f"Cache output dir is not empty: {output_dir}. Pass --overwrite explicitly."
             )
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -164,21 +233,30 @@ def _save_variable_shard(
     storage_dtype: np.dtype,
 ) -> dict[str, Any]:
     shard_dir = output_dir / shard["path"]
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    if shard_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite an existing cache shard: {shard_dir}")
+    shard_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{shard_dir.name}.tmp.", dir=shard_dir.parent))
     lengths = [int(sample["point_indices"].shape[0]) for sample in samples]
     offsets = np.zeros(len(samples) + 1, dtype=np.int64)
     offsets[1:] = np.cumsum(lengths, dtype=np.int64)
 
-    np.save(shard_dir / "sample_offsets.npy", offsets)
-    np.save(shard_dir / "point_indices.npy", np.concatenate([sample["point_indices"] for sample in samples], axis=0).astype(np.int64, copy=False))
-    np.save(shard_dir / "labels.npy", np.concatenate([sample["labels"] for sample in samples], axis=0).astype(np.int16, copy=False))
-    np.save(shard_dir / "weights.npy", np.concatenate([sample["weights"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "class_scores.npy", np.concatenate([sample["class_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "role_scores.npy", np.concatenate([sample["role_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "foreground_score.npy", np.concatenate([sample["foreground_score"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
-    np.save(shard_dir / "episode_index.npy", np.asarray([sample["episode_index"] for sample in samples], dtype=np.int64))
-    np.save(shard_dir / "frame_index.npy", np.asarray([sample["frame_index"] for sample in samples], dtype=np.int64))
-    np.save(shard_dir / "dataset_index.npy", np.asarray([sample["dataset_index"] for sample in samples], dtype=np.int64))
+    try:
+        np.save(temporary_dir / "sample_offsets.npy", offsets)
+        np.save(temporary_dir / "point_indices.npy", np.concatenate([sample["point_indices"] for sample in samples], axis=0).astype(np.int64, copy=False))
+        np.save(temporary_dir / "labels.npy", np.concatenate([sample["labels"] for sample in samples], axis=0).astype(np.int16, copy=False))
+        np.save(temporary_dir / "weights.npy", np.concatenate([sample["weights"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+        np.save(temporary_dir / "class_scores.npy", np.concatenate([sample["class_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+        np.save(temporary_dir / "role_scores.npy", np.concatenate([sample["role_scores"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+        np.save(temporary_dir / "foreground_score.npy", np.concatenate([sample["foreground_score"] for sample in samples], axis=0).astype(storage_dtype, copy=False))
+        np.save(temporary_dir / "episode_index.npy", np.asarray([sample["episode_index"] for sample in samples], dtype=np.int64))
+        np.save(temporary_dir / "frame_index.npy", np.asarray([sample["frame_index"] for sample in samples], dtype=np.int64))
+        np.save(temporary_dir / "dataset_index.npy", np.asarray([sample["dataset_index"] for sample in samples], dtype=np.int64))
+        os.replace(temporary_dir, shard_dir)
+    except Exception:
+        # Keep the temporary directory as failure evidence. A retry must use a
+        # new output directory, so it can never be mistaken for a completed shard.
+        raise
     shard["num_points"] = int(offsets[-1])
     return shard
 
@@ -217,25 +295,38 @@ def _episode_preview_targets(
     total_samples: int,
     vis_count: int,
 ) -> dict[int, list[tuple[int, str, int]]]:
-    episodes = dataset.meta.episodes
-    if episodes is None:
+    all_episodes = dataset.meta.episodes
+    if all_episodes is None:
         raise ValueError("Episode metadata is required to save first/middle/last pseudo-label previews.")
 
+    selected_episode_indices = getattr(dataset.dataset, "episodes", None)
+    if selected_episode_indices is None:
+        selected_episode_indices = range(len(all_episodes))
+
+    episode_records = []
+    relative_start = 0
+    for metadata_position in selected_episode_indices:
+        episode = all_episodes[int(metadata_position)]
+        episode_index = int(episode.get("episode_index", metadata_position))
+        episode_length = int(episode["dataset_to_index"]) - int(episode["dataset_from_index"])
+        episode_records.append((episode_index, episode, relative_start, episode_length))
+        relative_start += episode_length
+    if relative_start != len(dataset):
+        raise ValueError(
+            f"Selected episode lengths total {relative_start}, but wrapped dataset has {len(dataset)} samples."
+        )
+
     targets: dict[int, list[tuple[int, str, int]]] = {}
-    if vis_count <= 0 or len(episodes) == 0:
+    if vis_count <= 0 or len(episode_records) == 0:
         return targets
     selected_positions = np.linspace(
         0,
-        len(episodes) - 1,
-        num=min(int(vis_count), len(episodes)),
+        len(episode_records) - 1,
+        num=min(int(vis_count), len(episode_records)),
         dtype=np.int64,
     )
     for episode_position in np.unique(selected_positions).tolist():
-        episode = episodes[episode_position]
-        episode_index = int(episode.get("episode_index", episode_position))
-        start_index = int(episode["dataset_from_index"])
-        end_index = int(episode["dataset_to_index"])
-        episode_length = end_index - start_index
+        episode_index, episode, start_index, episode_length = episode_records[episode_position]
         if episode_length <= 0:
             continue
 
@@ -624,11 +715,121 @@ def _write_terminal_continuity_summary(output_dir: Path) -> None:
         },
     )
 
+def _fps_sample_cache_batch(
+    batch: dict[str, torch.Tensor],
+    *,
+    target_current_points: int,
+    target_future_points: int,
+    gripper_points: int,
+    fusion: str = "fps",
+    voxel_size: float = 0.005,
+) -> None:
+    """Apply the same FPS contract used by online inference before pseudo labels."""
+
+    current = batch["observation.point_cloud"]
+    current_pad = batch.get("observation.point_cloud_is_pad")
+    sampler = {
+        "fps": fps_sample_fused_point_cloud,
+        "voxel_fps": voxel_fps_sample_fused_point_cloud,
+        "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
+        "novelty_union": novelty_union_sample_fused_point_cloud,
+        "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
+    }[fusion]
+    sampler_kwargs = {"voxel_size": float(voxel_size)} if fusion != "fps" else {}
+    sampled, sampled_pad, selected = sampler(
+        current,
+        target_points=target_current_points,
+        gripper_points=gripper_points,
+        point_is_pad=current_pad,
+        **sampler_kwargs,
+    )
+    source_indices = batch.get("observation.point_cloud_indices")
+    batch["observation.point_cloud_indices"] = (
+        torch.gather(source_indices, 1, selected) if torch.is_tensor(source_indices) else selected
+    )
+    batch["observation.point_cloud"] = sampled
+    if sampled_pad is not None:
+        batch["observation.point_cloud_is_pad"] = sampled_pad
+
+    future = batch["observation.point_cloud_future"]
+    batch_size, time_steps, source_points, channels = future.shape
+    future_flat = future.reshape(batch_size * time_steps, source_points, channels)
+    future_pad = batch.get("observation.point_cloud_future_is_pad")
+    future_pad_flat = (
+        future_pad.reshape(batch_size * time_steps, source_points)
+        if torch.is_tensor(future_pad)
+        else None
+    )
+    future_sampled, future_sampled_pad, _ = sampler(
+        future_flat,
+        target_points=target_future_points,
+        gripper_points=gripper_points,
+        point_is_pad=future_pad_flat,
+        **sampler_kwargs,
+    )
+    batch["observation.point_cloud_future"] = future_sampled.reshape(
+        batch_size, time_steps, target_future_points, channels
+    )
+    if future_sampled_pad is not None:
+        batch["observation.point_cloud_future_is_pad"] = future_sampled_pad.reshape(
+            batch_size, time_steps, target_future_points
+        )
+
+
+def _primary_view_cache_batch(
+    batch: dict[str, torch.Tensor],
+    *,
+    target_points: int,
+    gripper_points: int,
+) -> None:
+    """Generate cache labels on the checkpoint-compatible primary cloud.
+
+    The ordered residual union is ``primary_scene, secondary_scene,
+    primary_gripper``. Cache supervision remains exactly aligned with the
+    baseline primary path, while training reconstructs the complete union for
+    the separately encoded secondary residual stream.
+    """
+
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    scene_points = target_points - gripper_points
+    union_points = 2 * scene_points + gripper_points
+    current = batch["observation.point_cloud"]
+    if current.shape[1] != union_points:
+        raise ValueError(
+            f"Expected primary_residual union with {union_points} points, got {current.shape}."
+        )
+    indices = torch.cat(
+        [
+            torch.arange(scene_points, device=current.device),
+            torch.arange(2 * scene_points, union_points, device=current.device),
+        ]
+    )
+    batch["observation.point_cloud"] = current.index_select(1, indices)
+    source_indices = batch.get("observation.point_cloud_indices")
+    batch["observation.point_cloud_indices"] = (
+        source_indices.index_select(1, indices) if torch.is_tensor(source_indices) else indices.unsqueeze(0)
+    )
+    current_pad = batch.get("observation.point_cloud_is_pad")
+    if torch.is_tensor(current_pad):
+        batch["observation.point_cloud_is_pad"] = current_pad.index_select(1, indices)
+
+    future = batch["observation.point_cloud_future"]
+    if future.shape[2] != union_points:
+        raise ValueError(
+            f"Expected primary_residual future union with {union_points} points, got {future.shape}."
+        )
+    batch["observation.point_cloud_future"] = future.index_select(2, indices)
+    future_pad = batch.get("observation.point_cloud_future_is_pad")
+    if torch.is_tensor(future_pad):
+        batch["observation.point_cloud_future_is_pad"] = future_pad.index_select(2, indices)
+
 
 def cache_samples(args: argparse.Namespace) -> None:
     if args.smoke_test:
-        args.current_points = min(args.current_points, 256)
-        args.future_points = min(args.future_points, 512)
+        if args.camera_view_fusion == "legacy_budget":
+            args.current_points = min(args.current_points, 256)
+            args.future_points = min(args.future_points, 512)
         args.batch_size = min(args.batch_size, 2)
         args.shard_size = min(args.shard_size, 4)
         args.max_samples = 4 if args.max_samples is None else min(args.max_samples, 4)
@@ -679,13 +880,81 @@ def cache_samples(args: argparse.Namespace) -> None:
             "temporal_mode": "bidirectional" if full_dataset.bidirectional else "future_only",
             "trajectory_mode": "sparse_full_episode",
             "trajectory_pose_source": "observation.state (achieved EEF pose)",
+            "trajectory_offset_filtering": "relative_frame_offsets",
             "trajectory_samples": full_dataset.trajectory_samples,
             "current_points": args.current_points,
             "future_points": args.future_points,
             "camera_views": list(full_dataset.camera_views),
+            "camera_view_weights": (
+                list(full_dataset.camera_view_weights)
+                if full_dataset.camera_view_weights is not None
+                else None
+            ),
+            "camera_view_fusion": full_dataset.camera_view_fusion,
+            "camera_view_voxel_size": (
+                float(args.camera_view_voxel_size)
+                if full_dataset.camera_view_fusion
+                in {
+                    "voxel_fps",
+                    "voxel_cover_fps",
+                    "novelty_union",
+                    "transport_novelty_union",
+                }
+                else None
+            ),
             "gripper_points": full_dataset.gripper_points,
             "variable_num_points": True,
-            "point_count_policy": "cap_without_repeat",
+            "point_count_policy": (
+                "primary_unique_voxels_plus_local_transport_secondary_novel_voxels_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "transport_novelty_union"
+                else ("primary_unique_voxels_plus_secondary_novel_voxels_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "novelty_union"
+                else ("cover_all_unique_voxels_then_union_fps_detail_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "voxel_cover_fps"
+                else ("voxel_deduplicate_then_fps_scene_union_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "voxel_fps"
+                else ("fps_scene_union_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "fps"
+                else ("full_scene_union_preserve_all_views_and_primary_gripper"
+                if full_dataset.camera_view_fusion == "full_union"
+                else ("uniform_without_replacement_scene_union_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "uniform_union"
+                else (
+                    "primary_exact_labels_secondary_residual_raw_union"
+                    if full_dataset.camera_view_fusion == "primary_residual"
+                    else "cap_without_repeat"
+                )))))))
+            ),
+            "fps_contract": (
+                {
+                    "backend": "pointops_cuda",
+                    "target_points": args.current_points,
+                    "target_scene_points": args.current_points - full_dataset.gripper_points,
+                    "preserved_gripper_points": full_dataset.gripper_points,
+                }
+                if full_dataset.camera_view_fusion
+                in {
+                    "fps",
+                    "voxel_fps",
+                    "voxel_cover_fps",
+                    "novelty_union",
+                    "transport_novelty_union",
+                }
+                else None
+            ),
+            "primary_residual_contract": (
+                {
+                    "model_input_layout": "primary_scene,secondary_scene,primary_gripper",
+                    "model_input_points": 2 * (args.current_points - full_dataset.gripper_points)
+                    + full_dataset.gripper_points,
+                    "cached_label_points": args.current_points,
+                    "cached_label_scope": "primary_scene_plus_primary_gripper",
+                    "secondary_supervision": "action_loss_through_zero_initialized_matrix_residual",
+                    "learned_gate": False,
+                }
+                if full_dataset.camera_view_fusion == "primary_residual"
+                else None
+            ),
             "pseudo_label_policy": "soft_binary_trajectory_v1",
             "evidence_channels": ["tool_comotion", "trajectory_approach", "near_contact"],
             "storage_dtype": args.storage_dtype,
@@ -757,6 +1026,27 @@ def cache_samples(args: argparse.Namespace) -> None:
                 batch_size = min(int(batch["observation.point_cloud"].shape[0]), local_samples - written)
                 batch = _slice_batch_to_size(batch, batch_size)
                 batch = move_batch_to_device(batch, device)
+                if args.camera_view_fusion in {
+                    "fps",
+                    "voxel_fps",
+                    "voxel_cover_fps",
+                    "novelty_union",
+                    "transport_novelty_union",
+                }:
+                    _fps_sample_cache_batch(
+                        batch,
+                        target_current_points=args.current_points,
+                        target_future_points=args.future_points,
+                        gripper_points=full_dataset.gripper_points,
+                        fusion=args.camera_view_fusion,
+                        voxel_size=args.camera_view_voxel_size,
+                    )
+                elif args.camera_view_fusion == "primary_residual":
+                    _primary_view_cache_batch(
+                        batch,
+                        target_points=args.current_points,
+                        gripper_points=full_dataset.gripper_points,
+                    )
                 current_pc = batch["observation.point_cloud"]
 
                 geometric_pseudo = generate_pseudo_labels(
@@ -767,6 +1057,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     current_is_pad=batch.get("observation.point_cloud_is_pad"),
                     future_point_is_pad=batch.get("observation.point_cloud_future_is_pad"),
                     trajectory_poses=batch.get("pointseg_trajectory_ee_poses"),
+                    trajectory_offsets=batch.get("pointseg_trajectory_offsets"),
                     config=pseudo_cfg,
                 )
                 pseudo = geometric_pseudo

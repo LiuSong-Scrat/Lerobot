@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "strict_official_multiview_camera_selection_v13_20260811"
+EVAL_BUILD_TAG = "strict_official_multiview_camera_selection_v17_20260811"
 
 import argparse
 import atexit
@@ -49,7 +49,7 @@ _ISOLATED_POLICY_WORKER_BOOTSTRAP = (
 _SUITE_LAUNCHER_BOOTSTRAP = any(
     arg == "--suite-gpu-ids" or arg.startswith("--suite-gpu-ids=") for arg in sys.argv[1:]
 )
-_EVALUATION_RUN_LOCK_FILE: Any | None = None
+_EVALUATION_RUN_LOCK_CLAIM_DIR: Path | None = None
 # This must be set before the policy import performs the first CUDA operation.
 # PyTorch uses it when deterministic cuBLAS execution is requested below.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -80,6 +80,22 @@ FAIR_EVALUATION_PROTOCOL = {
 def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Describe whether this is a standard benchmark or a source-demo domain diagnostic."""
 
+    if bool(cfg.get("secondary_view_causal_ablation", False)):
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "secondary_view_causal_ablation_rollout",
+            "secondary_view_causal_ablation": True,
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
+    if bool(cfg.get("world_to_ego_causal_ablation", False)):
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "world_to_ego_causal_ablation_rollout",
+            "world_to_ego_causal_ablation": True,
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
     if not bool(cfg.get("dataset_domain_env", False)):
         return dict(FAIR_EVALUATION_PROTOCOL)
     state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
@@ -109,58 +125,40 @@ def acquire_evaluation_run_lock(output_dir: Path) -> None:
 
     Multi-GPU suite children intentionally share their launcher's output root,
     so only the top-level launcher (or a normal single-process run) owns this
-    lock. The file descriptor remains open until process exit.
+    claim. The persistent atomic directory also records completed ownership and
+    avoids flock(2), which can block indefinitely on NFS mounts.
     """
-    global _EVALUATION_RUN_LOCK_FILE
+    global _EVALUATION_RUN_LOCK_CLAIM_DIR
     if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") == "1":
         return
-    if _EVALUATION_RUN_LOCK_FILE is not None:
+    if _EVALUATION_RUN_LOCK_CLAIM_DIR is not None:
         return
 
-    import fcntl
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / ".evaluation_run.lock"
-    lock_file = open(lock_path, "a+", encoding="utf-8")
+    claim_dir = output_dir / ".evaluation_run.claim"
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        lock_file.seek(0)
-        owner = lock_file.read().strip() or "unknown owner"
-        lock_file.close()
+        claim_dir.mkdir()
+    except FileExistsError as exc:
         raise RuntimeError(
-            f"Evaluation output directory is already active: {output_dir}. "
-            f"Lock owner: {owner}"
+            f"Evaluation output directory is already claimed: {output_dir}. "
+            f"Persistent claim: {claim_dir}"
         ) from exc
-
-    lock_file.seek(0)
-    lock_file.truncate()
-    json.dump(
-        {
-            "pid": os.getpid(),
-            "hostname": os.uname().nodename,
-            "started_unix_s": time.time(),
-            "argv": sys.argv,
-        },
-        lock_file,
-        ensure_ascii=False,
+    owner_path = claim_dir / "owner.json"
+    owner_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "hostname": os.uname().nodename,
+                "started_unix_s": time.time(),
+                "argv": sys.argv,
+                "backend": "persistent_atomic_mkdir",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
     )
-    lock_file.flush()
-    os.fsync(lock_file.fileno())
-    _EVALUATION_RUN_LOCK_FILE = lock_file
-
-    def _release() -> None:
-        global _EVALUATION_RUN_LOCK_FILE
-        active_lock = _EVALUATION_RUN_LOCK_FILE
-        if active_lock is None:
-            return
-        try:
-            fcntl.flock(active_lock.fileno(), fcntl.LOCK_UN)
-        finally:
-            active_lock.close()
-            _EVALUATION_RUN_LOCK_FILE = None
-
-    atexit.register(_release)
+    _EVALUATION_RUN_LOCK_CLAIM_DIR = claim_dir
 
 
 def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
@@ -570,6 +568,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
+    parser.add_argument(
+        "--secondary-view-causal-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Diagnostic only: load the same primary_residual checkpoint but skip its secondary-view "
+            "encoder and residual, leaving the checkpoint's primary path unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--world-to-ego-causal-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Diagnostic only: keep the World stream and Ego-to-World path active, but remove "
+            "both World-to-Ego cross-attention and the World residual twist correction."
+        ),
+    )
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument(
         "--suite-gpu-ids",
@@ -1031,16 +1047,28 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
 @contextmanager
 def interprocess_file_lock(path: Path):
-    """Serialize report updates from independent MuJoCo worker processes."""
+    """Serialize report updates from independent same-host MuJoCo workers.
+
+    Lock only the host-local surrogate. Opening an NFS lock file and waiting for
+    ENOLCK is insufficient because some NFS servers block inside flock instead.
+    """
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+", encoding="utf-8") as lock_file:
+    local_lock_root = Path(
+        os.environ.get("SONG_LIBERO_LOCAL_LOCK_ROOT", "/tmp/song_libero_file_locks")
+    )
+    local_lock_root.mkdir(parents=True, exist_ok=True)
+    lock_digest = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()
+    lock_file = open(local_lock_root / f"{lock_digest}.lock", "a+", encoding="utf-8")
+    try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 def _read_json_or_default(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -3529,7 +3557,9 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "dataset_domain_oracle_actions": bool(
                 cfg.get("dataset_domain_oracle_actions", False)
             ),
-            "benchmark_comparable": not bool(cfg.get("dataset_domain_env", False)),
+            "benchmark_comparable": not bool(cfg.get("dataset_domain_env", False))
+            and not bool(cfg.get("world_to_ego_causal_ablation", False))
+            and not bool(cfg.get("secondary_view_causal_ablation", False)),
             "demo_root": (
                 str(cfg.get("dataset_domain_demo_root"))
                 if bool(cfg.get("dataset_domain_env", False))
@@ -4107,6 +4137,8 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
             False if len(camera_names) > 1 else bool(cfg.get("gripper_shuffle_points", False))
         ),
         seed=int(seed),
+        camera_view_weights=cfg.get("camera_view_weights"),
+        camera_view_fusion=cfg.get("camera_view_fusion", "legacy_budget"),
     )
     world_pose9 = np.asarray(pose9_gripper[:9], dtype=np.float32)
     gripper = float(pose9_gripper[-1])
@@ -4573,6 +4605,12 @@ def reconcile_eval_camera_views_with_loaded_policy(
         "rgb": list(loaded_rgb),
         "rgb_source": loaded_rgb_source,
     }
+    cfg["camera_view_weights"] = (
+        list(infer.camera_view_weights)
+        if getattr(infer, "camera_view_weights", None) is not None
+        else None
+    )
+    cfg["camera_view_fusion"] = getattr(infer, "camera_view_fusion", "legacy_budget")
     return inspect_policy_camera_alignment(infer, cfg)
 
 
@@ -6602,6 +6640,8 @@ def run_episode(
                     else bool(cfg.get("gripper_shuffle_points", False))
                 ),
                 seed=steps,
+                camera_view_weights=cfg.get("camera_view_weights"),
+                camera_view_fusion=cfg.get("camera_view_fusion", "legacy_budget"),
             )
 
             transported_grasp = update_grasp_transport_state(eef_pose)
@@ -7980,22 +8020,28 @@ class _EpisodeWorkerJob:
 def _build_episode_worker_jobs(
     task_ids: list[int],
     *,
-    episode_count: int,
+    episode_indices: list[int],
     episode_workers_per_task: int,
 ) -> list[_EpisodeWorkerJob]:
-    shard_count = min(max(1, int(episode_workers_per_task)), max(1, int(episode_count)))
+    resolved_episode_indices = [int(index) for index in episode_indices]
+    shard_count = min(
+        max(1, int(episode_workers_per_task)),
+        max(1, len(resolved_episode_indices)),
+    )
     jobs: list[_EpisodeWorkerJob] = []
     for task_id in task_ids:
         for shard_index in range(shard_count):
-            episode_indices = tuple(range(shard_index, int(episode_count), shard_count))
-            if not episode_indices:
+            worker_episode_indices = tuple(
+                resolved_episode_indices[shard_index::shard_count]
+            )
+            if not worker_episode_indices:
                 continue
             jobs.append(
                 _EpisodeWorkerJob(
                     worker_id=len(jobs),
                     task_id=int(task_id),
                     shard_index=shard_index,
-                    episode_indices=episode_indices,
+                    episode_indices=worker_episode_indices,
                 )
             )
     return jobs
@@ -8034,7 +8080,7 @@ def merge_task_episode_shards(
     *,
     suite_name: str,
     task_ids: list[int],
-    episode_count: int,
+    episode_indices: list[int],
     partial_summaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     partials_by_task: dict[int, list[dict[str, Any]]] = {int(task_id): [] for task_id in task_ids}
@@ -8045,7 +8091,7 @@ def merge_task_episode_shards(
         partials_by_task[task_id].append(summary)
 
     merged: list[dict[str, Any]] = []
-    expected_episode_indices = set(range(int(episode_count)))
+    expected_episode_indices = {int(index) for index in episode_indices}
     for task_id in task_ids:
         partials = partials_by_task[int(task_id)]
         if not partials:
@@ -8108,16 +8154,19 @@ def evaluate_suite_process_parallel(
     batch_count = 0
     max_observed_batch = 0
     infrastructure_failures: list[str] = []
+    configured_episode_indices = [
+        int(index) for index in (cfg.get("episode_ids") or range(int(cfg["episodes"])))
+    ]
     episode_workers_per_task = min(
         max(1, int(cfg.get("episode_workers_per_task", 1))),
-        max(1, int(cfg["episodes"])),
+        max(1, len(configured_episode_indices)),
     )
 
     for wave_start in range(0, len(task_ids), max(1, int(worker_count))):
         wave_task_ids = [int(task_id) for task_id in task_ids[wave_start : wave_start + worker_count]]
         jobs = _build_episode_worker_jobs(
             wave_task_ids,
-            episode_count=int(cfg["episodes"]),
+            episode_indices=configured_episode_indices,
             episode_workers_per_task=episode_workers_per_task,
         )
         request_queue = context.Queue(maxsize=max(2, len(jobs) * 2))
@@ -8347,7 +8396,7 @@ def evaluate_suite_process_parallel(
     return merge_task_episode_shards(
         suite_name=suite_name,
         task_ids=task_ids,
-        episode_count=int(cfg["episodes"]),
+        episode_indices=configured_episode_indices,
         partial_summaries=partial_summaries,
     )
 
@@ -8583,6 +8632,22 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["dataset_domain_env"] = bool(
         cfg_get(cfg, args.dataset_domain_env, "dataset_domain_env", False)
     )
+    cfg["secondary_view_causal_ablation"] = bool(
+        cfg_get(
+            cfg,
+            args.secondary_view_causal_ablation,
+            "secondary_view_causal_ablation",
+            False,
+        )
+    )
+    cfg["world_to_ego_causal_ablation"] = bool(
+        cfg_get(
+            cfg,
+            args.world_to_ego_causal_ablation,
+            "world_to_ego_causal_ablation",
+            False,
+        )
+    )
     cfg["dataset_domain_oracle_actions"] = bool(
         cfg_get(
             cfg,
@@ -8632,7 +8697,9 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             if cfg["dataset_domain_env"]
             else None
         ),
-        "benchmark_comparable": not bool(cfg["dataset_domain_env"]),
+        "benchmark_comparable": not bool(cfg["dataset_domain_env"])
+        and not bool(cfg["world_to_ego_causal_ablation"])
+        and not bool(cfg["secondary_view_causal_ablation"]),
     }
     cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
@@ -9091,11 +9158,6 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
     )
     cfg["keyboard_control_enabled"] = configured_environment_workers == 1
-    if cfg.get("episode_ids") is not None and configured_environment_workers > 1:
-        raise ValueError(
-            "--episode-id is a targeted debugging mode and currently requires "
-            "--task-workers 1 --episode-workers-per-task 1."
-        )
     if configured_environment_workers > 1:
         if cfg["task_worker_backend"] not in {"process", "thread"}:
             raise ValueError(
@@ -9349,6 +9411,24 @@ def main() -> None:
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
     )
+    inference_ablation_modalities: set[str] = set()
+    if bool(cfg.get("secondary_view_causal_ablation", False)):
+        if getattr(infer.policy.config, "camera_view_fusion", "legacy_budget") != "primary_residual":
+            raise ValueError(
+                "--secondary-view-causal-ablation requires a primary_residual checkpoint."
+            )
+        inference_ablation_modalities.add("secondary_view")
+        print(
+            "[diagnostic] Secondary-view residual disabled; checkpoint primary path is unchanged.",
+            flush=True,
+        )
+    if bool(cfg.get("world_to_ego_causal_ablation", False)):
+        inference_ablation_modalities.add("world_to_ego")
+        print(
+            "[diagnostic] World-to-Ego causal path disabled: cross-attention and residual twist correction.",
+            flush=True,
+        )
+    infer.policy.model.inference_ablation_modalities = frozenset(inference_ablation_modalities)
     camera_alignment = reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
     print(
         "[info] model camera alignment: "
@@ -9410,7 +9490,9 @@ def main() -> None:
         f"env_seed={cfg['env_seed']}, "
         f"dataset_domain_env={cfg['dataset_domain_env']}, "
         f"dataset_domain_oracle_actions={cfg['dataset_domain_oracle_actions']}, "
-        f"benchmark_comparable={not cfg['dataset_domain_env']}, "
+        f"benchmark_comparable={not cfg['dataset_domain_env'] and not cfg['world_to_ego_causal_ablation'] and not cfg['secondary_view_causal_ablation']}, "
+        f"secondary_view_causal_ablation={cfg['secondary_view_causal_ablation']}, "
+        f"world_to_ego_causal_ablation={cfg['world_to_ego_causal_ablation']}, "
         f"use_suite_max_steps={cfg['use_suite_max_steps']}, "
         f"episode_horizons={episode_horizons}, "
         f"save_video={cfg['save_video']}, "
