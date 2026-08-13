@@ -210,11 +210,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # while keeping both streams trainable. This is not applied when loading a
     # trained WorldFlow checkpoint unless explicitly requested by the caller.
     worldflow_bootstrap_from_ego: bool = False
-    # Optional bounded residual gate from the joint World--Ego prediction back
-    # into the Ego action velocity. None preserves legacy WorldFlow checkpoint
-    # behavior (full joint prediction). New baseline-guarded experiments use
-    # 0.0, which is exactly the original Ego policy at initialization while the
-    # World branch learns from its own auxiliary losses.
+    # Deprecated checkpoint-compatibility field. World/Ego scalar gates are
+    # forbidden; only None is accepted. Keeping the parser field lets older
+    # gate-free checkpoints that serialized null continue to load.
     worldflow_ego_residual_gate_init: float | None = None
     # 0 keeps the complete predicted foreground. A positive value is an
     # optional memory cap applied after PointSeg foreground selection.
@@ -240,10 +238,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # transforms. ``conjugate_ego`` samples one physically valid Ego SE(3)
     # prior B_0 and derives the World prior exactly as G_0 = C B_0 C^{-1},
     # where C is the current EEF-to-World pose.  The latter is the recommended
-    # stochastic double-flow contract.  It requires either the valid-pose9
-    # prior or the complete manifold SE(3) flow because legacy Euclidean
-    # Gaussian rotation-6D vectors are not elements of SE(3) and therefore
-    # cannot be conjugated safely.
+    # stochastic double-flow contract. ``projected_ego_chart`` instead keeps a
+    # legacy checkpoint's exact Euclidean Ego noise distribution, projects its
+    # rotation-6D chart to SO(3), and conjugates only the World prior. This is
+    # the checkpoint-compatible coupling contract: it leaves the Ego input
+    # byte-for-byte unchanged while removing an unrelated World random origin.
+    # ``projected_ego_path`` strengthens that contract at every denoising time:
+    # World state is always the analytic conjugate of the current projected Ego
+    # chart, rather than following a second, incompatible Euclidean chord.
     worldflow_noise_coupling: str = "independent"
     # ``global`` is the historical spatial-transform frame G=CBC^-1. Its
     # translation contains a world-origin lever-arm term. ``current_ee`` keeps
@@ -262,6 +264,18 @@ class SmolVLAConfig(PreTrainedConfig):
     # has the same forward contract but stops the direct Ego-score gradient in
     # the World auxiliary objective. This makes the World residual learn the
     # remaining Ego error instead of allowing the two predictors to cancel.
+    # ``endpoint_geodesic_consensus`` retains the checkpoint's legacy pose9
+    # Ego flow.  Ego and World independently predict the same physical
+    # endpoint, the World endpoint is conjugated back to Ego coordinates, and
+    # their fixed 1:1 SE(3) geodesic midpoint is converted back to an Ego
+    # pose9 velocity.  This gives World a coordinate-defined path to Ego
+    # without a latent residual or learned gate.
+    # ``endpoint_residual_boosting`` instead keeps the pretrained Ego endpoint
+    # as the exact zero-residual function and uses the existing zero-initialized
+    # World twist head to predict only the remaining SE(3) endpoint error.  The
+    # corrected World endpoint is conjugated back to Ego and represented in the
+    # original pose9 chart.  It has no fixed mixing coefficient: World learns a
+    # physical correction, not a second absolute policy to average with Ego.
     # These are deterministic geometry/fixed fusion contracts, not learned gates.
     worldflow_action_fusion: str = "cross_attention"
     worldflow_augmentation_trans_scale: float = 0.20
@@ -519,6 +533,11 @@ class SmolVLAConfig(PreTrainedConfig):
             if not self.se3_enable:
                 raise ValueError("worldflow_se3_head_enable=True requires se3_enable=True.")
         if self.worldflow_enable:
+            if self.worldflow_ego_residual_gate_init is not None:
+                raise ValueError(
+                    "World/Ego residual gates are unsupported; "
+                    "worldflow_ego_residual_gate_init must be None."
+                )
             if self.worldflow_pretrained_lr_multiplier <= 0:
                 raise ValueError("worldflow_pretrained_lr_multiplier must be positive; zero would freeze Ego.")
             if self.worldflow_new_lr_multiplier <= 0:
@@ -542,9 +561,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_noise_trans_scale must be non-negative.")
             if self.worldflow_noise_rot_scale < 0:
                 raise ValueError("worldflow_noise_rot_scale must be non-negative.")
-            if self.worldflow_noise_coupling not in {"independent", "conjugate_ego"}:
+            if self.worldflow_noise_coupling not in {
+                "independent",
+                "conjugate_ego",
+                "projected_ego_chart",
+                "projected_ego_path",
+            }:
                 raise ValueError(
-                    "worldflow_noise_coupling must be 'independent' or 'conjugate_ego'; "
+                    "worldflow_noise_coupling must be 'independent', 'conjugate_ego', "
+                    "'projected_ego_chart', or 'projected_ego_path'; "
                     f"got {self.worldflow_noise_coupling!r}."
                 )
             if self.worldflow_frame_origin not in {"global", "current_ee"}:
@@ -558,11 +583,14 @@ class SmolVLAConfig(PreTrainedConfig):
                 "conjugate_residual",
                 "conjugate_residual_consensus",
                 "conjugate_residual_boosting",
+                "endpoint_geodesic_consensus",
+                "endpoint_residual_boosting",
             }:
                 raise ValueError(
                     "worldflow_action_fusion must be 'cross_attention', 'symmetric_twist', "
                     "'conjugate_residual', 'conjugate_residual_consensus', or "
-                    "'conjugate_residual_boosting'; "
+                    "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
+                    "'endpoint_residual_boosting'; "
                     f"got {self.worldflow_action_fusion!r}."
                 )
             if self.worldflow_action_fusion in {
@@ -572,6 +600,17 @@ class SmolVLAConfig(PreTrainedConfig):
                 "conjugate_residual_boosting",
             } and not self.se3_enable:
                 raise ValueError(f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires se3_enable=True.")
+            if self.worldflow_action_fusion in {
+                "endpoint_geodesic_consensus",
+                "endpoint_residual_boosting",
+            } and (
+                self.se3_enable or self.worldflow_noise_coupling != "projected_ego_path"
+            ):
+                raise ValueError(
+                    f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires the "
+                    "checkpoint-compatible legacy Ego chart (se3_enable=False) and "
+                    "worldflow_noise_coupling='projected_ego_path'."
+                )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable
             ):
@@ -580,13 +619,26 @@ class SmolVLAConfig(PreTrainedConfig):
                     "pose9_action_noise_enable=True or se3_enable=True so the Ego prior is a valid "
                     "SE(3) transform."
                 )
-            if self.worldflow_noise_coupling == "conjugate_ego" and (
+            if self.worldflow_noise_coupling in {
+                "projected_ego_chart",
+                "projected_ego_path",
+            } and (
+                self.pose9_action_noise_enable or self.se3_enable
+            ):
+                raise ValueError(
+                    "projected Ego chart coupling is only for the legacy Euclidean Ego chart; "
+                    "use 'conjugate_ego' with a valid-pose9 or SE(3) prior."
+                )
+            if self.worldflow_noise_coupling in {
+                "conjugate_ego",
+                "projected_ego_chart",
+                "projected_ego_path",
+            } and (
                 self.worldflow_noise_trans_scale != 0.15 or self.worldflow_noise_rot_scale != 0.20
             ):
                 warnings.warn(
                     "worldflow_noise_trans_scale/rot_scale are ignored when "
-                    "worldflow_noise_coupling='conjugate_ego'; the World prior is derived from "
-                    "the Ego prior and current pose by exact conjugation.",
+                    "the World prior is derived from the Ego prior and current pose by conjugation.",
                     stacklevel=2,
                 )
             ego_random_prior = (

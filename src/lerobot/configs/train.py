@@ -69,6 +69,10 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Match an equal-weight task benchmark by drawing the same number of valid
+    # frames from each task per dataloader epoch. Disabled by default to retain
+    # the historical global-uniform-over-frames training distribution.
+    task_balanced_sampling: bool = False
     # Number of micro-batches accumulated before one optimizer update.  ``steps``
     # continues to count optimizer updates, so enabling accumulation does not
     # silently change checkpoint or scheduler semantics.

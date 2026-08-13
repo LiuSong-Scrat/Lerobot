@@ -210,9 +210,6 @@ def _record_with_raw(metrics: dict[str, Any], baseline: torch.Tensor, dualview: 
 
 
 def _predict_item(infer: SmolVLA_ModelInference, item: dict[str, Any], *, seed: int) -> torch.Tensor:
-    batch = default_collate([dict(item)])
-    model_batch = infer.preprocessor(batch)
-    noise = infer._make_seeded_action_noise(model_batch, seed)
     policy_device = next(infer.policy.parameters()).device
     cuda_devices: list[int] = []
     if policy_device.type == "cuda":
@@ -222,6 +219,12 @@ def _predict_item(infer: SmolVLA_ModelInference, item: dict[str, Any], *, seed: 
         torch.manual_seed(seed)
         if policy_device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
+        # Point-cloud preprocessing may sample points.  Seed it together with
+        # the flow noise and model call so a repeated probe really is an
+        # identical intervention rather than a new stochastic input cloud.
+        batch = default_collate([dict(item)])
+        model_batch = infer.preprocessor(batch)
+        noise = infer._make_seeded_action_noise(model_batch, seed)
         action = infer.policy.predict_action_chunk(model_batch, noise=noise)
     return infer.postprocessor(action).detach().cpu().float()
 

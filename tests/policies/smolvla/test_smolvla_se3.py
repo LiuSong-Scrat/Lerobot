@@ -14,6 +14,7 @@ def test_action_chunk_start_offset_shifts_dataset_action_indices():
 
     assert cfg.action_delta_indices == [1, 2, 3, 4]
 from lerobot.policies.smolvla.modeling_smolvla import (
+    _worldflow_carrier_matrix,
     SmolVLAPolicy,
     VLAFlowMatching,
     WorldFlowActionBranch,
@@ -79,7 +80,6 @@ def test_conjugate_residual_zero_init_preserves_ego_and_conjugates_world_twist()
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(se3_enable=True, worldflow_action_fusion="conjugate_residual")
-    model.worldflow_ego_residual_gate_raw = None
     model.world_twist_residual_out_proj = nn.Linear(8, 6)
     nn.init.zeros_(model.world_twist_residual_out_proj.weight)
     nn.init.zeros_(model.world_twist_residual_out_proj.bias)
@@ -194,6 +194,197 @@ def test_conjugate_residual_consensus_is_exact_bidirectional_midpoint():
     assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
 
 
+def test_pose9_endpoint_geodesic_consensus_is_exact_and_jointly_trainable():
+    torch.manual_seed(1141)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+
+    batch, steps = 3, 5
+    time = torch.tensor([0.1, 0.35, 0.8])
+    remaining = (1.0 - time)[:, None, None]
+    ego_state_matrix = se3_exp(torch.randn(batch, steps, 6) * 0.12)
+    ego_endpoint_matrix = se3_exp(torch.randn(batch, steps, 6) * 0.12)
+    world_in_ego_endpoint_matrix = se3_exp(torch.randn(batch, steps, 6) * 0.12)
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.2)
+    carrier_inv = torch.linalg.inv(carrier)
+
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state_matrix), torch.randn(batch, steps, 1)],
+        dim=-1,
+    )
+    ego_velocity = torch.cat(
+        [
+            (matrix_to_pose9(ego_endpoint_matrix) - ego_x_t[..., :9]) / remaining,
+            torch.randn(batch, steps, 1),
+        ],
+        dim=-1,
+    ).requires_grad_()
+    world_state_matrix = carrier @ ego_state_matrix @ carrier_inv
+    world_endpoint_matrix = carrier @ world_in_ego_endpoint_matrix @ carrier_inv
+    world_x_t = matrix_to_pose9(world_state_matrix)
+    world_velocity = (
+        (matrix_to_pose9(world_endpoint_matrix) - world_x_t) / remaining
+    ).requires_grad_()
+
+    fused = model._compose_endpoint_geodesic_consensus(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_velocity,
+        time,
+        carrier_inv,
+        carrier,
+    )
+    fused_endpoint = pose9_to_matrix(ego_x_t[..., :9] + remaining * fused[..., :9])
+    expected_midpoint = (
+        se3_exp(
+            0.5
+            * se3_log(world_in_ego_endpoint_matrix @ torch.linalg.inv(ego_endpoint_matrix))
+        )
+        @ ego_endpoint_matrix
+    )
+    assert torch.allclose(fused_endpoint, expected_midpoint, atol=5e-5, rtol=5e-5)
+    assert torch.equal(fused[..., 9:], ego_velocity[..., 9:])
+
+    fused.square().mean().backward()
+    assert ego_velocity.grad is not None and ego_velocity.grad.abs().sum() > 0
+    assert world_velocity.grad is not None and world_velocity.grad.abs().sum() > 0
+
+
+def test_pose9_endpoint_consensus_requires_exact_projected_ego_path_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_geodesic_consensus",
+    )
+    assert not cfg.se3_enable
+
+    with pytest.raises(ValueError, match="requires the checkpoint-compatible legacy Ego chart"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_noise_coupling="independent",
+            worldflow_action_fusion="endpoint_geodesic_consensus",
+        )
+
+
+def test_pose9_endpoint_residual_zero_is_exact_ego_and_nonzero_is_conjugate():
+    torch.manual_seed(1143)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+    nn.init.zeros_(model.world_twist_residual_out_proj.weight)
+    nn.init.zeros_(model.world_twist_residual_out_proj.bias)
+
+    batch, steps = 2, 4
+    time = torch.tensor([0.2, 0.7])
+    remaining = (1.0 - time)[:, None, None]
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.15)
+    carrier_inv = torch.linalg.inv(carrier)
+    ego_state = se3_exp(torch.randn(batch, steps, 6) * 0.1)
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state), torch.randn(batch, steps, 1)],
+        dim=-1,
+    )
+    ego_velocity = torch.randn(batch, steps, 10, requires_grad=True)
+    world_x_t = matrix_to_pose9(carrier @ ego_state @ carrier_inv)
+    world_features = torch.randn(batch, steps, 8, requires_grad=True)
+
+    exact_ego, zero_world_velocity, zero_residual = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier_inv,
+    )
+    assert torch.equal(exact_ego, ego_velocity)
+    assert torch.count_nonzero(zero_residual) == 0
+    ego_endpoint = pose9_to_matrix(ego_x_t[..., :9] + remaining * ego_velocity[..., :9])
+    zero_world_endpoint = pose9_to_matrix(world_x_t + remaining * zero_world_velocity)
+    assert torch.allclose(
+        zero_world_endpoint,
+        carrier @ ego_endpoint @ carrier_inv,
+        atol=5e-5,
+        rtol=5e-5,
+    )
+
+    nn.init.normal_(model.world_twist_residual_out_proj.weight, std=0.03)
+    corrected_ego, corrected_world_velocity, residual = (
+        model._compose_endpoint_residual_boosting(
+            ego_x_t,
+            ego_velocity,
+            world_x_t,
+            world_features,
+            time,
+            carrier,
+            carrier_inv,
+        )
+    )
+    corrected_ego_endpoint = pose9_to_matrix(
+        ego_x_t[..., :9] + remaining * corrected_ego[..., :9]
+    )
+    corrected_world_endpoint = pose9_to_matrix(
+        world_x_t + remaining * corrected_world_velocity
+    )
+    assert torch.allclose(
+        corrected_world_endpoint,
+        carrier @ corrected_ego_endpoint @ carrier_inv,
+        atol=6e-5,
+        rtol=6e-5,
+    )
+    assert torch.equal(corrected_ego[..., 9:], ego_velocity[..., 9:])
+
+    corrected_ego.square().mean().backward()
+    assert ego_velocity.grad is not None and ego_velocity.grad.abs().sum() > 0
+    assert world_features.grad is not None and world_features.grad.abs().sum() > 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+
+def test_pose9_endpoint_residual_ablation_preserves_ego_but_trains_world():
+    torch.manual_seed(1144)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+    ego_x_t = torch.randn(1, 3, 10)
+    ego_velocity = torch.randn(1, 3, 10, requires_grad=True)
+    world_x_t = torch.randn(1, 3, 9)
+    features = torch.randn(1, 3, 8, requires_grad=True)
+    carrier = se3_exp(torch.randn(1, 1, 6) * 0.1)
+    ego_after, world_velocity, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        features,
+        torch.tensor([0.4]),
+        carrier,
+        torch.linalg.inv(carrier),
+        apply_world_to_ego=False,
+        detach_ego_for_world_supervision=True,
+    )
+    assert torch.equal(ego_after, ego_velocity)
+    assert world_velocity.shape == world_x_t.shape
+    world_velocity.square().mean().backward()
+    assert ego_velocity.grad is None or torch.count_nonzero(ego_velocity.grad) == 0
+    assert features.grad is not None and features.grad.abs().sum() > 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+
+def test_pose9_endpoint_residual_requires_projected_ego_path_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_residual_boosting",
+    )
+    assert not cfg.se3_enable
+    with pytest.raises(ValueError, match="requires the checkpoint-compatible legacy Ego chart"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_noise_coupling="independent",
+            worldflow_action_fusion="endpoint_residual_boosting",
+        )
+
+
 def test_conjugate_residual_boosting_detaches_only_direct_ego_world_gradient():
     torch.manual_seed(115)
     model = VLAFlowMatching.__new__(VLAFlowMatching)
@@ -254,7 +445,6 @@ def test_world_to_ego_causal_ablation_removes_cross_attention_and_residual_corre
     assert torch.equal(ego_after, ego_out)
 
     model.config = SimpleNamespace(se3_enable=True, worldflow_action_fusion="conjugate_residual")
-    model.worldflow_ego_residual_gate_raw = None
     model.world_twist_residual_out_proj = nn.Linear(8, 6)
     model._inject_point_action_features = lambda tokens: tokens
     ego_tokens = torch.randn(2, 4, 8)
@@ -614,7 +804,7 @@ def test_conjugate_worldflow_noise_matches_ego_prior_exactly():
     current = matrix_to_pose9(se3_exp(torch.randn(5, 6) * 0.2))
     world_noise = model.conjugate_ego_noise_to_world(ego_noise, current)
 
-    current_matrix = pose9_to_matrix(current)
+    current_matrix = _worldflow_carrier_matrix(current, cfg.worldflow_frame_origin)
     expected = (
         current_matrix.unsqueeze(1)
         @ pose9_to_matrix(ego_noise[..., :9])
@@ -634,6 +824,145 @@ def test_conjugate_worldflow_noise_matches_ego_prior_exactly():
         atol=4e-5,
         rtol=4e-5,
     )
+
+
+def test_projected_ego_chart_couples_world_without_changing_legacy_ego_noise():
+    torch.manual_seed(230)
+    cfg = SmolVLAConfig(
+        chunk_size=16,
+        n_action_steps=8,
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_chart",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    rng_state = torch.random.get_rng_state()
+    ego_noise = model.sample_noise((5, cfg.chunk_size, 10), torch.device("cpu"))
+    torch.random.set_rng_state(rng_state)
+    legacy_reference = model.sample_noise((5, cfg.chunk_size, 10), torch.device("cpu"))
+    assert torch.equal(ego_noise, legacy_reference)
+
+    current = matrix_to_pose9(se3_exp(torch.randn(5, 6) * 0.2))
+    world_noise = model.conjugate_ego_noise_to_world(ego_noise, current)
+    current_matrix = pose9_to_matrix(current)
+    expected = (
+        current_matrix.unsqueeze(1)
+        @ pose9_to_matrix(ego_noise[..., :9])
+        @ torch.linalg.inv(current_matrix).unsqueeze(1)
+    )
+    assert torch.allclose(pose9_to_matrix(world_noise), expected, atol=3e-5, rtol=3e-5)
+
+
+def test_projected_ego_path_is_conjugate_at_every_time_and_reaches_endpoint():
+    torch.manual_seed(2301)
+    cfg = SmolVLAConfig(
+        chunk_size=8,
+        n_action_steps=8,
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_frame_origin="current_ee",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    ego_x_t = torch.randn(4, cfg.chunk_size, 10) * 0.1
+    current = matrix_to_pose9(se3_exp(torch.randn(4, 6) * 0.2))
+    spatial_target = matrix_to_pose9(se3_exp(torch.randn(4, cfg.chunk_size, 6) * 0.2))
+    time = torch.tensor([0.0, 0.25, 0.5, 0.75])
+    world_x_t, world_u_t = model.project_ego_chart_path_to_world(
+        ego_x_t,
+        current,
+        spatial_target,
+        time,
+    )
+
+    current_matrix = _worldflow_carrier_matrix(current, cfg.worldflow_frame_origin)
+    expected_state = (
+        current_matrix.unsqueeze(1)
+        @ pose9_to_matrix(ego_x_t[..., :9])
+        @ torch.linalg.inv(current_matrix).unsqueeze(1)
+    )
+    assert torch.allclose(pose9_to_matrix(world_x_t), expected_state, atol=4e-5, rtol=4e-5)
+    remaining = (1.0 - time)[:, None, None]
+    assert torch.allclose(
+        world_x_t + remaining * world_u_t,
+        spatial_target,
+        atol=3e-6,
+        rtol=3e-6,
+    )
+
+
+def test_projected_ego_path_augmentation_transforms_current_state_not_old_chord(monkeypatch):
+    torch.manual_seed(2302)
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_augmentation_trans_scale=0.2,
+        worldflow_augmentation_rot_scale=0.3,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    class _WorldBranch:
+        def __call__(self, *_args, **_kwargs):
+            return {"action_tokens": torch.zeros(2, cfg.chunk_size, 8)}
+
+    model.worldflow_branch = _WorldBranch()
+    transform = se3_exp(torch.randn(2, 6) * 0.15)
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla._sample_random_se3",
+        lambda *_args, **_kwargs: transform,
+    )
+    current = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.12)
+    target = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.12)
+    noise = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.12)
+    state = {
+        "point_cloud_world": torch.randn(2, 20, 6),
+        "point_is_pad": torch.zeros(2, 20, dtype=torch.bool),
+        "spatial_gt": target,
+        "noise_spatial": noise,
+        "x_t": matrix_to_pose9(current),
+        "valid": torch.ones(2, cfg.chunk_size, dtype=torch.bool),
+    }
+    time = torch.tensor([0.25, 0.6])
+    augmented, actual_transform = model._augment_worldflow_training_state(
+        state,
+        torch.ones(2, 3, dtype=torch.long),
+        torch.ones(2, 3, dtype=torch.bool),
+        time,
+    )
+    transform_inv = torch.linalg.inv(transform)
+    expected_current = transform[:, None] @ current @ transform_inv[:, None]
+    expected_target = transform[:, None] @ target @ transform_inv[:, None]
+    assert torch.equal(actual_transform, transform)
+    assert torch.allclose(
+        pose9_to_matrix(augmented["x_t"]),
+        expected_current,
+        atol=4e-5,
+        rtol=4e-5,
+    )
+    remaining = (1.0 - time)[:, None, None]
+    assert torch.allclose(
+        augmented["x_t"] + remaining * augmented["u_t"],
+        matrix_to_pose9(expected_target),
+        atol=3e-6,
+        rtol=3e-6,
+    )
+
+
+def test_projected_ego_chart_rejects_nonlegacy_ego_prior():
+    with pytest.raises(ValueError, match="only for the legacy Euclidean Ego chart"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_noise_coupling="projected_ego_chart",
+            pose9_action_noise_enable=True,
+        )
 
 
 def test_current_ee_worldflow_frame_removes_global_origin_lever_arm():
@@ -1492,67 +1821,9 @@ def test_worldflow_branch_is_part_of_policy_inference_call_path():
     assert hasattr(VLAFlowMatching, "denoise_step_world_ego")
 
 
-def test_worldflow_zero_residual_gate_is_exact_ego_baseline_and_has_gradient():
-    model = VLAFlowMatching.__new__(VLAFlowMatching)
-    nn.Module.__init__(model)
-    model.worldflow_ego_residual_gate_raw = nn.Parameter(torch.tensor(0.0))
-    baseline = torch.randn(2, 4, 10)
-    joint = torch.randn(2, 4, 10, requires_grad=True)
-
-    blended = model._blend_worldflow_ego_velocity(baseline, joint)
-
-    assert torch.equal(blended, baseline)
-    blended.square().mean().backward()
-    assert model.worldflow_ego_residual_gate_raw.grad is not None
-    assert torch.isfinite(model.worldflow_ego_residual_gate_raw.grad)
-    assert torch.count_nonzero(joint.grad) == 0
-
-
-def test_worldflow_legacy_checkpoint_without_gate_keeps_joint_behavior():
-    model = VLAFlowMatching.__new__(VLAFlowMatching)
-    nn.Module.__init__(model)
-    model.register_parameter("worldflow_ego_residual_gate_raw", None)
-    baseline = torch.randn(2, 4, 10)
-    joint = torch.randn(2, 4, 10)
-
-    assert torch.equal(model._blend_worldflow_ego_velocity(baseline, joint), joint)
-
-
-def test_worldflow_inference_zero_gate_routes_exact_ego_only_velocity():
-    model = VLAFlowMatching.__new__(VLAFlowMatching)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(se3_enable=False)
-    model.worldflow_ego_residual_gate_raw = nn.Parameter(torch.tensor(0.0))
-    model.action_out_proj = nn.Identity()
-    model.world_action_out_proj = nn.Identity()
-    model._inject_point_action_features = lambda tokens: tokens
-
-    ego_tokens = torch.randn(1, 4, 6)
-    ego_mask = torch.ones(1, 4, dtype=torch.bool)
-    ego_att = torch.tensor([[1, 0, 0, 0]], dtype=ego_tokens.dtype)
-    baseline_out = torch.randn_like(ego_tokens)
-    joint_out = torch.randn_like(ego_tokens)
-    world_out = torch.randn(1, 4, 9)
-    model.embed_suffix = lambda *_args, **_kwargs: (ego_tokens, ego_mask, ego_att)
-    model._run_ego_suffix_expert = lambda *_args, **_kwargs: baseline_out
-    model._run_world_ego_joint_expert = lambda *_args, **_kwargs: (joint_out, world_out)
-
-    class _WorldBranch:
-        @staticmethod
-        def embed_action_tokens(*_args, **_kwargs):
-            return torch.randn(1, 4, 9), torch.ones(1, 4, dtype=torch.bool)
-
-    model.worldflow_branch = _WorldBranch()
-    ego_velocity, world_velocity = model.denoise_step_world_ego(
-        prefix_pad_masks=torch.ones(1, 3, dtype=torch.bool),
-        past_key_values=object(),
-        ego_x_t=torch.randn(1, 4, 10),
-        world_x_t=torch.randn(1, 4, 9),
-        timestep=torch.tensor([0.5]),
-        world_scene={},
-        lang_tokens=torch.ones(1, 2, dtype=torch.long),
-        lang_masks=torch.ones(1, 2, dtype=torch.bool),
-    )
-
-    assert torch.equal(ego_velocity, baseline_out)
-    assert torch.equal(world_velocity, world_out)
+def test_worldflow_scalar_residual_gates_are_rejected():
+    with pytest.raises(ValueError, match="residual gates are unsupported"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_ego_residual_gate_init=0.0,
+        )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from benchmarks.song_real_libero.scripts.smolvla_model_inference import SmolVLA_ModelInference
@@ -78,12 +79,16 @@ def test_zero_noise_is_valid_identity_pose9_for_pose_checkpoints():
     assert torch.equal(noise, expected)
 
 
-def test_seeded_world_noise_is_deferred_to_model_when_conjugate_coupling_is_enabled():
+@pytest.mark.parametrize(
+    "coupling",
+    ["conjugate_ego", "projected_ego_chart", "projected_ego_path"],
+)
+def test_seeded_world_noise_is_deferred_to_model_when_ego_coupling_is_enabled(coupling):
     model = _NoiseModel(
         se3_enable=False,
         pose9_enable=True,
         worldflow_enable=True,
-        worldflow_noise_coupling="conjugate_ego",
+        worldflow_noise_coupling=coupling,
     )
 
     world_noise = _inference_stub(model)._make_seeded_worldflow_noise({}, 7)

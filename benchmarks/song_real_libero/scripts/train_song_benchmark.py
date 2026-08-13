@@ -34,7 +34,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler, TaskBalancedFrameSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -1977,7 +1977,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
-    if bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False)):
+    worldflow_bootstrap_requested = bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False))
+    if worldflow_bootstrap_requested and not cfg.resume:
         bootstrap = getattr(getattr(policy, "model", None), "bootstrap_worldflow_from_ego", None)
         if not callable(bootstrap):
             raise RuntimeError(
@@ -1987,6 +1988,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         bootstrap_report = bootstrap()
         if is_main_process:
             logging.info("WorldFlow Ego bootstrap report: %s", bootstrap_report)
+    elif worldflow_bootstrap_requested and cfg.resume and is_main_process:
+        logging.info(
+            "Skipping WorldFlow Ego bootstrap during exact resume; preserving the checkpoint's "
+            "independently trained World and Ego parameters."
+        )
     validate_policy_camera_config_matches_training_config(cfg, policy)
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
@@ -2126,15 +2132,41 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if hasattr(cfg.policy, "drop_n_last_frames") or cfg.task_balanced_sampling:
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
+        sampler_kwargs = {
+            "dataset_from_indices": dataset.meta.episodes["dataset_from_index"],
+            "dataset_to_indices": dataset.meta.episodes["dataset_to_index"],
+            "episode_indices_to_use": dataset.episodes,
+            "drop_n_last_frames": int(getattr(cfg.policy, "drop_n_last_frames", 0)),
+            "shuffle": True,
+        }
+        if cfg.task_balanced_sampling:
+            episode_tasks = dataset.meta.episodes["tasks"]
+            invalid = [index for index, tasks in enumerate(episode_tasks) if len(tasks) != 1]
+            if invalid:
+                raise ValueError(
+                    "task_balanced_sampling requires exactly one task per episode; "
+                    f"invalid episode indices include {invalid[:10]}."
+                )
+            sampler = TaskBalancedFrameSampler(
+                episode_group_ids=[str(tasks[0]) for tasks in episode_tasks],
+                **sampler_kwargs,
+            )
+            if is_main_process:
+                source_counts = {
+                    str(group_id): len(indices)
+                    for group_id, indices in sampler.grouped_indices.items()
+                }
+                logging.info(
+                    "Task-balanced frame sampling enabled: %d tasks, %d samples/epoch, "
+                    "source frame counts=%s",
+                    len(source_counts),
+                    len(sampler),
+                    source_counts,
+                )
+        else:
+            sampler = EpisodeAwareSampler(**sampler_kwargs)
     else:
         shuffle = True
         sampler = None
@@ -2156,14 +2188,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         and sampler is not None
     ):
         base_num_samples = len(dataset.dataset)
-        base_indices = list(sampler.indices)
-        sampler.indices = base_indices + [index + base_num_samples for index in base_indices]
+        if isinstance(sampler, TaskBalancedFrameSampler):
+            base_count = len(sampler)
+            sampler.add_index_offset(base_num_samples)
+        else:
+            base_indices = list(sampler.indices)
+            base_count = len(base_indices)
+            sampler.indices = base_indices + [index + base_num_samples for index in base_indices]
         if is_main_process:
             logging.info(
                 "Expanded EpisodeAwareSampler for exact paired view coverage: "
                 "%d eligible frames x 2 complementary modes = %d samples.",
-                len(base_indices),
-                len(sampler.indices),
+                base_count,
+                len(sampler),
             )
 
     collate_fn = make_song_train_collate_fn(dataset)
@@ -2300,7 +2337,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_foreground_points",
                     "worldflow_noise_conjugacy_error",
                     "worldflow_path_conjugacy_error",
-                    "worldflow_ego_residual_gate",
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",

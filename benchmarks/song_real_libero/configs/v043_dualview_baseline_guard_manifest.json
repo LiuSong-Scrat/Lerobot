@@ -80,7 +80,7 @@
     "output_dir": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/training/stage2_worldflow_guarded",
     "requires_stage_1_checkpoint": true,
     "worldflow_enable": true,
-    "worldflow_ego_residual_gate_init": 0.0,
+    "worldflow_ego_residual_gate_init": null,
     "pose9_action_noise_enable": false,
     "worldflow_noise_coupling": "independent",
     "se3_enable": false,
