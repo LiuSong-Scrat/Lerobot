@@ -1714,6 +1714,27 @@ def test_pointseg_batchnorm_stats_can_be_frozen_without_freezing_parameters():
     assert batchnorm.bias.requires_grad
 
 
+def test_worldflow_batchnorm_stats_can_be_frozen_without_freezing_parameters():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(worldflow_freeze_batchnorm_stats=True)
+    policy.model = nn.Module()
+    policy.model.worldflow_branch = nn.Module()
+    policy.model.worldflow_branch.scene_encoder = nn.Sequential(
+        nn.BatchNorm1d(4),
+        nn.Linear(4, 4),
+    )
+
+    policy.train(True)
+
+    batchnorm = policy.model.worldflow_branch.scene_encoder[0]
+    linear = policy.model.worldflow_branch.scene_encoder[1]
+    assert not batchnorm.training
+    assert linear.training
+    assert batchnorm.weight.requires_grad
+    assert batchnorm.bias.requires_grad
+
+
 def test_worldflow_joint_loss_uses_foreground_only_and_backpropagates_bridge():
     torch.manual_seed(19)
     cfg = SmolVLAConfig(

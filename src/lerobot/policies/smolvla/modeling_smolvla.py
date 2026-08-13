@@ -765,11 +765,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         }
 
     def train(self, mode: bool = True):
-        """Set policy mode and optionally preserve pretrained PointSeg BN statistics.
+        """Set policy mode and optionally preserve pretrained point-path BN statistics.
 
-        This is a fine-tuning stability control, not a camera-fusion module:
-        all PointSeg parameters retain their existing ``requires_grad`` state.
-        Only running mean/variance updates are disabled, matching inference.
+        These are fine-tuning stability controls, not camera-fusion or World
+        fusion modules. All affine parameters retain their existing
+        ``requires_grad`` state; only running mean/variance updates are
+        disabled so training and inference use the same population statistics.
         """
 
         super().train(mode)
@@ -777,6 +778,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
             conditioner = getattr(getattr(self, "model", None), "pointseg_conditioner", None)
             if conditioner is not None:
                 for module in conditioner.modules():
+                    if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                        module.eval()
+        if mode and bool(getattr(self.config, "worldflow_freeze_batchnorm_stats", False)):
+            worldflow = getattr(getattr(self, "model", None), "worldflow_branch", None)
+            scene_encoder = getattr(worldflow, "scene_encoder", None)
+            if scene_encoder is not None:
+                for module in scene_encoder.modules():
                     if isinstance(module, nn.modules.batchnorm._BatchNorm):
                         module.eval()
         return self

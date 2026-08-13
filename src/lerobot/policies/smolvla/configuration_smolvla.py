@@ -192,6 +192,11 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_enable: bool = False
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
+    # Keep the pretrained World LitePT population statistics fixed during
+    # fine-tuning while leaving its BatchNorm affine parameters and every
+    # World/Ego path trainable. This removes a learning-rate-independent
+    # train/inference drift in the residual feature distribution.
+    worldflow_freeze_batchnorm_stats: bool = False
     worldflow_loss_weight: float = 0.05
     worldflow_geo_loss_weight: float = 0.05
     worldflow_bridge_loss_weight: float = 0.05
