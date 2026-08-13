@@ -10,7 +10,7 @@
 - 当前入口脚本为实验根目录中的 `scripts/eval_libero10_v16_one_checkpoint_a800_gpu345_total40_b40_fixedbarrier.sh`；多 checkpoint 的 tmux 入口为 `scripts/launch_eval_libero10_v16_steps100_240_480_720_a800_gpu345_total40_b40_tmux.sh`。
 - 同时筛选四个 checkpoint 时，使用实验根目录中的 `scripts/launch_eval_libero10_v17_steps100_240_480_720_a800_gpu345_concurrent4_total40_b40_tmux.sh`。该模式让 `100/240/480/720` 各使用 10 个环境并发，总并发仍为 40，推理 batch 参数仍为 40；不得与单 checkpoint 独占 40 环境的串行入口同时运行。
 - v17 已完成一整个 `10 tasks x 50 episodes` 训练 epoch。本地 first-10 screen 的 `100/240/480/720` 为 `90/92/94/96`，但 step 720 的正式 500-state 流在 `267/286` 时出现第 19 个失败，最高只可能追平 `481/500`，已数学早停并保留全部输出。覆盖完整 episode 区间的固定分层集合 `0,5,...,45` 上，正常 WorldFlow 为 `92/100`，同 checkpoint 关闭 World-to-Ego 为 `96/100`，因果增益是 `-4`；此前 first-10 的 `+3` 是切片偏差，v17 已正式否决。
-- 下一版 v19 从 exact-zero-residual、baseline-compatible 的 v14 起点重新训练，仅增加训练期 World-to-Ego stochastic depth `p=0.5`。它不增加参数、门控、辅助损失或推理分支；纯 Ego 和完整 World/Ego 样本共用原 action loss，且所有 Ego/World/残差参数保持非零学习率。训练仍为 4 GPU、batch 48/GPU、worker 12、720 steps、W&B enabled；脚本位于实验根目录 `scripts/run_v19_from_v14_world_to_ego_stochastic_depth_p50_4gpu_b48_w12_720steps.sh`。
+- v19 已从 exact-zero-residual、baseline-compatible 的 v14 起点启动，仅增加训练期 World-to-Ego stochastic depth `p=0.5`。它不增加参数、门控、辅助损失或推理分支；纯 Ego 和完整 World/Ego 样本共用原 action loss，且所有 Ego/World/残差参数保持非零学习率。训练使用 4 GPU、batch 48/GPU、worker 12、720 steps、W&B enabled，tmux 为 `wep_v043_libero10_v19_w2e_stochastic_depth_p50_720`。固定分层评测 waiter 为 `wep_v043_v19_stratified_worldflow_causal_after_train`，训练完成后自动评估 steps `100/240/480/720`，仅对超过同状态 baseline `95/100` 的 checkpoint 运行同 checkpoint 因果消融。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
