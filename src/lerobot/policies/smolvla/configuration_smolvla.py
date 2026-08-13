@@ -213,6 +213,13 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_pretrained_lr_multiplier: float = 1.0
     worldflow_new_lr_multiplier: float = 1.0
     worldflow_residual_lr_multiplier: float | None = None
+    # Training-only stochastic depth for the physical World-to-Ego correction.
+    # A dropped sample is optimized through the unchanged Ego action path;
+    # retained samples use the complete bidirectional World/Ego path. This adds
+    # no parameter or inference-time branch and uses the same action objective
+    # for both cases. A value of 1 is forbidden because it would prevent the
+    # World correction from receiving action gradients.
+    worldflow_training_world_to_ego_dropout_probability: float = 0.0
     # Optional one-shot initialization used when adapting an Ego checkpoint:
     # copy shape-compatible Ego action/point modules into the World stream,
     # while keeping both streams trainable. This is not applied when loading a
@@ -557,6 +564,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "worldflow_residual_lr_multiplier must be positive; zero would freeze the residual head."
                 )
+            if not 0.0 <= self.worldflow_training_world_to_ego_dropout_probability < 1.0:
+                raise ValueError(
+                    "worldflow_training_world_to_ego_dropout_probability must be in [0,1); "
+                    "1 would remove all World-to-Ego action gradients."
+                )
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError(
@@ -625,6 +637,14 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires the "
                     "checkpoint-compatible legacy Ego chart (se3_enable=False) and "
                     "worldflow_noise_coupling='projected_ego_path'."
+                )
+            if (
+                self.worldflow_training_world_to_ego_dropout_probability > 0
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_training_world_to_ego_dropout_probability is supported only for "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
                 )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable

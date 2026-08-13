@@ -3400,6 +3400,7 @@ class VLAFlowMatching(nn.Module):
         *,
         apply_world_to_ego: bool = True,
         detach_ego_for_world_supervision: bool = False,
+        world_to_ego_keep_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Predict only the physical endpoint error left by the Ego policy.
 
@@ -3522,6 +3523,18 @@ class VLAFlowMatching(nn.Module):
             ],
             dim=-1,
         )
+        if world_to_ego_keep_mask is not None:
+            keep = world_to_ego_keep_mask.to(device=ego_velocity.device, dtype=torch.bool)
+            if keep.shape != (ego_velocity.shape[0],):
+                raise ValueError(
+                    "Expected one World-to-Ego keep decision per batch item, "
+                    f"got {tuple(keep.shape)} for batch {ego_velocity.shape[0]}."
+                )
+            corrected_ego_velocity = torch.where(
+                keep[:, None, None],
+                corrected_ego_velocity,
+                ego_velocity,
+            )
         return corrected_ego_velocity, world_velocity.to(dtype=ego_velocity.dtype), residual
 
     def embed_prefix(
@@ -4925,6 +4938,7 @@ class VLAFlowMatching(nn.Module):
             joint_v_t = self.action_out_proj(ego_expert_out)
             v_t = joint_v_t
             world_velocity = self.world_action_out_proj(world_expert_out)
+            world_to_ego_keep_mask = None
             if x_t.shape[-1] < 9 or v_t.shape[-1] < 9:
                 raise ValueError("World–Ego bridge requires Ego pose9 actions.")
             if self.config.worldflow_action_fusion in {
@@ -4947,6 +4961,17 @@ class VLAFlowMatching(nn.Module):
                         current.unsqueeze(1),
                     )
                 else:
+                    dropout_probability = float(
+                        getattr(
+                            self.config,
+                            "worldflow_training_world_to_ego_dropout_probability",
+                            0.0,
+                        )
+                    )
+                    if dropout_probability > 0:
+                        world_to_ego_keep_mask = (
+                            torch.rand(x_t.shape[0], device=x_t.device) >= dropout_probability
+                        )
                     v_t, world_velocity, _ = self._compose_endpoint_residual_boosting(
                         x_t,
                         v_t,
@@ -4956,6 +4981,7 @@ class VLAFlowMatching(nn.Module):
                         current.unsqueeze(1),
                         current_inv.unsqueeze(1),
                         detach_ego_for_world_supervision=True,
+                        world_to_ego_keep_mask=world_to_ego_keep_mask,
                     )
             endpoint = x_t + (1.0 - time_expanded) * v_t
             self.last_body_pose9_prediction = endpoint[..., :9]
@@ -5013,6 +5039,10 @@ class VLAFlowMatching(nn.Module):
                 pred_aug_velocity=pred_aug_velocity,
                 augmentation_transform=augmentation_transform,
             )
+            if world_to_ego_keep_mask is not None:
+                self.last_worldflow_metrics["worldflow_world_to_ego_keep_ratio"] = (
+                    world_to_ego_keep_mask.to(dtype=torch.float32).mean().detach()
+                )
             self._record_standard_action_metrics(
                 actions=actions,
                 x_t=x_t,
