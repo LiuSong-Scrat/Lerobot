@@ -922,6 +922,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if self.config.worldflow_enable and (
                 self.config.worldflow_pretrained_lr_multiplier != 1.0
                 or self.config.worldflow_new_lr_multiplier != 1.0
+                or getattr(self.config, "worldflow_residual_lr_multiplier", None) is not None
             ):
                 new_world_prefixes = (
                     "model.worldflow_branch.",
@@ -939,25 +940,42 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "model.world_ego_scene_type_embedding",
                     "model.world_ego_action_type_embedding",
                 }
+                residual_prefix = "model.world_twist_residual_out_proj."
+                residual = [
+                    parameter
+                    for name, parameter in trainable
+                    if name.startswith(residual_prefix)
+                ]
                 new_world = [
                     parameter
                     for name, parameter in trainable
-                    if name in new_world_exact or name.startswith(new_world_prefixes)
+                    if (name in new_world_exact or name.startswith(new_world_prefixes))
+                    and not name.startswith(residual_prefix)
                 ]
                 pretrained = [
                     parameter
                     for name, parameter in trainable
                     if name not in new_world_exact and not name.startswith(new_world_prefixes)
                 ]
-                if not new_world or not pretrained:
+                residual_multiplier = getattr(
+                    self.config, "worldflow_residual_lr_multiplier", None
+                )
+                if not new_world or not pretrained or (residual_multiplier is not None and not residual):
                     raise RuntimeError(
-                        "Two-timescale WorldFlow optimization requires non-empty pretrained and new-module groups."
+                        "Discriminative WorldFlow optimization requires non-empty pretrained, World, "
+                        "and (when explicitly split) residual parameter groups."
                     )
-                grouped_ids = {id(parameter) for parameter in (*pretrained, *new_world)}
+                # Historical checkpoints/configs omit the residual multiplier.
+                # Preserve their exact two-group optimizer by returning the
+                # residual tensors to the World group.
+                if residual_multiplier is None:
+                    new_world.extend(residual)
+                    residual = []
+                grouped_ids = {id(parameter) for parameter in (*pretrained, *new_world, *residual)}
                 if len(grouped_ids) != len(trainable):
                     raise RuntimeError("WorldFlow optimizer parameter groups overlap or omit trainable parameters.")
                 base_lr = float(self.config.optimizer_lr)
-                return [
+                groups = [
                     {
                         "params": pretrained,
                         "lr": base_lr * float(self.config.worldflow_pretrained_lr_multiplier),
@@ -969,6 +987,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         "group_name": "new_world_bidirectional",
                     },
                 ]
+                if residual:
+                    groups.append(
+                        {
+                            "params": residual,
+                            "lr": base_lr * float(residual_multiplier),
+                            "group_name": "world_physical_residual_head",
+                        }
+                    )
+                return groups
             return [parameter for _, parameter in trainable]
         return self.parameters()
 

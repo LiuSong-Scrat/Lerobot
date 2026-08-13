@@ -199,12 +199,15 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_rot_weight: float = 1.0
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
-    # Two-timescale fine-tuning keeps the pretrained Ego/shared path plastic
-    # while allowing randomly initialized World/fusion modules to catch up.
-    # Both multipliers must stay positive: zero would silently freeze a branch.
-    # Defaults preserve the historical single-learning-rate optimizer exactly.
+    # Discriminative fine-tuning keeps every path plastic while permitting an
+    # existing World representation and its zero-initialized physical residual
+    # output head to adapt on different time scales. ``None`` preserves the
+    # historical two-group behavior by using ``worldflow_new_lr_multiplier``
+    # for the residual head as well. Every explicit multiplier must be positive:
+    # zero would silently freeze a path.
     worldflow_pretrained_lr_multiplier: float = 1.0
     worldflow_new_lr_multiplier: float = 1.0
+    worldflow_residual_lr_multiplier: float | None = None
     # Optional one-shot initialization used when adapting an Ego checkpoint:
     # copy shape-compatible Ego action/point modules into the World stream,
     # while keeping both streams trainable. This is not applied when loading a
@@ -542,6 +545,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_pretrained_lr_multiplier must be positive; zero would freeze Ego.")
             if self.worldflow_new_lr_multiplier <= 0:
                 raise ValueError("worldflow_new_lr_multiplier must be positive; zero would freeze World.")
+            if (
+                self.worldflow_residual_lr_multiplier is not None
+                and self.worldflow_residual_lr_multiplier <= 0
+            ):
+                raise ValueError(
+                    "worldflow_residual_lr_multiplier must be positive; zero would freeze the residual head."
+                )
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError(
