@@ -880,7 +880,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "uniform_union",
                     "full_union",
                 }
-                and not getattr(self.config, "worldflow_enable", False)
                 and (
                     getattr(self.config, "multiview_input_pretrained_lr_multiplier", 1.0) != 1.0
                     or getattr(self.config, "multiview_input_point_lr_multiplier", 1.0) != 1.0
@@ -897,6 +896,114 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     for name, parameter in trainable
                     if name.startswith(point_prefixes)
                 ]
+                if getattr(self.config, "worldflow_enable", False):
+                    world_pretrained_multiplier = float(
+                        self.config.worldflow_pretrained_lr_multiplier
+                    )
+                    multiview_pretrained_multiplier = float(
+                        getattr(self.config, "multiview_input_pretrained_lr_multiplier", 1.0)
+                    )
+                    if not math.isclose(
+                        world_pretrained_multiplier,
+                        multiview_pretrained_multiplier,
+                        rel_tol=0.0,
+                        abs_tol=0.0,
+                    ):
+                        raise ValueError(
+                            "Joint input-layer multi-view + WorldFlow optimization requires "
+                            "multiview_input_pretrained_lr_multiplier to equal "
+                            "worldflow_pretrained_lr_multiplier so the shared Ego path has one "
+                            "unambiguous learning rate."
+                        )
+                    new_world_prefixes = (
+                        "model.worldflow_branch.",
+                        "model.ego_scene_to_expert.",
+                        "model.world_scene_to_expert.",
+                        "model.world_action_out_proj.",
+                        "model.world_se3_action_out_proj.",
+                        "model.world_twist_residual_out_proj.",
+                        "model.ego_to_world_cross_norm.",
+                        "model.world_to_ego_cross_norm.",
+                        "model.ego_to_world_cross_attn.",
+                        "model.world_to_ego_cross_attn.",
+                    )
+                    new_world_exact = {
+                        "model.world_ego_scene_type_embedding",
+                        "model.world_ego_action_type_embedding",
+                    }
+                    residual_prefix = "model.world_twist_residual_out_proj."
+                    residual = [
+                        parameter
+                        for name, parameter in trainable
+                        if name.startswith(residual_prefix)
+                    ]
+                    new_world = [
+                        parameter
+                        for name, parameter in trainable
+                        if (name in new_world_exact or name.startswith(new_world_prefixes))
+                        and not name.startswith(residual_prefix)
+                    ]
+                    pretrained = [
+                        parameter
+                        for name, parameter in trainable
+                        if not name.startswith(point_prefixes)
+                        and name not in new_world_exact
+                        and not name.startswith(new_world_prefixes)
+                    ]
+                    residual_multiplier = getattr(
+                        self.config, "worldflow_residual_lr_multiplier", None
+                    )
+                    if residual_multiplier is None:
+                        new_world.extend(residual)
+                        residual = []
+                    if (
+                        not pretrained
+                        or not point_input
+                        or not new_world
+                        or (residual_multiplier is not None and not residual)
+                    ):
+                        raise RuntimeError(
+                            "Joint input-layer multi-view + WorldFlow optimization requires "
+                            "non-empty shared-Ego, point-input, World, and explicitly requested "
+                            "residual parameter groups."
+                        )
+                    grouped_ids = {
+                        id(parameter)
+                        for parameter in (*pretrained, *point_input, *new_world, *residual)
+                    }
+                    if len(grouped_ids) != len(trainable):
+                        raise RuntimeError(
+                            "Joint input-layer multi-view + WorldFlow optimizer groups overlap "
+                            "or omit trainable parameters."
+                        )
+                    base_lr = float(self.config.optimizer_lr)
+                    groups = [
+                        {
+                            "params": pretrained,
+                            "lr": base_lr * multiview_pretrained_multiplier,
+                            "group_name": "pretrained_ego_shared_nonpoint",
+                        },
+                        {
+                            "params": point_input,
+                            "lr": base_lr
+                            * float(getattr(self.config, "multiview_input_point_lr_multiplier", 1.0)),
+                            "group_name": "point_input_adaptation_path",
+                        },
+                        {
+                            "params": new_world,
+                            "lr": base_lr * float(self.config.worldflow_new_lr_multiplier),
+                            "group_name": "new_world_bidirectional",
+                        },
+                    ]
+                    if residual:
+                        groups.append(
+                            {
+                                "params": residual,
+                                "lr": base_lr * float(residual_multiplier),
+                                "group_name": "world_physical_residual_head",
+                            }
+                        )
+                    return groups
                 pretrained = [
                     parameter
                     for name, parameter in trainable

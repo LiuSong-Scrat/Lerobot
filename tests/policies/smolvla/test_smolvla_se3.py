@@ -1619,6 +1619,70 @@ def test_input_multiview_discriminative_optimizer_keeps_all_paths_trainable(fusi
     assert set(grouped) == set(expected)
 
 
+def test_joint_input_multiview_worldflow_optimizer_keeps_all_four_paths_trainable():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        vla_adapter_enable=True,
+        camera_view_fusion="novelty_union",
+        worldflow_enable=True,
+        multiview_input_pretrained_lr_multiplier=0.05,
+        multiview_input_point_lr_multiplier=1.0,
+        worldflow_pretrained_lr_multiplier=0.05,
+        worldflow_new_lr_multiplier=0.2,
+        worldflow_residual_lr_multiplier=1.0,
+        optimizer_lr=1e-6,
+    )
+    policy.model = nn.Module()
+    policy.model.action_out_proj = nn.Linear(4, 4)
+    policy.model.pointseg_conditioner = nn.Linear(4, 4)
+    policy.model.pointseg_object_proj = nn.Linear(4, 4)
+    policy.model.pointseg_background_proj = nn.Linear(4, 4)
+    policy.model.point_action_fusion = nn.Linear(4, 4)
+    policy.model.worldflow_branch = nn.Linear(4, 4)
+    policy.model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    policy.model.world_twist_residual_out_proj = nn.Linear(4, 4)
+
+    groups = policy.get_optim_params()
+
+    assert [group["group_name"] for group in groups] == [
+        "pretrained_ego_shared_nonpoint",
+        "point_input_adaptation_path",
+        "new_world_bidirectional",
+        "world_physical_residual_head",
+    ]
+    assert [group["lr"] for group in groups] == pytest.approx(
+        [5e-8, 1e-6, 2e-7, 1e-6]
+    )
+    assert all(parameter.requires_grad for group in groups for parameter in group["params"])
+    grouped = [id(parameter) for group in groups for parameter in group["params"]]
+    expected = [id(parameter) for parameter in policy.parameters() if parameter.requires_grad]
+    assert len(grouped) == len(set(grouped)) == len(expected)
+    assert set(grouped) == set(expected)
+
+
+def test_joint_input_multiview_worldflow_requires_one_shared_ego_learning_rate():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        vla_adapter_enable=True,
+        camera_view_fusion="novelty_union",
+        worldflow_enable=True,
+        multiview_input_pretrained_lr_multiplier=0.1,
+        multiview_input_point_lr_multiplier=1.0,
+        worldflow_pretrained_lr_multiplier=0.05,
+        worldflow_new_lr_multiplier=0.2,
+        worldflow_residual_lr_multiplier=1.0,
+        optimizer_lr=1e-6,
+    )
+    policy.model = nn.Module()
+    policy.model.action_out_proj = nn.Linear(4, 4)
+    policy.model.pointseg_conditioner = nn.Linear(4, 4)
+
+    with pytest.raises(ValueError, match="one unambiguous learning rate"):
+        policy.get_optim_params()
+
+
 def test_input_view_dropout_requires_supported_fusion_and_multiple_views():
     cfg = SmolVLAConfig(
         camera_views="agentview,robot0_eye_in_hand",
