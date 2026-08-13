@@ -8,6 +8,7 @@
 - A800 测评总环境并行上限为 `40`，推理 batch 固定为 `40`。
 - LIBERO-10 的当前通用划分为：GPU 3 运行 tasks `0,3,6,9`，GPU 4 运行 tasks `1,4,7`，GPU 5 运行 tasks `2,5,8`；每个 task 使用 4 个 episode worker，总并行为 `16+12+12=40`。
 - 当前入口脚本为实验根目录中的 `scripts/eval_libero10_v16_one_checkpoint_a800_gpu345_total40_b40_fixedbarrier.sh`；多 checkpoint 的 tmux 入口为 `scripts/launch_eval_libero10_v16_steps100_240_480_720_a800_gpu345_total40_b40_tmux.sh`。
+- 同时筛选四个 checkpoint 时，使用实验根目录中的 `scripts/launch_eval_libero10_v17_steps100_240_480_720_a800_gpu345_concurrent4_total40_b40_tmux.sh`。该模式让 `100/240/480/720` 各使用 10 个环境并发，总并发仍为 40，推理 batch 参数仍为 40；不得与单 checkpoint 独占 40 环境的串行入口同时运行。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
