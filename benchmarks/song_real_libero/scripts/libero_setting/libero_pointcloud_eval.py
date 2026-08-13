@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "strict_official_multiview_camera_selection_v17_20260811"
+EVAL_BUILD_TAG = "strict_official_fixed_barrier_v18_20260814"
 
 import argparse
 import atexit
@@ -988,6 +988,41 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Short collection window used by the shared-GPU dynamic batcher.",
+    )
+    parser.add_argument(
+        "--inference-batching-mode",
+        choices=("dynamic", "fixed_barrier"),
+        default=None,
+        help=(
+            "How process environment requests are batched. 'dynamic' maximizes throughput by arrival "
+            "time. 'fixed_barrier' keeps one stable slot per environment worker and a constant physical "
+            "batch shape, removing arrival-order numerical variation from comparable evaluations."
+        ),
+    )
+    parser.add_argument(
+        "--inference-repeatability-probe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "On the first fixed-barrier batch only, repeat the exact same policy forward and also "
+            "run a batch whose rows duplicate one request. This diagnostic adds two forwards but "
+            "does not alter the rollout action or any model/external-library implementation."
+        ),
+    )
+    parser.add_argument(
+        "--inference-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Persistent exact-input action-chunk cache. The cache key includes the checkpoint identity, "
+            "ordered fixed batch, complete observation bytes, instruction, and explicit noise seed."
+        ),
+    )
+    parser.add_argument(
+        "--inference-cache-mode",
+        choices=("off", "read_write", "readonly"),
+        default=None,
+        help="Use the deterministic inference cache (default: read_write when a cache directory is supplied).",
     )
     parser.add_argument(
         "--recreate-env-per-episode",
@@ -3588,6 +3623,9 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "task_worker_backend": str(cfg["task_worker_backend"]),
             "inference_batch_size": int(cfg["inference_batch_size"]),
             "inference_batch_wait_ms": float(cfg["inference_batch_wait_ms"]),
+            "inference_batching_mode": str(cfg["inference_batching_mode"]),
+            "inference_cache_mode": str(cfg.get("inference_cache_mode", "off")),
+            "inference_cache_dir": cfg.get("inference_cache_dir"),
             "recreate_env_per_episode": bool(cfg["recreate_env_per_episode"]),
             "deterministic_torch": bool(cfg["deterministic_torch"]),
             "torch_determinism": cfg.get("torch_determinism", {}),
@@ -4830,6 +4868,139 @@ class _ProcessInferenceRequest:
     noise_seed: int | None
 
 
+class FixedBatchInferenceCache:
+    """Memoize exact fixed-slot model calls without changing model outputs."""
+
+    schema_version = "fixed_batch_exact_action_chunk_v2"
+
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        policy_path: Path,
+        mode: str,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> None:
+        self.directory = directory.resolve()
+        self.mode = str(mode)
+        if self.mode not in {"read_write", "readonly"}:
+            raise ValueError(f"Unsupported inference cache mode: {self.mode!r}")
+        policy_path = policy_path.resolve()
+        model_path = policy_path / "model.safetensors"
+        if not model_path.is_file():
+            raise FileNotFoundError(model_path)
+
+        def _small_sha256(path: Path) -> str | None:
+            return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+        model_stat = model_path.stat()
+        identity_files = (
+            policy_path / "config.json",
+            policy_path / "policy_preprocessor.json",
+            policy_path / "policy_postprocessor.json",
+        )
+        self.identity = {
+            "schema_version": self.schema_version,
+            "eval_build_tag": EVAL_BUILD_TAG,
+            "policy_path": str(policy_path),
+            "model_resolved_path": str(model_path.resolve()),
+            "model_size": int(model_stat.st_size),
+            "model_mtime_ns": int(model_stat.st_mtime_ns),
+            "small_file_sha256": {path.name: _small_sha256(path) for path in identity_files},
+            "runtime_context": dict(runtime_context or {}),
+        }
+        self.identity_sha256 = hashlib.sha256(
+            json.dumps(self.identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if self.mode == "read_write":
+            self.directory.mkdir(parents=True, exist_ok=True)
+        manifest = self.directory / "manifest.json"
+        if manifest.exists():
+            existing = json.loads(manifest.read_text(encoding="utf-8"))
+            if existing != self.identity:
+                raise RuntimeError(f"Inference cache identity mismatch: {manifest}")
+        elif self.mode == "readonly":
+            raise FileNotFoundError(f"Readonly inference cache has no manifest: {manifest}")
+        else:
+            temporary = self.directory / f".manifest.{os.getpid()}.tmp"
+            temporary.write_text(json.dumps(self.identity, indent=2) + "\n", encoding="utf-8")
+            if manifest.exists():
+                temporary.unlink(missing_ok=True)
+                existing = json.loads(manifest.read_text(encoding="utf-8"))
+                if existing != self.identity:
+                    raise RuntimeError(f"Inference cache identity race mismatch: {manifest}")
+            else:
+                os.replace(temporary, manifest)
+        self.hit_count = 0
+        self.miss_count = 0
+        self.write_count = 0
+
+    def key(self, slots: list[_ProcessInferenceRequest]) -> str:
+        records = []
+        for row_index, request in enumerate(slots):
+            records.append(
+                {
+                    "row_index": row_index,
+                    "worker_id": int(request.worker_id),
+                    "observation_sha256": model_observation_fingerprints(request.observation)["__all__"],
+                    "task": str(request.task),
+                    "postprocess": bool(request.postprocess),
+                    "state_pose_mode": str(request.state_pose_mode),
+                    "noise_seed": None if request.noise_seed is None else int(request.noise_seed),
+                }
+            )
+        payload = {
+            "schema_version": self.schema_version,
+            "policy_identity_sha256": self.identity_sha256,
+            "ordered_slots": records,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _path(self, key: str) -> Path:
+        return self.directory / "entries" / key[:2] / f"{key}.npy"
+
+    def load(self, key: str) -> np.ndarray | None:
+        path = self._path(key)
+        if not path.is_file():
+            self.miss_count += 1
+            if self.mode == "readonly":
+                raise KeyError(f"Readonly inference cache miss: {key}")
+            return None
+        with path.open("rb") as stream:
+            value = np.load(stream, allow_pickle=False)
+        self.hit_count += 1
+        return np.ascontiguousarray(value)
+
+    def store(self, key: str, value: Any) -> None:
+        if self.mode != "read_write":
+            return
+        path = self._path(key)
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        array = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+        array = np.ascontiguousarray(array)
+        temporary = path.parent / f".{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with temporary.open("xb") as stream:
+            np.save(stream, array, allow_pickle=False)
+        if path.exists():
+            temporary.unlink(missing_ok=True)
+        else:
+            os.replace(temporary, path)
+            self.write_count += 1
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "directory": str(self.directory),
+            "hits": self.hit_count,
+            "misses": self.miss_count,
+            "writes": self.write_count,
+        }
+
+
 class ProcessInferenceProxy:
     """Child-process policy facade backed by the parent GPU model service."""
 
@@ -5015,6 +5186,148 @@ def _execute_process_inference_batch(
         error_text = traceback.format_exc()
         for request in requests:
             response_queues[request.worker_id].put(("error", request.request_id, error_text))
+
+
+def _execute_process_inference_fixed_slots(
+    infer: SmolVLA_ModelInference,
+    requests_by_worker: dict[int, _ProcessInferenceRequest],
+    response_queues: dict[int, Any],
+    *,
+    slot_count: int,
+    padding_requests_by_worker: dict[int, _ProcessInferenceRequest],
+    repeatability_probe_path: Path | None = None,
+    inference_cache: FixedBatchInferenceCache | None = None,
+) -> None:
+    """Execute a constant-shape batch whose row index is the stable worker id.
+
+    Dynamic arrival batching changes both the physical batch shape and each
+    episode's row position across otherwise identical runs. Small CUDA numeric
+    differences then bifurcate contact-rich closed-loop trajectories. This
+    mode waits for one request from every still-active worker, places it in its
+    immutable slot, and pads slots belonging to completed workers with their
+    last request. Only real requests receive responses.
+
+    Padding is deliberately inference-only: no extra environment rollout or
+    action selection is introduced, and each real request retains its keyed
+    per-episode/per-call Flow Matching noise.
+    """
+    if not requests_by_worker:
+        return
+    invalid = sorted(worker_id for worker_id in requests_by_worker if not 0 <= worker_id < slot_count)
+    if invalid:
+        raise RuntimeError(f"Fixed inference batch contains invalid worker slots: {invalid}.")
+
+    fallback = requests_by_worker[min(requests_by_worker)]
+    slots: list[_ProcessInferenceRequest] = []
+    real_slots: list[tuple[int, _ProcessInferenceRequest]] = []
+    for worker_id in range(int(slot_count)):
+        request = requests_by_worker.get(worker_id)
+        if request is not None:
+            padding_requests_by_worker[worker_id] = request
+            real_slots.append((worker_id, request))
+        else:
+            request = padding_requests_by_worker.get(worker_id, fallback)
+        slots.append(request)
+
+    try:
+        postprocess_values = {request.postprocess for request in slots}
+        state_modes = {request.state_pose_mode for request in slots}
+        if len(postprocess_values) != 1 or len(state_modes) != 1:
+            raise ValueError("All fixed-slot requests must use the same inference options.")
+        observation_batch = _stack_model_observations([request.observation for request in slots])
+        cache_key = inference_cache.key(slots) if inference_cache is not None else None
+        action_chunks = inference_cache.load(cache_key) if inference_cache is not None else None
+        if action_chunks is None:
+            action_chunks = infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in slots]
+                if all(request.noise_seed is not None for request in slots)
+                else None,
+            )
+            if inference_cache is not None:
+                inference_cache.store(cache_key, action_chunks)
+        if repeatability_probe_path is not None and not repeatability_probe_path.exists():
+            repeated_action_chunks = infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in slots]
+                if all(request.noise_seed is not None for request in slots)
+                else None,
+            )
+            duplicated_slots = [slots[0] for _ in slots]
+            duplicated_observation_batch = _stack_model_observations(
+                [request.observation for request in duplicated_slots]
+            )
+            duplicated_action_chunks = infer.predict_action_chunk_obs(
+                duplicated_observation_batch,
+                task=[request.task for request in duplicated_slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in duplicated_slots]
+                if duplicated_slots[0].noise_seed is not None
+                else None,
+            )
+
+            def _as_numpy(value: Any) -> np.ndarray:
+                if hasattr(value, "detach"):
+                    value = value.detach().cpu().numpy()
+                return np.ascontiguousarray(np.asarray(value))
+
+            first_array = _as_numpy(action_chunks)
+            repeated_array = _as_numpy(repeated_action_chunks)
+            duplicated_array = _as_numpy(duplicated_action_chunks)
+            temporal_abs = np.abs(first_array.astype(np.float64) - repeated_array.astype(np.float64))
+            row_reference = np.broadcast_to(duplicated_array[0:1], duplicated_array.shape)
+            row_abs = np.abs(duplicated_array.astype(np.float64) - row_reference.astype(np.float64))
+            probe = {
+                "probe_version": "same_process_same_batch_v1",
+                "slot_count": int(slot_count),
+                "same_process": True,
+                "same_loaded_policy": True,
+                "same_input_batch": True,
+                "same_explicit_noise_seeds": True,
+                "rollout_action_source": "first_forward",
+                "extra_forward_count": 2,
+                "model_or_external_library_modified": False,
+                "temporal_repeat": {
+                    "exact": bool(np.array_equal(first_array, repeated_array)),
+                    "max_abs_diff": float(temporal_abs.max(initial=0.0)),
+                    "mean_abs_diff": float(temporal_abs.mean()),
+                    "first_sha256": hashlib.sha256(first_array.view(np.uint8)).hexdigest(),
+                    "repeated_sha256": hashlib.sha256(repeated_array.view(np.uint8)).hexdigest(),
+                },
+                "duplicated_rows_single_forward": {
+                    "all_rows_exact": bool(np.all(duplicated_array == row_reference)),
+                    "max_abs_diff": float(row_abs.max(initial=0.0)),
+                    "mean_abs_diff": float(row_abs.mean()),
+                },
+            }
+            repeatability_probe_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = repeatability_probe_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(probe, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, repeatability_probe_path)
+            print(f"[repeatability-probe] {json.dumps(probe, sort_keys=True)}", flush=True)
+        if hasattr(action_chunks, "detach"):
+            action_chunks = action_chunks.detach().cpu().numpy()
+        else:
+            action_chunks = np.asarray(action_chunks)
+        if int(action_chunks.shape[0]) != int(slot_count):
+            raise RuntimeError(
+                f"Policy returned fixed batch {int(action_chunks.shape[0])}, expected {slot_count}."
+            )
+        for worker_id, request in real_slots:
+            response_queues[worker_id].put(
+                ("ok", request.request_id, np.asarray(action_chunks[worker_id : worker_id + 1]))
+            )
+    except BaseException:
+        error_text = traceback.format_exc()
+        for worker_id, request in real_slots:
+            response_queues[worker_id].put(("error", request.request_id, error_text))
 
 
 def _collect_process_request_batch(
@@ -8149,11 +8462,36 @@ def evaluate_suite_process_parallel(
     image_feature_keys = [str(key) for key in infer.policy.config.image_features]
     max_batch_size = max(1, int(cfg["inference_batch_size"]))
     batch_wait_s = max(0.0, float(cfg["inference_batch_wait_ms"])) / 1000.0
+    batching_mode = str(cfg.get("inference_batching_mode", "dynamic"))
+    if batching_mode not in {"dynamic", "fixed_barrier"}:
+        raise ValueError(f"Unknown inference_batching_mode={batching_mode!r}.")
     partial_summaries: list[dict[str, Any]] = []
     request_count = 0
     batch_count = 0
     max_observed_batch = 0
     infrastructure_failures: list[str] = []
+    inference_cache = None
+    if str(cfg.get("inference_cache_mode", "off")) != "off":
+        inference_cache = FixedBatchInferenceCache(
+            Path(cfg["inference_cache_dir"]),
+            policy_path=Path(cfg["policy_path"]),
+            mode=str(cfg["inference_cache_mode"]),
+            runtime_context={
+                "world_to_ego_causal_ablation": bool(
+                    cfg.get("world_to_ego_causal_ablation", False)
+                ),
+                "secondary_view_causal_ablation": bool(
+                    cfg.get("secondary_view_causal_ablation", False)
+                ),
+                "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
+                "image_camera_names": image_camera_names_from_config(cfg),
+            },
+        )
+    repeatability_probe_path = (
+        output_dir / "inference_repeatability_probe.json"
+        if bool(cfg.get("inference_repeatability_probe", False))
+        else None
+    )
     configured_episode_indices = [
         int(index) for index in (cfg.get("episode_ids") or range(int(cfg["episodes"])))
     ]
@@ -8169,6 +8507,11 @@ def evaluate_suite_process_parallel(
             episode_indices=configured_episode_indices,
             episode_workers_per_task=episode_workers_per_task,
         )
+        if batching_mode == "fixed_barrier" and len(jobs) > max_batch_size:
+            raise ValueError(
+                "fixed_barrier requires inference_batch_size to cover every stable worker slot in "
+                f"the wave: slots={len(jobs)}, inference_batch_size={max_batch_size}."
+            )
         request_queue = context.Queue(maxsize=max(2, len(jobs) * 2))
         ready_queue = context.Queue()
         result_queue = context.Queue()
@@ -8230,6 +8573,8 @@ def evaluate_suite_process_parallel(
         ready_workers: set[int] = set()
         finished_workers: set[int] = set()
         worker_summaries: dict[int, dict[str, Any]] = {}
+        pending_fixed_requests: dict[int, _ProcessInferenceRequest] = {}
+        fixed_slot_padding: dict[int, _ProcessInferenceRequest] = {}
 
         def _record_result(message: tuple[Any, ...]) -> None:
             status = str(message[0])
@@ -8331,20 +8676,64 @@ def evaluate_suite_process_parallel(
                 _record_dead_workers()
                 if len(finished_workers) >= len(jobs):
                     break
-                try:
-                    first_request = request_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                requests = _collect_process_request_batch(
-                    request_queue,
-                    first_request,
-                    max_batch_size=max_batch_size,
-                    batch_wait_s=batch_wait_s,
-                )
-                _execute_process_inference_batch(infer, requests, response_queues)
-                request_count += len(requests)
-                batch_count += 1
-                max_observed_batch = max(max_observed_batch, len(requests))
+                if batching_mode == "fixed_barrier":
+                    active_workers = set(processes) - finished_workers
+                    while not active_workers.issubset(pending_fixed_requests):
+                        try:
+                            request = request_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            _drain_results()
+                            _record_dead_workers()
+                            active_workers = set(processes) - finished_workers
+                            if not active_workers:
+                                break
+                            continue
+                        worker_id = int(request.worker_id)
+                        if worker_id not in processes:
+                            raise RuntimeError(
+                                f"Received inference request from unknown worker {worker_id}."
+                            )
+                        if worker_id in pending_fixed_requests:
+                            raise RuntimeError(
+                                f"Worker {worker_id} submitted two requests before receiving a response."
+                            )
+                        pending_fixed_requests[worker_id] = request
+                        _drain_results()
+                        _record_dead_workers()
+                        active_workers = set(processes) - finished_workers
+                    if not active_workers:
+                        break
+                    requests_by_worker = {
+                        worker_id: pending_fixed_requests.pop(worker_id)
+                        for worker_id in sorted(active_workers)
+                    }
+                    _execute_process_inference_fixed_slots(
+                        infer,
+                        requests_by_worker,
+                        response_queues,
+                        slot_count=len(jobs),
+                        padding_requests_by_worker=fixed_slot_padding,
+                        repeatability_probe_path=repeatability_probe_path,
+                        inference_cache=inference_cache,
+                    )
+                    request_count += len(requests_by_worker)
+                    batch_count += 1
+                    max_observed_batch = max(max_observed_batch, len(jobs))
+                else:
+                    try:
+                        first_request = request_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    requests = _collect_process_request_batch(
+                        request_queue,
+                        first_request,
+                        max_batch_size=max_batch_size,
+                        batch_wait_s=batch_wait_s,
+                    )
+                    _execute_process_inference_batch(infer, requests, response_queues)
+                    request_count += len(requests)
+                    batch_count += 1
+                    max_observed_batch = max(max_observed_batch, len(requests))
         except BaseException:
             start_event.set()
             for process in processes.values():
@@ -8376,10 +8765,13 @@ def evaluate_suite_process_parallel(
     mean_batch = request_count / batch_count if batch_count else 0.0
     print(
         "[parallel] process inference batches: "
+        f"mode={batching_mode}, "
         f"requests={request_count}, batches={batch_count}, "
         f"mean_batch={mean_batch:.2f}, max_batch={max_observed_batch}",
         flush=True,
     )
+    if inference_cache is not None:
+        print(f"[inference-cache] {json.dumps(inference_cache.report(), sort_keys=True)}", flush=True)
     if infrastructure_failures:
         preview = "\n".join(infrastructure_failures[:10])
         if len(infrastructure_failures) > 10:
@@ -9157,6 +9549,34 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         0.0,
         float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
     )
+    cfg["inference_batching_mode"] = str(
+        cfg_get(
+            cfg,
+            args.inference_batching_mode,
+            "inference_batching_mode",
+            "dynamic",
+        )
+    ).lower()
+    cfg["inference_repeatability_probe"] = bool(
+        cfg_get(
+            cfg,
+            args.inference_repeatability_probe,
+            "inference_repeatability_probe",
+            False,
+        )
+    )
+    cache_dir_value = cfg_get(cfg, args.inference_cache_dir, "inference_cache_dir", None)
+    cfg["inference_cache_dir"] = (
+        str(Path(cache_dir_value).expanduser().resolve()) if cache_dir_value is not None else None
+    )
+    cfg["inference_cache_mode"] = str(
+        cfg_get(
+            cfg,
+            args.inference_cache_mode,
+            "inference_cache_mode",
+            "read_write" if cache_dir_value is not None else "off",
+        )
+    ).lower()
     cfg["keyboard_control_enabled"] = configured_environment_workers == 1
     if configured_environment_workers > 1:
         if cfg["task_worker_backend"] not in {"process", "thread"}:
@@ -9175,6 +9595,18 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             )
     if cfg["episode_workers_per_task"] > 1 and cfg["task_worker_backend"] != "process":
         raise ValueError("--episode-workers-per-task > 1 requires --task-worker-backend process.")
+    if cfg["inference_batching_mode"] == "fixed_barrier" and cfg["task_worker_backend"] != "process":
+        raise ValueError("--inference-batching-mode fixed_barrier requires --task-worker-backend process.")
+    if cfg["inference_repeatability_probe"] and cfg["inference_batching_mode"] != "fixed_barrier":
+        raise ValueError("--inference-repeatability-probe requires --inference-batching-mode fixed_barrier.")
+    if cfg["inference_cache_mode"] not in {"off", "read_write", "readonly"}:
+        raise ValueError(f"Unknown inference_cache_mode={cfg['inference_cache_mode']!r}.")
+    if cfg["inference_cache_mode"] != "off" and cfg["inference_cache_dir"] is None:
+        raise ValueError("An enabled inference cache requires --inference-cache-dir.")
+    if cfg["inference_cache_mode"] != "off" and cfg["inference_batching_mode"] != "fixed_barrier":
+        raise ValueError("The deterministic inference cache requires --inference-batching-mode fixed_barrier.")
+    if cfg["inference_repeatability_probe"] and cfg["inference_cache_mode"] != "off":
+        raise ValueError("The repeatability probe must run with the inference cache disabled.")
     if cfg["isolated_policy_workers"] > 1 and cfg["episode_workers_per_task"] > 1:
         raise ValueError(
             "--isolated-policy-workers > 1 already provides independent rollout processes; "
@@ -9465,6 +9897,7 @@ def main() -> None:
         f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
         f"task_worker_backend={cfg['task_worker_backend']}, "
         f"inference_batch_size={cfg['inference_batch_size']}, "
+        f"inference_batching_mode={cfg['inference_batching_mode']}, "
         f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
         f"adaptive_exec_max_steps={cfg['control']['adaptive_exec_max_steps']}, "
