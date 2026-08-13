@@ -13,7 +13,9 @@
 - v19 已从 exact-zero-residual、baseline-compatible 的 v14 起点启动，仅增加训练期 World-to-Ego stochastic depth `p=0.5`。它不增加参数、门控、辅助损失或推理分支；纯 Ego 和完整 World/Ego 样本共用原 action loss，且所有 Ego/World/残差参数保持非零学习率。训练使用 4 GPU、batch 48/GPU、worker 12、720 steps、W&B enabled，tmux 为 `wep_v043_libero10_v19_w2e_stochastic_depth_p50_720`。固定分层评测 waiter 为 `wep_v043_v19_stratified_worldflow_causal_after_train`，训练完成后自动评估 steps `100/240/480/720`，仅对超过同状态 baseline `95/100` 的 checkpoint 运行同 checkpoint 因果消融。
 - v19 已完成并筛除。固定分层 episode IDs `0,5,...,45` 上，steps `100/240/480/720` 分别为 `92/93/95/92`，同 IDs baseline 为 `95/100`；没有 checkpoint 严格超过 baseline，因此 full-500 自动取消。补做的最佳 step480 同-checkpoint World-to-Ego 消融仍为 `95/100`，World 净因果增益为 `0`：World 正常臂独有成功 `(5,35),(6,25),(6,30)`，Ego-only 独有成功 `(1,45),(3,25),(9,30)`，共同失败 `(7,20),(9,25)`。v19 将 v17 的 broad World 因果效应从 `-4` 改善到 `0`，但尚未产生正增益。
 - v20 residual boosting gradient isolation 已完成 720 步、138,240 个样本，即完整 `10 tasks x 50 episodes` 数据的一整个 epoch。它不增加参数、门控、辅助损失或推理分支；代码 commit 为 `fe99a71`，完整测试 `67/67` 通过，W&B 的 720 个 keep-ratio 均值为 `0.500752`。固定 broad steps `100/240/480/720` 为 `94/96/91/92`；step240 同-checkpoint 关闭 World-to-Ego 为 `93`，故 World 因果增益为 `+3`，是唯一候选。但正式 full-500 正常臂在 `259/279` 时已有 20 个失败，即便剩余 221 个全成功也最多 `480/500`，无法超过 `481/500` baseline，已数学早停。所有输出和 cache 均保留，matched baseline 与 full causal arm 未启动。v20 改善了 World 因果性但未达到最终目标，不能恢复多视角联合阶段。
-- v21 是当前 active 控制实验，只将 v20 的训练期 World-to-Ego dropout 从 `0.5` 提高到 `0.75`：约 75% 样本正常更新 Ego，25% 样本使用 residual-anchor stop-gradient 更新 World/残差。其余模型、数据、原 action loss、三个 LR 组、初始化和推理完全不变，仍无门控、辅助损失或任务技巧。4-GPU、batch48/GPU、worker12、720-step 训练在 tmux `wep_v043_libero10_v21_residual_anchor_stopgrad_p75_720` 中运行，W&B 为 `worldflow-v21-v14zero-worldbnfixed-w2e-p75-residual-anchor-stopgrad-20260814`；broad 和 full-500 waiters 已分别在 `wep_v043_v21_stratified_worldflow_causal_after_train` 与 `wep_v043_v21_full500_matched_causal_after_screen` 等待。
+- v21 已完成一整个 epoch。最终 runtime audit：720 条 W&B history 完整，World-correction keep ratio 均值 `0.245978`，三个 optimizer group 均保持非零 LR，78 个 World BN buffer 与 v14 逐位一致，4,326 个 residual 参数全部非零。固定分层 Broad 的 steps `100/240/480/720` 为 `95/89/95/97`；step720 同 checkpoint 关闭 World-to-Ego 为 `95`，所以 Broad World 因果增益为 `+2`。但正式 Full-500 在停止时为 `411/435`、24 个失败，即使余下65个全部成功也最多 `476/500`，无法超过 baseline `481/500`；v21 已正式否决，所有 partial 输出保留。
+- v22 将 v21 step720 的547个 World-only参数保留、把1461个 baseline-common 参数逐位恢复，固定分层仅 `94/100`。这否定了“硬重置 shared/Ego 后直接拼接 World”的方案：Ego/shared 与 World 已产生共适应，不能硬拆。v23 对 v14→v21 的整套联合权重 delta 做统一 `alpha=0.50/0.75` 缩放，结果分别为 `95/100` 和 `94/100`，同样筛除；不再继续做 checkpoint 插值网格。
+- v24 是当前 active 实验，用复制出的完整 v21 step720 模型/optimizer/scheduler/RNG 状态精确续训至 step1440。调度器仍保留原 `num_decay_steps=720`，所以 step721 起保持已有 floor LR，不重新 warmup或升高 LR；模型、数据、原 action loss、p=0.75 gradient routing、无门控/无 World 辅助损失等均不变。4-GPU、batch48/GPU、worker12、W&B enabled，tmux 为 `wep_v043_libero10_v24_exact_resume_v21step720_floorlr_to1440`；step721 已实际连续运行。Broad waiter `wep_v043_v24_floorlr_stratified_causal_after_train` 将筛 `960/1200/1440`，formal waiter `wep_v043_v24_full500_matched_causal_after_screen` 只在 absolute+causal Broad gate 通过后启动，并使用可强制终止的 Full-500 数学早停。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
@@ -57,9 +59,9 @@ LIBERO HDF5
 ### 2.1 LeRobot 主仓库
 
 - 路径：`/home/liusong/ProgramFiles/Huggingface/lerobot`
-- 分支：`wep_vla_v0.4.3`
-- HEAD：`7f6a274d2ca22aef508b608e6fb6e27f0d67ba81`
-- 创建本交接文档之前主仓库工作树干净；创建后仅新增了本文档这一未跟踪文件。
+- 分支：`wep_vla_v0.4.3_multiview_doubleflow`
+- 本轮 v24 启动前 HEAD：`93d7f85`；World residual gradient isolation 的代码 commit 为 `fe99a71`。
+- 当前实验脚本、checkpoint、日志和 artifact 统一位于交接文档顶部所述 experiment root；不得删除 `/opt/data/private` 下任何文件。
 - 临时实验统一使用 `/tmp/temp`，不要把临时诊断文件写入正式数据目录。
 
 ### 2.2 HandPoseExtraction 外部仓库
