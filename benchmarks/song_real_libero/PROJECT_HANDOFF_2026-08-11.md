@@ -9,6 +9,7 @@
 - LIBERO-10 的当前通用划分为：GPU 3 运行 tasks `0,3,6,9`，GPU 4 运行 tasks `1,4,7`，GPU 5 运行 tasks `2,5,8`；每个 task 使用 4 个 episode worker，总并行为 `16+12+12=40`。
 - 当前入口脚本为实验根目录中的 `scripts/eval_libero10_v16_one_checkpoint_a800_gpu345_total40_b40_fixedbarrier.sh`；多 checkpoint 的 tmux 入口为 `scripts/launch_eval_libero10_v16_steps100_240_480_720_a800_gpu345_total40_b40_tmux.sh`。
 - 同时筛选四个 checkpoint 时，使用实验根目录中的 `scripts/launch_eval_libero10_v17_steps100_240_480_720_a800_gpu345_concurrent4_total40_b40_tmux.sh`。该模式让 `100/240/480/720` 各使用 10 个环境并发，总并发仍为 40，推理 batch 参数仍为 40；不得与单 checkpoint 独占 40 环境的串行入口同时运行。
+- v17 已完成一整个 `10 tasks x 50 episodes` 训练 epoch。本地固定输入 screen 的 `100/240/480/720` 为 `90/92/94/96`，匹配 baseline 为 `95/100`；step 720 关闭 World-to-Ego 后为 `93/100`，因此 WorldFlow 的同 checkpoint 因果增益为 `+3`。正式 500-episode 匹配链正在 tmux `wep_v043_v17_worldflow_full500_matched_gate_local4` 中运行。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
