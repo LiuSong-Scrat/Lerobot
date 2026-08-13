@@ -421,6 +421,65 @@ def test_pose9_endpoint_residual_training_keep_mask_has_no_gate_or_inference_cha
         )
 
 
+def test_pose9_endpoint_residual_stop_gradient_keeps_forward_and_splits_gradients():
+    torch.manual_seed(1146)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+
+    batch, steps = 4, 3
+    ego_x_t = torch.randn(batch, steps, 10)
+    ego_velocity = torch.randn(batch, steps, 10, requires_grad=True)
+    world_x_t = torch.randn(batch, steps, 9)
+    features = torch.randn(batch, steps, 8, requires_grad=True)
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.1)
+    carrier_inv = torch.linalg.inv(carrier)
+    time = torch.tensor([0.1, 0.3, 0.5, 0.7])
+    keep = torch.tensor([True, False, True, False])
+
+    ordinary, _, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        features,
+        time,
+        carrier,
+        carrier_inv,
+        world_to_ego_keep_mask=keep,
+    )
+    isolated, _, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        features,
+        time,
+        carrier,
+        carrier_inv,
+        world_to_ego_keep_mask=keep,
+        detach_retained_ego_anchor=True,
+    )
+    assert torch.equal(isolated, ordinary)
+
+    isolated.square().sum().backward()
+    assert torch.count_nonzero(ego_velocity.grad[keep]) == 0
+    assert ego_velocity.grad[~keep].abs().sum() > 0
+    assert features.grad[keep].abs().sum() > 0
+    assert torch.count_nonzero(features.grad[~keep]) == 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+    with pytest.raises(ValueError, match="requires a per-sample World-to-Ego keep mask"):
+        model._compose_endpoint_residual_boosting(
+            ego_x_t,
+            ego_velocity,
+            world_x_t,
+            features,
+            time,
+            carrier,
+            carrier_inv,
+            detach_retained_ego_anchor=True,
+        )
+
+
 def test_pose9_endpoint_residual_requires_projected_ego_path_contract():
     cfg = SmolVLAConfig(
         worldflow_enable=True,
@@ -1653,6 +1712,22 @@ def test_worldflow_training_world_to_ego_dropout_is_training_only_and_bounded():
             worldflow_enable=True,
             worldflow_action_fusion="cross_attention",
             worldflow_training_world_to_ego_dropout_probability=0.5,
+        )
+
+    isolated = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_residual_boosting",
+        worldflow_training_world_to_ego_dropout_probability=0.5,
+        worldflow_training_residual_anchor_stop_gradient=True,
+    )
+    assert isolated.worldflow_training_residual_anchor_stop_gradient is True
+    with pytest.raises(ValueError, match="requires training-time World-to-Ego dropout"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_noise_coupling="projected_ego_path",
+            worldflow_action_fusion="endpoint_residual_boosting",
+            worldflow_training_residual_anchor_stop_gradient=True,
         )
 
 

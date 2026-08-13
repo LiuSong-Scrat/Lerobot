@@ -220,6 +220,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # for both cases. A value of 1 is forbidden because it would prevent the
     # World correction from receiving action gradients.
     worldflow_training_world_to_ego_dropout_probability: float = 0.0
+    # Optional residual-boosting gradient routing. On samples whose physical
+    # World-to-Ego correction is retained, treat the current Ego prediction as
+    # a fixed boosting anchor and update the World/residual path through the
+    # unchanged action loss. Dropped samples continue to update the ordinary
+    # Ego action path. This is training-only, adds no parameter or loss, and
+    # leaves the complete inference forward exactly unchanged.
+    worldflow_training_residual_anchor_stop_gradient: bool = False
     # Optional one-shot initialization used when adapting an Ego checkpoint:
     # copy shape-compatible Ego action/point modules into the World stream,
     # while keeping both streams trainable. This is not applied when loading a
@@ -644,6 +651,15 @@ class SmolVLAConfig(PreTrainedConfig):
             ):
                 raise ValueError(
                     "worldflow_training_world_to_ego_dropout_probability is supported only for "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if self.worldflow_training_residual_anchor_stop_gradient and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+            ):
+                raise ValueError(
+                    "worldflow_training_residual_anchor_stop_gradient requires training-time "
+                    "World-to-Ego dropout and "
                     "worldflow_action_fusion='endpoint_residual_boosting'."
                 )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (

@@ -3401,6 +3401,7 @@ class VLAFlowMatching(nn.Module):
         apply_world_to_ego: bool = True,
         detach_ego_for_world_supervision: bool = False,
         world_to_ego_keep_mask: Tensor | None = None,
+        detach_retained_ego_anchor: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Predict only the physical endpoint error left by the Ego policy.
 
@@ -3424,10 +3425,34 @@ class VLAFlowMatching(nn.Module):
         if time.ndim != 1 or time.shape[0] != ego_x_t.shape[0]:
             raise ValueError(f"Expected time shape ({ego_x_t.shape[0]},), got {time.shape}.")
 
+        keep = None
+        if world_to_ego_keep_mask is not None:
+            keep = world_to_ego_keep_mask.to(device=ego_velocity.device, dtype=torch.bool)
+            if keep.shape != (ego_velocity.shape[0],):
+                raise ValueError(
+                    "Expected one World-to-Ego keep decision per batch item, "
+                    f"got {tuple(keep.shape)} for batch {ego_velocity.shape[0]}."
+                )
+        if detach_retained_ego_anchor:
+            if keep is None:
+                raise ValueError(
+                    "detach_retained_ego_anchor requires a per-sample World-to-Ego keep mask."
+                )
+            # Preserve the exact forward value while routing the corrected
+            # samples' action gradient into the residual booster. The dropped
+            # samples still optimize the ordinary Ego prediction below.
+            ego_velocity_anchor = torch.where(
+                keep[:, None, None],
+                ego_velocity.detach(),
+                ego_velocity,
+            )
+        else:
+            ego_velocity_anchor = ego_velocity
+
         remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
         ego_endpoint = pose9_to_matrix(
             ego_x_t[..., :9].to(dtype=torch.float32)
-            + remaining * ego_velocity[..., :9].to(dtype=torch.float32)
+            + remaining * ego_velocity_anchor[..., :9].to(dtype=torch.float32)
         )
         baseline_world_endpoint = (
             ego_to_world_transform @ ego_endpoint @ world_to_ego_transform
@@ -3475,7 +3500,7 @@ class VLAFlowMatching(nn.Module):
         # physical rotation is unchanged.
         raw_ego_endpoint_pose9 = (
             ego_x_t[..., :9].to(dtype=torch.float32)
-            + remaining * ego_velocity[..., :9].to(dtype=torch.float32)
+            + remaining * ego_velocity_anchor[..., :9].to(dtype=torch.float32)
         )
         raw_a1 = raw_ego_endpoint_pose9[..., 3:6]
         raw_a2 = raw_ego_endpoint_pose9[..., 6:9]
@@ -3514,22 +3539,16 @@ class VLAFlowMatching(nn.Module):
         )
         corrected_ego_velocity = torch.cat(
             [
-                ego_velocity[..., :9]
+                ego_velocity_anchor[..., :9]
                 + (
                     corrected_ego_pose9 - raw_ego_endpoint_pose9
-                ).to(dtype=ego_velocity.dtype)
-                / remaining.to(dtype=ego_velocity.dtype),
-                ego_velocity[..., 9:],
+                ).to(dtype=ego_velocity_anchor.dtype)
+                / remaining.to(dtype=ego_velocity_anchor.dtype),
+                ego_velocity_anchor[..., 9:],
             ],
             dim=-1,
         )
-        if world_to_ego_keep_mask is not None:
-            keep = world_to_ego_keep_mask.to(device=ego_velocity.device, dtype=torch.bool)
-            if keep.shape != (ego_velocity.shape[0],):
-                raise ValueError(
-                    "Expected one World-to-Ego keep decision per batch item, "
-                    f"got {tuple(keep.shape)} for batch {ego_velocity.shape[0]}."
-                )
+        if keep is not None:
             corrected_ego_velocity = torch.where(
                 keep[:, None, None],
                 corrected_ego_velocity,
@@ -4982,6 +5001,13 @@ class VLAFlowMatching(nn.Module):
                         current_inv.unsqueeze(1),
                         detach_ego_for_world_supervision=True,
                         world_to_ego_keep_mask=world_to_ego_keep_mask,
+                        detach_retained_ego_anchor=bool(
+                            getattr(
+                                self.config,
+                                "worldflow_training_residual_anchor_stop_gradient",
+                                False,
+                            )
+                        ),
                     )
             endpoint = x_t + (1.0 - time_expanded) * v_t
             self.last_body_pose9_prediction = endpoint[..., :9]
