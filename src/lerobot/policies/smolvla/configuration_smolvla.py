@@ -252,6 +252,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # gate; it adds no parameter or auxiliary objective. Disabled by default
     # so historical checkpoints preserve their exact inference function.
     worldflow_endpoint_residual_rate_parameterization: bool = False
+    # Express the endpoint residual twist in the Ego carrier frame instead of
+    # the arbitrary World coordinate frame. A rigid reparameterization of the
+    # World frame then leaves the target six-vector unchanged, rather than
+    # requiring the point network to learn the SE(3) adjoint transformation of
+    # a spatial World twist. The correction is still composed physically on
+    # SE(3), uses the same residual head and action loss, and adds no parameter,
+    # gate, auxiliary objective, or inference-time branch. Disabled by default
+    # for exact historical-checkpoint compatibility.
+    worldflow_endpoint_residual_ego_frame_parameterization: bool = False
     # Training-only reparameterization of the complete World coordinate frame.
     # One random rigid transform A is applied consistently to World points,
     # the Ego-to-World carrier C, and every World trajectory state, so the
@@ -605,6 +614,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_endpoint_residual_rate_parameterization=True requires "
                 "worldflow_enable=True."
             )
+        if self.worldflow_endpoint_residual_ego_frame_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
+                "worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -688,6 +702,14 @@ class SmolVLAConfig(PreTrainedConfig):
             ):
                 raise ValueError(
                     "worldflow_endpoint_residual_rate_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_ego_frame_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
                     "worldflow_action_fusion='endpoint_residual_boosting'."
                 )
             if self.worldflow_action_fusion in {

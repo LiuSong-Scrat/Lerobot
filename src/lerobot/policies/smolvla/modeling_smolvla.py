@@ -3408,10 +3408,12 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Predict only the physical endpoint error left by the Ego policy.
 
-        The zero residual is exactly the legacy Ego function.  A learned World
-        residual left-multiplies the conjugated Ego endpoint, and the corrected
-        endpoint is mapped back to the original Ego pose9 flow chart.  The same
-        corrected physical endpoint supervises both coordinate descriptions.
+        The zero residual is exactly the legacy Ego function. By default a
+        learned spatial World residual left-multiplies the conjugated Ego
+        endpoint. The optional Ego-frame parameterization instead applies the
+        same six output values before conjugation, making them invariant to an
+        arbitrary reparameterization of World coordinates. The same corrected
+        physical endpoint supervises both coordinate descriptions.
         """
 
         if self.world_twist_residual_out_proj is None:
@@ -3474,27 +3476,63 @@ class VLAFlowMatching(nn.Module):
             # network to relearn it from a finite time grid. The same
             # effective physical twist supervises World and returns to Ego.
             residual = residual * remaining.to(dtype=residual.dtype)
-        corrected_world_endpoint = se3_exp(residual.to(dtype=torch.float32)) @ baseline_world_endpoint
-        # Use the exact same matrix path for the neutral reference.  Taking
-        # their pose9 difference, rather than re-encoding the baseline chart
-        # itself, makes a zero residual bit-exactly preserve the legacy Ego
-        # velocity while gradients still flow through ``residual``.
-        neutral_world_endpoint = (
-            se3_exp(torch.zeros_like(residual, dtype=torch.float32))
-            @ baseline_world_endpoint
+        residual_in_ego_frame = bool(
+            getattr(
+                getattr(self, "config", None),
+                "worldflow_endpoint_residual_ego_frame_parameterization",
+                False,
+            )
         )
+        if residual_in_ego_frame:
+            corrected_ego_endpoint = se3_exp(residual.to(dtype=torch.float32)) @ ego_endpoint
+            neutral_ego_endpoint = (
+                se3_exp(torch.zeros_like(residual, dtype=torch.float32)) @ ego_endpoint
+            )
+            corrected_world_endpoint = (
+                ego_to_world_transform @ corrected_ego_endpoint @ world_to_ego_transform
+            )
+            neutral_world_endpoint = (
+                ego_to_world_transform @ neutral_ego_endpoint @ world_to_ego_transform
+            )
+        else:
+            corrected_world_endpoint = (
+                se3_exp(residual.to(dtype=torch.float32)) @ baseline_world_endpoint
+            )
+            # Use the exact same matrix path for the neutral reference. Taking
+            # their pose9 difference, rather than re-encoding the baseline
+            # chart itself, makes a zero residual bit-exactly preserve the
+            # legacy Ego velocity while gradients still flow through
+            # ``residual``.
+            neutral_world_endpoint = (
+                se3_exp(torch.zeros_like(residual, dtype=torch.float32))
+                @ baseline_world_endpoint
+            )
+            corrected_ego_endpoint = (
+                world_to_ego_transform @ corrected_world_endpoint @ ego_to_world_transform
+            )
+            neutral_ego_endpoint = (
+                world_to_ego_transform @ neutral_world_endpoint @ ego_to_world_transform
+            )
         corrected_world_pose9 = matrix_to_pose9(corrected_world_endpoint)
         if detach_ego_for_world_supervision:
             supervised_ego_endpoint = pose9_to_matrix(
                 ego_x_t[..., :9].to(dtype=torch.float32)
                 + remaining * ego_velocity[..., :9].detach().to(dtype=torch.float32)
             )
-            supervised_world_endpoint = (
-                se3_exp(residual.to(dtype=torch.float32))
-                @ ego_to_world_transform
-                @ supervised_ego_endpoint
-                @ world_to_ego_transform
-            )
+            if residual_in_ego_frame:
+                supervised_world_endpoint = (
+                    ego_to_world_transform
+                    @ se3_exp(residual.to(dtype=torch.float32))
+                    @ supervised_ego_endpoint
+                    @ world_to_ego_transform
+                )
+            else:
+                supervised_world_endpoint = (
+                    se3_exp(residual.to(dtype=torch.float32))
+                    @ ego_to_world_transform
+                    @ supervised_ego_endpoint
+                    @ world_to_ego_transform
+                )
             corrected_world_pose9 = matrix_to_pose9(supervised_world_endpoint)
         world_velocity = (
             corrected_world_pose9 - world_x_t.to(dtype=torch.float32)
@@ -3503,12 +3541,6 @@ class VLAFlowMatching(nn.Module):
         if not apply_world_to_ego:
             return ego_velocity, world_velocity.to(dtype=ego_velocity.dtype), residual
 
-        corrected_ego_endpoint = (
-            world_to_ego_transform @ corrected_world_endpoint @ ego_to_world_transform
-        )
-        neutral_ego_endpoint = (
-            world_to_ego_transform @ neutral_world_endpoint @ ego_to_world_transform
-        )
         # Lift the corrected SO(3) basis back into the *same* rotation-6D
         # gauge as the legacy raw endpoint.  The legacy endpoint generally has
         # arbitrary vector lengths and shear; replacing it by canonical unit
