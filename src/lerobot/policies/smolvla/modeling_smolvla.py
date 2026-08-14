@@ -3410,10 +3410,12 @@ class VLAFlowMatching(nn.Module):
 
         The zero residual is exactly the legacy Ego function. By default a
         learned spatial World residual left-multiplies the conjugated Ego
-        endpoint. The optional Ego-frame parameterization instead applies the
-        same six output values before conjugation, making them invariant to an
-        arbitrary reparameterization of World coordinates. The same corrected
-        physical endpoint supervises both coordinate descriptions.
+        endpoint. The optional carrier-frame parameterization applies the same
+        six output values before conjugation. The optional body-frame
+        parameterization right-multiplies the predicted Ego endpoint, so the
+        correction follows the endpoint's own axes. Both alternatives are
+        invariant to an arbitrary reparameterization of World coordinates.
+        The same corrected physical endpoint supervises both descriptions.
         """
 
         if self.world_twist_residual_out_proj is None:
@@ -3483,7 +3485,29 @@ class VLAFlowMatching(nn.Module):
                 False,
             )
         )
-        if residual_in_ego_frame:
+        residual_in_body_frame = bool(
+            getattr(
+                getattr(self, "config", None),
+                "worldflow_endpoint_residual_body_frame_parameterization",
+                False,
+            )
+        )
+        if residual_in_ego_frame and residual_in_body_frame:
+            raise ValueError(
+                "Carrier-frame and body-frame endpoint residual parameterizations are mutually exclusive."
+            )
+        if residual_in_body_frame:
+            corrected_ego_endpoint = ego_endpoint @ se3_exp(residual.to(dtype=torch.float32))
+            neutral_ego_endpoint = (
+                ego_endpoint @ se3_exp(torch.zeros_like(residual, dtype=torch.float32))
+            )
+            corrected_world_endpoint = (
+                ego_to_world_transform @ corrected_ego_endpoint @ world_to_ego_transform
+            )
+            neutral_world_endpoint = (
+                ego_to_world_transform @ neutral_ego_endpoint @ world_to_ego_transform
+            )
+        elif residual_in_ego_frame:
             corrected_ego_endpoint = se3_exp(residual.to(dtype=torch.float32)) @ ego_endpoint
             neutral_ego_endpoint = (
                 se3_exp(torch.zeros_like(residual, dtype=torch.float32)) @ ego_endpoint
@@ -3519,7 +3543,14 @@ class VLAFlowMatching(nn.Module):
                 ego_x_t[..., :9].to(dtype=torch.float32)
                 + remaining * ego_velocity[..., :9].detach().to(dtype=torch.float32)
             )
-            if residual_in_ego_frame:
+            if residual_in_body_frame:
+                supervised_world_endpoint = (
+                    ego_to_world_transform
+                    @ supervised_ego_endpoint
+                    @ se3_exp(residual.to(dtype=torch.float32))
+                    @ world_to_ego_transform
+                )
+            elif residual_in_ego_frame:
                 supervised_world_endpoint = (
                     ego_to_world_transform
                     @ se3_exp(residual.to(dtype=torch.float32))

@@ -261,6 +261,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # gate, auxiliary objective, or inference-time branch. Disabled by default
     # for exact historical-checkpoint compatibility.
     worldflow_endpoint_residual_ego_frame_parameterization: bool = False
+    # Express the endpoint correction as a body twist at the predicted Ego
+    # endpoint: B_corrected = B_ego Exp(xi_body).  The corresponding target
+    # Log(B_ego^-1 B_target) is right-invariant and follows the endpoint's own
+    # axes, while remaining independent of an arbitrary World-coordinate
+    # reparameterization.  This reuses the existing six-dimensional head and
+    # action loss; it adds no parameter, gate, auxiliary objective, or second
+    # forward.  Disabled by default for exact historical-checkpoint
+    # compatibility and mutually exclusive with the carrier-frame left twist
+    # above.
+    worldflow_endpoint_residual_body_frame_parameterization: bool = False
     # Training-only reparameterization of the complete World coordinate frame.
     # One random rigid transform A is applied consistently to World points,
     # the Ego-to-World carrier C, and every World trajectory state, so the
@@ -619,6 +629,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
                 "worldflow_enable=True."
             )
+        if self.worldflow_endpoint_residual_body_frame_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_body_frame_parameterization=True requires "
+                "worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -711,6 +726,22 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
                     "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_body_frame_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_body_frame_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_ego_frame_parameterization
+                and self.worldflow_endpoint_residual_body_frame_parameterization
+            ):
+                raise ValueError(
+                    "Select only one endpoint residual frame parameterization: "
+                    "carrier-frame left twist or endpoint body-frame right twist."
                 )
             if self.worldflow_action_fusion in {
                 "symmetric_twist",
