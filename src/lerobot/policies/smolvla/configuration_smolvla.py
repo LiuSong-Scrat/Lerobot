@@ -346,6 +346,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # parameterization: it restores absolute scene position without changing
     # the well-conditioned local World action state or adding model parameters.
     worldflow_scene_frame_origin: str = "carrier"
+    # Token topology used only while WorldFlow is enabled. ``legacy_asymmetric``
+    # preserves every historical checkpoint: Ego actions occupy the first
+    # causal block, followed by scene tokens and then World actions.  The
+    # ``symmetric_dual_coordinate`` topology presents Ego/World scenes as one
+    # context block and both coordinate descriptions of the action as one
+    # shared expert block.  Each action stream can therefore exchange
+    # information inside every Action Expert layer instead of meeting only in
+    # a post-expert residual.  WorldFlow-disabled construction never reads this
+    # option and remains the exact legacy network.
+    worldflow_joint_token_layout: str = "legacy_asymmetric"
     # ``cross_attention`` preserves historical checkpoints: World affects the
     # Ego head only through token exchange. ``symmetric_twist`` additionally
     # maps the World spatial twist back to Ego coordinates with the exact SE(3)
@@ -724,6 +734,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "worldflow_scene_frame_origin must be 'carrier' or 'global'; "
                     f"got {self.worldflow_scene_frame_origin!r}."
+                )
+            if self.worldflow_joint_token_layout not in {
+                "legacy_asymmetric",
+                "symmetric_dual_coordinate",
+            }:
+                raise ValueError(
+                    "worldflow_joint_token_layout must be 'legacy_asymmetric' or "
+                    "'symmetric_dual_coordinate'; "
+                    f"got {self.worldflow_joint_token_layout!r}."
                 )
             if (
                 self.worldflow_scene_frame_origin == "global"

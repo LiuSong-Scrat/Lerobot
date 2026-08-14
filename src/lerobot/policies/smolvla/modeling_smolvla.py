@@ -4172,14 +4172,16 @@ class VLAFlowMatching(nn.Module):
         ego_action_mask: Tensor,
         world_tokens: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, slice]]:
-        """Build a checkpoint-compatible asymmetric World–Ego suffix.
+        """Build the configured World–Ego Action Expert suffix.
 
-        Ego action tokens occupy the exact first suffix block used by the
-        pretrained policy, with unchanged values and position IDs. World
-        scene/action tokens are appended in later causal blocks, so they can
-        read Ego while Ego cannot be perturbed by randomly initialized World
-        tokens. Both losses still update the same Action Expert parameters;
-        this is joint multi-task training without a gate or a frozen branch.
+        The historical layout keeps Ego actions in the exact first suffix
+        block used by the pretrained policy and appends scene/World blocks.
+        The symmetric dual-coordinate layout instead places both scenes in a
+        shared context block followed by one shared Ego/World action block.
+        That topology lets both coordinate descriptions interact inside every
+        shared Action Expert layer.  It does not average the output heads or
+        introduce a gate; the World-informed Ego head remains the executed
+        policy.
         """
         required_modules = (
             self.ego_scene_to_expert,
@@ -4221,8 +4223,20 @@ class VLAFlowMatching(nn.Module):
         )
         ego_action_mask = ego_action_mask.to(device=ego_action_tokens.device, dtype=torch.bool)
 
+        token_layout = getattr(
+            self.config,
+            "worldflow_joint_token_layout",
+            "legacy_asymmetric",
+        )
+        if token_layout not in {"legacy_asymmetric", "symmetric_dual_coordinate"}:
+            raise ValueError(f"Unsupported World–Ego token layout: {token_layout!r}.")
+
         diagnostic_ablations = getattr(self, "inference_ablation_modalities", frozenset())
-        if "world" in diagnostic_ablations:
+        remove_world_view = "world" in diagnostic_ablations or (
+            token_layout == "symmetric_dual_coordinate"
+            and "world_to_ego" in diagnostic_ablations
+        )
+        if remove_world_view:
             # Keep the exact suffix layout and positional IDs while removing
             # every World-stream key/value. This makes fixed-noise comparisons
             # isolate World information instead of changing model topology.
@@ -4231,6 +4245,8 @@ class VLAFlowMatching(nn.Module):
 
         ego_scene = ego_scene + self.world_ego_scene_type_embedding[0]
         world_scene = world_scene + self.world_ego_scene_type_embedding[1]
+        if token_layout == "symmetric_dual_coordinate":
+            ego_action_tokens = ego_action_tokens + self.world_ego_action_type_embedding[0]
         world_action_tokens = world_action_tokens + self.world_ego_action_type_embedding[1]
 
         ego_scene_len = ego_scene.shape[1]
@@ -4243,37 +4259,58 @@ class VLAFlowMatching(nn.Module):
                 f"chunk_size={self.config.chunk_size}, got {ego_action_len} and {world_action_len}."
             )
 
-        suffix_embs = torch.cat(
-            [ego_action_tokens, ego_scene, world_scene, world_action_tokens],
-            dim=1,
-        )
-        suffix_pad_masks = torch.cat(
-            [ego_action_mask, ego_scene_mask, world_scene_mask, world_action_mask],
-            dim=1,
-        )
-
         scene_len = ego_scene_len + world_scene_len
         if scene_len <= 0 or ego_action_len <= 0 or world_action_len <= 0:
             raise ValueError("World–Ego joint suffix requires non-empty scene and action blocks.")
-        suffix_att_masks = torch.tensor(
-            [1]
-            + [0] * (ego_action_len - 1)
-            + [1]
-            + [0] * (scene_len - 1)
-            + [1]
-            + [0] * (world_action_len - 1),
-            dtype=suffix_embs.dtype,
-            device=suffix_embs.device,
-        )[None, :].expand(suffix_embs.shape[0], -1)
-
-        ego_action_start = 0
-        ego_scene_start = ego_action_len
-        world_scene_start = ego_scene_start + ego_scene_len
-        world_action_start = world_scene_start + world_scene_len
+        if token_layout == "symmetric_dual_coordinate":
+            suffix_embs = torch.cat(
+                [ego_scene, world_scene, ego_action_tokens, world_action_tokens],
+                dim=1,
+            )
+            suffix_pad_masks = torch.cat(
+                [ego_scene_mask, world_scene_mask, ego_action_mask, world_action_mask],
+                dim=1,
+            )
+            action_len = ego_action_len + world_action_len
+            suffix_att_masks = torch.tensor(
+                [1]
+                + [0] * (scene_len - 1)
+                + [1]
+                + [0] * (action_len - 1),
+                dtype=suffix_embs.dtype,
+                device=suffix_embs.device,
+            )[None, :].expand(suffix_embs.shape[0], -1)
+            ego_scene_start = 0
+            world_scene_start = ego_scene_len
+            ego_action_start = scene_len
+            world_action_start = ego_action_start + ego_action_len
+        else:
+            suffix_embs = torch.cat(
+                [ego_action_tokens, ego_scene, world_scene, world_action_tokens],
+                dim=1,
+            )
+            suffix_pad_masks = torch.cat(
+                [ego_action_mask, ego_scene_mask, world_scene_mask, world_action_mask],
+                dim=1,
+            )
+            suffix_att_masks = torch.tensor(
+                [1]
+                + [0] * (ego_action_len - 1)
+                + [1]
+                + [0] * (scene_len - 1)
+                + [1]
+                + [0] * (world_action_len - 1),
+                dtype=suffix_embs.dtype,
+                device=suffix_embs.device,
+            )[None, :].expand(suffix_embs.shape[0], -1)
+            ego_action_start = 0
+            ego_scene_start = ego_action_len
+            world_scene_start = ego_scene_start + ego_scene_len
+            world_action_start = world_scene_start + world_scene_len
         layout = {
-            "ego_scene": slice(ego_scene_start, world_scene_start),
-            "world_scene": slice(world_scene_start, world_action_start),
-            "ego_action": slice(ego_action_start, ego_action_len),
+            "ego_scene": slice(ego_scene_start, ego_scene_start + ego_scene_len),
+            "world_scene": slice(world_scene_start, world_scene_start + world_scene_len),
+            "ego_action": slice(ego_action_start, ego_action_start + ego_action_len),
             "world_action": slice(world_action_start, world_action_start + world_action_len),
         }
         return suffix_embs, suffix_pad_masks, suffix_att_masks, layout

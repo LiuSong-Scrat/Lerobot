@@ -2218,6 +2218,110 @@ def test_world_ego_joint_attention_preserves_ego_block_and_lets_world_read_ego()
     assert mask[world_action[:, None], world_action].all()
 
 
+def test_symmetric_dual_coordinate_layout_makes_both_action_streams_mutual():
+    torch.manual_seed(1801)
+    cfg = SmolVLAConfig(
+        chunk_size=2,
+        n_action_steps=2,
+        pointseg_feature_dim=4,
+        worldflow_feature_dim=4,
+        worldflow_joint_token_layout="symmetric_dual_coordinate",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.ego_scene_to_expert = nn.Linear(4, 8)
+    model.world_scene_to_expert = nn.Linear(4, 8)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 8))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 8))
+
+    ego_scene = torch.randn(1, 4, requires_grad=True)
+    world_scene = torch.randn(1, 4, requires_grad=True)
+    ego_actions = torch.randn(1, cfg.chunk_size, 8, requires_grad=True)
+    world_actions = torch.randn(1, cfg.chunk_size, 8, requires_grad=True)
+    model.last_ego_scene_global_feat = ego_scene
+    model.last_ego_scene_global_mask = torch.ones(1, dtype=torch.bool)
+    world = {
+        "scene_tokens": torch.randn(1, 5, 4),
+        "scene_mask": torch.ones(1, 5, dtype=torch.bool),
+        "global_feat": world_scene,
+        "action_tokens": world_actions,
+        "action_mask": torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+    }
+
+    suffix, pad, blocks, layout = model._build_world_ego_joint_suffix(
+        ego_actions,
+        torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+        world,
+    )
+    allowed = make_att_2d_masks(pad, blocks)
+    ego_indices = torch.arange(layout["ego_action"].start, layout["ego_action"].stop)
+    world_indices = torch.arange(layout["world_action"].start, layout["world_action"].stop)
+    scene_indices = torch.arange(0, layout["ego_action"].start)
+
+    assert layout["ego_scene"].start == 0
+    assert layout["world_scene"].stop == layout["ego_action"].start
+    assert allowed[0, ego_indices[:, None], scene_indices].all()
+    assert allowed[0, ego_indices[:, None], world_indices].all()
+    assert allowed[0, world_indices[:, None], scene_indices].all()
+    assert allowed[0, world_indices[:, None], ego_indices].all()
+
+    scores = suffix @ suffix.transpose(-1, -2) / suffix.shape[-1] ** 0.5
+    weights = torch.softmax(
+        scores.masked_fill(~allowed, torch.finfo(scores.dtype).min),
+        dim=-1,
+    )
+    attended = weights @ suffix
+    ego_loss = attended[:, layout["ego_action"]].square().mean()
+    ego_from_world = torch.autograd.grad(
+        ego_loss,
+        (world_scene, world_actions),
+        retain_graph=True,
+    )
+    world_loss = attended[:, layout["world_action"]].square().mean()
+    world_from_ego = torch.autograd.grad(world_loss, (ego_scene, ego_actions))
+    assert all(gradient.abs().sum() > 0 for gradient in ego_from_world)
+    assert all(gradient.abs().sum() > 0 for gradient in world_from_ego)
+
+
+def test_symmetric_dual_coordinate_causal_ablation_masks_world_view_in_place():
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_feature_dim=4,
+        worldflow_feature_dim=4,
+        worldflow_joint_token_layout="symmetric_dual_coordinate",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.ego_scene_to_expert = nn.Linear(4, 8)
+    model.world_scene_to_expert = nn.Linear(4, 8)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 8))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 8))
+    model.last_ego_scene_global_feat = torch.randn(1, 4)
+    model.last_ego_scene_global_mask = torch.ones(1, dtype=torch.bool)
+    model.inference_ablation_modalities = frozenset({"world_to_ego"})
+    world = {
+        "scene_tokens": torch.randn(1, 5, 4),
+        "scene_mask": torch.ones(1, 5, dtype=torch.bool),
+        "global_feat": torch.randn(1, 4),
+        "action_tokens": torch.randn(1, cfg.chunk_size, 8),
+        "action_mask": torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+    }
+
+    _suffix, pad, _blocks, layout = model._build_world_ego_joint_suffix(
+        torch.randn(1, cfg.chunk_size, 8),
+        torch.ones(1, cfg.chunk_size, dtype=torch.bool),
+        world,
+    )
+
+    assert pad[:, layout["ego_scene"]].all()
+    assert pad[:, layout["ego_action"]].all()
+    assert not pad[:, layout["world_scene"]].any()
+    assert not pad[:, layout["world_action"]].any()
+
+
 def test_world_stream_ablation_preserves_layout_but_masks_world_tokens():
     cfg = SmolVLAConfig(
         chunk_size=3,
