@@ -359,6 +359,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # through the full expert before the executed Ego head. WorldFlow-disabled
     # construction never reads this option and remains the exact legacy network.
     worldflow_joint_token_layout: str = "legacy_asymmetric"
+    # Structural alternative for ``parallel_dual_coordinate``.  The World
+    # stream keeps its global point-cloud encoder and independent point-action
+    # adapter, but follows the same canonical Ego action flow as the executed
+    # stream.  A dedicated current-carrier embedding tells the World adapter
+    # where the robot is in its global scene.  Both views therefore supervise
+    # one shared Action Expert in the same output coordinate system instead of
+    # asking it to co-predict an unrelated, much larger pose9 conjugation chart.
+    # This is a representation choice, not a loss weight, gate, or task rule.
+    worldflow_parallel_canonical_action_flow: bool = False
     # ``cross_attention`` preserves historical checkpoints: World affects the
     # Ego head only through token exchange. ``symmetric_twist`` additionally
     # maps the World spatial twist back to Ego coordinates with the exact SE(3)
@@ -748,6 +757,40 @@ class SmolVLAConfig(PreTrainedConfig):
                     "'symmetric_dual_coordinate' or 'parallel_dual_coordinate'; "
                     f"got {self.worldflow_joint_token_layout!r}."
                 )
+            if self.worldflow_parallel_canonical_action_flow:
+                if self.worldflow_joint_token_layout != "parallel_dual_coordinate":
+                    raise ValueError(
+                        "worldflow_parallel_canonical_action_flow=True requires "
+                        "worldflow_joint_token_layout='parallel_dual_coordinate'."
+                    )
+                if self.worldflow_action_fusion != "cross_attention":
+                    raise ValueError(
+                        "Canonical parallel World/Ego action flow uses latent bidirectional "
+                        "exchange and requires worldflow_action_fusion='cross_attention'."
+                    )
+                if self.worldflow_scene_frame_origin != "global":
+                    raise ValueError(
+                        "Canonical parallel World/Ego action flow requires "
+                        "worldflow_scene_frame_origin='global' so the second adapter retains "
+                        "absolute spatial information."
+                    )
+                if self.se3_enable:
+                    raise ValueError(
+                        "worldflow_parallel_canonical_action_flow is currently defined for the "
+                        "checkpoint-compatible Euclidean pose9 action chart; se3_enable must be False."
+                    )
+                if any(
+                    value != 0
+                    for value in (
+                        self.worldflow_geo_loss_weight,
+                        self.worldflow_bridge_loss_weight,
+                        self.worldflow_equiv_loss_weight,
+                    )
+                ):
+                    raise ValueError(
+                        "Canonical parallel World/Ego action flow is a direct co-prediction objective; "
+                        "World geo/bridge/equivariance auxiliary weights must all be zero."
+                    )
             if (
                 self.worldflow_scene_frame_origin == "global"
                 and self.worldflow_training_coordinate_frame_augmentation

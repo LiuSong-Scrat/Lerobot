@@ -1183,6 +1183,53 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert all(parameter.requires_grad for parameter in model.parameters())
 
 
+def test_canonical_worldflow_bootstrap_copies_complete_action_io_without_sharing():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(worldflow_se3_head_enable=False)
+    model.action_in_proj = nn.Linear(12, 4)
+    model.action_out_proj = nn.Linear(4, 12)
+    model.action_time_mlp_in = nn.Linear(8, 4)
+    model.action_time_mlp_out = nn.Linear(4, 4)
+    model.ego_scene_to_expert = nn.Linear(3, 4)
+    model.world_scene_to_expert = nn.Linear(3, 4)
+    model.world_action_out_proj = nn.Linear(4, 12)
+    model.world_se3_action_out_proj = None
+    model.point_action_fusion = nn.Linear(3, 4)
+    model.pointseg_conditioner = SimpleNamespace(foreground_encoder=nn.Linear(6, 3))
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_twist_residual_out_proj = nn.Linear(4, 6)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
+    carrier_context_proj = nn.Linear(9, 4)
+    world = SimpleNamespace(
+        canonical_action_flow=True,
+        scene_encoder=nn.Linear(6, 3),
+        point_action_adapter=nn.Linear(3, 4),
+        action_in_proj=nn.Linear(12, 4),
+        action_time_mlp_in=nn.Linear(8, 4),
+        action_time_mlp_out=nn.Linear(4, 4),
+        scene_context_proj=nn.Linear(3, 4),
+        carrier_context_proj=carrier_context_proj,
+        language_embedding=nn.Embedding(11, 4),
+        language_norm=nn.LayerNorm(4),
+    )
+    model.worldflow_branch = world
+
+    with torch.no_grad():
+        for ordinal, parameter in enumerate(model.parameters(), start=1):
+            parameter.fill_(ordinal / 100.0)
+    model.bootstrap_worldflow_from_ego()
+
+    assert torch.equal(world.action_in_proj.weight, model.action_in_proj.weight)
+    assert world.action_in_proj.weight.data_ptr() != model.action_in_proj.weight.data_ptr()
+    assert torch.equal(model.world_action_out_proj.weight, model.action_out_proj.weight)
+    assert model.world_action_out_proj.weight.data_ptr() != model.action_out_proj.weight.data_ptr()
+    assert torch.count_nonzero(carrier_context_proj.weight) == 0
+    assert torch.count_nonzero(carrier_context_proj.bias) == 0
+
+
 def test_dedicated_world_se3_head_decodes_twist_without_pose9_projection():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
@@ -2107,6 +2154,124 @@ def test_worldflow_branch_consumes_xyzrgb_without_role_or_probability_inputs():
         torch.zeros_like(output["action_tokens"][0, 2:]),
     )
     assert not hasattr(branch, "action_expert")
+
+
+def test_canonical_worldflow_branch_uses_full_ego_action_and_absolute_carrier():
+    torch.manual_seed(171)
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        worldflow_enable=True,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+        worldflow_joint_token_layout="parallel_dual_coordinate",
+        worldflow_scene_frame_origin="global",
+        worldflow_action_fusion="cross_attention",
+        worldflow_parallel_canonical_action_flow=True,
+        worldflow_geo_loss_weight=0.0,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    branch = _make_tiny_worldflow_branch(cfg)
+    assert branch.action_dim == cfg.max_action_dim
+    assert branch.action_in_proj.in_features == cfg.max_action_dim
+    assert branch.carrier_context_proj is not None
+    assert torch.count_nonzero(branch.carrier_context_proj.weight) == 0
+
+    point_cloud = torch.randn(2, 12, 6)
+    scene = branch.encode_scene(point_cloud)
+    lang_tokens = torch.randint(0, 64, (2, 5))
+    lang_masks = torch.ones(2, 5, dtype=torch.bool)
+    noisy_actions = torch.randn(2, cfg.chunk_size, cfg.max_action_dim)
+    time = torch.rand(2)
+    carrier_a = torch.randn(2, 9)
+    carrier_b = carrier_a.clone()
+    carrier_b[:, 0] += 0.25
+
+    tokens_a, _ = branch.embed_action_tokens(
+        scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_a
+    )
+    tokens_b, _ = branch.embed_action_tokens(
+        scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_b
+    )
+    assert torch.equal(tokens_a, tokens_b)
+    with torch.no_grad():
+        branch.carrier_context_proj.weight[:, 0].fill_(0.5)
+    learned_a, _ = branch.embed_action_tokens(
+        scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_a
+    )
+    learned_b, _ = branch.embed_action_tokens(
+        scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_b
+    )
+    assert not torch.equal(learned_a, learned_b)
+
+
+def test_canonical_worldflow_configuration_rejects_mixed_coordinate_contracts():
+    common = {
+        "worldflow_enable": True,
+        "worldflow_parallel_canonical_action_flow": True,
+        "worldflow_geo_loss_weight": 0.0,
+        "worldflow_bridge_loss_weight": 0.0,
+        "worldflow_equiv_loss_weight": 0.0,
+    }
+    with pytest.raises(ValueError, match="parallel_dual_coordinate"):
+        SmolVLAConfig(**common)
+    with pytest.raises(ValueError, match="scene_frame_origin='global'"):
+        SmolVLAConfig(**common, worldflow_joint_token_layout="parallel_dual_coordinate")
+    with pytest.raises(ValueError, match="direct co-prediction"):
+        SmolVLAConfig(
+            **{**common, "worldflow_geo_loss_weight": 0.1},
+            worldflow_joint_token_layout="parallel_dual_coordinate",
+            worldflow_scene_frame_origin="global",
+        )
+
+
+def test_canonical_worldflow_loss_uses_same_weighted_action_target_and_backpropagates():
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        worldflow_enable=True,
+        worldflow_joint_token_layout="parallel_dual_coordinate",
+        worldflow_scene_frame_origin="global",
+        worldflow_parallel_canonical_action_flow=True,
+        worldflow_loss_weight=1.0,
+        worldflow_geo_loss_weight=0.0,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    action_dim = 10
+    model.config = SimpleNamespace(
+        action_feature=SimpleNamespace(shape=(action_dim,)),
+        action_loss_translation_weight=cfg.action_loss_translation_weight,
+        action_loss_rotation_weight=cfg.action_loss_rotation_weight,
+        action_loss_gripper_weight=cfg.action_loss_gripper_weight,
+        worldflow_loss_weight=cfg.worldflow_loss_weight,
+    )
+    model.last_worldflow_metrics = {}
+    batch = 2
+    x_t = torch.randn(batch, cfg.chunk_size, cfg.max_action_dim)
+    u_t = torch.randn_like(x_t)
+    pred = torch.randn_like(x_t, requires_grad=True)
+    valid = torch.tensor([[True, True, False], [True, True, True]])
+    state = {
+        "x_t": x_t,
+        "u_t": u_t,
+        "valid": valid,
+        "point_cloud_world": torch.randn(batch, 20, 6),
+    }
+    result = model._finalize_worldflow_canonical_action_loss(
+        state,
+        pred,
+        torch.tensor([0.25, 0.75]),
+    )
+    assert result["per_sample_loss"].shape == (batch,)
+    assert model.last_worldflow_metrics["worldflow_canonical_action_flow_active"] == 1
+    result["per_sample_loss"].mean().backward()
+    assert pred.grad is not None
+    assert pred.grad[..., :action_dim].abs().sum() > 0
+    assert torch.count_nonzero(pred.grad[..., action_dim:]) == 0
 
 
 def test_worldflow_point_action_receives_every_litept_token():
