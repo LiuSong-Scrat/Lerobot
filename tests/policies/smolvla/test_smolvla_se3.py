@@ -1804,6 +1804,64 @@ def test_worldflow_and_complete_se3_flow_can_be_enabled_together():
     assert "worldflow=conjugate_ego" in cfg.flow_contract_summary()
 
 
+def test_worldflow_global_scene_keeps_absolute_translation_with_local_action_carrier():
+    cfg = SmolVLAConfig(
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_frame_origin="current_ee",
+        worldflow_scene_frame_origin="global",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = nn.Identity()
+
+    points_ego = torch.tensor(
+        [[[0.10, -0.02, 0.03, 12.0, 34.0, 56.0]]],
+        dtype=torch.float32,
+    )
+    model.last_worldflow_payload = {"foreground_pc_ego": points_ego}
+    current = se3_exp(torch.tensor([[0.42, -0.31, 0.27, 0.20, -0.10, 0.15]]))
+    current_pose9 = matrix_to_pose9(current)
+
+    scene_points, point_is_pad, _ = model._prepare_worldflow_foreground(current_pose9)
+    expected_scene = _ego_point_cloud_to_world(
+        points_ego,
+        current_pose9,
+        frame_origin="global",
+    )
+    local_action_carrier = _worldflow_carrier_matrix(
+        current_pose9,
+        cfg.worldflow_frame_origin,
+    )
+
+    assert torch.equal(scene_points, expected_scene)
+    assert torch.count_nonzero(point_is_pad) == 0
+    assert torch.count_nonzero(local_action_carrier[..., :3, 3]) == 0
+    assert torch.allclose(
+        scene_points[..., :3]
+        - _ego_point_cloud_to_world(
+            points_ego,
+            current_pose9,
+            frame_origin="current_ee",
+        )[..., :3],
+        current[..., :3, 3].unsqueeze(1),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
+def test_worldflow_global_scene_rejects_random_coordinate_reparameterization():
+    with pytest.raises(ValueError, match="fixed global scene frame"):
+        SmolVLAConfig(
+            pointseg_enable=True,
+            worldflow_enable=True,
+            worldflow_frame_origin="current_ee",
+            worldflow_scene_frame_origin="global",
+            worldflow_training_coordinate_frame_augmentation=True,
+        )
+
+
 def test_projected_pose9_is_a_valid_complete_se3_head_mode():
     cfg = SmolVLAConfig(
         se3_enable=True,

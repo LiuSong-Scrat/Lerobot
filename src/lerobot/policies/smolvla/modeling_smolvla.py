@@ -4117,7 +4117,14 @@ class VLAFlowMatching(nn.Module):
         self,
         current_pose: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Map the predicted Ego foreground into the current world frame."""
+        """Map the predicted Ego foreground into its configured scene frame.
+
+        The scene frame is deliberately independent of the action-flow
+        carrier. A local, world-aligned action carrier avoids the global-origin
+        lever arm in ``C B C^-1``; the scene can still retain absolute World
+        position as sensory evidence. Historical checkpoints use ``carrier``
+        and therefore preserve the previous exact behavior.
+        """
         if self.worldflow_branch is None:
             raise RuntimeError("WorldFlow is disabled.")
         payload = self.last_worldflow_payload
@@ -4149,10 +4156,13 @@ class VLAFlowMatching(nn.Module):
                 f"Expected current World EEF pose shape {(point_cloud_ego.shape[0], 9)}, "
                 f"got {current_pose.shape}."
             )
+        scene_frame_origin = self.config.worldflow_frame_origin
+        if getattr(self.config, "worldflow_scene_frame_origin", "carrier") == "global":
+            scene_frame_origin = "global"
         point_cloud_world = _ego_point_cloud_to_world(
             point_cloud_ego,
             current_pose,
-            frame_origin=self.config.worldflow_frame_origin,
+            frame_origin=scene_frame_origin,
         )
         return point_cloud_world, point_is_pad, current_pose
 

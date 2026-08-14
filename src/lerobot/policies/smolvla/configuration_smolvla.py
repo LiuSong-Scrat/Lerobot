@@ -338,6 +338,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # world-aligned axes but places the origin at the current EEF, yielding an
     # exactly invertible, better-conditioned conjugacy without that term.
     worldflow_frame_origin: str = "global"
+    # Coordinate frame used only to encode the World scene points. ``carrier``
+    # preserves the historical contract and reuses ``worldflow_frame_origin``.
+    # ``global`` keeps the scene in the fixed dataset/world frame even when the
+    # action-flow carrier uses ``current_ee`` to remove its conjugation
+    # lever-arm. This separates sensory information from action
+    # parameterization: it restores absolute scene position without changing
+    # the well-conditioned local World action state or adding model parameters.
+    worldflow_scene_frame_origin: str = "carrier"
     # ``cross_attention`` preserves historical checkpoints: World affects the
     # Ego head only through token exchange. ``symmetric_twist`` additionally
     # maps the World spatial twist back to Ego coordinates with the exact SE(3)
@@ -711,6 +719,20 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "worldflow_frame_origin must be 'global' or 'current_ee'; "
                     f"got {self.worldflow_frame_origin!r}."
+                )
+            if self.worldflow_scene_frame_origin not in {"carrier", "global"}:
+                raise ValueError(
+                    "worldflow_scene_frame_origin must be 'carrier' or 'global'; "
+                    f"got {self.worldflow_scene_frame_origin!r}."
+                )
+            if (
+                self.worldflow_scene_frame_origin == "global"
+                and self.worldflow_training_coordinate_frame_augmentation
+            ):
+                raise ValueError(
+                    "worldflow_scene_frame_origin='global' is incompatible with random "
+                    "World-coordinate reparameterization: the fixed global scene frame is "
+                    "the intended information source."
                 )
             if self.worldflow_action_fusion not in {
                 "cross_attention",
