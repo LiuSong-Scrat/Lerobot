@@ -386,6 +386,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 最近通过结果：HandPose 26 项，LeRobot real-camera-motion 22 项。
 
+## 6.5 2026-08-14：LIBERO 单视角 WorldFlow 当前运行状态
+
+- 当前同协议固定动作 baseline 是 `472/500 = 94.4%`；严格通过线是至少 `473/500`，并且同 checkpoint 的完整 World 因果消融必须更差。历史 `481/500` 仅作参考，不能替代当前同协议 baseline。
+- v36 已完成并被 Broad 筛除：step `100/240/480/720` 的保留结果分别为 `85/91`（6 失败）、`56/67`（11 失败）、`75/80`（5 失败）、`82/87`（5 失败）；各自的理论最高值均不超过 `95/100`，没有启动 causal 或 Full-500。
+- 当前独立代码工作树是 `/home/liusong/ProgramFiles/Huggingface/lerobot_worldflow_parallel_dualcoord`，分支 `wep_vla_v0.4.3_worldflow_parallel_dualcoord`，提交 `a04fc510cf35e61369c4ae3fc656a507c9ed9e00`。v37 使用两个原长度 action suffix、两个 point-action adapter、一个共享 point-action expert，并在进入 expert 前进行双向 Ego/World cross-attention；不含门控、task-specific 技巧、物理 residual vote 或 LitePT 修改。完整 WorldFlow/SE(3) 测试通过 `86/86`。
+- v36 的 50-step World-flow 滑动均值从 steps 1--50 的约 `0.0451` 持续下降到 steps 671--720 的约 `0.0113`，720 步仍不能视为明确收敛。因此 v37 训练长度设为 `2160` optimizer steps（约 3 epochs），而不是在 720 步强制结束。checkpoint 为 `100/240/480/720/1080/1440/1800/2160`，需同时参考 W&B 损失趋势和 rollout，不能仅凭早期 checkpoint 排除后期收敛。
+- 物理 batch48/GPU 在新的并行双坐标拓扑中会在 optimizer state 建立后 OOM。当前有效配置改为 microbatch24/GPU、gradient accumulation2、4 GPUs，保持有效单卡 batch48、全局 batch192；worker12、W&B enabled。激活检查点只用于训练共享 expert，推理函数不变。
+- 当前正式运行 variant：`v37r3_baseline_bootstrap_parallel_dualcoord_global_world_coprediction_equaljoint_4gpu_mb24_ga2_effb48_w12_2160steps`。tmux：`wep_v043_v37r3_parallel_dualcoord_train`、`wep_v043_v37r3_parallel_dualcoord_broad_after_train`、`wep_v043_v37r3_parallel_dualcoord_full500_after_broad`。W&B：`https://wandb.ai/liusong-scrat/wep_vla_v043_libero10/runs/worldflow-v37r3-parallel-dualcoord-global-world-coprediction-3epoch-20260814`。
+- v37r3 已越过此前 step2 OOM 点并稳定进入训练循环；初期 loss 有正常 batch 波动，未出现 OOM、Traceback 或非有限值。此前 r0/r1/r2 的失败输出与日志均保留作审计。没有删除 `/opt/data/private` 下的任何文件。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
