@@ -351,10 +351,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # causal block, followed by scene tokens and then World actions.  The
     # ``symmetric_dual_coordinate`` topology presents Ego/World scenes as one
     # context block and both coordinate descriptions of the action as one
-    # shared expert block.  Each action stream can therefore exchange
-    # information inside every Action Expert layer instead of meeting only in
-    # a post-expert residual.  WorldFlow-disabled construction never reads this
-    # option and remains the exact legacy network.
+    # shared expert block. ``parallel_dual_coordinate`` instead preserves the
+    # original action-only suffix layout for *both* coordinate streams. Their
+    # paired action tokens exchange information before two applications of the
+    # same Action Expert. This keeps the pretrained Ego token positions and
+    # attention graph exact at bootstrap while making World information pass
+    # through the full expert before the executed Ego head. WorldFlow-disabled
+    # construction never reads this option and remains the exact legacy network.
     worldflow_joint_token_layout: str = "legacy_asymmetric"
     # ``cross_attention`` preserves historical checkpoints: World affects the
     # Ego head only through token exchange. ``symmetric_twist`` additionally
@@ -738,10 +741,11 @@ class SmolVLAConfig(PreTrainedConfig):
             if self.worldflow_joint_token_layout not in {
                 "legacy_asymmetric",
                 "symmetric_dual_coordinate",
+                "parallel_dual_coordinate",
             }:
                 raise ValueError(
                     "worldflow_joint_token_layout must be 'legacy_asymmetric' or "
-                    "'symmetric_dual_coordinate'; "
+                    "'symmetric_dual_coordinate' or 'parallel_dual_coordinate'; "
                     f"got {self.worldflow_joint_token_layout!r}."
                 )
             if (

@@ -4366,6 +4366,134 @@ class VLAFlowMatching(nn.Module):
         )
         return ego_out + ego_delta, world_out
 
+    def _bidirectional_world_ego_input_exchange(
+        self,
+        ego_tokens: Tensor,
+        world_tokens: Tensor,
+        ego_mask: Tensor,
+        world_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Exchange paired coordinate evidence before the shared Action Expert.
+
+        Unlike the historical post-expert bridge, this exchange leaves both
+        streams in the original action-only suffix topology.  The World-to-Ego
+        output projection is zero at bootstrap, so the executed Ego forward is
+        exactly the pretrained forward before learning starts.  Both directions
+        are computed from the unmodified inputs, avoiding an order-dependent
+        World->Ego->World echo within one denoising call.
+        """
+
+        modules = (
+            self.ego_to_world_cross_norm,
+            self.world_to_ego_cross_norm,
+            self.ego_to_world_cross_attn,
+            self.world_to_ego_cross_attn,
+        )
+        if any(module is None for module in modules):
+            raise RuntimeError("Bidirectional World-Ego input exchange is not initialized.")
+        ego_valid = ego_mask.to(device=ego_tokens.device, dtype=torch.bool)
+        world_valid = world_mask.to(device=world_tokens.device, dtype=torch.bool)
+        ego_norm = self.ego_to_world_cross_norm(ego_tokens)
+        world_norm = self.world_to_ego_cross_norm(world_tokens)
+
+        world_delta, _ = self.ego_to_world_cross_attn(
+            query=world_norm,
+            key=ego_norm,
+            value=ego_norm,
+            key_padding_mask=~ego_valid,
+            need_weights=False,
+        )
+        world_conditioned = world_tokens + world_delta
+
+        ablations = getattr(self, "inference_ablation_modalities", frozenset())
+        if "world_to_ego" in ablations or "world" in ablations:
+            return ego_tokens, world_conditioned
+        ego_delta, _ = self.world_to_ego_cross_attn(
+            query=ego_norm,
+            key=world_norm,
+            value=world_norm,
+            key_padding_mask=~world_valid,
+            need_weights=False,
+        )
+        return ego_tokens + ego_delta, world_conditioned
+
+    def _run_world_ego_parallel_expert(
+        self,
+        prefix_embs: Tensor | None,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor | None,
+        ego_action_tokens: Tensor,
+        ego_action_mask: Tensor,
+        world_tokens: dict[str, Tensor],
+        *,
+        past_key_values=None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run two coordinate views through one shared action expert.
+
+        Each view uses exactly the baseline action-only suffix length, block
+        mask, and position IDs. During training the two views are stacked on
+        the batch axis for one shared-expert call. Cached inference performs
+        two calls against the same immutable prefix cache because transformer
+        cache implementations do not share a stable batch-repeat API.
+        """
+
+        world_action_tokens = world_tokens.get("action_tokens")
+        world_action_mask = world_tokens.get("action_mask")
+        if not torch.is_tensor(world_action_tokens) or not torch.is_tensor(world_action_mask):
+            raise ValueError("Parallel World-Ego expert requires World action tokens and mask.")
+        if world_action_tokens.shape != ego_action_tokens.shape:
+            raise ValueError(
+                "Parallel World-Ego expert requires paired token shapes, got "
+                f"{ego_action_tokens.shape} and {world_action_tokens.shape}."
+            )
+        ego_action_mask = ego_action_mask.to(device=ego_action_tokens.device, dtype=torch.bool)
+        world_action_mask = world_action_mask.to(device=world_action_tokens.device, dtype=torch.bool)
+        ego_input, world_input = self._bidirectional_world_ego_input_exchange(
+            ego_action_tokens,
+            world_action_tokens,
+            ego_action_mask,
+            world_action_mask,
+        )
+        action_len = ego_input.shape[1]
+        action_att_masks = torch.tensor(
+            [1] + [0] * (action_len - 1),
+            dtype=ego_input.dtype,
+            device=ego_input.device,
+        )[None, :].expand(ego_input.shape[0], -1)
+
+        if prefix_embs is not None:
+            if prefix_att_masks is None:
+                raise ValueError("prefix_att_masks are required when prefix_embs are provided.")
+            paired_out = self._run_ego_suffix_expert(
+                torch.cat([prefix_embs, prefix_embs], dim=0),
+                torch.cat([prefix_pad_masks, prefix_pad_masks], dim=0),
+                torch.cat([prefix_att_masks, prefix_att_masks], dim=0),
+                torch.cat([ego_input, world_input], dim=0),
+                torch.cat([ego_action_mask, world_action_mask], dim=0),
+                torch.cat([action_att_masks, action_att_masks], dim=0),
+            )
+            return paired_out.chunk(2, dim=0)
+
+        ego_out = self._run_ego_suffix_expert(
+            None,
+            prefix_pad_masks,
+            None,
+            ego_input,
+            ego_action_mask,
+            action_att_masks,
+            past_key_values=past_key_values,
+        )
+        world_out = self._run_ego_suffix_expert(
+            None,
+            prefix_pad_masks,
+            None,
+            world_input,
+            world_action_mask,
+            action_att_masks,
+            past_key_values=past_key_values,
+        )
+        return ego_out, world_out
+
     def _run_world_ego_joint_expert(
         self,
         prefix_embs: Tensor | None,
@@ -4377,6 +4505,19 @@ class VLAFlowMatching(nn.Module):
         *,
         past_key_values=None,
     ) -> tuple[Tensor, Tensor]:
+        if (
+            getattr(self.config, "worldflow_joint_token_layout", "legacy_asymmetric")
+            == "parallel_dual_coordinate"
+        ):
+            return self._run_world_ego_parallel_expert(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                ego_action_tokens,
+                ego_action_mask,
+                world_tokens,
+                past_key_values=past_key_values,
+            )
         suffix_embs, suffix_pad_masks, suffix_att_masks, layout = self._build_world_ego_joint_suffix(
             ego_action_tokens,
             ego_action_mask,

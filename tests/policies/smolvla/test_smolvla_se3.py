@@ -2442,6 +2442,130 @@ def test_bidirectional_cross_attention_is_function_preserving_without_a_gate():
     assert model.ego_to_world_cross_attn.out_proj.weight.grad.abs().sum() > 0
 
 
+def test_parallel_dual_coordinate_input_exchange_is_identity_then_bidirectional():
+    torch.manual_seed(182)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    dim = 8
+    model.ego_to_world_cross_norm = nn.LayerNorm(dim)
+    model.world_to_ego_cross_norm = nn.LayerNorm(dim)
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(dim, 2, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(dim, 2, batch_first=True)
+    for attention in (model.ego_to_world_cross_attn, model.world_to_ego_cross_attn):
+        nn.init.zeros_(attention.out_proj.weight)
+        nn.init.zeros_(attention.out_proj.bias)
+
+    ego = torch.randn(2, 4, dim, requires_grad=True)
+    world = torch.randn(2, 4, dim, requires_grad=True)
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    ego_out, world_out = model._bidirectional_world_ego_input_exchange(
+        ego,
+        world,
+        valid,
+        valid,
+    )
+
+    assert torch.equal(ego_out, ego)
+    assert torch.equal(world_out, world)
+    (ego_out.square().mean() + world_out.square().mean()).backward()
+    assert model.world_to_ego_cross_attn.out_proj.weight.grad.abs().sum() > 0
+    assert model.ego_to_world_cross_attn.out_proj.weight.grad.abs().sum() > 0
+
+    with torch.no_grad():
+        model.world_to_ego_cross_attn.out_proj.weight.copy_(torch.eye(dim))
+    ego_conditioned, _ = model._bidirectional_world_ego_input_exchange(
+        ego.detach(),
+        world.detach(),
+        valid,
+        valid,
+    )
+    assert not torch.equal(ego_conditioned, ego.detach())
+    model.inference_ablation_modalities = frozenset({"world_to_ego"})
+    ego_ablated, _ = model._bidirectional_world_ego_input_exchange(
+        ego.detach(),
+        world.detach(),
+        valid,
+        valid,
+    )
+    assert torch.equal(ego_ablated, ego.detach())
+
+
+def test_parallel_dual_coordinate_uses_baseline_suffix_for_both_shared_expert_views():
+    torch.manual_seed(183)
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_feature_dim=4,
+        worldflow_feature_dim=4,
+        worldflow_joint_token_layout="parallel_dual_coordinate",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    dim = 8
+    model.ego_to_world_cross_norm = nn.LayerNorm(dim)
+    model.world_to_ego_cross_norm = nn.LayerNorm(dim)
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(dim, 2, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(dim, 2, batch_first=True)
+    for attention in (model.ego_to_world_cross_attn, model.world_to_ego_cross_attn):
+        nn.init.zeros_(attention.out_proj.weight)
+        nn.init.zeros_(attention.out_proj.bias)
+
+    calls = []
+
+    def record_shared_expert(
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        suffix_embs,
+        suffix_pad_masks,
+        suffix_att_masks,
+        *,
+        past_key_values=None,
+    ):
+        calls.append(
+            {
+                "prefix_shape": tuple(prefix_embs.shape),
+                "suffix_shape": tuple(suffix_embs.shape),
+                "suffix_pad_masks": suffix_pad_masks.clone(),
+                "suffix_att_masks": suffix_att_masks.clone(),
+                "past_key_values": past_key_values,
+            }
+        )
+        return suffix_embs
+
+    model._run_ego_suffix_expert = record_shared_expert
+    batch = 2
+    ego = torch.randn(batch, cfg.chunk_size, dim)
+    world = torch.randn(batch, cfg.chunk_size, dim)
+    action_mask = torch.ones(batch, cfg.chunk_size, dtype=torch.bool)
+    prefix = torch.randn(batch, 5, dim)
+    prefix_mask = torch.ones(batch, 5, dtype=torch.bool)
+    prefix_blocks = torch.ones(batch, 5, dtype=torch.bool)
+    ego_out, world_out = model._run_world_ego_joint_expert(
+        prefix,
+        prefix_mask,
+        prefix_blocks,
+        ego,
+        action_mask,
+        {
+            "action_tokens": world,
+            "action_mask": action_mask,
+        },
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["prefix_shape"] == (2 * batch, 5, dim)
+    assert calls[0]["suffix_shape"] == (2 * batch, cfg.chunk_size, dim)
+    assert calls[0]["suffix_pad_masks"].all()
+    assert torch.equal(
+        calls[0]["suffix_att_masks"],
+        torch.tensor([[1, 0, 0]], dtype=ego.dtype).expand(2 * batch, -1),
+    )
+    assert torch.equal(ego_out, ego)
+    assert torch.equal(world_out, world)
+
+
 def test_worldflow_two_timescale_optimizer_keeps_both_branches_trainable():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
