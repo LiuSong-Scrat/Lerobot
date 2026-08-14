@@ -409,6 +409,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - Full waiter 为 `wep_v043_v38r1_full500_after_broad`。评测固定 action/noise/cache、local4 total30、inference batch30；先要求 Broad `>95/100`，再要求同 checkpoint 完整 World→Ego causal delta 为正，最后要求 Full500 `>=473/500`。在 WorldFlow 通过之前，多视角继续封存。
 - 所有运行文件统一位于 `/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811`；没有删除 `/opt/data/private` 下任何文件。
 
+## 6.7 2026-08-15：v38r1 按用户要求停止训练并直接筛查现有权重（覆盖 6.6 的运行状态）
+
+- 用户明确要求停止继续训练，在现有权重上测试；若效果没有改善，则该方案直接结束，不再以增加训练步数为理由继续。v38r1 训练、收敛 monitor、条件续训和旧的 step2160 waiter 均已停止；不会启动 step1080 之后的恢复训练。
+- 完整且可评测的 checkpoint 只有 `100/240/480/720/1080`。训练进程实际在约 step1102 被终止，但不存在完整 step1102 checkpoint，因此它不进入任何性能判断；所有已生成权重、optimizer state、日志和 cache 均保留。
+- 截止 step1080 的截断收敛审计完整解析1080个 update。最近200步 Ego/World loss 前后半分别变化 `+2.30%/+2.13%`，最近720步分别变化 `+1.84%/+1.09%`；World loss 在短、长尺度均没有继续实质下降，状态为 `no_material_tail_change_detected`。因此现有权重若 rollout 不改善，不能再归因于日志显示的明显未收敛。artifact：`singleview_worldflow/libero10_500ep/artifacts/v38r1_training_convergence_stopped_step001080_audit.json`。
+- 当前 Broad tmux 为 `wep_v043_v38r1_stopped1080_broad`，按 `100/240/480/720/1080` 顺序测试；Full 条件 waiter 为 `wep_v043_v38r1_stopped1080_full500`。Broad 仍使用固定 IDs `0,5,...,45`、fixed-action/fixed-noise/canonical exact cache、local4 total30、inference batch30；累计5个失败即数学早停。只有正常臂严格超过 `95/100` 且同 checkpoint 完整 World-to-Ego causal delta 为正，才进入权威 Full500；Full500 baseline 为 `472/500`，通过线为至少 `473/500`。
+- 新入口为实验根目录 `scripts/wait_then_eval_v38r1_stopped_step1080_local4.sh`。Broad日志为 `singleview_worldflow/libero10_500ep/logs/eval_v38r1_stopped_step1080_broad.log`；Full waiter日志为 `singleview_worldflow/libero10_500ep/logs/eval_v38r1_stopped_step1080_full500_waiter.log`。
+- v38r1 最终筛查已完成并正式否决。steps `100/240/480/720/1080` 分别在 `74/79`、`89/94`、`90/95`、`93/98`、`90/95` 时累计第5个失败；每个 checkpoint 的最大可能最终成绩都只有 `95/100`，不能严格超过 Broad baseline。没有候选，因此没有启动 World-to-Ego causal arm 或 Full500，条件 Full waiter 写出 `screened_out` 后正常退出。聚合 screen：`singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v38r1_canonical_world_token_residual_dualflow_stratified_checkpoint_causal_screen.json`；正式 gate：`singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v38r1_canonical_world_token_residual_dualflow_local4_fixedbarrier_all_candidates_full500_matched_worldflow_gate.json`。
+- 结论：现有 v38r1 权重未显示性能改善，而且 step1080 前的长窗口 loss 已无实质下降；按用户决定结束该方案，不继续训练。当前无 v38r1 训练或评测 tmux/进程，4张本地GPU已释放；所有输出均保留。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
