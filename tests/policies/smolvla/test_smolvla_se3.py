@@ -341,6 +341,72 @@ def test_pose9_endpoint_residual_zero_is_exact_ego_and_nonzero_is_conjugate():
     assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
 
 
+def test_pose9_endpoint_residual_rate_has_terminal_boundary_and_bounded_velocity():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(worldflow_endpoint_residual_rate_parameterization=True)
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+    nn.init.zeros_(model.world_twist_residual_out_proj.weight)
+    with torch.no_grad():
+        model.world_twist_residual_out_proj.bias.copy_(
+            torch.tensor([0.02, -0.01, 0.03, 0.0, 0.0, 0.0])
+        )
+
+    batch, steps = 2, 3
+    time = torch.tensor([0.2, 0.8])
+    remaining = (1.0 - time)[:, None, None]
+    identity = torch.eye(4).expand(batch, steps, -1, -1).clone()
+    pose9 = matrix_to_pose9(identity)
+    ego_x_t = torch.cat([pose9, torch.zeros(batch, steps, 1)], dim=-1)
+    ego_velocity = torch.zeros_like(ego_x_t)
+    world_x_t = pose9.clone()
+    world_features = torch.zeros(batch, steps, 8)
+    carrier = torch.eye(4).expand(batch, 1, -1, -1).clone()
+
+    corrected, world_velocity, effective_residual = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier,
+    )
+
+    rate = model.world_twist_residual_out_proj.bias[:3]
+    assert torch.allclose(
+        effective_residual[..., :3],
+        remaining * rate,
+        atol=1e-7,
+        rtol=1e-7,
+    )
+    assert torch.allclose(corrected[..., :3], rate.expand(batch, steps, -1), atol=2e-6, rtol=2e-6)
+    assert torch.allclose(
+        world_velocity[..., :3],
+        rate.expand(batch, steps, -1),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
+def test_endpoint_residual_rate_parameterization_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_residual_boosting",
+        worldflow_endpoint_residual_rate_parameterization=True,
+    )
+    assert cfg.worldflow_endpoint_residual_rate_parameterization is True
+
+    with pytest.raises(ValueError, match="requires worldflow_enable=True"):
+        SmolVLAConfig(worldflow_endpoint_residual_rate_parameterization=True)
+    with pytest.raises(ValueError, match="requires worldflow_action_fusion"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_endpoint_residual_rate_parameterization=True,
+        )
+
+
 def test_pose9_endpoint_residual_ablation_preserves_ego_but_trains_world():
     torch.manual_seed(1144)
     model = VLAFlowMatching.__new__(VLAFlowMatching)

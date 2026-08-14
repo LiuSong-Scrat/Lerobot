@@ -3461,6 +3461,19 @@ class VLAFlowMatching(nn.Module):
             ego_to_world_transform @ ego_endpoint @ world_to_ego_transform
         )
         residual = self.world_twist_residual_out_proj(world_features)
+        if bool(
+            getattr(
+                getattr(self, "config", None),
+                "worldflow_endpoint_residual_rate_parameterization",
+                False,
+            )
+        ):
+            # A bounded flow-velocity error induces an endpoint error that
+            # contracts with the remaining integration horizon. Encode that
+            # terminal boundary analytically instead of asking the World
+            # network to relearn it from a finite time grid. The same
+            # effective physical twist supervises World and returns to Ego.
+            residual = residual * remaining.to(dtype=residual.dtype)
         corrected_world_endpoint = se3_exp(residual.to(dtype=torch.float32)) @ baseline_world_endpoint
         # Use the exact same matrix path for the neutral reference.  Taking
         # their pose9 difference, rather than re-encoding the baseline chart

@@ -243,6 +243,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # complete gradients. Ego/common parameters still train from the original
     # Ego action loss, so no branch is frozen.
     worldflow_training_shared_gradient_ego_tangent_projection: bool = False
+    # Continuous-time parameterization for endpoint residual boosting. The
+    # World head predicts a bounded residual *rate* and the physical SE(3)
+    # endpoint correction is multiplied by the remaining flow time (1-t).
+    # Consequently the correction vanishes at the terminal boundary and the
+    # velocity reconstruction cannot amplify a time-independent residual by
+    # 1/(1-t). This is a fixed analytical boundary condition, not a learned
+    # gate; it adds no parameter or auxiliary objective. Disabled by default
+    # so historical checkpoints preserve their exact inference function.
+    worldflow_endpoint_residual_rate_parameterization: bool = False
     # Training-only reparameterization of the complete World coordinate frame.
     # One random rigid transform A is applied consistently to World points,
     # the Ego-to-World carrier C, and every World trajectory state, so the
@@ -591,6 +600,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_training_shared_gradient_ego_tangent_projection=True requires "
                 "worldflow_enable=True."
             )
+        if self.worldflow_endpoint_residual_rate_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_rate_parameterization=True requires "
+                "worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -667,6 +681,14 @@ class SmolVLAConfig(PreTrainedConfig):
                     "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
                     "'endpoint_residual_boosting'; "
                     f"got {self.worldflow_action_fusion!r}."
+                )
+            if (
+                self.worldflow_endpoint_residual_rate_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_rate_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
                 )
             if self.worldflow_action_fusion in {
                 "symmetric_twist",
