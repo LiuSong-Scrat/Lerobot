@@ -23,7 +23,10 @@
 - v28 已完成并正式否决。它完成1080步、138,240样本，W&B 1080行完整；Broad steps `100/240/480/720/1080` 为 `97/87/96/94/93`，其中 step100 的同 checkpoint World-to-Ego ablation 为 `95`，得到局部因果 `+2`。但权威 Full-500 正常臂在 `317/338` 时累计21个失败，即使余下162个全成功也最多 `479/500`，不能超过 established `481/500`，故数学早停。gate：`taskbalanced_v28_ego_tangent_projection_p75_local4_fixedbarrier_full500_matched_worldflow_gate.json`；全部 partial output/cache 保留。
 - v28 的单次-forward residual time profile 定位到一个独立于学习率/梯度路由的连续时间错误：legacy head 直接输出终点 twist，再除以 `(1-t)` 还原速度，但网络在 `t=0.9` 没有把 residual 缩至 `t=0` 的十分之一。step100 平移 residual 均值从 `t=0` 的 `2.118 mm` 到 `t=0.9` 仍为 `1.851 mm`，对应 legacy implied velocity 从 `2.118 mm` 放大到 `18.511 mm`；step240/480/720 同样存在约一个数量级末段放大。证据：`v28_residual_time_profile32_summary.json` 及逐 checkpoint profile。此前通过两次独立 forward 做 action 差分的探针被标为无效，因为 repeat max-abs `0.021--0.033` 与 intervention effect 同量级。
 - v29 代码 commit/HEAD `f15f72e` 增加默认关闭的 `worldflow_endpoint_residual_rate_parameterization`：head 预测有界 residual rate，物理 SE(3) 终点 twist 固定乘 `(1-t)`，随后除以 remaining 还原的速度不再解析放大，且 correction 在 `t→1` 自动为0。它不是门控，不增加参数、辅助 loss、第二次 forward 或 task-specific 规则；旧 checkpoint 默认推理逐值不变，v14 零 residual 起点仍 exact-Ego。完整 GPU 测试 `83/83`。
-- v29 保持 v28 的其余控制项：单视角10,000点、完整 `10 tasks x 50 episodes`、4 GPU、batch32/GPU、worker12、1080步、W&B enabled、p=0.75 residual-anchor routing、shared Ego-tangent gradient protection、所有 Ego/World/residual optimizer group 非零 LR、四项 World auxiliary loss 为0、无门控。训练已在 tmux `wep_v043_libero10_v29_residual_rate_ego_tangent_p75_1080` 启动，W&B：`https://wandb.ai/liusong-scrat/wep_vla_v043_libero10/runs/worldflow-v29-v14zero-worldbnfixed-p75-anchor-residual-rate-ego-tangent-projection-20260814`。step100 audit 通过：三组 `982/259/2` tensors 均非零 LR，78个 World BN buffer 与 v14 逐位一致，4,326个 residual 值全部非零，前100步 keep ratio `0.2391`，无非有限值；artifact：`v29_step000100_residual_rate_runtime_audit.json`。只保存/评估 `100/240/480/720/1080`，Broad/Full waiter 已排队；多视角继续封存，直到 WorldFlow 在 Full-500 同时超过 baseline 并证明正因果。
+- v29 已完成并否决。固定分层 Broad steps `100/240/480/720/1080 = 97/91/94/94/92`，step100 同 checkpoint 关闭 World-to-Ego 为 `94`，局部因果 `+3`；但 Full-500 正常臂在 `362/382` 时已有20个失败，最高只能 `480/500`。rate 参数化修复了末段解析放大，但没有达到 Full 目标。
+- v30 组合 v29 rate boundary、v26 训练期 World 坐标重参数化和 v28 shared Ego-tangent 保护。Broad 为 `93/90/96/91/95`；step480 同 checkpoint 关闭 World-to-Ego 为 `90`，World 局部因果 `+6`。Full-500 在 `322/341` 时累计19个失败，最高只能 `481/500`，正式否决。单次-forward profile 证明残差数值已稳定：step480 在 `t=0.9` 的有效终点平移仅约 `0.240 mm`，不存在 v28 的末段爆炸；剩余问题是残差选择性/表示，而不是幅值失控。
+- v31 将同一6D残差解释为 Ego carrier-frame 左 twist；commit `eb6393e`，完整测试 `73/73`。一整个训练 epoch 正常完成，Broad steps `100/240/480/720/1080 = 93/94/92/95/93`，没有 checkpoint 严格超过同 IDs baseline `95/100`，因此 screened out，Full-500 未启动。该结果否定了 carrier-frame 左残差作为当前答案；全部 checkpoint、日志、cache 和 artifact 保留。
+- v32 是当前活动版本。commit `d04aca7` 新增默认关闭的 endpoint body-frame 右不变残差：`B_corrected = B_ego Exp(xi_body)`，对应 target `Log(B_ego^-1 B_target)`。它沿预测终点自身坐标轴表达误差，并对任意 World 坐标重参数化保持不变；复用原6D head、原 action loss 和单次 forward，不增加参数、门控、辅助损失或 task-specific 规则。零残差仍 exact-baseline，Ego/World/残差三组均保持非零 LR；完整测试 `75/75`。v32 继续使用单视角10,000点、全 `10 tasks x 50 episodes`、4 GPU、batch32/GPU、worker12、1080步、W&B、p=0.75 residual-anchor、shared Ego-tangent、rate boundary 和训练期 World 坐标重参数化。多视角继续封存，直到 WorldFlow 通过 Full-500 与正因果 gate。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
@@ -68,7 +71,7 @@ LIBERO HDF5
 
 - 路径：`/home/liusong/ProgramFiles/Huggingface/lerobot`
 - 分支：`wep_vla_v0.4.3_multiview_doubleflow`
-- 当前 WorldFlow 实现及分支 HEAD：`f15f72e`；v29 residual-rate terminal-boundary parameterization 即该 commit；v28 Ego-tangent optimizer routing 为 `5d469a0`；v27 inactive-PCGrad 为 `0bfce41`。
+- 当前 WorldFlow 实现及分支 HEAD：`d04aca7`；v32 endpoint body-frame right-invariant residual 即该 commit；v31 carrier-frame left residual 为 `eb6393e`；v29 residual-rate terminal boundary 为 `f15f72e`；v28 Ego-tangent optimizer routing 为 `5d469a0`。
 - 当前实验脚本、checkpoint、日志和 artifact 统一位于交接文档顶部所述 experiment root；不得删除 `/opt/data/private` 下任何文件。
 - 临时实验统一使用 `/tmp/temp`，不要把临时诊断文件写入正式数据目录。
 
