@@ -2688,6 +2688,9 @@ class VLAFlowMatching(nn.Module):
         self.capture_pointseg_visualization = False
         self.last_pointseg_visualization: dict[str, Tensor] | None = None
         self.last_worldflow_metrics: dict[str, Tensor] = {}
+        # Per-sample stochastic-depth assignment for training-only optimizer
+        # routing. This is runtime state, not a checkpoint tensor.
+        self.last_worldflow_world_to_ego_keep_mask: Tensor | None = None
         self.last_se3_metrics: dict[str, Tensor] = {}
         self.last_action_metrics: dict[str, Tensor] = {}
 
@@ -4952,6 +4955,7 @@ class VLAFlowMatching(nn.Module):
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         self.last_worldflow_aux = None
         self.last_worldflow_metrics = {}
+        self.last_worldflow_world_to_ego_keep_mask = None
         self.last_action_metrics = {}
         if self.config.se3_enable:
             return self.forward_se3(
@@ -5135,6 +5139,7 @@ class VLAFlowMatching(nn.Module):
                 augmentation_transform=augmentation_transform,
             )
             if world_to_ego_keep_mask is not None:
+                self.last_worldflow_world_to_ego_keep_mask = world_to_ego_keep_mask.detach()
                 self.last_worldflow_metrics["worldflow_world_to_ego_keep_ratio"] = (
                     world_to_ego_keep_mask.to(dtype=torch.float32).mean().detach()
                 )

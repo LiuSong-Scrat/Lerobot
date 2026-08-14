@@ -7,6 +7,7 @@ import torch
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
+    worldflow_ego_priority_projection_statistics,
 )
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
 from lerobot.scripts.train_song_libero import (
@@ -178,3 +179,32 @@ def test_full_union_paired_cache_contract_rejects_point_loss_or_semantic_prior_d
     assert mismatches["current_points"] == (19_499, 10_000)
     assert mismatches["future_points"] == (19_499, 10_000)
     assert "pseudo_label_config" in mismatches
+
+
+def test_worldflow_ego_priority_projection_preserves_aligned_gradients():
+    ego = [torch.tensor([1.0, 2.0]), None]
+    world = [torch.tensor([3.0, 4.0]), torch.tensor([5.0])]
+
+    stats = worldflow_ego_priority_projection_statistics(ego, world)
+
+    assert stats["dot"].item() == pytest.approx(11.0)
+    assert stats["coefficient"].item() == pytest.approx(0.0)
+    assert stats["conflict"].item() == pytest.approx(0.0)
+    assert stats["overlap_parameter_count"] == 1
+
+
+def test_worldflow_ego_priority_projection_removes_only_conflicting_component():
+    ego = [torch.tensor([2.0, 0.0]), None]
+    world = [torch.tensor([-3.0, 4.0]), torch.tensor([7.0])]
+
+    stats = worldflow_ego_priority_projection_statistics(ego, world)
+    coefficient = stats["coefficient"]
+    assert torch.is_tensor(coefficient)
+    projected_shared = world[0] - coefficient * ego[0]
+
+    assert stats["dot"].item() == pytest.approx(-6.0)
+    assert coefficient.item() == pytest.approx(-1.5)
+    assert stats["conflict"].item() == pytest.approx(1.0)
+    assert torch.dot(projected_shared, ego[0]).item() == pytest.approx(0.0)
+    # A World-only tensor never enters the projection inner product.
+    assert torch.equal(world[1], torch.tensor([7.0]))

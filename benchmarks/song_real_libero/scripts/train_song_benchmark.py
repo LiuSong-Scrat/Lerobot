@@ -1748,6 +1748,68 @@ def ensure_ddp_parameters_initialized(module: torch.nn.Module, accelerator: Acce
     logging.warning(message)
 
 
+def worldflow_ego_priority_projection_statistics(
+    ego_gradients: list[torch.Tensor | None],
+    world_gradients: list[torch.Tensor | None],
+) -> dict[str, torch.Tensor | int]:
+    """Measure the asymmetric PCGrad correction for two action-loss paths.
+
+    ``ego_gradients`` comes from stochastic-depth samples that execute the
+    ordinary Ego policy. ``world_gradients`` comes from samples that retain the
+    physical World-to-Ego correction.  A negative global dot product means the
+    World update would locally increase the protected Ego objective.  In that
+    case the returned coefficient defines
+
+    ``g_world_projected = g_world - coefficient * g_ego``.
+
+    The function does not mutate gradients and intentionally has no model- or
+    task-specific parameter list: every parameter reached by both paths enters
+    the same global inner product, while disjoint World-only gradients are
+    untouched by the caller.
+    """
+
+    if len(ego_gradients) != len(world_gradients):
+        raise ValueError(
+            "Ego and World gradient lists must have equal length, got "
+            f"{len(ego_gradients)} and {len(world_gradients)}."
+        )
+    overlap = [
+        (ego, world)
+        for ego, world in zip(ego_gradients, world_gradients, strict=True)
+        if ego is not None and world is not None
+    ]
+    if not overlap:
+        raise RuntimeError("WorldFlow gradient projection found no shared trainable parameters.")
+
+    device = overlap[0][0].device
+    dot = torch.zeros((), device=device, dtype=torch.float32)
+    ego_norm_sq = torch.zeros_like(dot)
+    world_norm_sq = torch.zeros_like(dot)
+    for ego, world in overlap:
+        ego_float = ego.detach().to(dtype=torch.float32)
+        world_float = world.detach().to(dtype=torch.float32)
+        dot = dot + torch.sum(ego_float * world_float)
+        ego_norm_sq = ego_norm_sq + torch.sum(ego_float.square())
+        world_norm_sq = world_norm_sq + torch.sum(world_float.square())
+
+    epsilon = torch.finfo(torch.float32).tiny
+    cosine = dot / torch.sqrt((ego_norm_sq * world_norm_sq).clamp_min(epsilon))
+    coefficient = torch.where(
+        (dot < 0) & (ego_norm_sq > epsilon),
+        dot / ego_norm_sq.clamp_min(epsilon),
+        torch.zeros_like(dot),
+    )
+    return {
+        "dot": dot,
+        "ego_norm": torch.sqrt(ego_norm_sq),
+        "world_norm": torch.sqrt(world_norm_sq),
+        "cosine": cosine,
+        "coefficient": coefficient,
+        "conflict": (dot < 0).to(dtype=torch.float32),
+        "overlap_parameter_count": len(overlap),
+    }
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -1785,6 +1847,15 @@ def update_policy(
     """
     start_time = time.perf_counter()
     policy.train()
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    ego_priority_projection = bool(
+        getattr(
+            getattr(unwrapped_policy, "config", None),
+            "worldflow_training_ego_priority_gradient_projection",
+            False,
+        )
+    )
+    per_sample_loss = None
 
     # Get RA-BC weights if enabled
     rabc_batch_weights = None
@@ -1796,6 +1867,11 @@ def update_policy(
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
         if rabc_batch_weights is not None:
+            if ego_priority_projection:
+                raise ValueError(
+                    "WorldFlow Ego-priority gradient projection is not combined with RA-BC "
+                    "sample weighting; both alter per-sample gradient geometry."
+                )
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -1807,6 +1883,9 @@ def update_policy(
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+        elif ego_priority_projection:
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            loss = per_sample_loss.mean()
         else:
             loss, output_dict = policy.forward(batch)
 
@@ -1821,10 +1900,72 @@ def update_policy(
         train_metrics.update_s = time.perf_counter() - start_time
         return train_metrics, output_dict
 
-    # Use accelerator's backward method
-    # Scale each micro-batch contribution so accumulated gradients equal the
-    # mean over the effective batch.  The unscaled loss is retained for logs.
-    accelerator.backward(loss * float(loss_scale))
+    if ego_priority_projection:
+        if not perform_optimizer_step or float(loss_scale) != 1.0:
+            raise ValueError(
+                "WorldFlow Ego-priority gradient projection currently requires one physical "
+                "batch per optimizer step (gradient_accumulation_steps=1)."
+            )
+        if per_sample_loss is None or per_sample_loss.ndim != 1:
+            raise RuntimeError("Expected one per-sample loss vector for WorldFlow gradient projection.")
+        keep_mask = getattr(
+            getattr(unwrapped_policy, "model", None),
+            "last_worldflow_world_to_ego_keep_mask",
+            None,
+        )
+        if not torch.is_tensor(keep_mask) or keep_mask.shape != per_sample_loss.shape:
+            raise RuntimeError(
+                "WorldFlow gradient projection requires the forward pass's per-sample "
+                f"World-to-Ego keep mask, got {None if keep_mask is None else tuple(keep_mask.shape)} "
+                f"for losses {tuple(per_sample_loss.shape)}."
+            )
+        keep_mask = keep_mask.to(device=per_sample_loss.device, dtype=torch.bool)
+        local_batch_size = per_sample_loss.numel()
+        # Dividing each partition by the complete local batch means their sum
+        # is exactly the original mean action objective. DDP's averaged
+        # gradients therefore reconstruct the global-batch mean even when the
+        # stochastic keep counts differ across ranks.
+        ego_component = per_sample_loss[~keep_mask].sum() / local_batch_size
+        world_component = per_sample_loss[keep_mask].sum() / local_batch_size
+        trainable_parameters = [parameter for parameter in policy.parameters() if parameter.requires_grad]
+
+        accelerator.backward(ego_component, retain_graph=True)
+        ego_gradients = [
+            parameter.grad.detach().clone() if parameter.grad is not None else None
+            for parameter in trainable_parameters
+        ]
+        optimizer.zero_grad(set_to_none=True)
+        accelerator.backward(world_component)
+        world_gradients = [parameter.grad for parameter in trainable_parameters]
+        projection = worldflow_ego_priority_projection_statistics(
+            ego_gradients,
+            world_gradients,
+        )
+        coefficient = projection["coefficient"]
+        assert torch.is_tensor(coefficient)
+        ego_scale = 1.0 - coefficient
+        for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
+            if ego_gradient is None:
+                continue
+            if parameter.grad is None:
+                parameter.grad = ego_gradient
+            else:
+                parameter.grad.add_(ego_gradient * ego_scale.to(dtype=ego_gradient.dtype))
+
+        output_dict["worldflow_ego_priority_gradient_ego_loss"] = ego_component.detach().item()
+        output_dict["worldflow_ego_priority_gradient_world_loss"] = world_component.detach().item()
+        for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "coefficient", "conflict"):
+            metric = projection[metric_name]
+            assert torch.is_tensor(metric)
+            output_dict[f"worldflow_ego_priority_gradient_{metric_name}"] = metric.detach().item()
+        output_dict["worldflow_ego_priority_gradient_overlap_parameter_count"] = int(
+            projection["overlap_parameter_count"]
+        )
+    else:
+        # Use accelerator's backward method. Scale each micro-batch
+        # contribution so accumulated gradients equal the mean over the
+        # effective batch. The unscaled loss is retained for logs.
+        accelerator.backward(loss * float(loss_scale))
 
     if not perform_optimizer_step:
         train_metrics.loss = loss.item()

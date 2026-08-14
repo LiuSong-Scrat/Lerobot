@@ -227,6 +227,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Ego action path. This is training-only, adds no parameter or loss, and
     # leaves the complete inference forward exactly unchanged.
     worldflow_training_residual_anchor_stop_gradient: bool = False
+    # Training-only asymmetric PCGrad for the two stochastic-depth paths.
+    # The ordinary Ego-only samples define the protected shared gradient.  If
+    # the World-corrected samples produce an opposing gradient, only that
+    # opposing component is projected out; aligned World gradients and all
+    # World-only parameter gradients are retained.  Both paths still optimize
+    # the same action loss from one forward, every parameter remains trainable,
+    # and inference is unchanged.
+    worldflow_training_ego_priority_gradient_projection: bool = False
     # Training-only reparameterization of the complete World coordinate frame.
     # One random rigid transform A is applied consistently to World points,
     # the Ego-to-World carrier C, and every World trajectory state, so the
@@ -566,6 +574,10 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "worldflow_training_coordinate_frame_augmentation=True requires worldflow_enable=True."
             )
+        if self.worldflow_training_ego_priority_gradient_projection and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_ego_priority_gradient_projection=True requires worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -677,6 +689,16 @@ class SmolVLAConfig(PreTrainedConfig):
                     "worldflow_training_residual_anchor_stop_gradient requires training-time "
                     "World-to-Ego dropout and "
                     "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if self.worldflow_training_ego_priority_gradient_projection and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+                or not self.worldflow_training_residual_anchor_stop_gradient
+            ):
+                raise ValueError(
+                    "worldflow_training_ego_priority_gradient_projection requires "
+                    "endpoint_residual_boosting with positive training-time World-to-Ego "
+                    "dropout and residual-anchor stop-gradient."
                 )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable
