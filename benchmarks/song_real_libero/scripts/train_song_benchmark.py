@@ -1855,6 +1855,14 @@ def update_policy(
             False,
         )
     )
+    ego_tangent_projection = bool(
+        getattr(
+            getattr(unwrapped_policy, "config", None),
+            "worldflow_training_shared_gradient_ego_tangent_projection",
+            False,
+        )
+    )
+    gradient_projection_enabled = ego_priority_projection or ego_tangent_projection
     per_sample_loss = None
 
     # Get RA-BC weights if enabled
@@ -1867,7 +1875,7 @@ def update_policy(
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
         if rabc_batch_weights is not None:
-            if ego_priority_projection:
+            if gradient_projection_enabled:
                 raise ValueError(
                     "WorldFlow Ego-priority gradient projection is not combined with RA-BC "
                     "sample weighting; both alter per-sample gradient geometry."
@@ -1883,7 +1891,7 @@ def update_policy(
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-        elif ego_priority_projection:
+        elif gradient_projection_enabled:
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
             loss = per_sample_loss.mean()
         else:
@@ -1900,7 +1908,7 @@ def update_policy(
         train_metrics.update_s = time.perf_counter() - start_time
         return train_metrics, output_dict
 
-    if ego_priority_projection:
+    if gradient_projection_enabled:
         if not perform_optimizer_step or float(loss_scale) != 1.0:
             raise ValueError(
                 "WorldFlow Ego-priority gradient projection currently requires one physical "
@@ -1937,30 +1945,100 @@ def update_policy(
         optimizer.zero_grad(set_to_none=True)
         accelerator.backward(world_component)
         world_gradients = [parameter.grad for parameter in trainable_parameters]
-        projection = worldflow_ego_priority_projection_statistics(
-            ego_gradients,
-            world_gradients,
-        )
-        coefficient = projection["coefficient"]
-        assert torch.is_tensor(coefficient)
-        ego_scale = 1.0 - coefficient
-        for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
-            if ego_gradient is None:
-                continue
-            if parameter.grad is None:
-                parameter.grad = ego_gradient
-            else:
-                parameter.grad.add_(ego_gradient * ego_scale.to(dtype=ego_gradient.dtype))
+        if ego_priority_projection:
+            projection = worldflow_ego_priority_projection_statistics(
+                ego_gradients,
+                world_gradients,
+            )
+            coefficient = projection["coefficient"]
+            assert torch.is_tensor(coefficient)
+            ego_scale = 1.0 - coefficient
+            for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
+                if ego_gradient is None:
+                    continue
+                if parameter.grad is None:
+                    parameter.grad = ego_gradient
+                else:
+                    parameter.grad.add_(ego_gradient * ego_scale.to(dtype=ego_gradient.dtype))
 
-        output_dict["worldflow_ego_priority_gradient_ego_loss"] = ego_component.detach().item()
-        output_dict["worldflow_ego_priority_gradient_world_loss"] = world_component.detach().item()
-        for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "coefficient", "conflict"):
-            metric = projection[metric_name]
-            assert torch.is_tensor(metric)
-            output_dict[f"worldflow_ego_priority_gradient_{metric_name}"] = metric.detach().item()
-        output_dict["worldflow_ego_priority_gradient_overlap_parameter_count"] = int(
-            projection["overlap_parameter_count"]
-        )
+            output_dict["worldflow_ego_priority_gradient_ego_loss"] = ego_component.detach().item()
+            output_dict["worldflow_ego_priority_gradient_world_loss"] = world_component.detach().item()
+            for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "coefficient", "conflict"):
+                metric = projection[metric_name]
+                assert torch.is_tensor(metric)
+                output_dict[f"worldflow_ego_priority_gradient_{metric_name}"] = metric.detach().item()
+            output_dict["worldflow_ego_priority_gradient_overlap_parameter_count"] = int(
+                projection["overlap_parameter_count"]
+            )
+        else:
+            world_group_names = {"new_world_bidirectional", "world_physical_residual_head"}
+            protected_parameter_ids = {
+                id(parameter)
+                for group in optimizer.param_groups
+                if group.get("group_name") not in world_group_names
+                for parameter in group["params"]
+            }
+            if not protected_parameter_ids:
+                raise RuntimeError(
+                    "Ego-tangent projection requires a non-empty pretrained/common optimizer group."
+                )
+            protected_ego_gradients = []
+            protected_world_gradients = []
+            for parameter, ego_gradient, world_gradient in zip(
+                trainable_parameters,
+                ego_gradients,
+                world_gradients,
+                strict=True,
+            ):
+                if id(parameter) in protected_parameter_ids:
+                    protected_ego_gradients.append(ego_gradient)
+                    protected_world_gradients.append(world_gradient)
+            projection = worldflow_ego_priority_projection_statistics(
+                protected_ego_gradients,
+                protected_world_gradients,
+            )
+            dot = projection["dot"]
+            ego_norm = projection["ego_norm"]
+            world_norm = projection["world_norm"]
+            assert torch.is_tensor(dot) and torch.is_tensor(ego_norm) and torch.is_tensor(world_norm)
+            epsilon = torch.finfo(torch.float32).tiny
+            aligned_coefficient = torch.clamp_min(
+                dot / ego_norm.square().clamp_min(epsilon),
+                0.0,
+            )
+            retained_world_norm = aligned_coefficient * ego_norm
+            for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
+                if id(parameter) in protected_parameter_ids:
+                    if ego_gradient is None:
+                        parameter.grad = None
+                    else:
+                        parameter.grad = ego_gradient * (
+                            1.0 + aligned_coefficient.to(dtype=ego_gradient.dtype)
+                        )
+                elif ego_gradient is not None:
+                    if parameter.grad is None:
+                        parameter.grad = ego_gradient
+                    else:
+                        parameter.grad.add_(ego_gradient)
+
+            output_dict["worldflow_ego_tangent_gradient_ego_loss"] = ego_component.detach().item()
+            output_dict["worldflow_ego_tangent_gradient_world_loss"] = world_component.detach().item()
+            for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "conflict"):
+                metric = projection[metric_name]
+                assert torch.is_tensor(metric)
+                output_dict[f"worldflow_ego_tangent_gradient_{metric_name}"] = metric.detach().item()
+            output_dict["worldflow_ego_tangent_gradient_aligned_coefficient"] = (
+                aligned_coefficient.detach().item()
+            )
+            output_dict["worldflow_ego_tangent_gradient_retained_world_norm"] = (
+                retained_world_norm.detach().item()
+            )
+            output_dict["worldflow_ego_tangent_gradient_retained_world_fraction"] = (
+                retained_world_norm / world_norm.clamp_min(epsilon)
+            ).detach().item()
+            output_dict["worldflow_ego_tangent_gradient_protected_parameter_count"] = len(
+                protected_ego_gradients
+            )
     else:
         # Use accelerator's backward method. Scale each micro-batch
         # contribution so accumulated gradients equal the mean over the

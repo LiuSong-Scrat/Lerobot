@@ -1876,6 +1876,26 @@ def test_worldflow_training_world_to_ego_dropout_is_training_only_and_bounded():
             worldflow_training_ego_priority_gradient_projection=True,
         )
 
+    tangent = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_residual_boosting",
+        worldflow_training_world_to_ego_dropout_probability=0.75,
+        worldflow_training_residual_anchor_stop_gradient=True,
+        worldflow_training_shared_gradient_ego_tangent_projection=True,
+    )
+    assert tangent.worldflow_training_shared_gradient_ego_tangent_projection is True
+    with pytest.raises(ValueError, match="Select only one"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_noise_coupling="projected_ego_path",
+            worldflow_action_fusion="endpoint_residual_boosting",
+            worldflow_training_world_to_ego_dropout_probability=0.75,
+            worldflow_training_residual_anchor_stop_gradient=True,
+            worldflow_training_ego_priority_gradient_projection=True,
+            worldflow_training_shared_gradient_ego_tangent_projection=True,
+        )
+
 
 def test_worldflow_training_coordinate_frame_augmentation_requires_worldflow_and_valid_scales():
     with pytest.raises(ValueError, match="requires worldflow_enable=True"):
@@ -1889,6 +1909,9 @@ def test_worldflow_training_coordinate_frame_augmentation_requires_worldflow_and
 
     with pytest.raises(ValueError, match="gradient_projection=True requires worldflow_enable=True"):
         SmolVLAConfig(worldflow_training_ego_priority_gradient_projection=True)
+
+    with pytest.raises(ValueError, match="ego_tangent_projection=True requires worldflow_enable=True"):
+        SmolVLAConfig(worldflow_training_shared_gradient_ego_tangent_projection=True)
 
 
 @pytest.mark.parametrize(

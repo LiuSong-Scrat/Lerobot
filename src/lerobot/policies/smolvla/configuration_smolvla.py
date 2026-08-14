@@ -235,6 +235,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # the same action loss from one forward, every parameter remains trainable,
     # and inference is unchanged.
     worldflow_training_ego_priority_gradient_projection: bool = False
+    # Stronger shared-backbone variant: on pretrained/common parameters the
+    # World-corrected gradient is projected onto the non-negative one-
+    # dimensional span of the ordinary Ego gradient. Orthogonal or opposing
+    # World components cannot rewrite the baseline representation, while the
+    # dedicated World/bidirectional/residual parameter groups retain their
+    # complete gradients. Ego/common parameters still train from the original
+    # Ego action loss, so no branch is frozen.
+    worldflow_training_shared_gradient_ego_tangent_projection: bool = False
     # Training-only reparameterization of the complete World coordinate frame.
     # One random rigid transform A is applied consistently to World points,
     # the Ego-to-World carrier C, and every World trajectory state, so the
@@ -578,6 +586,11 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "worldflow_training_ego_priority_gradient_projection=True requires worldflow_enable=True."
             )
+        if self.worldflow_training_shared_gradient_ego_tangent_projection and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_shared_gradient_ego_tangent_projection=True requires "
+                "worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -699,6 +712,23 @@ class SmolVLAConfig(PreTrainedConfig):
                     "worldflow_training_ego_priority_gradient_projection requires "
                     "endpoint_residual_boosting with positive training-time World-to-Ego "
                     "dropout and residual-anchor stop-gradient."
+                )
+            if self.worldflow_training_shared_gradient_ego_tangent_projection and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+                or not self.worldflow_training_residual_anchor_stop_gradient
+            ):
+                raise ValueError(
+                    "worldflow_training_shared_gradient_ego_tangent_projection requires "
+                    "endpoint_residual_boosting with positive training-time World-to-Ego "
+                    "dropout and residual-anchor stop-gradient."
+                )
+            if (
+                self.worldflow_training_ego_priority_gradient_projection
+                and self.worldflow_training_shared_gradient_ego_tangent_projection
+            ):
+                raise ValueError(
+                    "Select only one WorldFlow shared-gradient projection strategy."
                 )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable
