@@ -2999,13 +2999,25 @@ class VLAFlowMatching(nn.Module):
             self.world_se3_action_out_proj.weight.zero_()
             self.world_se3_action_out_proj.bias.zero_()
 
-        return {
+        report = {
             "status": "bootstrapped",
             "source": "trained_ego_action_point_modules",
             "world_parameters_shared": False,
             "ego_frozen": False,
             "bidirectional_cross_attention_zero_output_init": True,
         }
+        if bool(getattr(world, "shared_state_dual_adapter", False)):
+            report.update(
+                {
+                    "one_canonical_action_state": True,
+                    "one_shared_expert_pass": True,
+                    "one_executed_action_head": True,
+                    "duplicate_world_action_loss": False,
+                    "world_token_residual_zero_output_init": True,
+                    "bidirectional_cross_attention_used": False,
+                }
+            )
+        return report
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled

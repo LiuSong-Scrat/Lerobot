@@ -1125,15 +1125,22 @@ class SmolVLAConfig(PreTrainedConfig):
             origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
             flow = "channel_euclidean"
         if self.worldflow_enable:
-            target_contract = (
-                "commanded_required"
-                if self.worldflow_require_action_target_sidecar
-                else "legacy_fallback_allowed"
-            )
-            world = (
-                f",worldflow={self.worldflow_noise_coupling},"
-                f"worldflow_targets={target_contract}"
-            )
+            if self.worldflow_joint_token_layout == "shared_state_dual_adapter":
+                world = (
+                    ",worldflow=shared_state_dual_adapter,"
+                    "worldflow_targets=current_carrier_only,"
+                    "worldflow_action_objective=single_executed"
+                )
+            else:
+                target_contract = (
+                    "commanded_required"
+                    if self.worldflow_require_action_target_sidecar
+                    else "legacy_fallback_allowed"
+                )
+                world = (
+                    f",worldflow={self.worldflow_noise_coupling},"
+                    f"worldflow_targets={target_contract}"
+                )
         else:
             world = ",worldflow=disabled"
         return (
