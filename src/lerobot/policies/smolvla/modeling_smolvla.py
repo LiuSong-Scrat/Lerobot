@@ -63,6 +63,7 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 from typing_extensions import Unpack
 
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -4464,14 +4465,36 @@ class VLAFlowMatching(nn.Module):
         if prefix_embs is not None:
             if prefix_att_masks is None:
                 raise ValueError("prefix_att_masks are required when prefix_embs are provided.")
-            paired_out = self._run_ego_suffix_expert(
-                torch.cat([prefix_embs, prefix_embs], dim=0),
-                torch.cat([prefix_pad_masks, prefix_pad_masks], dim=0),
-                torch.cat([prefix_att_masks, prefix_att_masks], dim=0),
-                torch.cat([ego_input, world_input], dim=0),
-                torch.cat([ego_action_mask, world_action_mask], dim=0),
-                torch.cat([action_att_masks, action_att_masks], dim=0),
-            )
+            paired_prefix = torch.cat([prefix_embs, prefix_embs], dim=0)
+            paired_prefix_pad = torch.cat([prefix_pad_masks, prefix_pad_masks], dim=0)
+            paired_prefix_att = torch.cat([prefix_att_masks, prefix_att_masks], dim=0)
+            paired_suffix = torch.cat([ego_input, world_input], dim=0)
+            paired_suffix_pad = torch.cat([ego_action_mask, world_action_mask], dim=0)
+            paired_suffix_att = torch.cat([action_att_masks, action_att_masks], dim=0)
+
+            def run_shared_expert(prefix: Tensor, suffix: Tensor) -> Tensor:
+                return self._run_ego_suffix_expert(
+                    prefix,
+                    paired_prefix_pad,
+                    paired_prefix_att,
+                    suffix,
+                    paired_suffix_pad,
+                    paired_suffix_att,
+                )
+
+            # The two coordinate views double the Action Expert activation
+            # footprint. Recompute this pure shared-expert function during
+            # backward so physical batch 48 remains feasible on 24 GiB GPUs.
+            # This changes neither parameters nor forward/inference values.
+            if self.training and torch.is_grad_enabled():
+                paired_out = checkpoint(
+                    run_shared_expert,
+                    paired_prefix,
+                    paired_suffix,
+                    use_reentrant=False,
+                )
+            else:
+                paired_out = run_shared_expert(paired_prefix, paired_suffix)
             return paired_out.chunk(2, dim=0)
 
         ego_out = self._run_ego_suffix_expert(

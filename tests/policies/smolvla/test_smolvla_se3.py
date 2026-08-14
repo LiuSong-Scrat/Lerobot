@@ -2510,6 +2510,7 @@ def test_parallel_dual_coordinate_uses_baseline_suffix_for_both_shared_expert_vi
     for attention in (model.ego_to_world_cross_attn, model.world_to_ego_cross_attn):
         nn.init.zeros_(attention.out_proj.weight)
         nn.init.zeros_(attention.out_proj.bias)
+    model.shared_expert_probe = nn.Linear(dim, dim)
 
     calls = []
 
@@ -2532,12 +2533,12 @@ def test_parallel_dual_coordinate_uses_baseline_suffix_for_both_shared_expert_vi
                 "past_key_values": past_key_values,
             }
         )
-        return suffix_embs
+        return model.shared_expert_probe(suffix_embs)
 
     model._run_ego_suffix_expert = record_shared_expert
     batch = 2
-    ego = torch.randn(batch, cfg.chunk_size, dim)
-    world = torch.randn(batch, cfg.chunk_size, dim)
+    ego = torch.randn(batch, cfg.chunk_size, dim, requires_grad=True)
+    world = torch.randn(batch, cfg.chunk_size, dim, requires_grad=True)
     action_mask = torch.ones(batch, cfg.chunk_size, dtype=torch.bool)
     prefix = torch.randn(batch, 5, dim)
     prefix_mask = torch.ones(batch, 5, dtype=torch.bool)
@@ -2562,8 +2563,14 @@ def test_parallel_dual_coordinate_uses_baseline_suffix_for_both_shared_expert_vi
         calls[0]["suffix_att_masks"],
         torch.tensor([[1, 0, 0]], dtype=ego.dtype).expand(2 * batch, -1),
     )
-    assert torch.equal(ego_out, ego)
-    assert torch.equal(world_out, world)
+    assert torch.allclose(ego_out, model.shared_expert_probe(ego), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(world_out, model.shared_expert_probe(world), atol=1e-6, rtol=1e-6)
+    (ego_out.square().mean() + world_out.square().mean()).backward()
+    # One no-grad-equivalent forward plus one activation-checkpoint recompute.
+    assert len(calls) == 2
+    assert model.shared_expert_probe.weight.grad.abs().sum() > 0
+    assert model.world_to_ego_cross_attn.out_proj.weight.grad.abs().sum() > 0
+    assert model.ego_to_world_cross_attn.out_proj.weight.grad.abs().sum() > 0
 
 
 def test_worldflow_two_timescale_optimizer_keeps_both_branches_trainable():
