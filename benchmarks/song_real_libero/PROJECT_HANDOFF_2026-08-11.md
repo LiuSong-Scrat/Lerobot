@@ -26,7 +26,8 @@
 - v29 已完成并否决。固定分层 Broad steps `100/240/480/720/1080 = 97/91/94/94/92`，step100 同 checkpoint 关闭 World-to-Ego 为 `94`，局部因果 `+3`；但 Full-500 正常臂在 `362/382` 时已有20个失败，最高只能 `480/500`。rate 参数化修复了末段解析放大，但没有达到 Full 目标。
 - v30 组合 v29 rate boundary、v26 训练期 World 坐标重参数化和 v28 shared Ego-tangent 保护。Broad 为 `93/90/96/91/95`；step480 同 checkpoint 关闭 World-to-Ego 为 `90`，World 局部因果 `+6`。Full-500 在 `322/341` 时累计19个失败，最高只能 `481/500`，正式否决。单次-forward profile 证明残差数值已稳定：step480 在 `t=0.9` 的有效终点平移仅约 `0.240 mm`，不存在 v28 的末段爆炸；剩余问题是残差选择性/表示，而不是幅值失控。
 - v31 将同一6D残差解释为 Ego carrier-frame 左 twist；commit `eb6393e`，完整测试 `73/73`。一整个训练 epoch 正常完成，Broad steps `100/240/480/720/1080 = 93/94/92/95/93`，没有 checkpoint 严格超过同 IDs baseline `95/100`，因此 screened out，Full-500 未启动。该结果否定了 carrier-frame 左残差作为当前答案；全部 checkpoint、日志、cache 和 artifact 保留。
-- v32 是当前活动版本。commit `d04aca7` 新增默认关闭的 endpoint body-frame 右不变残差：`B_corrected = B_ego Exp(xi_body)`，对应 target `Log(B_ego^-1 B_target)`。它沿预测终点自身坐标轴表达误差，并对任意 World 坐标重参数化保持不变；复用原6D head、原 action loss 和单次 forward，不增加参数、门控、辅助损失或 task-specific 规则。零残差仍 exact-baseline，Ego/World/残差三组均保持非零 LR；完整测试 `75/75`。v32 继续使用单视角10,000点、全 `10 tasks x 50 episodes`、4 GPU、batch32/GPU、worker12、1080步、W&B、p=0.75 residual-anchor、shared Ego-tangent、rate boundary 和训练期 World 坐标重参数化。多视角继续封存，直到 WorldFlow 通过 Full-500 与正因果 gate。
+- v32 已完成并正式否决。固定分层 Broad 的 steps `100/240/480/720/1080 = 96/94/96/95/91`；step100 正常/关闭 World-to-Ego 为 `96/93`，局部因果 `+3`，step480 为 `96/92`，局部因果 `+4`。自动选择的 step480 Full-500 在 `269/289` 时已有20个失败，最高只能 `480/500`；补做的更早 step100 在 `386/405` 时达到第19个失败，最高只能 `481/500`。step100 是迄今最接近目标的 WorldFlow，但仍只能理论追平 established baseline，不能达到所需 `482/500`。这也证明 Broad 同分时不能用更大的局部因果 delta 选择 Full 候选；后续会验证所有合格 checkpoint，并在正常分相同时优先更早 step。
+- v33 是当前活动版本。commit `1b9905d` 将同一6D World head 从“预测终点上的有限 body twist”改为“当前 Flow 状态上的右平凡化 body-twist velocity”：`dB_t/dt = B_t hat(xi_body)`。该物理切向量被提升回预训练 pose9/rotation-6D 的原始 scale/shear gauge，直接加到 Ego Euclidean vector field；坐标轴来自已知当前状态，不再来自仍变化的预测终点。它不增加参数、门控、辅助损失、第二次 forward 或 task-specific 规则；零残差 exact-baseline，完整测试 `80/80`。正式训练使用单视角10,000点、全 `10 tasks x 50 episodes`、4 GPU、batch32/GPU、worker12、1080步、W&B、p=0.75 residual-anchor、shared Ego-tangent 和训练期 World 坐标重参数化；三个有限 endpoint residual 开关均关闭。训练 tmux 为 `wep_v043_libero10_v33_bodyvelocity_coordframe_ego_tangent_p75_1080`，Broad 与多候选 Full waiters 已启动。多视角继续封存，直到 WorldFlow 通过 Full-500 与正因果 gate。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
@@ -71,7 +72,7 @@ LIBERO HDF5
 
 - 路径：`/home/liusong/ProgramFiles/Huggingface/lerobot`
 - 分支：`wep_vla_v0.4.3_multiview_doubleflow`
-- 当前 WorldFlow 核心实现 commit：`d04aca7`；v32 endpoint body-frame right-invariant residual 即该 commit；v31 carrier-frame left residual 为 `eb6393e`；v29 residual-rate terminal boundary 为 `f15f72e`；v28 Ego-tangent optimizer routing 为 `5d469a0`。其后的 handoff 文档 commit 不改变核心代码哈希。
+- 当前 WorldFlow 核心实现 commit：`1b9905d`；v33 current-state body-velocity residual 即该 commit；v32 endpoint body-frame right-invariant residual 为 `d04aca7`；v31 carrier-frame left residual 为 `eb6393e`；v29 residual-rate terminal boundary 为 `f15f72e`；v28 Ego-tangent optimizer routing 为 `5d469a0`。其后的 handoff 文档 commit 不改变核心模型代码哈希。
 - 当前实验脚本、checkpoint、日志和 artifact 统一位于交接文档顶部所述 experiment root；不得删除 `/opt/data/private` 下任何文件。
 - 临时实验统一使用 `/tmp/temp`，不要把临时诊断文件写入正式数据目录。
 
