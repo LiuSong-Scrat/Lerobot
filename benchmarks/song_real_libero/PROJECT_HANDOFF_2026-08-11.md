@@ -396,6 +396,19 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - 当前正式运行 variant：`v37r3_baseline_bootstrap_parallel_dualcoord_global_world_coprediction_equaljoint_4gpu_mb24_ga2_effb48_w12_2160steps`。tmux：`wep_v043_v37r3_parallel_dualcoord_train`、`wep_v043_v37r3_parallel_dualcoord_broad_after_train`、`wep_v043_v37r3_parallel_dualcoord_full500_after_broad`。W&B：`https://wandb.ai/liusong-scrat/wep_vla_v043_libero10/runs/worldflow-v37r3-parallel-dualcoord-global-world-coprediction-3epoch-20260814`。
 - v37r3 已越过此前 step2 OOM 点并稳定进入训练循环；初期 loss 有正常 batch 波动，未出现 OOM、Traceback 或非有限值。此前 r0/r1/r2 的失败输出与日志均保留作审计。没有删除 `/opt/data/private` 下的任何文件。
 
+## 6.6 2026-08-15：v37 最终结论与 v38r1 canonical 双流（覆盖 6.5 的“当前”状态）
+
+- 权威协议不变：Ego-only matched fixed-action baseline 为 `472/500 = 94.4%`，WorldFlow 必须至少 `473/500`，并且同一 checkpoint 的完整 World→Ego 因果消融必须更差。固定分层 Broad baseline 为 `95/100`，候选必须严格高于95才进入因果和 Full500。
+- v37r3 已完成2160步、约三个 task-balanced epochs 并正式否决。最终 last720 的 World/Ego 变化仅 `-1.74%/+0.32%`，共享 Expert 从1080到2160基本不动，属于 epoch-scale plateau，不是训练不足。八个 Broad checkpoint `100/240/480/720/1080/1440/1800/2160` 均在第五个失败或更早失去严格超过95的可能；没有启动 causal 或 Full500。完整 screen 为 experiment root 下 `singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v37r3_parallel_dualcoord_global_world_coprediction_stratified_checkpoint_causal_screen.json`。
+- 当前代码改为 v38r1 canonical World-conditioned dual flow。独立 worktree `/home/liusong/ProgramFiles/Huggingface/lerobot_worldflow_canonical_dualflow`，branch `wep_vla_v0.4.3_worldflow_canonical_dualflow`，commit `62e8670537ba72339c762ba954c528646757eb5f`；configuration/model/trainer SHA256 分别为 `e671316cdbe84b19d2ea2f5a3d7552398d2c42f4271455a981ff2585804ef0a2`、`4df699b348891bbf1ac2e73d814258ed728795ccc6479fced42ae293c7b30431`、`abeb34735bbc3e873733d8ea369905a1015a08f60ed206fb979e5c88dfe16c61`。
+- v38r1 保持两个独立 point-action adapter、两个 action head 和一个共享 point-action Action Expert。World 场景使用绝对 global 点云；World 前端将场景、语言和当前 carrier 编码成完整 token-space residual，叠加到同一 canonical action state 的 Ego token。World/Ego 在进入共享 Expert 前双向交换。canonical residual、carrier projection 和两条 cross-attention output projection 均为完整矩阵、exact-zero bootstrap、随后共同训练；不存在 scalar/learned gate、冻结 Ego、task rule、World geo/bridge/equiv auxiliary loss、SE3 或 LitePT 修改。
+- 两步4-GPU smoke 已证明 baseline-preserving 起点：step1 Ego/World flow loss 均为 `0.0002622`，step2 才轻微分化为 `0.00008427/0.00008520`；所有双流模块及 Ego/shared 路径均获得更新。SmolVLA WorldFlow/SE3 tests `91/91`、dataset tests `12/12` 通过。
+- 正式训练 variant 为 `v38r1_canonical_world_token_residual_dualflow_4gpu_mb24_ga2_effb48_w12_2160steps`，tmux `wep_v043_v38r1_canonical_dualflow_train`。配置：4 GPUs、microbatch24/GPU、accumulation2、effective batch48/GPU、global batch192、worker12、W&B enabled、完整单视角10-task×50-episode数据、2160 updates，保存 `100/240/480/720/1080/1440/1800/2160`。
+- 首个完整 step720 epoch 的独立窗口 `481--720` Ego/World loss 为 `0.00018501/0.00018376`；整个720-step长窗口前后半仅变化 `+0.47%/+0.85%`，状态 `no_material_tail_change_detected`。step480 的短尾回升已恢复，没有出现 v37 式 World下降而Ego持续恶化。World双向交互/residual/carrier继续增长，共享 Expert layer0 drift 仅 `0.004234`。这只是训练充分性证据，不是 rollout 通过证据；训练仍完成三 epochs。
+- 收敛 monitor 为 `wep_v043_v38r1_convergence_monitor`。Broad waiter `wep_v043_v38r1_broad_after_convergence` 会先审计最终 short200 与 epoch720 窗口；若 epoch-scale World loss 仍显著下降，则写入 `v38r1_extension_required_before_broad.json`、不启动 rollout，并由 `wep_v043_v38r1_conditional_resume_to2880` 精确恢复 model/optimizer/scheduler/RNG 至第四个 epoch。若已平台化则直接筛查全部 checkpoints。
+- Full waiter 为 `wep_v043_v38r1_full500_after_broad`。评测固定 action/noise/cache、local4 total30、inference batch30；先要求 Broad `>95/100`，再要求同 checkpoint 完整 World→Ego causal delta 为正，最后要求 Full500 `>=473/500`。在 WorldFlow 通过之前，多视角继续封存。
+- 所有运行文件统一位于 `/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811`；没有删除 `/opt/data/private` 下任何文件。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
