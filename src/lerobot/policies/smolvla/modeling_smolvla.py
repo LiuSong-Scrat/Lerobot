@@ -2143,6 +2143,18 @@ class WorldFlowActionBranch(nn.Module):
             # its complete matrix learn; this is not a scalar or learned gate.
             nn.init.zeros_(self.carrier_context_proj.weight)
             nn.init.zeros_(self.carrier_context_proj.bias)
+        self.canonical_token_delta_out = (
+            nn.Linear(self.action_hidden_dim, self.action_hidden_dim)
+            if self.canonical_action_flow
+            else None
+        )
+        if self.canonical_token_delta_out is not None:
+            # The World adapter predicts a full token-space residual around the
+            # already point-conditioned Ego token.  Zero initialization makes
+            # the complete second flow exactly baseline-equivalent before
+            # learning while every matrix element remains trainable.
+            nn.init.zeros_(self.canonical_token_delta_out.weight)
+            nn.init.zeros_(self.canonical_token_delta_out.bias)
 
         # A separate embedding avoids sharing even the language lookup table
         # with the Ego/VLM branch. Masked mean language context is sufficient
@@ -2242,6 +2254,8 @@ class WorldFlowActionBranch(nn.Module):
             point_mask=scene["scene_mask"],
             actions_is_pad=actions_is_pad,
         )
+        if self.canonical_token_delta_out is not None:
+            action_tokens = self.canonical_token_delta_out(action_tokens)
 
         if actions_is_pad is None:
             action_valid = torch.ones(
@@ -2930,6 +2944,10 @@ class VLAFlowMatching(nn.Module):
         if carrier_context_proj is not None:
             carrier_context_proj.weight.zero_()
             carrier_context_proj.bias.zero_()
+        canonical_token_delta_out = getattr(world, "canonical_token_delta_out", None)
+        if canonical_token_delta_out is not None:
+            canonical_token_delta_out.weight.zero_()
+            canonical_token_delta_out.bias.zero_()
         self.world_ego_scene_type_embedding.zero_()
         self.world_ego_action_type_embedding.zero_()
         for attention in (self.ego_to_world_cross_attn, self.world_to_ego_cross_attn):
@@ -4488,6 +4506,11 @@ class VLAFlowMatching(nn.Module):
                 "Parallel World-Ego expert requires paired token shapes, got "
                 f"{ego_action_tokens.shape} and {world_action_tokens.shape}."
             )
+        if bool(getattr(self.config, "worldflow_parallel_canonical_action_flow", False)):
+            # In canonical mode the World front-end predicts a token residual,
+            # not a second unrelated absolute embedding.  At bootstrap this is
+            # exactly zero, hence both shared-expert views are identical.
+            world_action_tokens = ego_action_tokens + world_action_tokens
         ego_action_mask = ego_action_mask.to(device=ego_action_tokens.device, dtype=torch.bool)
         world_action_mask = world_action_mask.to(device=world_action_tokens.device, dtype=torch.bool)
         ego_input, world_input = self._bidirectional_world_ego_input_exchange(

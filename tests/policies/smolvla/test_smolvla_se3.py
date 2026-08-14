@@ -1203,6 +1203,7 @@ def test_canonical_worldflow_bootstrap_copies_complete_action_io_without_sharing
     model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
     model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
     carrier_context_proj = nn.Linear(9, 4)
+    canonical_token_delta_out = nn.Linear(4, 4)
     world = SimpleNamespace(
         canonical_action_flow=True,
         scene_encoder=nn.Linear(6, 3),
@@ -1212,6 +1213,7 @@ def test_canonical_worldflow_bootstrap_copies_complete_action_io_without_sharing
         action_time_mlp_out=nn.Linear(4, 4),
         scene_context_proj=nn.Linear(3, 4),
         carrier_context_proj=carrier_context_proj,
+        canonical_token_delta_out=canonical_token_delta_out,
         language_embedding=nn.Embedding(11, 4),
         language_norm=nn.LayerNorm(4),
     )
@@ -1228,6 +1230,8 @@ def test_canonical_worldflow_bootstrap_copies_complete_action_io_without_sharing
     assert model.world_action_out_proj.weight.data_ptr() != model.action_out_proj.weight.data_ptr()
     assert torch.count_nonzero(carrier_context_proj.weight) == 0
     assert torch.count_nonzero(carrier_context_proj.bias) == 0
+    assert torch.count_nonzero(canonical_token_delta_out.weight) == 0
+    assert torch.count_nonzero(canonical_token_delta_out.bias) == 0
 
 
 def test_dedicated_world_se3_head_decodes_twist_without_pose9_projection():
@@ -2195,8 +2199,10 @@ def test_canonical_worldflow_branch_uses_full_ego_action_and_absolute_carrier():
         scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_b
     )
     assert torch.equal(tokens_a, tokens_b)
+    assert torch.count_nonzero(tokens_a) == 0
     with torch.no_grad():
         branch.carrier_context_proj.weight[:, 0].fill_(0.5)
+        branch.canonical_token_delta_out.weight.copy_(torch.eye(32))
     learned_a, _ = branch.embed_action_tokens(
         scene, lang_tokens, lang_masks, noisy_actions, time, carrier_pose9=carrier_a
     )
@@ -2736,6 +2742,54 @@ def test_parallel_dual_coordinate_uses_baseline_suffix_for_both_shared_expert_vi
     assert model.shared_expert_probe.weight.grad.abs().sum() > 0
     assert model.world_to_ego_cross_attn.out_proj.weight.grad.abs().sum() > 0
     assert model.ego_to_world_cross_attn.out_proj.weight.grad.abs().sum() > 0
+
+
+def test_canonical_parallel_world_tokens_are_zero_residual_around_ego_at_bootstrap():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.eval()
+    model.config = SimpleNamespace(worldflow_parallel_canonical_action_flow=True)
+    model._bidirectional_world_ego_input_exchange = (
+        lambda ego, world, ego_mask, world_mask: (ego, world)
+    )
+    captured = {}
+
+    def identity_expert(
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        suffix_embs,
+        suffix_pad_masks,
+        suffix_att_masks,
+        *,
+        past_key_values=None,
+    ):
+        del prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_pad_masks
+        del suffix_att_masks, past_key_values
+        captured["suffix"] = suffix_embs.clone()
+        return suffix_embs
+
+    model._run_ego_suffix_expert = identity_expert
+    ego = torch.randn(2, 3, 8)
+    zero_world_residual = torch.zeros_like(ego)
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    prefix = torch.randn(2, 5, 8)
+    prefix_valid = torch.ones(2, 5, dtype=torch.bool)
+    prefix_blocks = torch.ones(2, 5, dtype=torch.bool)
+
+    ego_out, world_out = model._run_world_ego_parallel_expert(
+        prefix,
+        prefix_valid,
+        prefix_blocks,
+        ego,
+        valid,
+        {"action_tokens": zero_world_residual, "action_mask": valid},
+    )
+
+    paired_ego, paired_world = captured["suffix"].chunk(2, dim=0)
+    assert torch.equal(paired_ego, ego)
+    assert torch.equal(paired_world, ego)
+    assert torch.equal(ego_out, world_out)
 
 
 def test_worldflow_two_timescale_optimizer_keeps_both_branches_trainable():
