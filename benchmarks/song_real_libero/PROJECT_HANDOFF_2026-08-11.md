@@ -71,7 +71,7 @@ LIBERO HDF5
 
 - 路径：`/home/liusong/ProgramFiles/Huggingface/lerobot`
 - 分支：`wep_vla_v0.4.3_multiview_doubleflow`
-- 当前 WorldFlow 实现及分支 HEAD：`d04aca7`；v32 endpoint body-frame right-invariant residual 即该 commit；v31 carrier-frame left residual 为 `eb6393e`；v29 residual-rate terminal boundary 为 `f15f72e`；v28 Ego-tangent optimizer routing 为 `5d469a0`。
+- 当前 WorldFlow 核心实现 commit：`d04aca7`；v32 endpoint body-frame right-invariant residual 即该 commit；v31 carrier-frame left residual 为 `eb6393e`；v29 residual-rate terminal boundary 为 `f15f72e`；v28 Ego-tangent optimizer routing 为 `5d469a0`。其后的 handoff 文档 commit 不改变核心代码哈希。
 - 当前实验脚本、checkpoint、日志和 artifact 统一位于交接文档顶部所述 experiment root；不得删除 `/opt/data/private` 下任何文件。
 - 临时实验统一使用 `/tmp/temp`，不要把临时诊断文件写入正式数据目录。
 
