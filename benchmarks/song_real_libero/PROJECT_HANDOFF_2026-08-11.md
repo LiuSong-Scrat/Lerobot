@@ -19,6 +19,10 @@
 - v25 已完成并筛除。它处理 `138,240` 个样本（`1.004724` epochs），W&B 720 条 history 完整，action loss 从 `2.4864e-4` 降至 `1.6744e-4`；三个 optimizer group 均保持非零 LR，78 个 World BN buffer 与 v14 逐位一致，4,326 个 residual 参数全部非零。固定分层 Broad 的 steps `100/240/480/720` 为 `94/94/92/88`，没有 checkpoint 超过同状态 baseline `95/100`，Full-500 未启动。step240 参数审计显示 Ego action-in 漂移仅为 v20 的 `7.07%`，而 World body/residual 漂移分别保留为 `98.89%/105.12%`，所以“降低 Ego 漂移但保持 World 学习”在机械上已经实现，却仍随 World 训练成熟而退化；不再继续 dropout/LR 网格。证据：`v25_step000720_p50_anchor_common0005_runtime_audit.json`、`v25_vs_v20_step000240_low_drift_parameter_audit.json`、`taskbalanced_v25_p50_anchor_common0005_stratified_checkpoint_causal_screen.json`。
 - v26 已完成并正式否决。代码 commit `90afd26` 新增默认关闭的训练期 World 坐标系 SE(3) 重参数化：对 World 点云、carrier `C` 和整条 World 轨迹一致施加随机 `A`，使 `G'=(AC)B(AC)^-1=A G A^-1`，映回 Ego 后仍严格得到同一物理动作 `B`。它只使用原 action loss，不增加第二次 forward、辅助损失、参数、门控或推理操作；完整 GPU 测试 `69/69` 通过。训练完成 720 steps、138,240 samples（`1.004724` epochs），W&B 720 行完整；坐标增强每步均启用，noise conjugacy error 为 0、path conjugacy error 约 `1.64e-7`，四项 World auxiliary loss 均为 0，三个 optimizer group 最终 LR 均非零，78 个 World BN buffer 与 v14 逐位一致，4,326 个 residual 参数全部非零。
 - v26 固定分层 Broad 的 steps `100/240/480/720` 为 `96/94/96/93`。step100 的 same-checkpoint World-to-Ego-disabled 为 `89/100`，Broad World 因果增益 `+7`，因此进入正式 Full-500；step480 的消融反而为 `98/100`，World 因果增益 `-2`，其余 checkpoint 未进入 Full。权威 step100 Full-500 正常臂在 `391` 个已完成 episode 时为 `372/391`，累计第 19 个失败后，即使余下109个全部成功也最多 `481/500`，不能严格超过 established baseline `481/500` 和所需 `482/500`，故数学早停。matched baseline 与 Full causal arm 未启动，所有 partial 输出/cache 均保留。Broad artifact：`taskbalanced_v26_coordframe_aug_p75_stratified_checkpoint_causal_screen.json`；正式 gate：`taskbalanced_v26_coordframe_aug_p75_local4_fixedbarrier_full500_matched_worldflow_gate.json`。这说明随机坐标重参数化能产生很强的早期 Broad 因果信号，但不足以在 Full-500 上达到最终目标；不再搜索 dropout/LR/增强幅度网格。
+- v27 的 asymmetric PCGrad 已在机制层面否决。它保持同一 forward/action loss 和同一模型，但 76 个 DDP update 中 Ego/World common-gradient cosine 仅在 `[-5.56e-6,7.18e-6]`，投影系数均值仅 `-4.84e-6`，数值上几乎等同既有 p=0.75 训练；因此在首个 checkpoint 前停止，没有生成 rollout，也不能作为性能证据。artifact：`v27_ego_priority_pcgrad_mechanism_rejection_step000076.json`。
+- v28 当前正在训练。代码 commit/HEAD 为 `5d469a0`，完整 GPU 测试 `81/81`。它不改模型、loss 或推理：仅在优化器中把 pretrained/common 参数上的 World-corrected 梯度限制到普通 Ego 梯度张成的非负切向方向；World/bidirectional 与 physical residual 专属参数仍接收完整梯度，Ego/common 仍由普通 action-loss 样本训练，没有冻结、门控或辅助 World loss。训练使用 4 GPU、batch32/GPU、worker12、1080 steps（完整数据约一个 epoch），W&B enabled，只保存 `100/240/480/720/1080`。
+- v28 step100 runtime audit 已通过：982 个 common tensor 每步均受保护；前100步 retained World/common gradient fraction 均值 `0.001091`，约 `49%` update 的 World/common 梯度因相反方向被截断；259 个 World 专属 tensor 与2个 residual tensor 保留完整梯度。78 个 World BN buffer 与 v14 逐位一致，4,326 个 residual 参数全部非零，所有 optimizer group 非空且 LR 非零，四项 World auxiliary loss 均为0。artifact：`v28_step000100_ego_tangent_projection_runtime_audit.json`。
+- v28 自动评测已经排队：tmux `wep_v043_v28_stratified_worldflow_causal_after_train` 在训练结束和 GPU 空闲后运行 fixed IDs `0,5,...,45` 的 steps `100/240/480/720/1080`；正常组必须严格超过同状态 baseline `95/100`，且 same-checkpoint World-to-Ego ablation 必须更低。tmux `wep_v043_v28_full500_matched_causal_after_screen` 仅对通过者运行权威 Full-500，必须同时超过 established `481/500`、matched baseline，并保持正因果 delta。第19个失败时数学早停，只终止隔离 rollout 进程组并保留所有输出。
 - 文档后文出现的 6-A800、80 workers 或 batch 80 均是历史实验记录，仅用于追溯结果，不再代表当前执行配置。
 
 本文档用于在新 Codex 会话、换人维护或长时间中断后快速恢复项目上下文。内容区分为：
@@ -63,7 +67,7 @@ LIBERO HDF5
 
 - 路径：`/home/liusong/ProgramFiles/Huggingface/lerobot`
 - 分支：`wep_vla_v0.4.3_multiview_doubleflow`
-- 当前 WorldFlow 实现 commit：`90afd26`；当前分支记录 HEAD：`d6389d0`；World residual gradient isolation 的代码 commit 为 `fe99a71`。
+- 当前 WorldFlow 实现及分支 HEAD：`5d469a0`；v28 Ego-tangent optimizer routing 即该 commit；v27 inactive-PCGrad commit 为 `0bfce41`；World residual gradient isolation 的基础 commit 为 `fe99a71`。
 - 当前实验脚本、checkpoint、日志和 artifact 统一位于交接文档顶部所述 experiment root；不得删除 `/opt/data/private` 下任何文件。
 - 临时实验统一使用 `/tmp/temp`，不要把临时诊断文件写入正式数据目录。
 
