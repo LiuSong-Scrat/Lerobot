@@ -4223,6 +4223,22 @@ class VLAFlowMatching(nn.Module):
         absolute_current = pose9_to_matrix(current_pose)
         absolute_current_inv = invert_transform(absolute_current)
         current = _worldflow_carrier_matrix(current_pose, self.config.worldflow_frame_origin)
+        coordinate_frame_transform = None
+        if self.training and bool(
+            getattr(self.config, "worldflow_training_coordinate_frame_augmentation", False)
+        ):
+            coordinate_frame_transform = _sample_random_se3(
+                point_cloud_world.shape[0],
+                point_cloud_world.device,
+                point_cloud_world.dtype,
+                trans_scale=float(self.config.worldflow_augmentation_trans_scale),
+                rot_scale=float(self.config.worldflow_augmentation_rot_scale),
+            )
+            point_cloud_world = _transform_point_cloud_xyzrgb(
+                point_cloud_world,
+                coordinate_frame_transform,
+            )
+            current = coordinate_frame_transform @ current
         current_inv = invert_transform(current)
         target = pose9_to_matrix(target_poses)
         body_gt = absolute_current_inv.unsqueeze(1) @ target
@@ -4247,8 +4263,17 @@ class VLAFlowMatching(nn.Module):
             ego_noise[..., 7] = 1.0
 
         if ego_coupled_noise:
-            noise_pose9 = self.conjugate_ego_noise_to_world(ego_noise, current_pose)
-            noise_spatial = pose9_to_matrix(noise_pose9)
+            if coordinate_frame_transform is None:
+                noise_pose9 = self.conjugate_ego_noise_to_world(ego_noise, current_pose)
+                noise_spatial = pose9_to_matrix(noise_pose9)
+            else:
+                ego_noise_transform = pose9_to_matrix(ego_noise[..., :9].to(dtype=torch.float32))
+                noise_spatial = (
+                    current.unsqueeze(1)
+                    @ ego_noise_transform
+                    @ current_inv.unsqueeze(1)
+                )
+                noise_pose9 = matrix_to_pose9(noise_spatial)
         else:
             noise_twist = torch.randn(
                 *spatial_gt_pose9.shape[:2],
@@ -4265,9 +4290,16 @@ class VLAFlowMatching(nn.Module):
             noise_spatial = se3_exp(noise_twist)
             noise_pose9 = matrix_to_pose9(noise_spatial)
 
-        expected_conjugate_noise = pose9_to_matrix(
-            self.conjugate_ego_noise_to_world(ego_noise, current_pose)
-        )
+        if coordinate_frame_transform is None:
+            expected_conjugate_noise = pose9_to_matrix(
+                self.conjugate_ego_noise_to_world(ego_noise, current_pose)
+            )
+        else:
+            expected_conjugate_noise = (
+                current.unsqueeze(1)
+                @ pose9_to_matrix(ego_noise[..., :9].to(dtype=torch.float32))
+                @ current_inv.unsqueeze(1)
+            )
         noise_conjugacy_error = se3_geodesic_loss(
             noise_spatial,
             expected_conjugate_noise,
@@ -4277,12 +4309,19 @@ class VLAFlowMatching(nn.Module):
         if self.config.worldflow_noise_coupling == "projected_ego_path":
             if ego_x_t is None:
                 raise ValueError("projected_ego_path requires the current Ego chart state.")
-            x_t, u_t = self.project_ego_chart_path_to_world(
-                ego_x_t,
-                current_pose,
-                spatial_gt_pose9,
-                time,
-            )
+            if coordinate_frame_transform is None:
+                x_t, u_t = self.project_ego_chart_path_to_world(
+                    ego_x_t,
+                    current_pose,
+                    spatial_gt_pose9,
+                    time,
+                )
+            else:
+                ego_h_t = pose9_to_matrix(ego_x_t[..., :9].to(dtype=torch.float32))
+                world_h_t = current.unsqueeze(1) @ ego_h_t @ current_inv.unsqueeze(1)
+                x_t = matrix_to_pose9(world_h_t)
+                remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
+                u_t = (spatial_gt_pose9 - x_t) / remaining
         elif self.config.se3_enable:
             world_h_t, u_t = se3_geodesic_flow_state(noise_spatial, spatial_gt, time)
             x_t = matrix_to_pose9(world_h_t)
@@ -4312,7 +4351,7 @@ class VLAFlowMatching(nn.Module):
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
         )
-        return {
+        state = {
             "point_cloud_world": point_cloud_world,
             "point_is_pad": point_is_pad,
             "current": current,
@@ -4326,6 +4365,9 @@ class VLAFlowMatching(nn.Module):
             "valid": valid,
             "world_tokens": world_tokens,
         }
+        if coordinate_frame_transform is not None:
+            state["coordinate_frame_transform"] = coordinate_frame_transform
+        return state
 
     def _augment_worldflow_training_state(
         self,
@@ -4556,6 +4598,33 @@ class VLAFlowMatching(nn.Module):
                 valid,
             ).mean().detach(),
         }
+        coordinate_frame_transform = state.get("coordinate_frame_transform")
+        if torch.is_tensor(coordinate_frame_transform):
+            identity_rotation = torch.eye(
+                3,
+                device=coordinate_frame_transform.device,
+                dtype=coordinate_frame_transform.dtype,
+            ).expand(coordinate_frame_transform.shape[0], -1, -1)
+            self.last_worldflow_metrics.update(
+                {
+                    "worldflow_coordinate_frame_augmentation_active": torch.ones(
+                        (), device=point_cloud_world.device, dtype=torch.float32
+                    ),
+                    "worldflow_coordinate_frame_translation": torch.linalg.vector_norm(
+                        coordinate_frame_transform[..., :3, 3], dim=-1
+                    ).mean().detach(),
+                    "worldflow_coordinate_frame_rotation_deg": torch.rad2deg(
+                        _rotation_geodesic(
+                            coordinate_frame_transform[..., :3, :3],
+                            identity_rotation,
+                        ).mean().detach()
+                    ),
+                }
+            )
+        else:
+            self.last_worldflow_metrics["worldflow_coordinate_frame_augmentation_active"] = torch.zeros(
+                (), device=point_cloud_world.device, dtype=torch.float32
+            )
         return {
             "loss_flow": per_sample_flow.mean(),
             "loss_geo": per_sample_geo.mean(),

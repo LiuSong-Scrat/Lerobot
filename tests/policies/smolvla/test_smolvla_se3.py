@@ -1066,6 +1066,134 @@ def test_projected_ego_path_augmentation_transforms_current_state_not_old_chord(
     )
 
 
+def test_training_coordinate_frame_reparameterization_preserves_physical_ego_path(monkeypatch):
+    torch.manual_seed(2303)
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_frame_origin="current_ee",
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_max_points=8,
+        worldflow_training_coordinate_frame_augmentation=True,
+        worldflow_augmentation_trans_scale=0.05,
+        worldflow_augmentation_rot_scale=0.2,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = _make_tiny_worldflow_branch(cfg)
+    model.last_worldflow_metrics = {}
+    model.train()
+
+    bsize = 2
+    foreground = torch.randn(bsize, 12, 6)
+    foreground[..., 3:6] = torch.rand(bsize, 12, 3) * 255.0
+    model.last_worldflow_payload = {"foreground_pc_ego": foreground}
+    absolute_current = se3_exp(torch.randn(bsize, 6) * 0.1)
+    body_target = se3_exp(torch.randn(bsize, cfg.chunk_size, 6) * 0.1)
+    absolute_target = absolute_current.unsqueeze(1) @ body_target
+    ego_noise_h = se3_exp(torch.randn(bsize, cfg.chunk_size, 6) * 0.1)
+    ego_x_t_h = se3_exp(torch.randn(bsize, cfg.chunk_size, 6) * 0.1)
+    ego_noise = torch.cat(
+        [matrix_to_pose9(ego_noise_h), torch.zeros(bsize, cfg.chunk_size, 1)], dim=-1
+    )
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_x_t_h), torch.zeros(bsize, cfg.chunk_size, 1)], dim=-1
+    )
+    current_pose = matrix_to_pose9(absolute_current)
+    context = {
+        "current_ee_pose": current_pose,
+        "ee_poses": matrix_to_pose9(absolute_target),
+        "step_is_pad": torch.zeros(bsize, cfg.chunk_size, dtype=torch.bool),
+    }
+    lang_tokens = torch.randint(0, 64, (bsize, 5))
+    lang_masks = torch.ones(bsize, 5, dtype=torch.bool)
+    time = torch.tensor([0.25, 0.6])
+    coordinate_change = se3_exp(torch.randn(bsize, 6) * 0.15)
+    calls = {"count": 0}
+
+    def fixed_coordinate_change(*_args, **_kwargs):
+        calls["count"] += 1
+        return coordinate_change
+
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla._sample_random_se3",
+        fixed_coordinate_change,
+    )
+    state = model._prepare_worldflow_training_state(
+        context,
+        lang_tokens,
+        lang_masks,
+        time,
+        actions_is_pad=None,
+        ego_noise=ego_noise,
+        ego_x_t=ego_x_t,
+    )
+
+    canonical_carrier = _worldflow_carrier_matrix(current_pose, cfg.worldflow_frame_origin)
+    expected_carrier = coordinate_change @ canonical_carrier
+    expected_carrier_inv = torch.linalg.inv(expected_carrier)
+    expected_spatial = expected_carrier[:, None] @ body_target @ expected_carrier_inv[:, None]
+    expected_noise = expected_carrier[:, None] @ ego_noise_h @ expected_carrier_inv[:, None]
+    expected_x_t = expected_carrier[:, None] @ ego_x_t_h @ expected_carrier_inv[:, None]
+    canonical_points = _ego_point_cloud_to_world(
+        foreground[:, : cfg.worldflow_max_points],
+        current_pose,
+        frame_origin=cfg.worldflow_frame_origin,
+    )
+    expected_xyz = (
+        canonical_points[..., :3]
+        @ coordinate_change[..., :3, :3].transpose(-1, -2)
+        + coordinate_change[..., None, :3, 3]
+    )
+
+    assert calls["count"] == 1
+    assert torch.equal(state["coordinate_frame_transform"], coordinate_change)
+    assert torch.allclose(state["current"], expected_carrier, atol=3e-6, rtol=3e-6)
+    assert torch.allclose(state["point_cloud_world"][..., :3], expected_xyz, atol=3e-6, rtol=3e-6)
+    assert torch.equal(state["point_cloud_world"][..., 3:6], canonical_points[..., 3:6])
+    assert torch.allclose(state["spatial_gt"], expected_spatial, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(state["noise_spatial"], expected_noise, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(pose9_to_matrix(state["x_t"]), expected_x_t, atol=4e-5, rtol=4e-5)
+    recovered_body = state["current_inv"][:, None] @ state["spatial_gt"] @ state["current"][:, None]
+    assert torch.allclose(recovered_body, body_target, atol=4e-5, rtol=4e-5)
+    remaining = (1.0 - time)[:, None, None]
+    assert torch.allclose(
+        state["x_t"] + remaining * state["u_t"],
+        matrix_to_pose9(expected_spatial),
+        atol=3e-6,
+        rtol=3e-6,
+    )
+
+    output = model._finalize_worldflow_training_loss(
+        state,
+        state["u_t"],
+        matrix_to_pose9(body_target),
+        time,
+    )
+    assert output["loss_flow"].item() < 1e-8
+    assert model.last_worldflow_metrics["worldflow_coordinate_frame_augmentation_active"].item() == 1.0
+
+    model.eval()
+    canonical_state = model._prepare_worldflow_training_state(
+        context,
+        lang_tokens,
+        lang_masks,
+        time,
+        actions_is_pad=None,
+        ego_noise=ego_noise,
+        ego_x_t=ego_x_t,
+    )
+    assert calls["count"] == 1
+    assert "coordinate_frame_transform" not in canonical_state
+    assert torch.equal(canonical_state["current"], canonical_carrier)
+
+
 def test_projected_ego_chart_rejects_nonlegacy_ego_prior():
     with pytest.raises(ValueError, match="only for the legacy Euclidean Ego chart"):
         SmolVLAConfig(
@@ -1729,6 +1857,17 @@ def test_worldflow_training_world_to_ego_dropout_is_training_only_and_bounded():
             worldflow_action_fusion="endpoint_residual_boosting",
             worldflow_training_residual_anchor_stop_gradient=True,
         )
+
+
+def test_worldflow_training_coordinate_frame_augmentation_requires_worldflow_and_valid_scales():
+    with pytest.raises(ValueError, match="requires worldflow_enable=True"):
+        SmolVLAConfig(worldflow_training_coordinate_frame_augmentation=True)
+
+    with pytest.raises(ValueError, match="worldflow_augmentation_trans_scale must be non-negative"):
+        SmolVLAConfig(worldflow_enable=True, worldflow_augmentation_trans_scale=-0.01)
+
+    with pytest.raises(ValueError, match="worldflow_augmentation_rot_scale must be non-negative"):
+        SmolVLAConfig(worldflow_enable=True, worldflow_augmentation_rot_scale=-0.01)
 
 
 @pytest.mark.parametrize(

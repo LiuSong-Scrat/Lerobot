@@ -227,6 +227,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Ego action path. This is training-only, adds no parameter or loss, and
     # leaves the complete inference forward exactly unchanged.
     worldflow_training_residual_anchor_stop_gradient: bool = False
+    # Training-only reparameterization of the complete World coordinate frame.
+    # One random rigid transform A is applied consistently to World points,
+    # the Ego-to-World carrier C, and every World trajectory state, so the
+    # physical Ego action represented by C^-1 G C is unchanged. This replaces
+    # the canonical World representation for the ordinary single action-loss
+    # forward; it adds no second view, auxiliary objective, parameter, gate, or
+    # inference-time operation.
+    worldflow_training_coordinate_frame_augmentation: bool = False
     # Optional one-shot initialization used when adapting an Ego checkpoint:
     # copy shape-compatible Ego action/point modules into the World stream,
     # while keeping both streams trainable. This is not applied when loading a
@@ -554,6 +562,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_se3_head_enable=True requires worldflow_enable=True.")
             if not self.se3_enable:
                 raise ValueError("worldflow_se3_head_enable=True requires se3_enable=True.")
+        if self.worldflow_training_coordinate_frame_augmentation and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_coordinate_frame_augmentation=True requires worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
@@ -595,6 +607,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_noise_trans_scale must be non-negative.")
             if self.worldflow_noise_rot_scale < 0:
                 raise ValueError("worldflow_noise_rot_scale must be non-negative.")
+            if self.worldflow_augmentation_trans_scale < 0:
+                raise ValueError("worldflow_augmentation_trans_scale must be non-negative.")
+            if self.worldflow_augmentation_rot_scale < 0:
+                raise ValueError("worldflow_augmentation_rot_scale must be non-negative.")
             if self.worldflow_noise_coupling not in {
                 "independent",
                 "conjugate_ego",
