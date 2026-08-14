@@ -419,6 +419,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - v38r1 最终筛查已完成并正式否决。steps `100/240/480/720/1080` 分别在 `74/79`、`89/94`、`90/95`、`93/98`、`90/95` 时累计第5个失败；每个 checkpoint 的最大可能最终成绩都只有 `95/100`，不能严格超过 Broad baseline。没有候选，因此没有启动 World-to-Ego causal arm 或 Full500，条件 Full waiter 写出 `screened_out` 后正常退出。聚合 screen：`singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v38r1_canonical_world_token_residual_dualflow_stratified_checkpoint_causal_screen.json`；正式 gate：`singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v38r1_canonical_world_token_residual_dualflow_local4_fixedbarrier_all_candidates_full500_matched_worldflow_gate.json`。
 - 结论：现有 v38r1 权重未显示性能改善，而且 step1080 前的长窗口 loss 已无实质下降；按用户决定结束该方案，不继续训练。当前无 v38r1 训练或评测 tmux/进程，4张本地GPU已释放；所有输出均保留。
 
+## 6.8 2026-08-15：v39 shared-state dual-adapter 仅测现有权重后停止
+
+- v39 位于独立 worktree `/home/liusong/ProgramFiles/Huggingface/lerobot_worldflow_shared_state_dual_adapter`，branch `wep_vla_v0.4.3_worldflow_shared_state_dual_adapter`，commit `507ffc575067e706e85f7b276662c8dd96a3c0d2`。它保留两个 point-action adapter 和一个共享 point-action expert，但只使用一个 canonical Ego action state、一次共享 expert forward 和原 Ego action head；World adapter 以 Ego-conditioned action token 为 query，从 global World 点云和当前 carrier 生成完整 token residual，再写回同一 Ego token。不存在第二 action target/head、门控、World auxiliary loss、task rule、SE3 或 LitePT 修改；关闭 WorldFlow 的旧路径不变。
+- 完整 SmolVLA WorldFlow/SE3 与 dataset 回归测试通过 `108/108`。4-GPU batch48/GPU、worker12 的两步 smoke 完成且无 OOM；step1/2 action loss 为 `0.0002378/0.0001936`。参数审计证明 World residual、World upstream、Ego adapter 和共享 expert 均发生更新，而未参与计算的旧 World head/cross-attention 参数保持完全不变。
+- 用户随后要求停止继续训练，只测试现有权重。此时不存在正式训练 checkpoint，只有 smoke `step2`：累计仅见过384个样本，即约 `0.28%` epoch。正式720-step任务均衡训练没有启动，也不会续跑。
+- 对现有 step2 使用固定分层 IDs `0,5,...,45`、fixed-barrier total30/inference batch30、policy-noise seed0 进行 Broad 筛查。终止时为 `91/98`、7个失败；即使剩余2个全部成功，最高也只有 `93/100`，低于同协议 baseline `95/100`，因此数学提前淘汰。没有启动 causal ablation 或 Full500。artifact：`singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v39_shared_state_dual_adapter_existing_step000002_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_stratified_step5_v39_existingonly.json`。
+- 按用户的 existing-weight-only 决策，v39 运行路线结束，不再训练。科学解释上，这不是“充分训练后结构无效”的收敛结论，因为被测权重仅训练2步；它只证明现有权重没有改善。当前没有 v39 训练或评测进程，4张本地GPU均空闲；所有 checkpoint、cache、progress、日志和 artifact 均保留。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
