@@ -21,6 +21,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     _aggregate_motion_hypotheses,
     compose_point_cloud_views,
     fps_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
@@ -266,6 +267,44 @@ def test_novelty_union_replaces_only_redundant_primary_voxel_points():
         sampled,
         torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
     )
+
+
+def test_multiscale_novelty_union_keeps_fine_primary_cover_and_only_coarse_novel_secondary():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.010, 0.011, 0.040, 0.041,
+         0.002, 0.012, 0.050, 0.091, 0.092, 0.130]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+    repeated, _, repeated_indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert indices.tolist() == [[0, 9, 2, 11, 4, 5, 12, 13]]
+    assert torch.equal(indices, repeated_indices)
+    assert torch.equal(sampled, repeated)
+    assert {0, 2, 4}.issubset(set(indices[0, :-2].tolist()))
+    assert set(indices[0, :-2].tolist()) & {6, 7, 8, 10} == set()
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+
+
+def test_multiscale_novelty_union_is_exact_identity_for_single_view():
+    cloud = torch.randn(2, 8, 6)
+    sampled, sampled_pad, indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert torch.equal(sampled, cloud)
+    assert indices.tolist() == [list(range(8)), list(range(8))]
 
 
 def test_transport_novelty_union_uses_local_one_to_one_replacements():

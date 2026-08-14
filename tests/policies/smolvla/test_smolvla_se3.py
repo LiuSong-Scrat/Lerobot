@@ -2303,6 +2303,13 @@ def test_input_view_dropout_requires_supported_fusion_and_multiple_views():
     )
     assert novelty_union_cfg.multiview_input_view_dropout_enable is True
 
+    multiscale_novelty_union_cfg = SmolVLAConfig(
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        multiview_input_view_dropout_enable=True,
+    )
+    assert multiscale_novelty_union_cfg.multiview_input_view_dropout_enable is True
+
     transport_novelty_cfg = SmolVLAConfig(
         camera_views="agentview,robot0_eye_in_hand",
         camera_view_fusion="transport_novelty_union",

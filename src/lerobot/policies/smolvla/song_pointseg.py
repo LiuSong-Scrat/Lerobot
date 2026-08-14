@@ -647,6 +647,8 @@ def parse_camera_view_fusion(value: Any = None) -> str:
         "voxel_coverage_fps": "voxel_cover_fps",
         "novelty_union": "novelty_union",
         "novelty": "novelty_union",
+        "multiscale_novelty_union": "multiscale_novelty_union",
+        "multiscale_novelty": "multiscale_novelty_union",
         "transport_novelty_union": "transport_novelty_union",
         "transport_novelty": "transport_novelty_union",
         "uniform_union": "uniform_union",
@@ -660,7 +662,8 @@ def parse_camera_view_fusion(value: Any = None) -> str:
     if mode not in aliases:
         raise ValueError(
             "camera view fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
-            "'voxel_cover_fps', 'novelty_union', 'transport_novelty_union', "
+            "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+            "'transport_novelty_union', "
             "'uniform_union', 'full_union', "
             "or 'primary_residual'; "
             f"got {value!r}."
@@ -983,6 +986,7 @@ def novelty_union_sample_fused_point_cloud(
     voxel_size: float = 0.01,
     point_is_pad: Tensor | None = None,
     local_transport: bool = False,
+    coarse_novelty_scale: float | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor]:
     """Preserve the primary cloud and insert only secondary-view novel voxels.
 
@@ -1000,6 +1004,10 @@ def novelty_union_sample_fused_point_cloud(
     voxel_size = float(voxel_size)
     if not np.isfinite(voxel_size) or voxel_size <= 0.0:
         raise ValueError(f"voxel_size must be finite and positive, got {voxel_size}.")
+    if coarse_novelty_scale is not None and (
+        not np.isfinite(float(coarse_novelty_scale)) or float(coarse_novelty_scale) <= 1.0
+    ):
+        raise ValueError("coarse_novelty_scale must be finite and greater than one.")
     batch_size, source_points, _ = point_cloud.shape
     if source_points == target_points:
         identity = torch.arange(source_points, device=point_cloud.device, dtype=torch.long)
@@ -1047,7 +1055,45 @@ def novelty_union_sample_fused_point_cloud(
         reduce="amin",
         include_self=True,
     )
-    novel_global = first_secondary[(first_primary == sentinel) & (first_secondary != sentinel)]
+    if coarse_novelty_scale is None:
+        novel_global = first_secondary[(first_primary == sentinel) & (first_secondary != sentinel)]
+    else:
+        # A secondary point is admitted only when its coarser occupied cell is
+        # absent from the complete primary cloud.  One representative per
+        # coarse novel cell suppresses fine-grid boundary/sampling noise while
+        # the independent fine grid below still protects every primary
+        # occupied cell.  The insertion count is determined by geometry; no
+        # camera ratio, point quota, task rule, or primary/secondary pairing is
+        # used.
+        coarse_quantized = torch.floor(
+            flat_xyz / (voxel_size * float(coarse_novelty_scale))
+        ).to(torch.int64)
+        coarse_voxels, coarse_inverse = torch.unique(
+            torch.cat([batch_ids.unsqueeze(1), coarse_quantized], dim=1),
+            dim=0,
+            return_inverse=True,
+        )
+        coarse_first_primary = torch.full(
+            (coarse_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+        )
+        coarse_first_secondary = coarse_first_primary.clone()
+        coarse_first_primary.scatter_reduce_(
+            0,
+            coarse_inverse[primary_mask],
+            flat_global_indices[primary_mask],
+            reduce="amin",
+            include_self=True,
+        )
+        coarse_first_secondary.scatter_reduce_(
+            0,
+            coarse_inverse[~primary_mask],
+            flat_global_indices[~primary_mask],
+            reduce="amin",
+            include_self=True,
+        )
+        novel_global = coarse_first_secondary[
+            (coarse_first_primary == sentinel) & (coarse_first_secondary != sentinel)
+        ]
     redundant_primary_global = flat_global_indices[
         primary_mask & (flat_global_indices != first_primary[inverse])
     ]
@@ -1093,6 +1139,33 @@ def novelty_union_sample_fused_point_cloud(
     sampled = torch.gather(point_cloud, 1, indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1]))
     sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
     return sampled, sampled_pad, indices
+
+
+def multiscale_novelty_union_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Insert only coarse-persistent secondary coverage into a fine-protected primary cloud.
+
+    The configured voxel size protects every occupied primary cell.  Secondary
+    coverage must remain novel on a three-times-coarser grid, and only one
+    representative of each coarse novel cell is inserted.  This is a
+    view-count-agnostic input coreset: it changes no model module and assigns no
+    fixed point budget to any camera.
+    """
+
+    return novelty_union_sample_fused_point_cloud(
+        point_cloud,
+        target_points=target_points,
+        gripper_points=gripper_points,
+        voxel_size=voxel_size,
+        point_is_pad=point_is_pad,
+        coarse_novelty_scale=3.0,
+    )
 
 
 def _local_transport_replacement_pairs(
@@ -1293,6 +1366,7 @@ def compose_point_cloud_views(
         "voxel_fps",
         "voxel_cover_fps",
         "novelty_union",
+        "multiscale_novelty_union",
         "transport_novelty_union",
         "full_union",
         "primary_residual",
@@ -1593,6 +1667,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -1628,6 +1703,7 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
                     "transport_novelty_union",
                     "uniform_union",
                     "full_union",

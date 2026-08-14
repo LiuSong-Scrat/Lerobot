@@ -50,6 +50,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongTemporalPointCloudDataset,
     compose_point_cloud_views,
     fps_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
@@ -392,6 +393,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         if self.camera_view_fusion in {
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
         }:
             # Raw/no-cache training still obeys the same input-adapter contract:
@@ -399,6 +401,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             sampler = {
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
             sampled, _point_is_pad, _indices = sampler(
@@ -701,6 +704,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
         }:
             cached_voxel_size = float(self.cache.manifest.get("camera_view_voxel_size", -1.0))
@@ -1037,6 +1041,7 @@ class OnlinePointSegBatchCollator:
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
         }:
             sampler = {
@@ -1044,6 +1049,7 @@ class OnlinePointSegBatchCollator:
                 "voxel_fps": voxel_fps_sample_fused_point_cloud,
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
             sampler_kwargs = (
@@ -1053,6 +1059,7 @@ class OnlinePointSegBatchCollator:
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else {}

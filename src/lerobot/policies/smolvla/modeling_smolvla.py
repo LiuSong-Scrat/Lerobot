@@ -876,6 +876,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
                     "transport_novelty_union",
                     "uniform_union",
                     "full_union",

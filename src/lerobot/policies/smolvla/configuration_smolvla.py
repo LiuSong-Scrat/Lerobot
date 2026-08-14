@@ -71,6 +71,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # spatial union, then applies the same FPS contract.
     # ``voxel_cover_fps`` retains one representative of every occupied voxel
     # when possible, then fills remaining detail slots in union-FPS order.
+    # ``multiscale_novelty_union`` protects every primary fine voxel and adds
+    # one secondary representative only for coverage that remains novel at a
+    # three-times-coarser scale; the geometry determines the camera share.
     # ``transport_novelty_union`` preserves every primary occupied voxel and
     # inserts secondary novel voxels through local one-to-one replacements.
     # ``full_union`` preserves every scene point from every selected view and
@@ -445,6 +448,7 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -452,7 +456,8 @@ class SmolVLAConfig(PreTrainedConfig):
         }:
             raise ValueError(
                 "camera_view_fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
-                "'voxel_cover_fps', 'novelty_union', 'transport_novelty_union', "
+                "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+                "'transport_novelty_union', "
                 "'uniform_union', 'full_union', "
                 "or 'primary_residual'; "
                 f"got {self.camera_view_fusion!r}."
@@ -470,6 +475,7 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -487,13 +493,14 @@ class SmolVLAConfig(PreTrainedConfig):
             if self.camera_view_fusion not in {
                 "fps",
                 "novelty_union",
+                "multiscale_novelty_union",
                 "transport_novelty_union",
                 "uniform_union",
                 "full_union",
             }:
                 raise ValueError(
                     "multiview_input_view_dropout_enable currently requires "
-                    "camera_view_fusion='fps', 'novelty_union', "
+                    "camera_view_fusion='fps', 'novelty_union', 'multiscale_novelty_union', "
                     "'transport_novelty_union', 'uniform_union', or 'full_union'."
                 )
             views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())
