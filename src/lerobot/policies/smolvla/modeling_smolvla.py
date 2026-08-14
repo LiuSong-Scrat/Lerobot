@@ -1291,19 +1291,27 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions_is_pad = actions_is_pad.to(device=actions.device, dtype=torch.bool)
         worldflow_context = None
         if self.config.worldflow_enable:
+            shared_state_dual_adapter = (
+                self.config.worldflow_joint_token_layout == "shared_state_dual_adapter"
+            )
             required_worldflow_keys = (
-                "worldflow.current_ee_pose",
-                "worldflow.ee_poses",
-                "worldflow.step_is_pad",
+                ("worldflow.current_ee_pose", "worldflow.step_is_pad")
+                if shared_state_dual_adapter
+                else (
+                    "worldflow.current_ee_pose",
+                    "worldflow.ee_poses",
+                    "worldflow.step_is_pad",
+                )
             )
             missing = [key for key in required_worldflow_keys if key not in batch]
             if missing:
                 raise ValueError(f"WorldFlow training batch is missing required keys: {missing}")
             worldflow_context = {
                 "current_ee_pose": batch["worldflow.current_ee_pose"],
-                "ee_poses": batch["worldflow.ee_poses"],
                 "step_is_pad": batch["worldflow.step_is_pad"],
             }
+            if not shared_state_dual_adapter:
+                worldflow_context["ee_poses"] = batch["worldflow.ee_poses"]
         loss_dict = {}
         losses = self.model.forward(
             pc_feats,
@@ -2102,7 +2110,12 @@ class WorldFlowActionBranch(nn.Module):
         self.chunk_size = int(config.chunk_size)
         self.feature_dim = int(config.worldflow_feature_dim)
         self.action_hidden_dim = int(action_hidden_dim)
-        self.canonical_action_flow = bool(config.worldflow_parallel_canonical_action_flow)
+        self.shared_state_dual_adapter = (
+            config.worldflow_joint_token_layout == "shared_state_dual_adapter"
+        )
+        self.canonical_action_flow = bool(config.worldflow_parallel_canonical_action_flow) or (
+            self.shared_state_dual_adapter
+        )
         self.action_dim = int(config.max_action_dim) if self.canonical_action_flow else self.pose_dim
         self.min_period = float(config.min_period)
         self.max_period = float(config.max_period)
@@ -2200,6 +2213,7 @@ class WorldFlowActionBranch(nn.Module):
         *,
         actions_is_pad: Tensor | None = None,
         carrier_pose9: Tensor | None = None,
+        base_action_tokens: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if noisy_action_state.ndim != 3 or noisy_action_state.shape[-1] != self.action_dim:
             raise ValueError(
@@ -2225,6 +2239,28 @@ class WorldFlowActionBranch(nn.Module):
         action_tokens = self.action_time_mlp_out(
             F.silu(self.action_time_mlp_in(torch.cat([action_tokens, time_emb], dim=-1)))
         )
+        if self.shared_state_dual_adapter:
+            if base_action_tokens is None:
+                raise ValueError(
+                    "shared_state_dual_adapter requires Ego-conditioned base_action_tokens."
+                )
+            base_action_tokens = base_action_tokens.to(
+                device=action_tokens.device,
+                dtype=action_tokens.dtype,
+            )
+            if base_action_tokens.shape != action_tokens.shape:
+                raise ValueError(
+                    "Expected base_action_tokens shape "
+                    f"{action_tokens.shape}, got {base_action_tokens.shape}."
+                )
+            # The Ego point-conditioned action state queries the independent
+            # World adapter (Ego->World). The full residual projection below
+            # returns World evidence to that same state (World->Ego).
+            action_tokens = action_tokens + base_action_tokens
+        elif base_action_tokens is not None:
+            raise ValueError(
+                "base_action_tokens are defined only for shared_state_dual_adapter."
+            )
 
         lang_emb = self.language_embedding(lang_tokens.to(device=action_tokens.device, dtype=torch.long))
         lang_context = _masked_language_mean(
@@ -2283,6 +2319,7 @@ class WorldFlowActionBranch(nn.Module):
         point_is_pad: Tensor | None = None,
         actions_is_pad: Tensor | None = None,
         carrier_pose9: Tensor | None = None,
+        base_action_tokens: Tensor | None = None,
     ) -> dict[str, Tensor]:
         scene = self.encode_scene(point_cloud_world, point_is_pad=point_is_pad)
         action_tokens, action_mask = self.embed_action_tokens(
@@ -2293,6 +2330,7 @@ class WorldFlowActionBranch(nn.Module):
             time,
             actions_is_pad=actions_is_pad,
             carrier_pose9=carrier_pose9,
+            base_action_tokens=base_action_tokens,
         )
         return {
             **scene,
@@ -4477,6 +4515,44 @@ class VLAFlowMatching(nn.Module):
         )
         return ego_tokens + ego_delta, world_conditioned
 
+    def _fuse_shared_state_world_adapter(
+        self,
+        ego_tokens: Tensor,
+        ego_mask: Tensor,
+        world_tokens: dict[str, Tensor],
+    ) -> Tensor:
+        """Write the World adapter residual into one canonical action state.
+
+        ``WorldFlowActionBranch`` has already used the Ego-conditioned tokens
+        as its action query, so this addition completes the bidirectional
+        Ego->World->Ego path. There is no second action state, expert pass,
+        output head, vote, or learned scalar gate.
+        """
+
+        world_residual = world_tokens.get("action_tokens")
+        world_mask = world_tokens.get("action_mask")
+        if not torch.is_tensor(world_residual) or not torch.is_tensor(world_mask):
+            raise ValueError(
+                "shared_state_dual_adapter requires World action residual tokens and mask."
+            )
+        if world_residual.shape != ego_tokens.shape:
+            raise ValueError(
+                "shared_state_dual_adapter requires paired token shapes, got "
+                f"{ego_tokens.shape} and {world_residual.shape}."
+            )
+        ego_valid = ego_mask.to(device=ego_tokens.device, dtype=torch.bool)
+        world_valid = world_mask.to(device=ego_tokens.device, dtype=torch.bool)
+        if not torch.equal(ego_valid, world_valid):
+            raise ValueError(
+                "shared_state_dual_adapter requires identical Ego/World action masks."
+            )
+        ablations = getattr(self, "inference_ablation_modalities", frozenset())
+        if "world_to_ego" in ablations or "world" in ablations:
+            return ego_tokens
+        residual = world_residual.to(device=ego_tokens.device, dtype=ego_tokens.dtype)
+        residual = residual * ego_valid.unsqueeze(-1).to(dtype=residual.dtype)
+        return ego_tokens + residual
+
     def _run_world_ego_parallel_expert(
         self,
         prefix_embs: Tensor | None,
@@ -4669,10 +4745,19 @@ class VLAFlowMatching(nn.Module):
         ego_noise: Tensor | None = None,
         ego_x_t: Tensor | None = None,
         ego_u_t: Tensor | None = None,
+        base_action_tokens: Tensor | None = None,
     ) -> dict[str, Tensor | dict[str, Tensor]]:
         if self.worldflow_branch is None:
             raise RuntimeError("WorldFlow is disabled.")
-        required = ("current_ee_pose", "ee_poses", "step_is_pad")
+        shared_state_dual_adapter = (
+            getattr(self.config, "worldflow_joint_token_layout", "legacy_asymmetric")
+            == "shared_state_dual_adapter"
+        )
+        required = (
+            ("current_ee_pose", "step_is_pad")
+            if shared_state_dual_adapter
+            else ("current_ee_pose", "ee_poses", "step_is_pad")
+        )
         missing = [key for key in required if key not in worldflow_context]
         if missing:
             raise ValueError(f"WorldFlow training context is missing required keys: {missing}")
@@ -4680,17 +4765,11 @@ class VLAFlowMatching(nn.Module):
         point_cloud_world, point_is_pad, current_pose = self._prepare_worldflow_foreground(
             worldflow_context["current_ee_pose"]
         )
-        target_poses = worldflow_context["ee_poses"].to(
-            device=point_cloud_world.device,
-            dtype=torch.float32,
-        )
         step_is_pad = worldflow_context["step_is_pad"].to(
             device=point_cloud_world.device,
             dtype=torch.bool,
         )
         expected_shape = (point_cloud_world.shape[0], self.config.chunk_size, 9)
-        if target_poses.shape != expected_shape:
-            raise ValueError(f"Expected WorldFlow target poses shape {expected_shape}, got {target_poses.shape}.")
         if step_is_pad.shape != expected_shape[:2]:
             raise ValueError(f"Expected WorldFlow step_is_pad shape {expected_shape[:2]}, got {step_is_pad.shape}.")
 
@@ -4700,6 +4779,45 @@ class VLAFlowMatching(nn.Module):
             if action_pad.shape != valid.shape:
                 raise ValueError(f"Expected action_is_pad shape {valid.shape}, got {action_pad.shape}.")
             valid = valid & ~action_pad
+
+        if shared_state_dual_adapter:
+            if ego_x_t is None or ego_u_t is None or base_action_tokens is None:
+                raise ValueError(
+                    "shared_state_dual_adapter requires the canonical Ego state, target, "
+                    "and Ego-conditioned action tokens."
+                )
+            branch_x_t = ego_x_t.to(device=point_cloud_world.device, dtype=torch.float32)
+            branch_u_t = ego_u_t.to(device=point_cloud_world.device, dtype=torch.float32)
+            carrier_pose9 = current_pose.to(device=point_cloud_world.device, dtype=torch.float32)
+            world_tokens = self.worldflow_branch(
+                point_cloud_world,
+                lang_tokens,
+                lang_masks,
+                branch_x_t,
+                time,
+                point_is_pad=point_is_pad,
+                actions_is_pad=~valid,
+                carrier_pose9=carrier_pose9,
+                base_action_tokens=base_action_tokens,
+            )
+            world_tokens["carrier_pose9"] = carrier_pose9
+            return {
+                "point_cloud_world": point_cloud_world,
+                "point_is_pad": point_is_pad,
+                "x_t": branch_x_t,
+                "u_t": branch_u_t,
+                "valid": valid,
+                "world_tokens": world_tokens,
+                "canonical_action_flow": True,
+                "shared_state_dual_adapter": True,
+            }
+
+        target_poses = worldflow_context["ee_poses"].to(
+            device=point_cloud_world.device,
+            dtype=torch.float32,
+        )
+        if target_poses.shape != expected_shape:
+            raise ValueError(f"Expected WorldFlow target poses shape {expected_shape}, got {target_poses.shape}.")
 
         absolute_current = pose9_to_matrix(current_pose)
         absolute_current_inv = invert_transform(absolute_current)
@@ -4825,7 +4943,9 @@ class VLAFlowMatching(nn.Module):
 
         canonical_action_flow = bool(
             getattr(self.config, "worldflow_parallel_canonical_action_flow", False)
-        )
+        ) or getattr(
+            self.config, "worldflow_joint_token_layout", "legacy_asymmetric"
+        ) == "shared_state_dual_adapter"
         if canonical_action_flow:
             if ego_x_t is None or ego_u_t is None:
                 raise ValueError(
@@ -4848,6 +4968,7 @@ class VLAFlowMatching(nn.Module):
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
             carrier_pose9=carrier_pose9,
+            base_action_tokens=base_action_tokens,
         )
         if carrier_pose9 is not None:
             # Retain the exact absolute carrier with the encoded scene so every
@@ -5612,8 +5733,14 @@ class VLAFlowMatching(nn.Module):
                 )
             canonical_action_flow = bool(
                 getattr(self.config, "worldflow_parallel_canonical_action_flow", False)
+            ) or getattr(
+                self.config, "worldflow_joint_token_layout", "legacy_asymmetric"
+            ) == "shared_state_dual_adapter"
+            shared_state_dual_adapter = (
+                getattr(self.config, "worldflow_joint_token_layout", "legacy_asymmetric")
+                == "shared_state_dual_adapter"
             )
-            if self.world_action_out_proj is None:
+            if self.world_action_out_proj is None and not shared_state_dual_adapter:
                 raise RuntimeError("WorldFlow output projection is not initialized.")
             world_state = self._prepare_worldflow_training_state(
                 worldflow_context,
@@ -5624,10 +5751,80 @@ class VLAFlowMatching(nn.Module):
                 noise,
                 x_t,
                 u_t,
+                base_action_tokens=(suffix_embs if shared_state_dual_adapter else None),
             )
             world_tokens = world_state["world_tokens"]
             if not isinstance(world_tokens, dict):
                 raise TypeError("WorldFlow token state must be a dictionary.")
+            if shared_state_dual_adapter:
+                fused_suffix = self._fuse_shared_state_world_adapter(
+                    suffix_embs,
+                    suffix_pad_masks,
+                    world_tokens,
+                )
+                suffix_out = self._run_ego_suffix_expert(
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    fused_suffix,
+                    suffix_pad_masks,
+                    suffix_att_masks,
+                )
+                v_t = self.action_out_proj(suffix_out)
+                if x_t.shape[-1] >= 9 and v_t.shape[-1] >= 9:
+                    endpoint = x_t + (1.0 - time_expanded) * v_t
+                    self.last_body_pose9_prediction = endpoint[..., :9]
+                else:
+                    self.last_body_pose9_prediction = None
+                residual = world_tokens.get("action_tokens")
+                valid = world_tokens.get("action_mask")
+                point_cloud_world = world_state.get("point_cloud_world")
+                if not all(
+                    torch.is_tensor(value)
+                    for value in (residual, valid, point_cloud_world)
+                ):
+                    raise TypeError("Shared-state World adapter diagnostics are incomplete.")
+                valid_f = valid.to(device=residual.device, dtype=residual.dtype)
+                residual_rms = torch.sqrt(
+                    (
+                        residual.square()
+                        * valid_f.unsqueeze(-1)
+                    ).sum()
+                    / (
+                        valid_f.sum().clamp_min(1.0)
+                        * residual.shape[-1]
+                    )
+                )
+                zero = torch.zeros((), device=v_t.device, dtype=v_t.dtype)
+                self.last_worldflow_metrics = {
+                    "loss_worldflow_flow": zero,
+                    "loss_worldflow_geo": zero,
+                    "loss_worldflow_bridge": zero,
+                    "loss_worldflow_equiv": zero,
+                    "worldflow_adapter_residual_rms": residual_rms.detach(),
+                    "worldflow_valid_ratio": valid_f.mean().detach(),
+                    "worldflow_foreground_points": torch.tensor(
+                        point_cloud_world.shape[1],
+                        device=v_t.device,
+                        dtype=torch.float32,
+                    ),
+                    "worldflow_shared_state_dual_adapter_active": torch.ones(
+                        (), device=v_t.device, dtype=torch.float32
+                    ),
+                }
+                # There is deliberately no duplicate World objective. Both
+                # point-action adapters, the shared expert, and the executed
+                # Ego head learn together from this single action loss.
+                self.last_worldflow_aux = None
+                self._record_standard_action_metrics(
+                    actions=actions,
+                    x_t=x_t,
+                    u_t=u_t,
+                    pred_velocity=v_t,
+                    time=time,
+                    actions_is_pad=actions_is_pad,
+                )
+                return F.mse_loss(u_t, v_t, reduction="none")
             ego_expert_out, world_expert_out = self._run_world_ego_joint_expert(
                 prefix_embs,
                 prefix_pad_masks,
@@ -5864,7 +6061,9 @@ class VLAFlowMatching(nn.Module):
             )
             canonical_action_flow = bool(
                 getattr(self.config, "worldflow_parallel_canonical_action_flow", False)
-            )
+            ) or getattr(
+                self.config, "worldflow_joint_token_layout", "legacy_asymmetric"
+            ) == "shared_state_dual_adapter"
             if canonical_action_flow:
                 world_scene["carrier_pose9"] = current_ee_pose
                 # The two flows start from the same canonical prior but evolve
@@ -5939,7 +6138,9 @@ class VLAFlowMatching(nn.Module):
                         raise RuntimeError("WorldFlow inference state was not initialized.")
                     canonical_action_flow = bool(
                         getattr(self.config, "worldflow_parallel_canonical_action_flow", False)
-                    )
+                    ) or getattr(
+                        self.config, "worldflow_joint_token_layout", "legacy_asymmetric"
+                    ) == "shared_state_dual_adapter"
                     if (
                         not canonical_action_flow
                         and self.config.worldflow_noise_coupling == "projected_ego_path"
@@ -5991,6 +6192,10 @@ class VLAFlowMatching(nn.Module):
             raise RuntimeError("Joint World–Ego inference modules are not initialized.")
         ego_tokens, ego_mask, ego_att_mask = self.embed_suffix(ego_x_t, timestep)
         ego_tokens = self._inject_point_action_features(ego_tokens)
+        shared_state_dual_adapter = (
+            getattr(self.config, "worldflow_joint_token_layout", "legacy_asymmetric")
+            == "shared_state_dual_adapter"
+        )
         world_action_tokens, world_action_mask = self.worldflow_branch.embed_action_tokens(
             world_scene,
             lang_tokens,
@@ -5998,12 +6203,33 @@ class VLAFlowMatching(nn.Module):
             world_x_t,
             timestep,
             carrier_pose9=world_scene.get("carrier_pose9"),
+            base_action_tokens=(ego_tokens if shared_state_dual_adapter else None),
         )
         world_tokens = {
             **world_scene,
             "action_tokens": world_action_tokens,
             "action_mask": world_action_mask,
         }
+        if shared_state_dual_adapter:
+            fused_tokens = self._fuse_shared_state_world_adapter(
+                ego_tokens,
+                ego_mask,
+                world_tokens,
+            )
+            ego_out = self._run_ego_suffix_expert(
+                None,
+                prefix_pad_masks,
+                None,
+                fused_tokens,
+                ego_mask,
+                ego_att_mask,
+                past_key_values=past_key_values,
+            )
+            ego_velocity = self.action_out_proj(ego_out)
+            # The API retains a paired return for the outer integration loop,
+            # but both values describe the one canonical action state. There
+            # is no second prediction or World output head in this topology.
+            return ego_velocity, ego_velocity
         ego_out, world_out = self._run_world_ego_joint_expert(
             None,
             prefix_pad_masks,

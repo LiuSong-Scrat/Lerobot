@@ -356,8 +356,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # paired action tokens exchange information before two applications of the
     # same Action Expert. This keeps the pretrained Ego token positions and
     # attention graph exact at bootstrap while making World information pass
-    # through the full expert before the executed Ego head. WorldFlow-disabled
-    # construction never reads this option and remains the exact legacy network.
+    # through the full expert before the executed Ego head.
+    # ``shared_state_dual_adapter`` keeps one canonical action state, one
+    # shared-expert pass, and the pretrained Ego output head. The Ego
+    # point-action adapter first conditions the action tokens; those tokens
+    # query an independent World point-action adapter over the global point
+    # cloud, and the resulting full token residual is written back before the
+    # shared Action Expert. This gives an explicit Ego->World->Ego information
+    # path without a second flow target, output vote, learned gate, or auxiliary
+    # World loss. WorldFlow-disabled construction never reads this option and
+    # remains the exact legacy network.
     worldflow_joint_token_layout: str = "legacy_asymmetric"
     # Structural alternative for ``parallel_dual_coordinate``.  The World
     # stream keeps its global point-cloud encoder and independent point-action
@@ -751,10 +759,12 @@ class SmolVLAConfig(PreTrainedConfig):
                 "legacy_asymmetric",
                 "symmetric_dual_coordinate",
                 "parallel_dual_coordinate",
+                "shared_state_dual_adapter",
             }:
                 raise ValueError(
                     "worldflow_joint_token_layout must be 'legacy_asymmetric' or "
-                    "'symmetric_dual_coordinate' or 'parallel_dual_coordinate'; "
+                    "'symmetric_dual_coordinate' or 'parallel_dual_coordinate' or "
+                    "'shared_state_dual_adapter'; "
                     f"got {self.worldflow_joint_token_layout!r}."
                 )
             if self.worldflow_parallel_canonical_action_flow:
@@ -790,6 +800,43 @@ class SmolVLAConfig(PreTrainedConfig):
                     raise ValueError(
                         "Canonical parallel World/Ego action flow is a direct co-prediction objective; "
                         "World geo/bridge/equivariance auxiliary weights must all be zero."
+                    )
+            if self.worldflow_joint_token_layout == "shared_state_dual_adapter":
+                if self.worldflow_parallel_canonical_action_flow:
+                    raise ValueError(
+                        "shared_state_dual_adapter owns one canonical action state and is mutually "
+                        "exclusive with worldflow_parallel_canonical_action_flow."
+                    )
+                if self.worldflow_action_fusion != "cross_attention":
+                    raise ValueError(
+                        "shared_state_dual_adapter uses its input-level World token residual as the "
+                        "only World-to-Ego path; worldflow_action_fusion must remain 'cross_attention'."
+                    )
+                if self.worldflow_scene_frame_origin != "global":
+                    raise ValueError(
+                        "shared_state_dual_adapter requires worldflow_scene_frame_origin='global'."
+                    )
+                if self.se3_enable:
+                    raise ValueError(
+                        "shared_state_dual_adapter preserves the pretrained canonical pose9 flow; "
+                        "se3_enable must be False."
+                    )
+                if any(
+                    value != 0
+                    for value in (
+                        self.worldflow_geo_loss_weight,
+                        self.worldflow_bridge_loss_weight,
+                        self.worldflow_equiv_loss_weight,
+                    )
+                ):
+                    raise ValueError(
+                        "shared_state_dual_adapter is trained only by the executed action loss; "
+                        "World geo/bridge/equivariance auxiliary weights must all be zero."
+                    )
+                if self.worldflow_loss_weight != 0:
+                    raise ValueError(
+                        "shared_state_dual_adapter has no duplicate World flow objective; "
+                        "worldflow_loss_weight must be zero."
                     )
             if (
                 self.worldflow_scene_frame_origin == "global"
@@ -979,7 +1026,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 )
             )
-            if self.worldflow_noise_coupling == "independent":
+            if (
+                self.worldflow_noise_coupling == "independent"
+                and self.worldflow_joint_token_layout != "shared_state_dual_adapter"
+            ):
                 detail = (
                     " Both priors are valid poses, but their random origins still describe different "
                     "physical trajectories."

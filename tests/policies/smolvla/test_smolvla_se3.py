@@ -2232,6 +2232,234 @@ def test_canonical_worldflow_configuration_rejects_mixed_coordinate_contracts():
         )
 
 
+def test_shared_state_dual_adapter_configuration_requires_single_action_objective():
+    common = {
+        "worldflow_enable": True,
+        "worldflow_joint_token_layout": "shared_state_dual_adapter",
+        "worldflow_scene_frame_origin": "global",
+        "worldflow_action_fusion": "cross_attention",
+        "worldflow_loss_weight": 0.0,
+        "worldflow_geo_loss_weight": 0.0,
+        "worldflow_bridge_loss_weight": 0.0,
+        "worldflow_equiv_loss_weight": 0.0,
+    }
+    cfg = SmolVLAConfig(**common)
+    assert cfg.worldflow_joint_token_layout == "shared_state_dual_adapter"
+    assert cfg.worldflow_parallel_canonical_action_flow is False
+    with pytest.raises(ValueError, match="worldflow_loss_weight must be zero"):
+        SmolVLAConfig(**{**common, "worldflow_loss_weight": 1.0})
+    with pytest.raises(ValueError, match="parallel_dual_coordinate"):
+        SmolVLAConfig(**{**common, "worldflow_parallel_canonical_action_flow": True})
+
+
+def test_shared_state_world_branch_is_zero_residual_then_uses_ego_query():
+    torch.manual_seed(172)
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        worldflow_enable=True,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+        worldflow_joint_token_layout="shared_state_dual_adapter",
+        worldflow_scene_frame_origin="global",
+        worldflow_action_fusion="cross_attention",
+        worldflow_loss_weight=0.0,
+        worldflow_geo_loss_weight=0.0,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    branch = _make_tiny_worldflow_branch(cfg)
+    assert branch.shared_state_dual_adapter
+    assert branch.action_dim == cfg.max_action_dim
+    scene = branch.encode_scene(torch.randn(2, 12, 6))
+    lang_tokens = torch.randint(0, 64, (2, 5))
+    lang_masks = torch.ones(2, 5, dtype=torch.bool)
+    noisy_actions = torch.randn(2, cfg.chunk_size, cfg.max_action_dim)
+    time = torch.rand(2)
+    carrier = torch.randn(2, 9)
+    ego_query_a = torch.randn(2, cfg.chunk_size, 32)
+    ego_query_b = ego_query_a.clone()
+    ego_query_b[:, 1] += 0.25
+
+    residual_a, _ = branch.embed_action_tokens(
+        scene,
+        lang_tokens,
+        lang_masks,
+        noisy_actions,
+        time,
+        carrier_pose9=carrier,
+        base_action_tokens=ego_query_a,
+    )
+    assert torch.count_nonzero(residual_a) == 0
+    with torch.no_grad():
+        branch.canonical_token_delta_out.weight.copy_(torch.eye(32))
+    learned_a, _ = branch.embed_action_tokens(
+        scene,
+        lang_tokens,
+        lang_masks,
+        noisy_actions,
+        time,
+        carrier_pose9=carrier,
+        base_action_tokens=ego_query_a,
+    )
+    learned_b, _ = branch.embed_action_tokens(
+        scene,
+        lang_tokens,
+        lang_masks,
+        noisy_actions,
+        time,
+        carrier_pose9=carrier,
+        base_action_tokens=ego_query_b,
+    )
+    assert not torch.equal(learned_a, learned_b)
+
+
+def test_shared_state_world_residual_is_exact_identity_and_causally_ablatable():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    ego = torch.randn(2, 4, 8)
+    residual = torch.randn_like(ego, requires_grad=True)
+    valid = torch.tensor(
+        [[True, True, False, False], [True, True, True, True]], dtype=torch.bool
+    )
+    residual_payload = {"action_tokens": residual, "action_mask": valid}
+
+    model.inference_ablation_modalities = frozenset()
+    fused = model._fuse_shared_state_world_adapter(ego, valid, residual_payload)
+    expected = ego + residual * valid.unsqueeze(-1)
+    assert torch.equal(fused, expected)
+    fused.square().mean().backward()
+    assert residual.grad is not None and residual.grad.abs().sum() > 0
+
+    model.inference_ablation_modalities = frozenset({"world_to_ego"})
+    ablated = model._fuse_shared_state_world_adapter(ego, valid, residual_payload)
+    assert torch.equal(ablated, ego)
+
+
+def test_shared_state_denoise_uses_one_expert_pass_and_no_world_head():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_joint_token_layout="shared_state_dual_adapter",
+        se3_enable=False,
+    )
+    model.inference_ablation_modalities = frozenset()
+    ego = torch.randn(2, 4, 8)
+    residual = torch.randn_like(ego)
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    action_att = torch.tensor([[1, 0, 0, 0]], dtype=ego.dtype).expand(2, -1)
+    model.embed_suffix = lambda *_args, **_kwargs: (ego, valid, action_att)
+    model._inject_point_action_features = lambda tokens: tokens
+    calls = {"expert": 0}
+
+    class _WorldBranch:
+        @staticmethod
+        def embed_action_tokens(*_args, **kwargs):
+            assert torch.equal(kwargs["base_action_tokens"], ego)
+            return residual, valid
+
+    def one_expert(
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        suffix_embs,
+        suffix_pad_masks,
+        suffix_att_masks,
+        *,
+        past_key_values=None,
+    ):
+        del prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_pad_masks
+        del suffix_att_masks, past_key_values
+        calls["expert"] += 1
+        return suffix_embs
+
+    model.worldflow_branch = _WorldBranch()
+    model._run_ego_suffix_expert = one_expert
+    model.action_out_proj = nn.Identity()
+    model.world_action_out_proj = None
+    actual_ego, paired_api_value = model.denoise_step_world_ego(
+        prefix_pad_masks=torch.ones(2, 3, dtype=torch.bool),
+        past_key_values=object(),
+        ego_x_t=torch.randn(2, 4, 10),
+        world_x_t=torch.randn(2, 4, 32),
+        timestep=torch.tensor([0.25, 0.75]),
+        world_scene={},
+        lang_tokens=torch.ones(2, 2, dtype=torch.long),
+        lang_masks=torch.ones(2, 2, dtype=torch.bool),
+    )
+    assert calls["expert"] == 1
+    assert torch.equal(actual_ego, ego + residual)
+    assert torch.equal(paired_api_value, actual_ego)
+
+    model.inference_ablation_modalities = frozenset({"world_to_ego"})
+    ablated_ego, _ = model.denoise_step_world_ego(
+        prefix_pad_masks=torch.ones(2, 3, dtype=torch.bool),
+        past_key_values=object(),
+        ego_x_t=torch.randn(2, 4, 10),
+        world_x_t=torch.randn(2, 4, 32),
+        timestep=torch.tensor([0.25, 0.75]),
+        world_scene={},
+        lang_tokens=torch.ones(2, 2, dtype=torch.long),
+        lang_masks=torch.ones(2, 2, dtype=torch.bool),
+    )
+    assert calls["expert"] == 2
+    assert torch.equal(ablated_ego, ego)
+
+
+def test_shared_state_training_state_does_not_construct_a_second_flow_target():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_joint_token_layout="shared_state_dual_adapter",
+        chunk_size=4,
+    )
+    point_cloud_world = torch.randn(2, 12, 6)
+    point_is_pad = torch.zeros(2, 12, dtype=torch.bool)
+    current_pose = torch.randn(2, 9)
+    model._prepare_worldflow_foreground = lambda _pose: (
+        point_cloud_world,
+        point_is_pad,
+        current_pose,
+    )
+    captured = {}
+
+    class _WorldBranch:
+        def __call__(self, point_cloud, *_args, **kwargs):
+            captured["point_cloud"] = point_cloud
+            captured["base_action_tokens"] = kwargs["base_action_tokens"]
+            return {
+                "action_tokens": torch.zeros_like(kwargs["base_action_tokens"]),
+                "action_mask": ~kwargs["actions_is_pad"],
+            }
+
+    model.worldflow_branch = _WorldBranch()
+    ego_x_t = torch.randn(2, 4, 32)
+    ego_u_t = torch.randn_like(ego_x_t)
+    base_tokens = torch.randn(2, 4, 8)
+    state = model._prepare_worldflow_training_state(
+        {
+            "current_ee_pose": current_pose,
+            "step_is_pad": torch.zeros(2, 4, dtype=torch.bool),
+            # Deliberately no future ``ee_poses``: this topology has no second
+            # World action state or target.
+        },
+        torch.ones(2, 3, dtype=torch.long),
+        torch.ones(2, 3, dtype=torch.bool),
+        torch.tensor([0.25, 0.75]),
+        None,
+        ego_noise=torch.randn_like(ego_x_t),
+        ego_x_t=ego_x_t,
+        ego_u_t=ego_u_t,
+        base_action_tokens=base_tokens,
+    )
+    assert state["shared_state_dual_adapter"] is True
+    assert torch.equal(state["x_t"], ego_x_t)
+    assert torch.equal(state["u_t"], ego_u_t)
+    assert "spatial_gt" not in state
+    assert "noise_spatial" not in state
+    assert torch.equal(captured["base_action_tokens"], base_tokens)
+
+
 def test_canonical_worldflow_loss_uses_same_weighted_action_target_and_backpropagates():
     cfg = SmolVLAConfig(
         chunk_size=3,
