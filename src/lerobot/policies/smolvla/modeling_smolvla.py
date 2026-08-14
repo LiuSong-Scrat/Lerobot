@@ -397,6 +397,54 @@ def pose9_velocity_to_spatial_twist(current_pose9: Tensor, pose9_velocity: Tenso
     return torch.cat([linear, omega], dim=-1)
 
 
+def body_twist_to_pose9_velocity(current_pose9: Tensor, body_twist: Tensor) -> Tensor:
+    """Lift a right-trivialized SE(3) tangent into the legacy pose9 gauge.
+
+    For a body twist ``xi = [v, omega]``, the physical tangent is
+    ``T_dot = T hat(xi)``.  Hence ``p_dot = R v`` and
+    ``R_dot = R hat(omega)``.  The pretrained action chart does not store an
+    orthonormal rotation directly: its two raw 3-vectors may contain scale and
+    shear that are removed by the rot6d projection.  Preserve those gauge
+    coefficients while lifting ``R_dot`` so adding a zero twist is exactly the
+    original Euclidean vector field and a nonzero twist changes only the
+    represented physical tangent.
+    """
+
+    if current_pose9.shape[:-1] != body_twist.shape[:-1]:
+        raise ValueError(
+            "pose9 state and body twist must have matching leading dimensions; "
+            f"got {current_pose9.shape} and {body_twist.shape}."
+        )
+    if current_pose9.shape[-1] < 9 or body_twist.shape[-1] != 6:
+        raise ValueError(
+            "body-twist lifting requires pose9 state dim >=9 and twist dim 6; "
+            f"got {current_pose9.shape[-1]} and {body_twist.shape[-1]}."
+        )
+
+    current = current_pose9[..., :9].to(dtype=torch.float32)
+    twist = body_twist.to(device=current.device, dtype=torch.float32)
+    transform = pose9_to_matrix(current)
+    rotation = transform[..., :3, :3]
+
+    linear_body = twist[..., :3]
+    angular_body = twist[..., 3:6]
+    position_dot = (rotation @ linear_body.unsqueeze(-1)).squeeze(-1)
+    rotation_dot = rotation @ _skew(angular_body)
+    basis_1_dot = rotation_dot[..., :, 0]
+    basis_2_dot = rotation_dot[..., :, 1]
+
+    raw_1 = current[..., 3:6]
+    raw_2 = current[..., 6:9]
+    basis_1 = rotation[..., :, 0]
+    basis_2 = rotation[..., :, 1]
+    scale_1 = (raw_1 * basis_1).sum(dim=-1, keepdim=True)
+    shear_12 = (raw_2 * basis_1).sum(dim=-1, keepdim=True)
+    scale_2 = (raw_2 * basis_2).sum(dim=-1, keepdim=True)
+    raw_1_dot = scale_1 * basis_1_dot
+    raw_2_dot = shear_12 * basis_1_dot + scale_2 * basis_2_dot
+    return torch.cat([position_dot, raw_1_dot, raw_2_dot], dim=-1)
+
+
 def pose9_endpoint_velocity_to_spatial_twist(
     current_pose9: Tensor,
     pose9_velocity: Tensor,
@@ -3413,9 +3461,12 @@ class VLAFlowMatching(nn.Module):
         endpoint. The optional carrier-frame parameterization applies the same
         six output values before conjugation. The optional body-frame
         parameterization right-multiplies the predicted Ego endpoint, so the
-        correction follows the endpoint's own axes. Both alternatives are
-        invariant to an arbitrary reparameterization of World coordinates.
-        The same corrected physical endpoint supervises both descriptions.
+        correction follows the endpoint's own axes. The optional body-velocity
+        parameterization instead lifts a right-trivialized tangent at the
+        current Ego Flow state directly into the pretrained pose9 vector
+        field. All alternatives are invariant to an arbitrary
+        reparameterization of World coordinates. The same corrected physical
+        motion supervises both descriptions.
         """
 
         if self.world_twist_residual_out_proj is None:
@@ -3465,13 +3516,21 @@ class VLAFlowMatching(nn.Module):
             ego_to_world_transform @ ego_endpoint @ world_to_ego_transform
         )
         residual = self.world_twist_residual_out_proj(world_features)
-        if bool(
+        residual_is_body_velocity = bool(
+            getattr(
+                getattr(self, "config", None),
+                "worldflow_body_velocity_residual_parameterization",
+                False,
+            )
+        )
+        residual_has_endpoint_rate_boundary = bool(
             getattr(
                 getattr(self, "config", None),
                 "worldflow_endpoint_residual_rate_parameterization",
                 False,
             )
-        ):
+        )
+        if residual_has_endpoint_rate_boundary:
             # A bounded flow-velocity error induces an endpoint error that
             # contracts with the remaining integration horizon. Encode that
             # terminal boundary analytically instead of asking the World
@@ -3492,9 +3551,76 @@ class VLAFlowMatching(nn.Module):
                 False,
             )
         )
+        if residual_is_body_velocity and (
+            residual_has_endpoint_rate_boundary
+            or residual_in_ego_frame
+            or residual_in_body_frame
+        ):
+            raise ValueError(
+                "Body-velocity residuals are mutually exclusive with finite endpoint-residual "
+                "rate and frame parameterizations."
+            )
         if residual_in_ego_frame and residual_in_body_frame:
             raise ValueError(
                 "Carrier-frame and body-frame endpoint residual parameterizations are mutually exclusive."
+            )
+        if residual_is_body_velocity:
+            # The World head predicts a right-trivialized velocity at the
+            # *current* Ego Flow state.  Lift that physical tangent into the
+            # same raw pose9 gauge as the pretrained Euclidean vector field;
+            # no finite endpoint or 1/(1-t) reconstruction is involved.
+            pose9_delta = body_twist_to_pose9_velocity(
+                ego_x_t[..., :9],
+                residual,
+            ).to(dtype=ego_velocity_anchor.dtype)
+            corrected_ego_velocity = torch.cat(
+                [
+                    ego_velocity_anchor[..., :9] + pose9_delta,
+                    ego_velocity_anchor[..., 9:],
+                ],
+                dim=-1,
+            )
+            corrected_ego_endpoint = pose9_to_matrix(
+                ego_x_t[..., :9].to(dtype=torch.float32)
+                + remaining * corrected_ego_velocity[..., :9].to(dtype=torch.float32)
+            )
+            corrected_world_endpoint = (
+                ego_to_world_transform @ corrected_ego_endpoint @ world_to_ego_transform
+            )
+            if detach_ego_for_world_supervision:
+                supervised_ego_velocity = torch.cat(
+                    [
+                        ego_velocity[..., :9].detach().to(dtype=pose9_delta.dtype)
+                        + pose9_delta,
+                        ego_velocity[..., 9:].detach().to(dtype=pose9_delta.dtype),
+                    ],
+                    dim=-1,
+                )
+                supervised_ego_endpoint = pose9_to_matrix(
+                    ego_x_t[..., :9].to(dtype=torch.float32)
+                    + remaining * supervised_ego_velocity[..., :9].to(dtype=torch.float32)
+                )
+                corrected_world_endpoint = (
+                    ego_to_world_transform
+                    @ supervised_ego_endpoint
+                    @ world_to_ego_transform
+                )
+            corrected_world_pose9 = matrix_to_pose9(corrected_world_endpoint)
+            world_velocity = (
+                corrected_world_pose9 - world_x_t.to(dtype=torch.float32)
+            ) / remaining
+            if not apply_world_to_ego:
+                return ego_velocity, world_velocity.to(dtype=ego_velocity.dtype), residual
+            if keep is not None:
+                corrected_ego_velocity = torch.where(
+                    keep[:, None, None],
+                    corrected_ego_velocity,
+                    ego_velocity,
+                )
+            return (
+                corrected_ego_velocity,
+                world_velocity.to(dtype=ego_velocity.dtype),
+                residual,
             )
         if residual_in_body_frame:
             corrected_ego_endpoint = ego_endpoint @ se3_exp(residual.to(dtype=torch.float32))

@@ -18,6 +18,7 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     SmolVLAPolicy,
     VLAFlowMatching,
     WorldFlowActionBranch,
+    body_twist_to_pose9_velocity,
     make_att_2d_masks,
     matrix_to_pose9,
     pose9_endpoint_velocity_to_spatial_twist,
@@ -606,6 +607,277 @@ def test_endpoint_residual_body_frame_parameterization_contract():
             worldflow_endpoint_residual_ego_frame_parameterization=True,
             worldflow_endpoint_residual_body_frame_parameterization=True,
         )
+
+
+def test_body_twist_pose9_velocity_is_the_right_trivialized_tangent():
+    torch.manual_seed(11431)
+    batch, steps = 3, 5
+    transform = se3_exp(torch.randn(batch, steps, 6) * 0.15)
+    canonical = matrix_to_pose9(transform)
+    basis_1 = canonical[..., 3:6]
+    basis_2 = canonical[..., 6:9]
+    scale_1 = torch.rand(batch, steps, 1) + 0.7
+    scale_2 = torch.rand(batch, steps, 1) + 0.7
+    shear = torch.randn(batch, steps, 1) * 0.25
+    raw_pose9 = torch.cat(
+        [
+            canonical[..., :3],
+            scale_1 * basis_1,
+            shear * basis_1 + scale_2 * basis_2,
+        ],
+        dim=-1,
+    )
+    body_twist = torch.randn(batch, steps, 6) * 0.08
+    velocity = body_twist_to_pose9_velocity(raw_pose9, body_twist)
+
+    epsilon = 1e-4
+    actual = pose9_to_matrix(raw_pose9 + epsilon * velocity)
+    expected = pose9_to_matrix(raw_pose9) @ se3_exp(epsilon * body_twist)
+    assert torch.allclose(actual, expected, atol=3e-5, rtol=3e-5)
+
+
+def test_body_velocity_residual_is_exact_zero_safe_and_world_equivariant():
+    torch.manual_seed(11432)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_body_velocity_residual_parameterization=True,
+        worldflow_endpoint_residual_rate_parameterization=False,
+        worldflow_endpoint_residual_ego_frame_parameterization=False,
+        worldflow_endpoint_residual_body_frame_parameterization=False,
+    )
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+    nn.init.zeros_(model.world_twist_residual_out_proj.weight)
+    nn.init.zeros_(model.world_twist_residual_out_proj.bias)
+
+    batch, steps = 2, 4
+    time = torch.tensor([0.2, 0.65])
+    remaining = (1.0 - time)[:, None, None]
+    ego_state = se3_exp(torch.randn(batch, steps, 6) * 0.1)
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state), torch.randn(batch, steps, 1)],
+        dim=-1,
+    )
+    ego_velocity = torch.randn(batch, steps, 10, requires_grad=True)
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.1)
+    carrier_inv = torch.linalg.inv(carrier)
+    coordinate_change = se3_exp(torch.randn(batch, 1, 6) * 0.12)
+    changed_carrier = coordinate_change @ carrier
+    changed_carrier_inv = torch.linalg.inv(changed_carrier)
+    world_x_t = matrix_to_pose9(carrier @ ego_state @ carrier_inv)
+    changed_world_x_t = matrix_to_pose9(
+        changed_carrier @ ego_state @ changed_carrier_inv
+    )
+    world_features = torch.randn(batch, steps, 8, requires_grad=True)
+
+    zero_corrected, _, zero_residual = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier_inv,
+    )
+    assert torch.equal(zero_corrected, ego_velocity)
+    assert torch.count_nonzero(zero_residual) == 0
+
+    with torch.no_grad():
+        nn.init.normal_(model.world_twist_residual_out_proj.weight, std=0.01)
+        model.world_twist_residual_out_proj.bias.copy_(
+            torch.tensor([0.012, -0.008, 0.004, 0.03, -0.02, 0.01])
+        )
+    corrected, world_velocity, residual = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier_inv,
+    )
+    changed_corrected, changed_world_velocity, changed_residual = (
+        model._compose_endpoint_residual_boosting(
+            ego_x_t,
+            ego_velocity,
+            changed_world_x_t,
+            world_features,
+            time,
+            changed_carrier,
+            changed_carrier_inv,
+        )
+    )
+    expected_delta = body_twist_to_pose9_velocity(ego_x_t[..., :9], residual)
+    assert torch.allclose(
+        corrected[..., :9],
+        ego_velocity[..., :9] + expected_delta,
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    assert torch.equal(corrected[..., 9:], ego_velocity[..., 9:])
+    assert torch.allclose(changed_residual, residual, atol=1e-7, rtol=1e-7)
+    assert torch.allclose(changed_corrected, corrected, atol=3e-6, rtol=3e-6)
+
+    corrected_world_endpoint = pose9_to_matrix(
+        world_x_t + remaining * world_velocity
+    )
+    changed_world_endpoint = pose9_to_matrix(
+        changed_world_x_t + remaining * changed_world_velocity
+    )
+    assert torch.allclose(
+        changed_world_endpoint,
+        coordinate_change
+        @ corrected_world_endpoint
+        @ torch.linalg.inv(coordinate_change),
+        atol=8e-5,
+        rtol=8e-5,
+    )
+    assert torch.allclose(
+        corrected_world_endpoint,
+        carrier
+        @ pose9_to_matrix(ego_x_t[..., :9] + remaining * corrected[..., :9])
+        @ carrier_inv,
+        atol=8e-5,
+        rtol=8e-5,
+    )
+
+    corrected.square().mean().backward()
+    assert ego_velocity.grad is not None and ego_velocity.grad.abs().sum() > 0
+    assert world_features.grad is not None and world_features.grad.abs().sum() > 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+
+def test_body_velocity_residual_keep_mask_and_anchor_gradient_routing():
+    torch.manual_seed(11433)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_body_velocity_residual_parameterization=True,
+        worldflow_endpoint_residual_rate_parameterization=False,
+        worldflow_endpoint_residual_ego_frame_parameterization=False,
+        worldflow_endpoint_residual_body_frame_parameterization=False,
+    )
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+
+    batch, steps = 4, 3
+    ego_state = se3_exp(torch.randn(batch, steps, 6) * 0.1)
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state), torch.randn(batch, steps, 1)],
+        dim=-1,
+    )
+    ego_velocity = torch.randn(batch, steps, 10, requires_grad=True)
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.1)
+    carrier_inv = torch.linalg.inv(carrier)
+    world_x_t = matrix_to_pose9(carrier @ ego_state @ carrier_inv)
+    world_features = torch.randn(batch, steps, 8, requires_grad=True)
+    time = torch.tensor([0.1, 0.3, 0.5, 0.7])
+    keep = torch.tensor([True, False, True, False])
+
+    ordinary, _, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier_inv,
+        world_to_ego_keep_mask=keep,
+    )
+    isolated, _, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        time,
+        carrier,
+        carrier_inv,
+        world_to_ego_keep_mask=keep,
+        detach_retained_ego_anchor=True,
+    )
+    assert torch.equal(isolated, ordinary)
+    assert torch.equal(isolated[~keep], ego_velocity[~keep])
+
+    isolated.square().sum().backward()
+    assert torch.count_nonzero(ego_velocity.grad[keep]) == 0
+    assert ego_velocity.grad[~keep].abs().sum() > 0
+    assert world_features.grad[keep].abs().sum() > 0
+    assert torch.count_nonzero(world_features.grad[~keep]) == 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+
+def test_body_velocity_residual_ablation_preserves_ego_but_trains_world():
+    torch.manual_seed(11434)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_body_velocity_residual_parameterization=True,
+        worldflow_endpoint_residual_rate_parameterization=False,
+        worldflow_endpoint_residual_ego_frame_parameterization=False,
+        worldflow_endpoint_residual_body_frame_parameterization=False,
+    )
+    model.world_twist_residual_out_proj = nn.Linear(8, 6)
+
+    batch, steps = 2, 3
+    ego_state = se3_exp(torch.randn(batch, steps, 6) * 0.1)
+    ego_x_t = torch.cat(
+        [matrix_to_pose9(ego_state), torch.randn(batch, steps, 1)],
+        dim=-1,
+    )
+    ego_velocity = torch.randn(batch, steps, 10, requires_grad=True)
+    carrier = se3_exp(torch.randn(batch, 1, 6) * 0.1)
+    carrier_inv = torch.linalg.inv(carrier)
+    world_x_t = matrix_to_pose9(carrier @ ego_state @ carrier_inv)
+    world_features = torch.randn(batch, steps, 8, requires_grad=True)
+
+    ego_after, world_velocity, _ = model._compose_endpoint_residual_boosting(
+        ego_x_t,
+        ego_velocity,
+        world_x_t,
+        world_features,
+        torch.tensor([0.25, 0.6]),
+        carrier,
+        carrier_inv,
+        apply_world_to_ego=False,
+        detach_ego_for_world_supervision=True,
+    )
+    assert torch.equal(ego_after, ego_velocity)
+    assert world_velocity.shape == world_x_t.shape
+
+    world_velocity.square().mean().backward()
+    assert ego_velocity.grad is None or torch.count_nonzero(ego_velocity.grad) == 0
+    assert world_features.grad is not None and world_features.grad.abs().sum() > 0
+    assert model.world_twist_residual_out_proj.weight.grad.abs().sum() > 0
+
+
+def test_body_velocity_residual_parameterization_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_noise_coupling="projected_ego_path",
+        worldflow_action_fusion="endpoint_residual_boosting",
+        worldflow_body_velocity_residual_parameterization=True,
+    )
+    assert cfg.worldflow_body_velocity_residual_parameterization is True
+
+    with pytest.raises(ValueError, match="requires worldflow_enable=True"):
+        SmolVLAConfig(worldflow_body_velocity_residual_parameterization=True)
+    with pytest.raises(ValueError, match="requires worldflow_action_fusion"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_body_velocity_residual_parameterization=True,
+        )
+    for incompatible in (
+        "worldflow_endpoint_residual_rate_parameterization",
+        "worldflow_endpoint_residual_ego_frame_parameterization",
+        "worldflow_endpoint_residual_body_frame_parameterization",
+    ):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SmolVLAConfig(
+                worldflow_enable=True,
+                worldflow_noise_coupling="projected_ego_path",
+                worldflow_action_fusion="endpoint_residual_boosting",
+                worldflow_body_velocity_residual_parameterization=True,
+                **{incompatible: True},
+            )
 
 
 def test_pose9_endpoint_residual_ablation_preserves_ego_but_trains_world():
