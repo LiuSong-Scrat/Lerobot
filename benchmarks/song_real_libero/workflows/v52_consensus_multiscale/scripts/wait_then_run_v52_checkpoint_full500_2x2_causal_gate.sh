@@ -143,6 +143,11 @@ stop_arm() {
 }
 
 base_output="$root/singleview_worldflow/libero10_500ep/eval_4gpu_50ep/libero10_worldflow_endpoint_residual_${label}_step${step6}_all10tasks50ep_4x4090_total30_b30_codefbfacd7_fixedbarrierv18"
+cache_root="$root/joint_multiview_worldflow/libero10_500ep/inference_cache/4gpu_total30_b30"
+dual_cache="$cache_root/v52childenvfix_step${step6}_full500_dual_world"
+primary_cache="$cache_root/v52childenvfix_step${step6}_full500_primary_world"
+dual_ablated_cache="$cache_root/v52childenvfix_step${step6}_full500_dual_worldablated"
+primary_ablated_cache="$cache_root/v52childenvfix_step${step6}_full500_primary_worldablated"
 dual_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks50ep_codefbfacd7_fixedbarrierv18_full500_dual_world.json"
 primary_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks50ep_codefbfacd7_fixedbarrierv18_primaryonly_full500_primary_world.json"
 dual_ablated_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks50ep_codefbfacd7_fixedbarrierv18_worldtoegoablated_full500_dual_worldablated.json"
@@ -250,11 +255,38 @@ fi
 primary_ablated_successes=$(jq -r '.success_count' "$primary_ablated_artifact")
 
 "$python" - "$gate" "$screen" "$dual_artifact" "$primary_artifact" "$dual_ablated_artifact" "$primary_ablated_artifact" \
-  "$dual_successes" "$primary_successes" "$dual_ablated_successes" "$primary_ablated_successes" "$baseline_successes" "$v32_worldflow_successes" "$step" <<'PY'
+  "$dual_successes" "$primary_successes" "$dual_ablated_successes" "$primary_ablated_successes" "$baseline_successes" "$v32_worldflow_successes" "$step" \
+  "$dual_cache" "$primary_cache" "$dual_ablated_cache" "$primary_ablated_cache" <<'PY'
 import json,pathlib,sys
 out,screen,dual,primary,dual_a,primary_a=map(pathlib.Path,sys.argv[1:7])
 d,p,da,pa,b,v=map(int,sys.argv[7:13])
 step=int(sys.argv[13])
+artifact_paths=(dual,primary,dual_a,primary_a)
+cache_paths=tuple(map(pathlib.Path,sys.argv[14:18]))
+runtime_contexts=(
+    {"world_to_ego_causal_ablation":False,"secondary_view_causal_ablation":False,
+     "pointcloud_camera_names":["agentview","robot0_eye_in_hand"],"image_camera_names":["agentview"]},
+    {"world_to_ego_causal_ablation":False,"secondary_view_causal_ablation":False,
+     "pointcloud_camera_names":["agentview"],"image_camera_names":["agentview"]},
+    {"world_to_ego_causal_ablation":True,"secondary_view_causal_ablation":False,
+     "pointcloud_camera_names":["agentview","robot0_eye_in_hand"],"image_camera_names":["agentview"]},
+    {"world_to_ego_causal_ablation":True,"secondary_view_causal_ablation":False,
+     "pointcloud_camera_names":["agentview"],"image_camera_names":["agentview"]},
+)
+manifests=[]
+for artifact_path,cache_path,expected_context in zip(artifact_paths,cache_paths,runtime_contexts,strict=True):
+    artifact=json.load(artifact_path.open(encoding="utf-8"))
+    assert artifact["episode_count"]==500
+    assert artifact["inference_batching_mode"]=="fixed_barrier"
+    assert artifact["policy_noise_seed"]==0
+    assert artifact["inference_cache_mode"]=="read_write"
+    assert pathlib.Path(artifact["inference_cache_dir"]).resolve()==cache_path.resolve()
+    manifest=json.load((cache_path/"manifest.json").open(encoding="utf-8"))
+    assert manifest["schema_version"]=="fixed_batch_exact_action_chunk_v2"
+    assert manifest["runtime_context"]==expected_context
+    manifests.append(manifest)
+common_identities=[{key:value for key,value in manifest.items() if key!="runtime_context"} for manifest in manifests]
+assert all(identity==common_identities[0] for identity in common_identities[1:])
 passed=d>b and d>=v and d>p and d>da
 x={
  "status":"passed" if passed else "failed_joint_gate",
@@ -274,8 +306,13 @@ x={
  "multiview_delta_with_world_ablated":da-pa,
  "causal_interaction_successes":d-p-da+pa,
  "same_checkpoint":True,
+ "same_episodes":True,
  "same_fixed_barrier_protocol":True,
  "same_policy_noise_seed":True,
+ "same_canonical_exact_action_cache_protocol_and_root":True,
+ "fixed_action_cache_schema":"fixed_batch_exact_action_chunk_v2",
+ "fixed_action_cache_namespaces":{name:str(path) for name,path in zip(
+     ("dual_world","primary_world","dual_world_ablated","primary_world_ablated"),cache_paths,strict=True)},
  "passes_absolute_baseline_gate":d>b,
  "passes_v32_nondegradation_gate":d>=v,
  "passes_multiview_causal_gate":d>p,
