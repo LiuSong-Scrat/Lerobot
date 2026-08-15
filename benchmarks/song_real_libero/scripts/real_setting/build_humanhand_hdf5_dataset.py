@@ -14,7 +14,8 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.signal import butter, sosfiltfilt
+from scipy.spatial.transform import Rotation as R, Slerp
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import REAL_DATA_ROOT
@@ -32,7 +33,8 @@ else:
 
 
 HANDPOSE_ROOT = Path("/home/liusong/ProgramFiles/HandPoseExtraction")
-REQUIRED_HANDPOSE_PIPELINE_VERSION = "wilor_mano_mesh_rgbd_chamfer_v5"
+RAW_RIGID_HANDPOSE_PIPELINE_VERSION = "wilor_mano_mesh_rgbd_rigid_icp_v6"
+REQUIRED_HANDPOSE_PIPELINE_VERSION = "wilor_mano_mesh_rgbd_rigid_icp_temporal_v7"
 DEFAULT_POINTS_NUM = 640 * 480
 _VIDEO_CAPTURE_CACHE = {}
 _SEGMENT_WORKER_CONTEXT = None
@@ -217,6 +219,81 @@ def main() -> None:
     parser.add_argument("--hand-max-depth-m", type=float, default=3.0)
     parser.add_argument("--hand-min-valid-depth-points", type=int, default=6)
     parser.add_argument(
+        "--hand-depth-knn-backend",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="Nearest-neighbor backend for MANO/RGB-D alignment.",
+    )
+    parser.add_argument(
+        "--hand-depth-rigid-refinement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Refine the complete WiLoR MANO hand with one conservative RGB-D SE(3) "
+            "correction before the unchanged virtual-gripper fitting stage."
+        ),
+    )
+    parser.add_argument(
+        "--hand-rigid-temporal-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Interpolate short rejected RGB-D rigid-pose gaps and smooth only the "
+            "global MANO correction before the unchanged gripper fitting output."
+        ),
+    )
+    parser.add_argument("--hand-rigid-temporal-filter-window", type=int, default=21)
+    parser.add_argument("--hand-rigid-temporal-filter-order", type=int, default=2)
+    parser.add_argument("--hand-rigid-temporal-max-gap", type=int, default=10)
+    parser.add_argument(
+        "--ego-trajectory-filter",
+        choices=("none", "se3_lowpass"),
+        default="none",
+        help=(
+            "Optional per-episode offline filter applied after camera-motion compensation. "
+            "se3_lowpass uses a zero-phase Butterworth filter for translation and quaternion "
+            "orientation, so it suppresses high-frequency hand-pose noise without causal lag."
+        ),
+    )
+    parser.add_argument(
+        "--ego-trajectory-filter-cutoff-hz",
+        type=float,
+        default=4.0,
+        help="Low-pass cutoff for filtered gripper translation/orientation (default: 4 Hz).",
+    )
+    parser.add_argument(
+        "--ego-trajectory-filter-order",
+        type=int,
+        default=3,
+        help="Butterworth order used by --ego-trajectory-filter=se3_lowpass (default: 3).",
+    )
+    parser.add_argument(
+        "--ego-trajectory-max-angular-speed-deg-s",
+        type=float,
+        default=900.0,
+        help=(
+            "Treat a larger frame-to-frame angular speed as an orientation-frame reset and "
+            "carry a constant correction into following frames before low-pass filtering. "
+            "900 deg/s is above normal demonstration motion but catches WiLoR anatomical-axis "
+            "flips; set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--ego-trajectory-parallel-jaw-symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Before smoothing, choose the temporally continuous representative of the parallel-jaw "
+            "gripper's 180-degree rotation symmetry around its local approach axis."
+        ),
+    )
+    parser.add_argument(
+        "--ego-trajectory-filter-preserve-endpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply a smooth correction so the filtered episode retains its original start/end poses.",
+    )
+    parser.add_argument(
         "--allow-legacy-handpose-jsonl",
         action="store_true",
         help=(
@@ -309,6 +386,21 @@ def main() -> None:
         raise ValueError("Require 0 <= --hand-min-depth-m < --hand-max-depth-m.")
     if args.hand_min_valid_depth_points < 1:
         raise ValueError("--hand-min-valid-depth-points must be >= 1.")
+    if (
+        args.hand_rigid_temporal_filter_window < 3
+        or args.hand_rigid_temporal_filter_window % 2 == 0
+    ):
+        raise ValueError("--hand-rigid-temporal-filter-window must be an odd integer >= 3.")
+    if args.hand_rigid_temporal_filter_order < 1:
+        raise ValueError("--hand-rigid-temporal-filter-order must be >= 1.")
+    if args.hand_rigid_temporal_max_gap < 0:
+        raise ValueError("--hand-rigid-temporal-max-gap must be >= 0.")
+    if args.ego_trajectory_filter_cutoff_hz <= 0.0:
+        raise ValueError("--ego-trajectory-filter-cutoff-hz must be positive.")
+    if args.ego_trajectory_filter_order < 1:
+        raise ValueError("--ego-trajectory-filter-order must be >= 1.")
+    if args.ego_trajectory_max_angular_speed_deg_s < 0.0:
+        raise ValueError("--ego-trajectory-max-angular-speed-deg-s must be non-negative.")
     if args.camera_reference_mode == "canonical" and args.canonical_camera_to_tracking_matrix is None:
         raise ValueError("--camera-reference-mode=canonical requires --canonical-camera-to-tracking-matrix.")
     if args.transform_to_world:
@@ -346,6 +438,11 @@ def main() -> None:
     validate_handpose_pipeline_versions(
         payloads,
         allow_legacy=bool(args.allow_legacy_handpose_jsonl),
+        required_version=(
+            REQUIRED_HANDPOSE_PIPELINE_VERSION
+            if args.hand_rigid_temporal_filter
+            else RAW_RIGID_HANDPOSE_PIPELINE_VERSION
+        ),
     )
     samples = align_samples(frame_records, payloads)
     if not samples:
@@ -421,6 +518,24 @@ def run_offline_wilor(args: argparse.Namespace, input_dir: Path, jsonl_path: Pat
         str(args.hand_max_depth_m),
         "--min-valid-depth-points",
         str(args.hand_min_valid_depth_points),
+        "--depth-knn-backend",
+        str(args.hand_depth_knn_backend),
+        (
+            "--depth-rigid-refinement"
+            if args.hand_depth_rigid_refinement
+            else "--no-depth-rigid-refinement"
+        ),
+        (
+            "--rigid-temporal-filter"
+            if args.hand_rigid_temporal_filter
+            else "--no-rigid-temporal-filter"
+        ),
+        "--rigid-temporal-filter-window",
+        str(args.hand_rigid_temporal_filter_window),
+        "--rigid-temporal-filter-order",
+        str(args.hand_rigid_temporal_filter_order),
+        "--rigid-temporal-max-gap",
+        str(args.hand_rigid_temporal_max_gap),
     ]
     if args.show_inference:
         cmd.append("--show")
@@ -639,6 +754,7 @@ def validate_handpose_pipeline_versions(
     payloads: list[dict],
     *,
     allow_legacy: bool,
+    required_version: str = REQUIRED_HANDPOSE_PIPELINE_VERSION,
 ) -> None:
     versions = sorted(
         {
@@ -646,11 +762,11 @@ def validate_handpose_pipeline_versions(
             for payload in payloads
         }
     )
-    if versions == [REQUIRED_HANDPOSE_PIPELINE_VERSION]:
+    if versions == [str(required_version)]:
         return
     message = (
         "Hand-pose JSONL was generated by an incompatible fusion pipeline: "
-        f"found={versions}, required={REQUIRED_HANDPOSE_PIPELINE_VERSION!r}. "
+        f"found={versions}, required={str(required_version)!r}. "
         "Regenerate it with --run-inference so hand keypoints and scene points use the same "
         "calibrated camera rays."
     )
@@ -1189,10 +1305,43 @@ def save_segment_hdf5(
             f"missing local indices {missing_rendered_images[:20]}"
         )
     stored_images = [image for image in images if image is not None]
-    pose_eular, gripper_quat_xyzw = canonicalize_gripper_pose_sequence(
-        pose_eular,
-        gripper_quat_xyzw,
-    )
+    trajectory_filter_metrics: dict[str, float | int | bool | str] = {
+        "method": "none",
+    }
+    if args.ego_trajectory_filter == "se3_lowpass":
+        pose_eular, gripper_quat_xyzw, trajectory_filter_metrics = filter_gripper_pose_sequence(
+            pose_eular,
+            gripper_quat_xyzw,
+            timestamps_ms,
+            cutoff_hz=float(args.ego_trajectory_filter_cutoff_hz),
+            order=int(args.ego_trajectory_filter_order),
+            max_angular_speed_deg_s=float(
+                args.ego_trajectory_max_angular_speed_deg_s
+            ),
+            parallel_jaw_symmetry=bool(args.ego_trajectory_parallel_jaw_symmetry),
+            preserve_endpoints=bool(args.ego_trajectory_filter_preserve_endpoints),
+        )
+        print(
+            "[ego-trajectory-filter] "
+            f"segment={segment.start}:{segment.end} "
+            f"cutoff={trajectory_filter_metrics['cutoff_hz']:.2f}Hz "
+            f"translation_residual_rms="
+            f"{trajectory_filter_metrics['translation_residual_rms_mm']:.2f}mm "
+            f"rotation_residual_rms="
+            f"{trajectory_filter_metrics['rotation_residual_rms_deg']:.2f}deg "
+            f"symmetry_switches="
+            f"{trajectory_filter_metrics['parallel_jaw_state_switch_count']} "
+            f"frame_resets="
+            f"{trajectory_filter_metrics['orientation_frame_reset_count']} "
+            f"timestamp_repairs="
+            f"{trajectory_filter_metrics['timestamp_repair_count']}",
+            flush=True,
+        )
+    else:
+        pose_eular, gripper_quat_xyzw = canonicalize_gripper_pose_sequence(
+            pose_eular,
+            gripper_quat_xyzw,
+        )
     if progress_enabled:
         sys.stderr.write("\n")
         sys.stderr.flush()
@@ -1271,8 +1420,18 @@ def save_segment_hdf5(
                 episode_first_intrinsics.coeffs,
                 dtype=np.float64,
             )
-        root.attrs["handpose_pipeline_version"] = REQUIRED_HANDPOSE_PIPELINE_VERSION
+        root.attrs["handpose_pipeline_version"] = str(
+            samples[0][1].get("handpose_pipeline_version", "missing")
+        )
         root.attrs["gripper_rotation_representation"] = "quaternion_xyzw+continuous_euler_zyx"
+        root.attrs["ego_trajectory_filter"] = str(args.ego_trajectory_filter)
+        root.attrs["ego_trajectory_filter_metrics_json"] = json.dumps(
+            trajectory_filter_metrics,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        root.attrs["ego_trajectory_filter_clouds_modified"] = False
+        root.attrs["ego_trajectory_filter_keypoints_modified"] = False
         root.attrs["camera_names"] = json.dumps(camera_names, ensure_ascii=False)
         root.attrs["camera_datasets_hardlinked"] = len(camera_names) > 1
         root.attrs["camera_tracking_pose_available"] = bool(has_camera_poses)
@@ -1344,11 +1503,13 @@ def save_segment_hdf5(
         obs.create_dataset("qpos", data=np.asarray(qpos, dtype=np.float64))
         pose_dataset = obs.create_dataset("pose_eular", data=np.asarray(pose_eular, dtype=np.float64))
         pose_dataset.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
+        pose_dataset.attrs["trajectory_filter"] = str(args.ego_trajectory_filter)
         obs.create_dataset("eff_angular", data=np.asarray(eff_angular, dtype=np.float64))
         quat_dataset = obs.create_dataset(
             "gripper_quat_xyzw", data=np.asarray(gripper_quat_xyzw, dtype=np.float64)
         )
         quat_dataset.attrs["coordinate_frame"] = str(root.attrs["reference_frame"])
+        quat_dataset.attrs["trajectory_filter"] = str(args.ego_trajectory_filter)
         keypoint_dataset = obs.create_dataset(
             "keypoints_3d_m", data=np.asarray(keypoints_3d_m, dtype=np.float64)
         )
@@ -1634,6 +1795,311 @@ def canonicalize_gripper_pose_sequence(
     continuous_euler = R.from_quat(quaternions).as_euler("zyx")
     poses[:, 3:] = np.unwrap(continuous_euler, axis=0)
     return poses, quaternions
+
+
+def _continuous_parallel_jaw_rotations(
+    rotations: R,
+) -> tuple[R, dict[str, int]]:
+    """Choose the shortest sequence in the parallel-jaw orientation quotient.
+
+    Rotating an ideal parallel-jaw gripper by 180 degrees around its local
+    approach axis swaps the two identical fingers and represents the same
+    grasp. Hand anatomy occasionally chooses opposite representatives of this
+    symmetry on adjacent frames. Dynamic programming removes those persistent
+    basis flips while anchoring the first frame to its original representative.
+    """
+
+    matrices = rotations.as_matrix()
+    frame_count = matrices.shape[0]
+    if frame_count == 0:
+        return rotations, {"corrected_frame_count": 0, "state_switch_count": 0}
+
+    symmetry = np.diag([-1.0, -1.0, 1.0])
+    candidates = np.stack([matrices, matrices @ symmetry], axis=1)
+    costs = np.full((frame_count, 2), np.inf, dtype=np.float64)
+    previous_state = np.zeros((frame_count, 2), dtype=np.int8)
+    costs[0, 0] = 0.0
+
+    for frame_index in range(1, frame_count):
+        for current_state in range(2):
+            transition_costs = []
+            for prior_state in range(2):
+                relative = (
+                    candidates[frame_index - 1, prior_state].T
+                    @ candidates[frame_index, current_state]
+                )
+                angle = float(R.from_matrix(relative).magnitude())
+                transition_costs.append(costs[frame_index - 1, prior_state] + angle * angle)
+            best_prior = int(np.argmin(transition_costs))
+            costs[frame_index, current_state] = transition_costs[best_prior]
+            previous_state[frame_index, current_state] = best_prior
+
+    states = np.zeros(frame_count, dtype=np.int8)
+    states[-1] = int(np.argmin(costs[-1]))
+    for frame_index in range(frame_count - 1, 0, -1):
+        states[frame_index - 1] = previous_state[frame_index, states[frame_index]]
+    selected = candidates[np.arange(frame_count), states]
+    return R.from_matrix(selected), {
+        "corrected_frame_count": int(np.count_nonzero(states)),
+        "state_switch_count": int(np.count_nonzero(np.diff(states))),
+    }
+
+
+def _stabilize_rotation_frame_resets(
+    rotations: R,
+    timestamps_s: np.ndarray,
+    *,
+    max_angular_speed_deg_s: float,
+) -> tuple[R, dict[str, float | int]]:
+    """Carry a constant SO(3) correction across implausible frame resets.
+
+    This differs from clipping every large angular velocity. Once WiLoR changes
+    anatomical basis, subsequent relative motion is usually useful but remains
+    expressed in the new basis. A persistent left correction reconnects that
+    complete run to the preceding orientation while preserving all following
+    relative rotations.
+    """
+
+    matrices = rotations.as_matrix()
+    if len(matrices) <= 1 or max_angular_speed_deg_s <= 0.0:
+        return rotations, {"reset_count": 0, "largest_rejected_speed_deg_s": 0.0}
+
+    positive_steps = np.diff(timestamps_s)
+    positive_steps = positive_steps[positive_steps > 0.0]
+    if positive_steps.size == 0:
+        raise ValueError("Rotation reset stabilization requires a positive timestamp interval.")
+    nominal_dt = float(np.median(positive_steps))
+    correction = np.eye(3, dtype=np.float64)
+    corrected = np.empty_like(matrices)
+    corrected[0] = matrices[0]
+    reset_count = 0
+    largest_rejected_speed = 0.0
+    for frame_index in range(1, len(matrices)):
+        candidate = correction @ matrices[frame_index]
+        dt = float(timestamps_s[frame_index] - timestamps_s[frame_index - 1])
+        if dt <= 0.0:
+            dt = nominal_dt
+        angle = float(R.from_matrix(corrected[frame_index - 1].T @ candidate).magnitude())
+        speed_deg_s = float(np.rad2deg(angle) / dt)
+        if speed_deg_s > float(max_angular_speed_deg_s):
+            # Make this frame continuous, then retain one constant coordinate
+            # correction so future raw relative rotations remain untouched.
+            correction = corrected[frame_index - 1] @ matrices[frame_index].T
+            candidate = correction @ matrices[frame_index]
+            reset_count += 1
+            largest_rejected_speed = max(largest_rejected_speed, speed_deg_s)
+        corrected[frame_index] = candidate
+    return R.from_matrix(corrected), {
+        "reset_count": reset_count,
+        "largest_rejected_speed_deg_s": largest_rejected_speed,
+    }
+
+
+def _pose_filter_metrics(
+    original_positions: np.ndarray,
+    original_rotations: R,
+    filtered_positions: np.ndarray,
+    filtered_rotations: R,
+) -> dict[str, float]:
+    position_residual = np.linalg.norm(filtered_positions - original_positions, axis=1)
+    rotation_residual = (filtered_rotations.inv() * original_rotations).magnitude()
+    original_position_steps = np.linalg.norm(np.diff(original_positions, axis=0), axis=1)
+    filtered_position_steps = np.linalg.norm(np.diff(filtered_positions, axis=0), axis=1)
+    original_rotation_steps = (original_rotations[:-1].inv() * original_rotations[1:]).magnitude()
+    filtered_rotation_steps = (filtered_rotations[:-1].inv() * filtered_rotations[1:]).magnitude()
+
+    def percentile(values: np.ndarray, quantile: float) -> float:
+        return float(np.percentile(values, quantile)) if values.size else 0.0
+
+    return {
+        "translation_residual_rms_mm": float(np.sqrt(np.mean(position_residual**2)) * 1000.0),
+        "translation_residual_p95_mm": percentile(position_residual, 95.0) * 1000.0,
+        "translation_residual_max_mm": float(position_residual.max(initial=0.0) * 1000.0),
+        "rotation_residual_rms_deg": float(np.rad2deg(np.sqrt(np.mean(rotation_residual**2)))),
+        "rotation_residual_p95_deg": float(np.rad2deg(percentile(rotation_residual, 95.0))),
+        "rotation_residual_max_deg": float(np.rad2deg(rotation_residual.max(initial=0.0))),
+        "translation_path_before_m": float(original_position_steps.sum()),
+        "translation_path_after_m": float(filtered_position_steps.sum()),
+        "rotation_path_before_deg": float(np.rad2deg(original_rotation_steps.sum())),
+        "rotation_path_after_deg": float(np.rad2deg(filtered_rotation_steps.sum())),
+        "translation_step_p95_before_mm": percentile(original_position_steps, 95.0) * 1000.0,
+        "translation_step_p95_after_mm": percentile(filtered_position_steps, 95.0) * 1000.0,
+        "rotation_step_p95_before_deg": float(
+            np.rad2deg(percentile(original_rotation_steps, 95.0))
+        ),
+        "rotation_step_p95_after_deg": float(
+            np.rad2deg(percentile(filtered_rotation_steps, 95.0))
+        ),
+    }
+
+
+def filter_gripper_pose_sequence(
+    pose_euler: list[np.ndarray] | np.ndarray,
+    quaternion_xyzw: list[np.ndarray] | np.ndarray,
+    timestamps_ms: list[float] | np.ndarray,
+    *,
+    cutoff_hz: float = 4.0,
+    order: int = 3,
+    max_angular_speed_deg_s: float = 900.0,
+    parallel_jaw_symmetry: bool = True,
+    preserve_endpoints: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int | bool | str]]:
+    """Offline zero-phase smoothing of one camera-compensated gripper trajectory.
+
+    Translation is filtered in the episode reference frame. Quaternion
+    components are sign-continuous, filtered forward/backward, normalized back
+    onto S3, and converted to SO(3). RGB-D clouds, keypoints, and the source
+    WiLoR JSONL are deliberately left untouched.
+    """
+
+    poses, quaternions = canonicalize_gripper_pose_sequence(pose_euler, quaternion_xyzw)
+    frame_count = poses.shape[0]
+    if frame_count < 8:
+        raise ValueError(
+            "SE(3) trajectory filtering requires at least 8 frames, "
+            f"got {frame_count}."
+        )
+    if cutoff_hz <= 0.0:
+        raise ValueError("cutoff_hz must be positive.")
+    if order < 1:
+        raise ValueError("order must be >= 1.")
+    if max_angular_speed_deg_s < 0.0:
+        raise ValueError("max_angular_speed_deg_s must be non-negative.")
+
+    timestamps_s = np.asarray(timestamps_ms, dtype=np.float64).reshape(-1) / 1000.0
+    if timestamps_s.shape != (frame_count,) or not np.isfinite(timestamps_s).all():
+        raise ValueError(
+            f"Expected {frame_count} finite trajectory timestamps, got {timestamps_s.shape}."
+        )
+    timestamp_steps = np.diff(timestamps_s)
+    positive_steps = timestamp_steps[timestamp_steps > 0.0]
+    if positive_steps.size == 0:
+        raise ValueError("Trajectory timestamps contain no positive interval.")
+    nominal_dt = float(np.median(positive_steps))
+    timestamp_repair_count = int(np.count_nonzero(timestamp_steps <= 0.0))
+    if timestamp_repair_count:
+        filter_times = timestamps_s[0] + np.arange(frame_count, dtype=np.float64) * nominal_dt
+    else:
+        filter_times = timestamps_s
+    duration_s = float(filter_times[-1] - filter_times[0])
+    if duration_s <= 0.0:
+        raise ValueError("Trajectory duration must be positive.")
+    uniform_times = np.linspace(filter_times[0], filter_times[-1], frame_count)
+    sampling_hz = float((frame_count - 1) / duration_s)
+    nyquist_hz = 0.5 * sampling_hz
+    if cutoff_hz >= nyquist_hz:
+        raise ValueError(
+            f"cutoff_hz={cutoff_hz} must be below Nyquist frequency {nyquist_hz:.3f} Hz."
+        )
+
+    original_positions = poses[:, :3].copy()
+    raw_rotations = R.from_quat(quaternions)
+    symmetry_metrics = {"corrected_frame_count": 0, "state_switch_count": 0}
+    canonical_rotations = raw_rotations
+    if parallel_jaw_symmetry:
+        canonical_rotations, symmetry_metrics = _continuous_parallel_jaw_rotations(raw_rotations)
+    canonical_rotations, reset_metrics = _stabilize_rotation_frame_resets(
+        canonical_rotations,
+        filter_times,
+        max_angular_speed_deg_s=float(max_angular_speed_deg_s),
+    )
+
+    canonical_quaternions = canonical_rotations.as_quat()
+    for frame_index in range(1, frame_count):
+        if float(np.dot(canonical_quaternions[frame_index - 1], canonical_quaternions[frame_index])) < 0.0:
+            canonical_quaternions[frame_index] *= -1.0
+
+    uniform_positions = np.column_stack(
+        [
+            np.interp(uniform_times, filter_times, original_positions[:, axis])
+            for axis in range(3)
+        ]
+    )
+    uniform_rotations = Slerp(filter_times, R.from_quat(canonical_quaternions))(uniform_times)
+    uniform_quaternions = uniform_rotations.as_quat()
+    for frame_index in range(1, frame_count):
+        if float(np.dot(uniform_quaternions[frame_index - 1], uniform_quaternions[frame_index])) < 0.0:
+            uniform_quaternions[frame_index] *= -1.0
+
+    filter_sos = butter(
+        int(order),
+        float(cutoff_hz),
+        btype="lowpass",
+        fs=sampling_hz,
+        output="sos",
+    )
+    try:
+        filtered_uniform_positions = sosfiltfilt(filter_sos, uniform_positions, axis=0)
+        filtered_uniform_quaternions = sosfiltfilt(filter_sos, uniform_quaternions, axis=0)
+    except ValueError as exc:
+        raise ValueError(
+            "Trajectory is too short for the requested zero-phase filter: "
+            f"frames={frame_count}, order={order}."
+        ) from exc
+    quaternion_norms = np.linalg.norm(filtered_uniform_quaternions, axis=1)
+    if np.any(~np.isfinite(quaternion_norms)) or np.any(quaternion_norms < 1e-8):
+        raise ValueError("Quaternion low-pass filtering produced an invalid orientation.")
+    filtered_uniform_quaternions /= quaternion_norms[:, None]
+    filtered_uniform_rotations = R.from_quat(filtered_uniform_quaternions)
+
+    if preserve_endpoints:
+        progress = np.linspace(0.0, 1.0, frame_count)
+        filtered_uniform_positions += (
+            (1.0 - progress)[:, None]
+            * (uniform_positions[0] - filtered_uniform_positions[0])[None]
+            + progress[:, None]
+            * (uniform_positions[-1] - filtered_uniform_positions[-1])[None]
+        )
+        start_correction = filtered_uniform_rotations[0].inv() * uniform_rotations[0]
+        end_correction = filtered_uniform_rotations[-1].inv() * uniform_rotations[-1]
+        endpoint_correction = Slerp(
+            [0.0, 1.0],
+            R.from_quat(np.stack([start_correction.as_quat(), end_correction.as_quat()])),
+        )(progress)
+        filtered_uniform_rotations = filtered_uniform_rotations * endpoint_correction
+
+    filtered_positions = np.column_stack(
+        [
+            np.interp(filter_times, uniform_times, filtered_uniform_positions[:, axis])
+            for axis in range(3)
+        ]
+    )
+    filtered_rotations = Slerp(uniform_times, filtered_uniform_rotations)(filter_times)
+    filtered_quaternions = filtered_rotations.as_quat()
+    for frame_index in range(1, frame_count):
+        if float(np.dot(filtered_quaternions[frame_index - 1], filtered_quaternions[frame_index])) < 0.0:
+            filtered_quaternions[frame_index] *= -1.0
+
+    filtered_poses = poses.copy()
+    filtered_poses[:, :3] = filtered_positions
+    filtered_poses[:, 3:] = np.unwrap(filtered_rotations.as_euler("zyx"), axis=0)
+    metrics: dict[str, float | int | bool | str] = {
+        "method": "zero_phase_butterworth_translation_quaternion",
+        "cutoff_hz": float(cutoff_hz),
+        "order": int(order),
+        "sampling_hz": sampling_hz,
+        "parallel_jaw_symmetry": bool(parallel_jaw_symmetry),
+        "parallel_jaw_corrected_frame_count": int(symmetry_metrics["corrected_frame_count"]),
+        "parallel_jaw_state_switch_count": int(symmetry_metrics["state_switch_count"]),
+        "max_angular_speed_deg_s": float(max_angular_speed_deg_s),
+        "orientation_frame_reset_count": int(reset_metrics["reset_count"]),
+        "largest_rejected_angular_speed_deg_s": float(
+            reset_metrics["largest_rejected_speed_deg_s"]
+        ),
+        "preserve_endpoints": bool(preserve_endpoints),
+        "timestamp_repair_count": timestamp_repair_count,
+        **_pose_filter_metrics(
+            original_positions,
+            canonical_rotations,
+            filtered_positions,
+            filtered_rotations,
+        ),
+    }
+    raw_rotation_steps = (raw_rotations[:-1].inv() * raw_rotations[1:]).magnitude()
+    metrics["raw_rotation_step_max_deg"] = float(
+        np.rad2deg(raw_rotation_steps.max(initial=0.0))
+    )
+    return filtered_poses, filtered_quaternions, metrics
 
 
 def transform_keypoints(keypoints: np.ndarray, transform: np.ndarray) -> np.ndarray:
