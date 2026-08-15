@@ -490,6 +490,13 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - child-env-fixed Broad 使用固定 IDs `0,5,...,45`、fixed-barrier-v18、policy-noise seed0、每臂100 episodes。step260 三臂为 dual+World `96`、primary+World `93`、dual+World-to-Ego-disabled `96`，因 WorldFlow delta `0` 被筛除。step520 三臂为 `98/95/96`，多视角 delta `+3`、WorldFlow delta `+2`，`passes_joint_screen=true`，是首个正式 Full500 候选。step780 在 `72/77` 时累计5失败、理论最高95；step1040 在 `75/80` 时累计5失败、理论最高95；二者均数学早停且未运行消融。step1300/1564 继续由原 Broad waiter 顺序筛查；Full500 waiter 必须等待六点聚合后按预注册排名执行，当前不得宣称最终门禁通过。
 - 按用户要求，V52 executable 历史已通过 merge commit `664f14e` 合入 `wep_vla_v0.4.3_multiview_doubleflow`，同时保留主分支已有的默认关闭 WorldFlow 能力和全部较新 handoff。合并后的主分支可从自身 `src/lerobot` 直接解析 step520 的 `camera_view_coarse_novelty_scale=4.0`、`multiview_input_symmetric_point_path_adaptation=true` 并导入 `consensus_multiscale_novelty_union_sample_fused_point_cloud`；配置/导入 preflight 通过，四个正式测试文件回归为 `144 passed, 8 warnings`。这只证明运行时兼容与回归正确，不替代剩余 Broad 或 Full500 性能门禁。
 
+## 6.14 2026-08-15：V52 six-checkpoint Broad 完成，step520 启动 Full500（覆盖 6.13 的运行状态）
+
+- 按用户明确要求，Broad 编排改为两阶段：先完成全部 checkpoint 的 dual+World 100-episode 初筛，再仅对严格 `>95/100` 的 checkpoint 逐步运行 primary+World 和 dual+World-to-Ego-disabled。workflow archive 已推送 `4216d49e556a1109bb2305e2fd46a011534b4528`；阶段二为保留被中断的 step1300 primary 部分输出使用新 namespace。初版长标签触发 Linux `NAME_MAX`，四个 worker 在创建日志前退出、没有产生评测结果；随后以短标签 `s5p2` 修复并推送 `8fcf983`。旧 step1300 primary 部分目录保留在 `65/100`，没有覆盖或删除。
+- six-checkpoint dual 初筛及候选消融已全部完成。step260 为 `96/93/96`，WorldFlow delta `0`，筛除；step520 为 `98/95/96`，multiview delta `+3`、WorldFlow delta `+2`，唯一联合候选；step780 在 `72/77`、step1040 在 `75/80`、step1564 在 `93/98` 时达到第5个失败，理论最高均为95，数学早停且未运行消融；step1300 dual/primary 为 `96/96`，multiview delta `0`，筛除且未运行 disabled arm。
+- 权威聚合 Broad artifact 为 `joint_multiview_worldflow/libero10_500ep/artifacts/v52childenvfix_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json`，`candidate_steps_ranked=[520]`。所有淘汰 checkpoint、被中断的 eager primary、数学早停 progress、cache 和日志均保留。
+- step520 已通过 Full500 2×2 preflight，并由 tmux `wep_v043_v52childenvfix_all_candidates_full500_2x2_gate` 启动第一臂 dual+World 500 episodes。协议仍为同 checkpoint、episodes `0..49`、policy-noise seed0、fixed-barrier-v18、local4 total30/batch30 和 canonical exact-action-cache v2；只有 dual+World 达到至少 `475/500` 才会逐步运行 primary、dual-disabled 和 primary-disabled。当前尚无 Full500 结果，绝不能标记最终目标完成。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
