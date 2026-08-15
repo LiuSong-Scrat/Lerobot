@@ -497,6 +497,13 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - 权威聚合 Broad artifact 为 `joint_multiview_worldflow/libero10_500ep/artifacts/v52childenvfix_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json`，`candidate_steps_ranked=[520]`。所有淘汰 checkpoint、被中断的 eager primary、数学早停 progress、cache 和日志均保留。
 - step520 已通过 Full500 2×2 preflight，并由 tmux `wep_v043_v52childenvfix_all_candidates_full500_2x2_gate` 启动第一臂 dual+World 500 episodes。协议仍为同 checkpoint、episodes `0..49`、policy-noise seed0、fixed-barrier-v18、local4 total30/batch30 和 canonical exact-action-cache v2；只有 dual+World 达到至少 `475/500` 才会逐步运行 primary、dual-disabled 和 primary-disabled。当前尚无 Full500 结果，绝不能标记最终目标完成。
 
+## 6.15 2026-08-16：V52 step520 Full500 数学早停，A800 Full500 交叉复核（覆盖 6.14 的运行状态）
+
+- 本地权威 step520 dual+World 第一臂在完成 `487/500` 时得到 `461` successes、`26` failures；剩余13个即使全成功也最多 `474/500`，低于预注册的 `475/500` 非退化线，因此 workflow 以 `mathematical_early_stop_dual_below_v32_nondegradation` 正常停止。只启动了 dual+World；primary+World、dual+World-to-Ego-disabled 和 primary-disabled 均未启动，不能把缺失消融解释为通过。step gate 为 `joint_multiview_worldflow/libero10_500ep/artifacts/v52childenvfix_step000520_full500_2x2_multiview_worldflow_causal_gate.json`，aggregate 为 `v52childenvfix_all_candidates_full500_2x2_multiview_worldflow_causal_gate.json`，状态 `failed_all_ranked_candidates`；全部 partial、cache 和日志保留。
+- 对同一487个已完成 episode 与权威 V32 做逐状态对齐：V52 与 V32共同成功441、共同失败5，V52恢复20个V32失败但新增21个失败，净变化 `-1`；V32在尚未运行的13个task8 episode上全部成功，所以V52的数学上限恰好是474。该结果说明1 cm overlap consensus能够移动失败边界，但没有产生净稳健性。
+- 用户上传的单卡 A800 Full500 附件已核验：step520、dual pointcloud、WorldFlow enabled、strict official init、seed0/7、1000 steps、fixed_barrier，结果为 `462/500 = 92.4%`；task8=`38/50`、task9=`42/50` 是主要失败来源。它实际使用10×8=`80`个环境和batch80，cache目录名却含`total40_b40`，所以不是预注册的A800 total40/batch40，也不能替代本地local4 total30/batch30门禁。代码哈希与V52 executable一致；A800相对V32为恢复15个、引入28个，净 `-13`。A800与本地在共同487状态上仍有20个local-only failures和30个A800-only failures，证明fixed_barrier只稳定给定布局，不保证跨硬件/批布局动作相同。轻量交叉审计为 `joint_multiview_worldflow/libero10_500ep/artifacts/v52_step000520_a800_gpu5_b80_full500_cross_hardware_audit.json`；9 MB原始summary不进Git。
+- V52 已正式否决，`/goal` 仍未完成。下一轮必须从上述逐状态净交换、task6/8/9退化和Broad抽样假阳性中寻找通用输入表示或双流负交互原因；不得继续对V52运行未通过前置门禁的Full500消融，也不得把A800 batch80结果包装成权威协议结果。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
