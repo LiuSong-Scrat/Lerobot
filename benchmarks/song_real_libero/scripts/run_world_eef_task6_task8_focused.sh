@@ -22,6 +22,22 @@ from pathlib import Path
 import numpy as np
 
 root = Path(sys.argv[1])
+
+def pose9_to_matrix(pose):
+    x_axis = pose[..., 3:6].astype(np.float64)
+    y_axis = pose[..., 6:9].astype(np.float64)
+    x_axis /= np.linalg.norm(x_axis, axis=-1, keepdims=True)
+    y_axis -= np.sum(x_axis * y_axis, axis=-1, keepdims=True) * x_axis
+    y_axis /= np.linalg.norm(y_axis, axis=-1, keepdims=True)
+    z_axis = np.cross(x_axis, y_axis)
+    matrix = np.zeros((*pose.shape[:-1], 4, 4), dtype=np.float64)
+    matrix[..., 3, 3] = 1.0
+    matrix[..., :3, 0] = x_axis
+    matrix[..., :3, 1] = y_axis
+    matrix[..., :3, 2] = z_axis
+    matrix[..., :3, 3] = pose[..., :3]
+    return matrix
+
 info = json.loads((root / "meta/info.json").read_text())
 summary = json.loads((root / "libero_collect_summary.json").read_text())
 episodes = summary["episodes"]
@@ -41,20 +57,32 @@ assert current_meta["coordinate_frame"] == "robot_base"
 assert target_meta["coordinate_frame"] == "robot_base"
 assert target_meta["target_semantics"] == "commanded_eef_pose"
 
+max_frame_invariance_error = 0.0
 for episode_index, episode in enumerate(episodes):
     current = np.load(root / f"world_base_ee_poses/episode_{episode_index:06d}.npy")
     target = np.load(root / f"world_base_action_target_ee_poses/episode_{episode_index:06d}.npy")
+    current_camera = np.load(root / f"world_ee_poses/episode_{episode_index:06d}.npy")
+    target_camera = np.load(root / f"action_target_ee_poses/episode_{episode_index:06d}.npy")
     expected_frames = int(episode["frames"])
     assert current.shape == (expected_frames, 9), (episode_index, current.shape, expected_frames)
     assert target.shape == (expected_frames, 9), (episode_index, target.shape, expected_frames)
-    assert np.isfinite(current).all(), episode_index
-    assert np.isfinite(target).all(), episode_index
+    assert current_camera.shape == target_camera.shape == current.shape
+    assert all(
+        np.isfinite(array).all()
+        for array in (current, target, current_camera, target_camera)
+    ), episode_index
+    relative_camera = np.linalg.inv(pose9_to_matrix(current_camera)) @ pose9_to_matrix(target_camera)
+    relative_base = np.linalg.inv(pose9_to_matrix(current)) @ pose9_to_matrix(target)
+    frame_error = float(np.max(np.abs(relative_camera - relative_base)))
+    max_frame_invariance_error = max(max_frame_invariance_error, frame_error)
     assert (root / f"point_clouds/episode_{episode_index:06d}.zarr").is_dir(), episode_index
+assert max_frame_invariance_error < 2e-5, max_frame_invariance_error
 
 print(
     "dataset audit PASS: "
     f"episodes={info['total_episodes']} frames={info['total_frames']} "
-    "task_counts={6: 50, 8: 50} frame=robot_base target=commanded_eef_pose"
+    "task_counts={6: 50, 8: 50} frame=robot_base target=commanded_eef_pose "
+    f"rigid_frame_max_error={max_frame_invariance_error:.3e}"
 )
 PY
 }
