@@ -817,6 +817,13 @@ class SmolVLA_ModelInference:
                 "point_cloud": one_step_point_cloud,
                 "state": one_step_agent_pos,
             }
+            if bool(getattr(self.policy.config, "worldflow_enable", False)):
+                # This API receives both the cloud and EEF pose in the caller's
+                # fixed world frame, so preserve that pose explicitly even
+                # though the Ego action state is identity-normalized below.
+                model_observation["worldflow.current_ee_pose"] = np.asarray(
+                    one_step_agent_pos[:9], dtype=np.float32
+                )
             for image_alias in ("overhead", "hand"):
                 if image_alias in cur_model_observation:
                     model_observation[image_alias] = cur_model_observation[image_alias]
@@ -925,25 +932,20 @@ class SmolVLA_ModelInference:
         if self.policy.config.worldflow_enable:
             worldflow_value = observation.get("worldflow.current_ee_pose")
             if worldflow_value is None:
-                if state is None:
-                    raise ValueError(
-                        "WorldFlow inference requires 'worldflow.current_ee_pose' or a raw current pose9 state."
-                    )
-                worldflow_current_pose = self._prepare_state_tensor(
-                    state,
-                    state_pose_mode="raw",
-                    batch_size=batch_size,
-                )[..., :9]
-            else:
-                worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
-                if worldflow_current_pose.ndim == 1:
-                    worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
-                if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
-                    raise ValueError(
-                        "worldflow.current_ee_pose must have shape (9,) or (B,9), "
-                        f"got {tuple(worldflow_current_pose.shape)}."
-                    )
-                worldflow_current_pose = worldflow_current_pose[..., :9]
+                raise ValueError(
+                    "WorldFlow inference requires an explicit 'worldflow.current_ee_pose' "
+                    "expressed in the checkpoint's fixed world reference frame; it must not "
+                    "be inferred from identity-normalized observation.state."
+                )
+            worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
+            if worldflow_current_pose.ndim == 1:
+                worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
+            if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
+                raise ValueError(
+                    "worldflow.current_ee_pose must have shape (9,) or (B,9), "
+                    f"got {tuple(worldflow_current_pose.shape)}."
+                )
+            worldflow_current_pose = worldflow_current_pose[..., :9]
             worldflow_current_pose = self._match_batch_size(
                 worldflow_current_pose,
                 batch_size,

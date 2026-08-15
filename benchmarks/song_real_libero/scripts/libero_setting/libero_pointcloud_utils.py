@@ -747,6 +747,56 @@ def matrix_to_pose9_np(matrix: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def eef_pose9_world_to_reference_np(
+    eef_pose_world: np.ndarray,
+    reference_to_world: np.ndarray,
+) -> np.ndarray:
+    """Express a simulator-world EEF pose in a fixed reference frame.
+
+    ``reference_to_world`` is the camera extrinsic used when the dataset point
+    clouds were generated.  Any values after the pose9 prefix (for example the
+    physical gripper width) are copied unchanged.
+    """
+
+    eef_pose_world = np.asarray(eef_pose_world, dtype=np.float32)
+    reference_to_world = np.asarray(reference_to_world, dtype=np.float32)
+    if eef_pose_world.ndim < 1 or eef_pose_world.shape[-1] < 9:
+        raise ValueError(
+            "eef_pose_world must end with at least 9 pose values, "
+            f"got shape {eef_pose_world.shape}."
+        )
+    if reference_to_world.shape != (4, 4):
+        raise ValueError(
+            "reference_to_world must have shape (4, 4), "
+            f"got {reference_to_world.shape}."
+        )
+
+    eef_to_world = pose9_to_homo_np(eef_pose_world[..., :9])
+    world_to_reference = fast_inverse_homogeneous(reference_to_world)
+    eef_to_reference = world_to_reference @ eef_to_world
+    return np.concatenate(
+        [matrix_to_pose9_np(eef_to_reference), eef_pose_world[..., 9:]],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def eef_pose9_world_to_reference_camera(
+    env: Any,
+    eef_pose_world: np.ndarray,
+    reference_camera: str,
+) -> np.ndarray:
+    """Express a simulator-world EEF pose in a fixed LIBERO camera frame."""
+
+    try:
+        from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+    except Exception as exc:  # pragma: no cover - optional LIBERO dependency path
+        raise RuntimeError("robosuite camera utilities are required for LIBERO pose conversion.") from exc
+
+    reference_camera = normalize_camera_name(reference_camera)
+    reference_to_world = get_camera_extrinsic_matrix(env.sim, reference_camera).astype(np.float32)
+    return eef_pose9_world_to_reference_np(eef_pose_world, reference_to_world)
+
+
 def observation_to_camera_point_cloud(
     env: Any,
     raw_obs: dict[str, Any],

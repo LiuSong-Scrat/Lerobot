@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -94,3 +95,23 @@ def test_seeded_world_noise_is_deferred_to_model_when_ego_coupling_is_enabled(co
     world_noise = _inference_stub(model)._make_seeded_worldflow_noise({}, 7)
 
     assert world_noise is None
+
+
+def test_worldflow_batch_rejects_missing_fixed_reference_pose():
+    inference = object.__new__(SmolVLA_ModelInference)
+    inference.device = torch.device("cpu")
+    inference.camera_view_fusion = "legacy_budget"
+    inference.policy = SimpleNamespace(
+        config=SimpleNamespace(
+            worldflow_enable=True,
+            robot_state_feature=None,
+            max_state_dim=10,
+        )
+    )
+    observation = {
+        "point_cloud": np.zeros((8, 6), dtype=np.float32),
+        "state": np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.02], dtype=np.float32),
+    }
+
+    with pytest.raises(ValueError, match="explicit 'worldflow.current_ee_pose'.*fixed world reference"):
+        inference.build_model_batch(observation, state_pose_mode="identity")
