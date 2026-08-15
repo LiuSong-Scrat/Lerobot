@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -8,6 +11,7 @@ from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
     make_policy_on_accelerator_device,
+    update_policy,
     worldflow_ego_priority_projection_statistics,
 )
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
@@ -249,3 +253,79 @@ def test_worldflow_ego_priority_projection_removes_only_conflicting_component():
     assert torch.dot(projected_shared, ego[0]).item() == pytest.approx(0.0)
     # A World-only tensor never enters the projection inner product.
     assert torch.equal(world[1], torch.tensor([7.0]))
+
+
+class _GradientRecordingAccelerator:
+    def autocast(self):
+        return nullcontext()
+
+    def unwrap_model(self, policy, keep_fp32_wrapper=True):
+        assert keep_fp32_wrapper is True
+        return policy
+
+    def backward(self, loss, **kwargs):
+        loss.backward(**kwargs)
+
+    def clip_grad_norm_(self, parameters, max_norm):
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
+class _MixedPointRolePolicy(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ego_point = torch.nn.Parameter(torch.tensor(1.0))
+        self.world_point = torch.nn.Parameter(torch.tensor(1.0))
+        self.config = SimpleNamespace(
+            worldflow_training_ego_priority_gradient_projection=False,
+            worldflow_training_shared_gradient_ego_tangent_projection=True,
+        )
+        self.model = SimpleNamespace(
+            last_worldflow_world_to_ego_keep_mask=torch.tensor([False, True])
+        )
+
+    def get_worldflow_ego_tangent_world_only_parameter_ids(self) -> set[int]:
+        return {id(self.world_point)}
+
+    def forward(self, batch, reduction="mean"):
+        assert batch == {}
+        per_sample = torch.stack((self.ego_point.square(), self.world_point.square()))
+        assert reduction == "none"
+        return per_sample, {}
+
+
+def test_ego_tangent_merge_retains_world_gradient_inside_mixed_point_lr_group():
+    policy = _MixedPointRolePolicy()
+    optimizer = torch.optim.SGD(
+        [
+            {
+                "params": [policy.ego_point, policy.world_point],
+                "lr": 5e-8,
+                "group_name": "point_input_adaptation_path",
+            }
+        ]
+    )
+    captured = {}
+
+    def record_gradients_without_updating(closure=None):
+        assert closure is None
+        captured["ego"] = policy.ego_point.grad.detach().clone()
+        captured["world"] = policy.world_point.grad.detach().clone()
+
+    optimizer.step = record_gradients_without_updating
+    metrics = SimpleNamespace(loss=None, grad_norm=None, lr=None, update_s=None)
+
+    _, output = update_policy(
+        metrics,
+        policy,
+        {},
+        optimizer,
+        grad_clip_norm=0.0,
+        accelerator=_GradientRecordingAccelerator(),
+    )
+
+    assert captured["ego"].item() == pytest.approx(1.0)
+    assert captured["world"].item() == pytest.approx(1.0)
+    assert output["worldflow_ego_tangent_gradient_world_only_point_parameter_count"] == 1
+    # The optimizer step above only records gradients; the weights are unchanged.
+    assert policy.ego_point.item() == pytest.approx(1.0)
+    assert policy.world_point.item() == pytest.approx(1.0)
