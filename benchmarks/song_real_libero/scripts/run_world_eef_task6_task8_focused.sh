@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo=/home/liusong/ProgramFiles/Huggingface/lerobot_singleview_object_worldflow
+repo=/home/liusong/ProgramFiles/Huggingface/lerobot
 python=/home/liusong/anaconda3/envs/reap/bin/python
 torchrun=/home/liusong/anaconda3/envs/reap/bin/torchrun
 dataset=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep
