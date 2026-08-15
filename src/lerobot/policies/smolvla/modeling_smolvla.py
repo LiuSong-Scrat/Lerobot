@@ -886,11 +886,28 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     or getattr(self.config, "multiview_input_point_lr_multiplier", 1.0) != 1.0
                 )
             ):
-                point_prefixes = (
+                ego_point_prefixes = (
                     "model.pointseg_conditioner.",
                     "model.pointseg_object_proj.",
                     "model.pointseg_background_proj.",
                     "model.point_action_fusion.",
+                )
+                world_point_prefixes = (
+                    "model.worldflow_branch.scene_encoder.",
+                    "model.worldflow_branch.scene_context_proj.",
+                    "model.worldflow_branch.point_action_adapter.",
+                    "model.ego_scene_to_expert.",
+                    "model.world_scene_to_expert.",
+                )
+                symmetric_point_adaptation = bool(
+                    getattr(
+                        self.config,
+                        "multiview_input_symmetric_point_path_adaptation",
+                        False,
+                    )
+                )
+                point_prefixes = ego_point_prefixes + (
+                    world_point_prefixes if symmetric_point_adaptation else ()
                 )
                 point_input = [
                     parameter
@@ -942,6 +959,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         parameter
                         for name, parameter in trainable
                         if (name in new_world_exact or name.startswith(new_world_prefixes))
+                        and not name.startswith(point_prefixes)
                         and not name.startswith(residual_prefix)
                     ]
                     pretrained = [

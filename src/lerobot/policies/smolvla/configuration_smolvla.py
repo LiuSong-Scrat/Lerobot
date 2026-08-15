@@ -92,6 +92,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # the pretrained action path to reduce catastrophic forgetting.
     multiview_input_pretrained_lr_multiplier: float = 1.0
     multiview_input_point_lr_multiplier: float = 1.0
+    # When jointly adapting an Ego/World double-flow checkpoint to a new
+    # point-cloud input distribution, place both coordinate streams' direct
+    # point consumers in the point-input optimizer group.  This changes only
+    # training-time optimizer membership; the forward graph and old-checkpoint
+    # path are unchanged.  It is opt-in so historical runs remain exact.
+    multiview_input_symmetric_point_path_adaptation: bool = False
     # Training-only input augmentation: deterministically expose roughly half
     # the frames as the original primary view and half as the all-view fused
     # cloud. Inference still uses every configured view. No model module or
@@ -489,6 +495,10 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("multiview_input_pretrained_lr_multiplier must be positive; zero would freeze parameters.")
         if float(self.multiview_input_point_lr_multiplier) <= 0:
             raise ValueError("multiview_input_point_lr_multiplier must be positive; zero would freeze parameters.")
+        if self.multiview_input_symmetric_point_path_adaptation and not self.worldflow_enable:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires worldflow_enable=True."
+            )
         if self.multiview_input_view_dropout_enable:
             if self.camera_view_fusion not in {
                 "fps",
