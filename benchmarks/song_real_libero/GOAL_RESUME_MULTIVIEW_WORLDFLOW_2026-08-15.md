@@ -134,7 +134,7 @@ network_access = true
 八、2026-08-15 同日 continuation（优先级高于上一行的 launch-era 状态）
 
 1. 上一行仅保留最初恢复点的历史记录。V51 后续已完成正式 cache、审计、完整 paired 训练和全部 six-checkpoint Broad；所有 checkpoint 均未严格超过 `95/100`，正式归档为 `screened_out`，没有 Full500。详见 `PROJECT_HANDOFF_2026-08-11.md` 的 6.10。
-2. 当前继续方案为 V52 纯输入级 `1 cm voxel consensus + 4 cm persistent novelty`，fusion 名为 `consensus_multiscale_novelty_union`。可执行 branch/commit：`wep_vla_v0.4.3_v52_consensus_multiscale@9447a43a0e2ed3130a578618ac92225f71eb8a31`。workflow branch/commit：`wep_vla_v0.4.3_v52_workflow_archive@84e4c51e0ab7c78241fbe18b3e642af923f4908c`。详见 handoff 6.11。
+2. 当前继续方案为 V52 纯输入级 `1 cm voxel consensus + 4 cm persistent novelty`，fusion 名为 `consensus_multiscale_novelty_union`。可执行 branch/commit：`wep_vla_v0.4.3_v52_consensus_multiscale@9447a43a0e2ed3130a578618ac92225f71eb8a31`。workflow branch/commit：`wep_vla_v0.4.3_v52_workflow_archive@179fd1a8a52345ea3d270e37a55b978a2de73d5e`。详见 handoff 6.11。
 3. V52 回归 `137 passed`，4-sample smoke、smoke exact-index audit 和真实 V32 optimizer/gradient-role preflight 已通过。正式 `137590` samples/36-shard cache 当前正在运行；必须继续等待既有 tmux 链路完成 cache→36-shard exact-index audit→1564-step paired epoch→six-checkpoint Broad→候选 Full500 2×2，不要重复启动已有目录或会话。
 4. 续跑时以实时文件系统、origin 和 handoff 6.10/6.11 为准；不得把 V51 launch-era commit pin 或“尚未启动”覆盖到更晚的 V51/V52 证据上。最终 Full500 门禁、安全边界和所有方法约束保持完全不变。
 ```
