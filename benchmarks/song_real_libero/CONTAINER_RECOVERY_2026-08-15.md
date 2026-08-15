@@ -112,12 +112,8 @@ pgrep -af 'openai.chatgpt.*codex.*app-server'
 最抗断线的 Codex 交互方式是在服务器 tmux 内使用 CLI。当前 WEP 会话可按保存的 thread ID 恢复：
 
 ```bash
-tmux new -As codex-wep
-codex \
-  -C /home/liusong/ProgramFiles/Huggingface/lerobot \
-  -s danger-full-access \
-  -a never \
-  resume 01a00405-aa05-7312-8b24-c189ea35f0da
+tmux new-session -A -s codex-wep \
+  'exec codex -C /home/liusong/ProgramFiles/Huggingface/lerobot -s danger-full-access -a never resume 01a00405-aa05-7312-8b24-c189ea35f0da'
 ```
 
 CLI 的 `codex resume --last` 也可以恢复当前目录最近的会话；显式 thread ID 更不容易选错。恢复前仍须确保 IDE 中没有另一个活跃 owner。评测/训练 tmux 与 Codex tmux 分开命名，这样重启 Codex 或 VS Code 不会影响实验任务。
