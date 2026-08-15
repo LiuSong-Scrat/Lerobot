@@ -73,7 +73,7 @@ class SmolVLAConfig(PreTrainedConfig):
     # when possible, then fills remaining detail slots in union-FPS order.
     # ``multiscale_novelty_union`` protects every primary fine voxel and adds
     # one secondary representative only for coverage that remains novel at a
-    # three-times-coarser scale; the geometry determines the camera share.
+    # configurable coarser scale; the geometry determines the camera share.
     # ``transport_novelty_union`` preserves every primary occupied voxel and
     # inserts secondary novel voxels through local one-to-one replacements.
     # ``full_union`` preserves every scene point from every selected view and
@@ -85,6 +85,7 @@ class SmolVLAConfig(PreTrainedConfig):
     camera_view_fps_target_points: int = 10_000
     camera_view_fps_gripper_points: int = 500
     camera_view_voxel_size: float = 0.005
+    camera_view_coarse_novelty_scale: float = 3.0
     multiview_pretrained_lr_multiplier: float = 1.0
     multiview_residual_lr_multiplier: float = 1.0
     # Discriminative fine-tuning for input-layer multi-view fusion. All
@@ -476,6 +477,11 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not math.isfinite(float(self.camera_view_voxel_size)) or float(self.camera_view_voxel_size) <= 0.0:
             raise ValueError("camera_view_voxel_size must be finite and positive.")
+        if (
+            not math.isfinite(float(self.camera_view_coarse_novelty_scale))
+            or float(self.camera_view_coarse_novelty_scale) <= 1.0
+        ):
+            raise ValueError("camera_view_coarse_novelty_scale must be finite and greater than one.")
         if self.camera_view_fusion in {
             "fps",
             "voxel_fps",

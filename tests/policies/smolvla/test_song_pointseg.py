@@ -307,6 +307,40 @@ def test_multiscale_novelty_union_is_exact_identity_for_single_view():
     assert indices.tolist() == [list(range(8)), list(range(8))]
 
 
+def test_multiscale_novelty_union_supports_more_conservative_coarse_scale():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.010, 0.011, 0.080, 0.081,
+         0.002, 0.012, 0.035, 0.091, 0.092, 0.130]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    _, _, default_indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+    sampled, sampled_pad, conservative_indices = (
+        multiscale_novelty_union_sample_fused_point_cloud(
+            cloud,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    assert default_indices.tolist() == [[0, 8, 2, 9, 4, 11, 12, 13]]
+    assert conservative_indices.tolist() == [[0, 11, 2, 3, 4, 5, 12, 13]]
+    assert torch.equal(
+        sampled,
+        torch.gather(
+            cloud,
+            1,
+            conservative_indices.unsqueeze(-1).expand(-1, -1, 6),
+        ),
+    )
+
+
 def test_transport_novelty_union_uses_local_one_to_one_replacements():
     cloud = torch.zeros(1, 14, 6)
     cloud[0, :12, 0] = torch.tensor(

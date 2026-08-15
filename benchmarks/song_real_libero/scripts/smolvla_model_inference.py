@@ -894,6 +894,10 @@ class SmolVLA_ModelInference:
                 sampler_kwargs["voxel_size"] = float(
                     getattr(self.policy.config, "camera_view_voxel_size", 0.005)
                 )
+            if fusion == "multiscale_novelty_union":
+                sampler_kwargs["coarse_novelty_scale"] = float(
+                    getattr(self.policy.config, "camera_view_coarse_novelty_scale", 3.0)
+                )
             pc, _point_is_pad, _indices = sampler(
                 pc,
                 target_points=int(

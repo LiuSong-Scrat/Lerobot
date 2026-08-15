@@ -1147,12 +1147,13 @@ def multiscale_novelty_union_sample_fused_point_cloud(
     target_points: int = 10_000,
     gripper_points: int = 500,
     voxel_size: float = 0.01,
+    coarse_novelty_scale: float = 3.0,
     point_is_pad: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor]:
     """Insert only coarse-persistent secondary coverage into a fine-protected primary cloud.
 
     The configured voxel size protects every occupied primary cell.  Secondary
-    coverage must remain novel on a three-times-coarser grid, and only one
+    coverage must remain novel on the configured coarser grid, and only one
     representative of each coarse novel cell is inserted.  This is a
     view-count-agnostic input coreset: it changes no model module and assigns no
     fixed point budget to any camera.
@@ -1164,7 +1165,7 @@ def multiscale_novelty_union_sample_fused_point_cloud(
         gripper_points=gripper_points,
         voxel_size=voxel_size,
         point_is_pad=point_is_pad,
-        coarse_novelty_scale=3.0,
+        coarse_novelty_scale=coarse_novelty_scale,
     )
 
 
