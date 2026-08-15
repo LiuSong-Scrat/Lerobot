@@ -128,6 +128,25 @@ def validate_policy_camera_config_matches_training_config(
             )
 
 
+def canonical_rgb_camera_name(name: str) -> str:
+    """Map dataset/checkpoint RGB aliases to one semantic camera name.
+
+    This is used only for compatibility validation. It intentionally does not
+    rename dataset features or copy image tensors: the policy continues to read
+    the exact serialized feature key, such as ``observation.images.overhead``.
+    """
+
+    name = str(name).removeprefix("observation.images.")
+    aliases = {
+        "overhead": "agentview",
+        "overview": "agentview",
+        "external": "agentview",
+        "wrist": "robot0_eye_in_hand",
+        "hand": "robot0_eye_in_hand",
+    }
+    return aliases.get(name, name)
+
+
 def write_training_camera_provenance(
     cfg: TrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -1508,12 +1527,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     selected_views = parse_camera_views(getattr(cfg.policy, "camera_views", "agentview"))
     rgb_value = getattr(cfg.policy, "rgb_camera_views", None)
     selected_rgb_views = parse_camera_views(selected_views if rgb_value is None else rgb_value)
-    expected_image_keys = {f"observation.images.{view}" for view in selected_rgb_views}
     actual_image_keys = set(getattr(policy.config, "image_features", {}))
-    missing_image_keys = sorted(expected_image_keys - actual_image_keys)
-    if missing_image_keys and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
+    expected_rgb_cameras = {
+        canonical_rgb_camera_name(view)
+        for view in selected_rgb_views
+    }
+    actual_rgb_cameras = {
+        canonical_rgb_camera_name(key)
+        for key in actual_image_keys
+    }
+    missing_rgb_cameras = sorted(expected_rgb_cameras - actual_rgb_cameras)
+    if missing_rgb_cameras and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
         raise ValueError(
-            f"Selected RGB camera views {selected_rgb_views} require image features {missing_image_keys}, "
+            f"Selected RGB camera views {selected_rgb_views} require semantic cameras "
+            f"{missing_rgb_cameras}, "
             f"but policy image features are {sorted(actual_image_keys)}."
         )
     if is_main_process:

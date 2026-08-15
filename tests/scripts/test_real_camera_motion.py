@@ -780,3 +780,93 @@ def test_fixed_camera_episode_keeps_legacy_real_conversion_semantics(tmp_path) -
     assert record["reference_frame"] == "world"
     assert record["world_definition"] == "fixed_overview_camera"
     assert record["uses_camera_tracking_pose"] is False
+
+
+def test_episode_first_camera_world_is_accepted_without_second_alignment(tmp_path) -> None:
+    """Aligned human-hand/StageGen files need no rewrite or camera reapplication."""
+
+    hdf5_path = tmp_path / "episode_first_camera_world.hdf5"
+    raw_pose9 = matrix_to_pose9(
+        np.stack(
+            [
+                _translation(0.0, 0.0, 0.5),
+                _translation(0.05, 0.0, 0.5),
+            ]
+        )
+    )
+    cloud = np.asarray(
+        [
+            [0.0, 0.0, 0.8, 120.0, 80.0, 40.0],
+            [0.1, 0.0, 0.9, 120.0, 80.0, 40.0],
+        ],
+        dtype=np.float32,
+    )
+    with h5py.File(hdf5_path, "w") as root:
+        root.attrs["pose_frame"] = "world"
+        root.attrs["source_pose_frame"] = "camera"
+        root.attrs["reference_frame"] = "episode_first_camera"
+        root.attrs["world_frame_definition"] = "camera frame at first source_record_index"
+        root.attrs["episode_first_alignment_applied"] = True
+        root.attrs["uses_camera_extrinsic"] = False
+        root.attrs["camera_reference_mode"] = "episode_first"
+        root.attrs["task"] = "already aligned camera world"
+        cloud_dataset = root.create_dataset(
+            "observations/cloud_rgb/overhead",
+            data=np.stack([cloud, cloud]),
+        )
+        cloud_dataset.attrs["coordinate_frame"] = "episode_first_camera"
+        cloud_dataset.attrs["alignment_applied"] = True
+        pose_dataset = root.create_dataset("observations/pose_eular", data=raw_pose9)
+        pose_dataset.attrs["coordinate_frame"] = "episode_first_camera"
+        root.create_dataset("observations/eff_angular", data=np.asarray([0.08, 0.04]))
+        root.create_dataset("timestamp_ms", data=np.asarray([0.0, 33.0]))
+
+        # This is retained audit metadata, not a transform to apply again. Its
+        # direction is intentionally outside load_camera_motion's raw-input
+        # contract so the test fails if the converter attempts a second pass.
+        camera_pose = root.create_dataset(
+            "observations/camera_tracking_pose/overhead",
+            data=np.stack([np.eye(4), _translation(0.4)]),
+        )
+        camera_pose.attrs["transform_direction"] = "camera_to_episode_first_camera"
+        camera_pose.attrs["translation_unit"] = "meter"
+        camera_pose.attrs["pose_format"] = "matrix"
+
+    cfg = {
+        **_camera_cfg(camera_motion_compensation="required"),
+        "point_cloud_key": None,
+        "image_key": "none",
+        "image_feature_key": None,
+        "pose_key": "observations/pose_eular",
+        "pose_format": "pose9",
+        "gripper_key": "observations/eff_angular",
+        "timestamp_key": "timestamp_ms",
+        "timestamp_mode": "source",
+        "cloud_frame": "auto",
+        "task": None,
+        "fps": 30,
+        "max_frames": None,
+        "num_points": len(cloud),
+        "add_gripper_cloud": False,
+        "input_has_gripper_cloud": False,
+        "gripper_points": 0,
+        "gripper_len": 0.06,
+        "gripper_template": "reap",
+        "gripper_drop_strategy": "random",
+        "gripper_shuffle_points": False,
+        "gripper_widths_are_normalized": False,
+        "gripper_max_width": 0.08,
+        "seed": 7,
+        "camera_motion_debug": False,
+        "camera_motion_debug_frames": 2,
+        "camera_motion_debug_max_points": len(cloud),
+    }
+    episode, record = convert_hdf5_episode(hdf5_path, cfg)
+
+    np.testing.assert_allclose(episode["world_ee_poses"], raw_pose9, atol=1e-7)
+    assert "camera_to_world" not in episode
+    assert record["source_cloud_frame"] == "camera"
+    assert record["world_definition"] == "episode_first_overview_camera"
+    assert record["source_already_camera_reference_aligned"] is True
+    assert record["uses_camera_tracking_pose"] is False
+    assert record["camera_motion"]["reason"] == "source_already_camera_reference_aligned"

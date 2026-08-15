@@ -6,6 +6,7 @@ import torch
 
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
+    canonical_rgb_camera_name,
 )
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
 from lerobot.scripts.train_song_libero import (
@@ -36,6 +37,15 @@ def _pose_sequence(offset: float) -> np.ndarray:
     poses[:, 3] = 1.0
     poses[:, 7] = 1.0
     return poses
+
+
+def test_training_rgb_camera_validation_uses_semantic_aliases() -> None:
+    assert canonical_rgb_camera_name("observation.images.overhead") == "agentview"
+    assert canonical_rgb_camera_name("overview") == "agentview"
+    assert canonical_rgb_camera_name("external") == "agentview"
+    assert canonical_rgb_camera_name("observation.images.hand") == "robot0_eye_in_hand"
+    assert canonical_rgb_camera_name("wrist") == "robot0_eye_in_hand"
+    assert canonical_rgb_camera_name("custom_camera") == "custom_camera"
 
 
 def test_worldflow_dataset_uses_achieved_current_and_commanded_future_targets(tmp_path):

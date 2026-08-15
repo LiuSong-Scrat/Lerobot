@@ -360,12 +360,144 @@ def resolve_cloud_key(h5_file: h5py.File, requested_key: str | None, camera: str
     raise KeyError(f"Camera {camera!r} is unavailable. Point-cloud cameras: {names}")
 
 
-def resolve_cloud_frame(h5_file: h5py.File, requested: str) -> str:
+def _attr_bool(value: Any, default: bool = False) -> bool:
+    """Decode a scalar HDF5 boolean without treating ``"False"`` as true."""
+
+    if value is None:
+        return bool(default)
+    value = decode_attr(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def camera_reference_aligned_world_metadata(
+    h5_file: h5py.File,
+    *,
+    cloud_dataset: h5py.Dataset | None = None,
+    pose_dataset: h5py.Dataset | None = None,
+) -> dict[str, Any]:
+    """Recognize camera-derived data already stored in one fixed reference.
+
+    Episode-first human-hand exports intentionally use ``pose_frame='world'``:
+    their model world *is* the first overview-camera frame. StageGen preserves
+    those attributes and applies augmentation in the same storage frame. Such
+    files must not be rejected as robot/world-frame data, and any retained
+    per-frame camera trajectory must not be applied for a second time.
+
+    Acceptance is deliberately evidence based. An arbitrary legacy
+    ``pose_frame='world'`` file remains rejected unless the root and both
+    spatial datasets agree that their common frame is a fixed camera-derived
+    reference and no robot-camera extrinsic was used.
+    """
+
+    pose_frame = str(decode_attr(h5_file.attrs.get("pose_frame", ""))).strip().lower()
+    source_pose_frame = str(
+        decode_attr(h5_file.attrs.get("source_pose_frame", ""))
+    ).strip().lower()
+    reference_frame = str(
+        decode_attr(h5_file.attrs.get("reference_frame", ""))
+    ).strip().lower()
+    reference_mode = str(
+        decode_attr(h5_file.attrs.get("camera_reference_mode", ""))
+    ).strip().lower()
+    world_definition = str(
+        decode_attr(h5_file.attrs.get("world_frame_definition", ""))
+    ).strip().lower()
+    pose_coordinate_frame = (
+        str(decode_attr(pose_dataset.attrs.get("coordinate_frame", ""))).strip().lower()
+        if pose_dataset is not None
+        else ""
+    )
+    cloud_coordinate_frame = (
+        str(decode_attr(cloud_dataset.attrs.get("coordinate_frame", ""))).strip().lower()
+        if cloud_dataset is not None
+        else ""
+    )
+    episode_first_alignment = _attr_bool(
+        h5_file.attrs.get("episode_first_alignment_applied"),
+    )
+    cloud_alignment = (
+        _attr_bool(cloud_dataset.attrs.get("alignment_applied"))
+        if cloud_dataset is not None
+        else False
+    )
+    uses_camera_extrinsic = _attr_bool(
+        h5_file.attrs.get("uses_camera_extrinsic"),
+    )
+
+    fixed_camera_reference = (
+        "camera" in reference_frame
+        and reference_frame != "current_camera"
+        and any(
+            marker in reference_frame
+            for marker in ("episode_first", "canonical", "fixed", "overview")
+        )
+    )
+    spatial_frames_match = bool(
+        reference_frame
+        and pose_coordinate_frame == reference_frame
+        and cloud_coordinate_frame == reference_frame
+    )
+    camera_origin_evidence = (
+        source_pose_frame == "camera"
+        and (episode_first_alignment or reference_mode == "canonical")
+    )
+    alignment_evidence = episode_first_alignment or cloud_alignment
+    definition_evidence = "camera" in world_definition or reference_mode in {
+        "episode_first",
+        "canonical",
+    }
+    accepted = bool(
+        pose_frame == "world"
+        and fixed_camera_reference
+        and spatial_frames_match
+        and camera_origin_evidence
+        and alignment_evidence
+        and definition_evidence
+        and not uses_camera_extrinsic
+    )
+    return {
+        "accepted": accepted,
+        "pose_frame": pose_frame,
+        "source_pose_frame": source_pose_frame,
+        "reference_frame": reference_frame,
+        "camera_reference_mode": reference_mode,
+        "world_frame_definition": world_definition,
+        "pose_coordinate_frame": pose_coordinate_frame,
+        "cloud_coordinate_frame": cloud_coordinate_frame,
+        "episode_first_alignment_applied": episode_first_alignment,
+        "cloud_alignment_applied": cloud_alignment,
+        "uses_camera_extrinsic": uses_camera_extrinsic,
+    }
+
+
+def resolve_cloud_frame(
+    h5_file: h5py.File,
+    requested: str,
+    *,
+    cloud_dataset: h5py.Dataset | None = None,
+    pose_dataset: h5py.Dataset | None = None,
+) -> str:
     if requested != "auto":
         return requested
     value = str(decode_attr(h5_file.attrs.get("pose_frame", "camera"))).lower()
     if value == "camera":
         return value
+    aligned_world = camera_reference_aligned_world_metadata(
+        h5_file,
+        cloud_dataset=cloud_dataset,
+        pose_dataset=pose_dataset,
+    )
+    if value == "world" and bool(aligned_world["accepted"]):
+        # Compatibility representation: the arrays are already in the fixed
+        # camera-derived model world, which is exactly the converter's accepted
+        # camera-reference geometry. No data rewrite is required.
+        return "camera"
     if value in {"world", "base", "current_eff"}:
         raise ValueError(
             "Only camera-frame real HDF5 data is accepted in camera-reference mode: "
@@ -748,14 +880,40 @@ def convert_hdf5_episode(source_path: Path, cfg: dict[str, Any]) -> tuple[dict[s
         if frame_count < 2:
             raise ValueError(f"Episode needs at least 2 frames, got {frame_count}: {source_path}")
 
-        cloud_frame = resolve_cloud_frame(h5_file, str(cfg["cloud_frame"]))
+        if str(cfg["pose_key"]) not in h5_file:
+            raise KeyError(f"Missing end-effector pose key: {cfg['pose_key']}")
+        pose_dataset = h5_file[str(cfg["pose_key"])]
+        aligned_world_metadata = camera_reference_aligned_world_metadata(
+            h5_file,
+            cloud_dataset=cloud_dataset,
+            pose_dataset=pose_dataset,
+        )
+        source_already_reference_aligned = bool(aligned_world_metadata["accepted"])
+        cloud_frame = resolve_cloud_frame(
+            h5_file,
+            str(cfg["cloud_frame"]),
+            cloud_dataset=cloud_dataset,
+            pose_dataset=pose_dataset,
+        )
         source_ee_poses = load_pose9(
             h5_file,
             str(cfg["pose_key"]),
             str(cfg["pose_format"]),
             frame_count,
         )
-        camera_to_model_world, camera_motion = load_camera_motion(h5_file, cfg, frame_count)
+        if source_already_reference_aligned:
+            # The retained camera trajectory describes how the raw frames were
+            # aligned. Applying it here would transform already aligned clouds
+            # and poses a second time.
+            camera_to_model_world = None
+            camera_motion = {
+                "enabled": False,
+                "mode": str(cfg["camera_motion_compensation"]),
+                "reason": "source_already_camera_reference_aligned",
+                "source_reference_frame": aligned_world_metadata["reference_frame"],
+            }
+        else:
+            camera_to_model_world, camera_motion = load_camera_motion(h5_file, cfg, frame_count)
         reference_ee_poses = (
             transform_pose9_sequence(source_ee_poses, camera_to_model_world)
             if camera_to_model_world is not None
@@ -813,10 +971,20 @@ def convert_hdf5_episode(source_path: Path, cfg: dict[str, Any]) -> tuple[dict[s
         "source_cloud_frame": cloud_frame,
         "reference_frame": "world",
         "world_definition": (
-            "episode_first_overview_camera" if camera_to_model_world is not None else "fixed_overview_camera"
+            "episode_first_overview_camera"
+            if source_already_reference_aligned
+            and aligned_world_metadata["camera_reference_mode"] == "episode_first"
+            else "canonical_fixed_overview_camera"
+            if source_already_reference_aligned
+            and aligned_world_metadata["camera_reference_mode"] == "canonical"
+            else "episode_first_overview_camera"
+            if camera_to_model_world is not None
+            else "fixed_overview_camera"
         ),
         "uses_real_camera_extrinsic": False,
         "uses_camera_tracking_pose": camera_to_model_world is not None,
+        "source_already_camera_reference_aligned": source_already_reference_aligned,
+        "source_alignment_metadata": aligned_world_metadata,
         "camera_motion": camera_motion,
         "timestamp_source": timestamp_source,
         "add_gripper_cloud": bool(cfg["add_gripper_cloud"]) and not bool(cfg["input_has_gripper_cloud"]),
