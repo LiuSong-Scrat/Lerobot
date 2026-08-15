@@ -269,4 +269,3 @@ if out.exists(): assert json.load(out.open(encoding="utf-8"))==p
 else: out.write_text(json.dumps(p,indent=2)+"\n",encoding="utf-8")
 print(json.dumps(p,indent=2))
 PY
-

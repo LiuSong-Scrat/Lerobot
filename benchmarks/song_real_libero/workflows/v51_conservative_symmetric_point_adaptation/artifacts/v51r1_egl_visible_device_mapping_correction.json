@@ -14,7 +14,7 @@
   },
   "correction": {
     "runner": "eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_localvisibleegl.sh",
-    "runner_sha256": "b7a515dfc15a366b85279a1ef3cf6dff9f064dc347671d333265d9b4dffb36fa",
+    "runner_sha256": "fa1ea9310ecc5e1af4cca163743eec4472d47858c6c7f2865422f1ddb7e3e98b",
     "cuda_visible_devices": "physical partition GPU index",
     "mujoco_egl_device_id": 0,
     "render_gpu_device_id": 0,
@@ -24,4 +24,3 @@
     "fresh_inference_cache_namespace": true
   }
 }
-
