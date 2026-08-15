@@ -7,6 +7,7 @@ import torch
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
+    make_policy_on_accelerator_device,
     worldflow_ego_priority_projection_statistics,
 )
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
@@ -30,6 +31,46 @@ class _TinyDataset(torch.utils.data.Dataset):
             "frame_index": torch.tensor(self.frame_index),
             "action": torch.zeros(self.chunk_size, 10),
         }
+
+
+def test_policy_materialization_uses_explicit_local_cuda_then_restores_portable_config(monkeypatch):
+    class _Config:
+        device = "cuda"
+
+    class _Policy:
+        pass
+
+    config = _Config()
+    policy = _Policy()
+    policy.config = config
+    observed = {}
+
+    def fake_make_policy(*, cfg, ds_meta, rename_map):
+        observed["device_during_load"] = cfg.device
+        observed["ds_meta"] = ds_meta
+        observed["rename_map"] = rename_map
+        return policy
+
+    monkeypatch.setattr(
+        "benchmarks.song_real_libero.scripts.train_song_benchmark.make_policy",
+        fake_make_policy,
+    )
+
+    result = make_policy_on_accelerator_device(
+        policy_cfg=config,
+        ds_meta="metadata",
+        rename_map={"old": "new"},
+        accelerator_device=torch.device("cuda:3"),
+    )
+
+    assert result is policy
+    assert observed == {
+        "device_during_load": "cuda:3",
+        "ds_meta": "metadata",
+        "rename_map": {"old": "new"},
+    }
+    assert config.device == "cuda"
+    assert policy.config.device == "cuda"
 
 
 def _pose_sequence(offset: float) -> np.ndarray:

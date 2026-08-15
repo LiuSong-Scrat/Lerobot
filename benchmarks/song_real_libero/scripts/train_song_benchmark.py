@@ -194,6 +194,42 @@ def validate_policy_camera_config_matches_training_config(
             "Camera view fusion diverged while loading the policy: "
             f"training={train_fusion!r}, model={model_fusion!r}."
         )
+
+
+def make_policy_on_accelerator_device(
+    *,
+    policy_cfg: Any,
+    ds_meta: Any,
+    rename_map: dict[str, str] | None,
+    accelerator_device: torch.device,
+) -> PreTrainedPolicy:
+    """Materialize a distributed policy directly on its process-local GPU.
+
+    Policy configs intentionally save the portable device value ``"cuda"``.
+    Passing that unindexed value through safetensors while every DDP process can
+    see every GPU may, however, transiently materialize nonzero ranks on GPU 0.
+    The released tensors leave a CUDA context behind and consume enough memory
+    to make a legitimate batch-48 update intermittently OOM on a 24 GiB GPU.
+
+    Temporarily make the load device explicit (for example ``cuda:3``), then
+    restore the portable config value.  This changes neither model parameters
+    nor the device recorded in checkpoints and does not touch LitePT.
+    """
+
+    saved_device = policy_cfg.device
+    if accelerator_device.type == "cuda":
+        policy_cfg.device = str(accelerator_device)
+    try:
+        policy = make_policy(
+            cfg=policy_cfg,
+            ds_meta=ds_meta,
+            rename_map=rename_map,
+        )
+    finally:
+        policy_cfg.device = saved_device
+    return policy
+
+
 def write_training_camera_provenance(
     cfg: TrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -2198,10 +2234,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
-    policy = make_policy(
-        cfg=cfg.policy,
+    policy = make_policy_on_accelerator_device(
+        policy_cfg=cfg.policy,
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
+        accelerator_device=device,
     )
     worldflow_bootstrap_requested = bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False))
     if worldflow_bootstrap_requested and not cfg.resume:
