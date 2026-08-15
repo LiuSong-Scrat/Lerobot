@@ -40,10 +40,10 @@ network_access = true
    - /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/CONTAINER_RECOVERY_2026-08-15.md
 3. V51 Git-tracked workflow 位于远端分支：
    wep_vla_v0.4.3_v51_workflow_archive
-   commit c9574e9cbfef3631d15d17c0fc74d3c08f755682
+   commit 707ba6012ef834169e67f0d5b16305cede78bcb7
 4. V51 可执行代码必须使用独立 worktree：
    branch wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation
-   commit 93e2d8a3177a8addc40229da00962fcc2e7b7100
+   commit 9db8504a2c575ad386f1d90efa98784c0ea8d701
 5. 读取 workflow archive 中：
    benchmarks/song_real_libero/workflows/v51_conservative_symmetric_point_adaptation/README.md
    benchmarks/song_real_libero/workflows/v51_conservative_symmetric_point_adaptation/CURRENT_CONVERSATION_ARCHIVE_2026-08-15.md

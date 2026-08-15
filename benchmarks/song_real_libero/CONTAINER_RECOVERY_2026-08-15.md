@@ -36,8 +36,8 @@ benchmarks/song_real_libero/workflows/v51_conservative_symmetric_point_adaptatio
 | V46 1cm/3cm input | `wep_vla_v0.4.3_v46_multiscale_novelty_union` | `d752f14df8c75cfcd9acd9c6b34d8e2e7d5b7296` |
 | V49 对称点路径 | `wep_vla_v0.4.3_v49_symmetric_point_adaptation` | `0b8e7b48dbddcbab847737ef6d676709cc8dfbef` |
 | V50 保守输入 | `wep_vla_v0.4.3_v50_conservative_multiscale_novelty` | `3daeddd7de6afb7db086dffb3a0ebcf590d5db9c` |
-| V51 可执行代码 | `wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation` | `93e2d8a3177a8addc40229da00962fcc2e7b7100` |
-| V51 运行归档 | `wep_vla_v0.4.3_v51_workflow_archive` | `c9574e9cbfef3631d15d17c0fc74d3c08f755682` |
+| V51 可执行代码 | `wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation` | `9db8504a2c575ad386f1d90efa98784c0ea8d701` |
+| V51 运行归档 | `wep_vla_v0.4.3_v51_workflow_archive` | `707ba6012ef834169e67f0d5b16305cede78bcb7` |
 | 对称双坐标 | `wep_vla_v0.4.3_worldflow_symmetric_dualcoord` | `4562fd17c8de5c7ee15ae930b1afdebb7881fd93` |
 | 并行双坐标 | `wep_vla_v0.4.3_worldflow_parallel_dualcoord` | `a04fc510cf35e61369c4ae3fc656a507c9ed9e00` |
 | canonical dualflow | `wep_vla_v0.4.3_worldflow_canonical_dualflow` | `62e8670537ba72339c762ba954c528646757eb5f` |
@@ -45,10 +45,10 @@ benchmarks/song_real_libero/workflows/v51_conservative_symmetric_point_adaptatio
 
 ## 重要运行状态
 
-- V51 cache 尚未生成。
-- V51 training 尚未启动。
-- V51 cache/training tmux 均不存在。
-- 新一轮 pytest 在切换到归档请求时被中断，没有新结果；历史回归结果为 `78 + 35 + 16` passed，真正启动 cache 前应快速重跑。
+- V51 v12 cache 已完成：`137590` samples、`36` shards；36-shard exact-index audit 全部通过。
+- 原训练入口在 step 0 暴露 dual v12 / primary v11 compatible schema 误拒绝；无 optimizer update，失败证据保留。
+- schema compatibility 修复后测试为 `130/130`；修复 commit 为 `9db8504a2c575ad386f1d90efa98784c0ea8d701`。
+- `v51r1_schemafix` 正在 tmux `wep_v043_v51r1_schemafix_conservative_symmetricpoint_paired_train` 中训练；恢复时先查 tmux、进程、W&B 与最新 checkpoint，不得重复启动。
 - cache 基准 voxel 为 `1 cm`；`4 cm` 只用于副视角新颖性判断。
 - 大型 dataset、checkpoint、cache 和 rollout 不进 Git；若 `/opt/data/private` 在新容器继续挂载，仍按原绝对路径复用。
 - 不得删除 `/opt/data/private` 下任何文件。

@@ -2,7 +2,16 @@
 
 更新时间：2026-08-15
 
-容器迁移恢复入口：`benchmarks/song_real_libero/CONTAINER_RECOVERY_2026-08-15.md`。V51 的完整 Git-tracked 运行包位于远端分支 `wep_vla_v0.4.3_v51_workflow_archive`，可执行模型代码严格固定在 `wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation@93e2d8a3177a8addc40229da00962fcc2e7b7100`。
+容器迁移恢复入口：`benchmarks/song_real_libero/CONTAINER_RECOVERY_2026-08-15.md`。V51 的完整 Git-tracked 运行包位于远端分支 `wep_vla_v0.4.3_v51_workflow_archive@707ba6012ef834169e67f0d5b16305cede78bcb7`，当前可执行代码为 `wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation@9db8504a2c575ad386f1d90efa98784c0ea8d701`。
+
+## 当前强制覆盖项（2026-08-15 V51 新容器恢复）
+
+- 三组回归已重新通过；schema compatibility 修复后完整合并结果为 `130/130`。
+- V51 v12 cache 已完成：`137590` samples、`36` shards、1 cm 基准、scale4 副视角新颖性；36-shard online/cache exact-index audit 的 strict10k、unique indices 与 gripper exact 全部通过。
+- 第一次训练启动在 step 0 因 paired semantic-contract 错把支持的 dual v12 / primary v11 storage schema 差异当作不兼容而停止；没有 optimizer update 或 checkpoint，失败目录与日志保留。
+- 通用修复 commit `9db8504a2c575ad386f1d90efa98784c0ea8d701` 只从 paired semantic equality 移除 schema version；每个 cache 仍由 reader 严格限制为 supported versions `(11,12)`。
+- 独立重启 `v51r1_schemafix` 已于 2026-08-15 15:05 进入正式训练，tmux 为 `wep_v043_v51r1_schemafix_conservative_symmetricpoint_paired_train`；W&B online，4 GPU、batch44/GPU、worker12、目标1564 steps。step19 时无 OOM/NaN，约2.1秒/步；这只是运行健康证据，不是性能结论。
+- 权威 output 为 `joint_multiview_worldflow/libero10_500ep/training/v51r1_from_v32step100_multiscale_novelty1cm4cm_paired_symmetricpoint5e8_policy5e9_devicebound_schemafix_4gpu_b44_w12_1564steps`。原无 schemafix 的 output 不得覆盖或删除。
 
 ## 当前强制覆盖项（2026-08-14）
 
