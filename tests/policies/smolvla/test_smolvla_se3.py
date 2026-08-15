@@ -1804,6 +1804,51 @@ def test_worldflow_and_complete_se3_flow_can_be_enabled_together():
     assert "worldflow=conjugate_ego" in cfg.flow_contract_summary()
 
 
+def test_worldflow_robot_base_reference_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_reference_frame="robot_base",
+        point_action_fusion_enable=True,
+    )
+    assert cfg.worldflow_reference_frame == "robot_base"
+
+    with pytest.raises(ValueError, match="worldflow_reference_frame"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_reference_frame="current_camera_guess",
+            point_action_fusion_enable=True,
+        )
+
+
+def test_object_worldflow_requires_independent_token_only_contract():
+    cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="object_centered_motion",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="cross_attention",
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert "worldflow_targets=object_centered_motion" in cfg.flow_contract_summary()
+    assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
+
+    with pytest.raises(ValueError, match="strict independent-object contract"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_target_type="object_centered_motion",
+            worldflow_reference_frame="robot_base",
+            worldflow_frame_origin="global",
+            worldflow_scene_frame_origin="global",
+            worldflow_noise_coupling="independent",
+            worldflow_action_fusion="endpoint_residual_boosting",
+            worldflow_bridge_loss_weight=0.0,
+            worldflow_equiv_loss_weight=0.0,
+        )
+
+
 def test_worldflow_global_scene_keeps_absolute_translation_with_local_action_carrier():
     cfg = SmolVLAConfig(
         pointseg_enable=True,
@@ -2910,6 +2955,70 @@ def test_worldflow_joint_loss_uses_foreground_only_and_backpropagates_bridge():
     assert body_prediction.grad is not None
     assert "loss_worldflow_geo" in model.last_worldflow_metrics
     assert model.last_worldflow_metrics["worldflow_foreground_points"].item() == cfg.worldflow_max_points
+
+
+def test_object_worldflow_target_is_not_conjugated_through_eef_and_has_no_bridge_loss():
+    torch.manual_seed(23)
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_target_type="object_centered_motion",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="cross_attention",
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = _make_tiny_worldflow_branch(cfg)
+    model.last_worldflow_metrics = {}
+    foreground_pc_ego = torch.randn(2, 8, 6)
+    model.last_worldflow_payload = {"foreground_pc_ego": foreground_pc_ego}
+
+    current_eef = matrix_to_pose9(se3_exp(torch.randn(2, 6) * 0.4))
+    object_target = matrix_to_pose9(se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.1))
+    state = model._prepare_worldflow_training_state(
+        {
+            "current_ee_pose": current_eef,
+            "object_centered_motion": object_target,
+            "step_is_pad": torch.zeros(2, cfg.chunk_size, dtype=torch.bool),
+        },
+        torch.randint(0, 64, (2, 5)),
+        torch.ones(2, 5, dtype=torch.bool),
+        torch.rand(2),
+        actions_is_pad=None,
+    )
+
+    assert torch.allclose(state["spatial_gt"], pose9_to_matrix(object_target), atol=1e-6)
+    current_eef_matrix = pose9_to_matrix(current_eef)
+    expected_xyz_base = (
+        current_eef_matrix[:, None, :3, :3]
+        @ foreground_pc_ego[..., :3, None]
+    ).squeeze(-1) + current_eef_matrix[:, None, :3, 3]
+    assert torch.allclose(
+        state["point_cloud_world"][..., :3],
+        expected_xyz_base,
+        atol=1e-5,
+    )
+    assert state["u_t"].shape == (2, cfg.chunk_size, 6)
+    identity = torch.eye(4).expand(2, -1, -1)
+    assert torch.equal(state["current"], identity)
+    output = model._finalize_worldflow_training_loss(
+        state,
+        torch.zeros_like(state["u_t"], requires_grad=True),
+        matrix_to_pose9(se3_exp(torch.randn(2, cfg.chunk_size, 6))),
+        torch.rand(2),
+    )
+    assert output["loss_bridge"].item() == 0.0
+    assert model.last_worldflow_metrics["loss_worldflow_bridge"].item() == 0.0
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():

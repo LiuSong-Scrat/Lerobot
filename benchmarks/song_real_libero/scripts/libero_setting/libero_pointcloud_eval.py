@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "worldflow_fixed_reference_pose_v19_20260816"
+EVAL_BUILD_TAG = "worldflow_robot_base_reference_v20_20260816"
 
 import argparse
 import atexit
@@ -183,6 +183,7 @@ if __package__ and __package__.startswith("benchmarks."):
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
         eef_pose9_world_to_reference_camera,
+        eef_pose9_world_to_robot_base,
         ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
@@ -202,6 +203,7 @@ else:
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
         eef_pose9_world_to_reference_camera,
+        eef_pose9_world_to_robot_base,
         ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
@@ -6966,13 +6968,27 @@ def run_episode(
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
             }
             if bool(getattr(infer.policy.config, "worldflow_enable", False)):
-                model_observation["worldflow.current_ee_pose"] = (
-                    eef_pose9_world_to_reference_camera(
+                worldflow_reference_frame = str(
+                    getattr(
+                        infer.policy.config,
+                        "worldflow_reference_frame",
+                        "pointcloud_reference_camera",
+                    )
+                )
+                if worldflow_reference_frame == "robot_base":
+                    current_worldflow_pose = eef_pose9_world_to_robot_base(env, eef_pose)
+                elif worldflow_reference_frame == "pointcloud_reference_camera":
+                    current_worldflow_pose = eef_pose9_world_to_reference_camera(
                         env,
                         eef_pose,
                         str(cfg["pointcloud_reference_camera"]),
-                    )[:9]
-                )
+                    )
+                else:
+                    raise ValueError(
+                        "Unsupported checkpoint worldflow_reference_frame="
+                        f"{worldflow_reference_frame!r}."
+                    )
+                model_observation["worldflow.current_ee_pose"] = current_worldflow_pose[:9]
             chunk_start_model_world = pose9_to_homo_np(np.asarray(eef_pose[:9], dtype=np.float32))
             chunk_start_model_worlds.append(np.asarray(chunk_start_model_world, dtype=np.float32))
             if previous_issued_target_model_world is not None:

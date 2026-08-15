@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
+from types import SimpleNamespace
 
 from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_utils import (
     eef_pose9_world_to_reference_np,
+    eef_pose9_world_to_robot_base,
     matrix_to_pose9_np,
     pose9_to_homo_np,
 )
@@ -49,3 +51,29 @@ def test_eef_world_pose_conversion_supports_batches():
 
     assert converted.shape == (2, 10)
     np.testing.assert_allclose(converted, np.stack([first, second]), atol=1e-6)
+
+
+def test_robot_base_pose_is_read_from_robot_root_body():
+    base_to_world = _transform(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [0.5, -0.2, 0.1],
+    )
+    eef_to_world = _transform(np.eye(3, dtype=np.float32), [0.7, 0.1, 0.4])
+    eef_pose_world = matrix_to_pose9_np(eef_to_world)
+
+    data = SimpleNamespace(
+        get_body_xpos=lambda name: base_to_world[:3, 3] if name == "robot0_base" else None,
+        get_body_xmat=lambda name: base_to_world[:3, :3].reshape(-1) if name == "robot0_base" else None,
+    )
+    env = SimpleNamespace(
+        robots=[SimpleNamespace(robot_model=SimpleNamespace(root_body="robot0_base"))],
+        sim=SimpleNamespace(data=data),
+    )
+
+    converted = eef_pose9_world_to_robot_base(env, eef_pose_world)
+
+    np.testing.assert_allclose(
+        pose9_to_homo_np(converted),
+        np.linalg.inv(base_to_world) @ eef_to_world,
+        atol=1e-6,
+    )

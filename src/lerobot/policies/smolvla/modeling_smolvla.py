@@ -1357,9 +1357,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions_is_pad = actions_is_pad.to(device=actions.device, dtype=torch.bool)
         worldflow_context = None
         if self.config.worldflow_enable:
+            object_motion = (
+                getattr(self.config, "worldflow_target_type", "legacy_eef")
+                == "object_centered_motion"
+            )
+            target_batch_key = (
+                "worldflow.object_centered_motion"
+                if object_motion
+                else "worldflow.ee_poses"
+            )
             required_worldflow_keys = (
                 "worldflow.current_ee_pose",
-                "worldflow.ee_poses",
+                target_batch_key,
                 "worldflow.step_is_pad",
             )
             missing = [key for key in required_worldflow_keys if key not in batch]
@@ -1367,7 +1376,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 raise ValueError(f"WorldFlow training batch is missing required keys: {missing}")
             worldflow_context = {
                 "current_ee_pose": batch["worldflow.current_ee_pose"],
-                "ee_poses": batch["worldflow.ee_poses"],
+                (
+                    "object_centered_motion" if object_motion else "ee_poses"
+                ): batch[target_batch_key],
                 "step_is_pad": batch["worldflow.step_is_pad"],
             }
         loss_dict = {}
@@ -2830,21 +2841,36 @@ class VLAFlowMatching(nn.Module):
         )
         if self.worldflow_branch is not None:
             expert_dim = self.vlm_with_expert.expert_hidden_size
+            object_worldflow = (
+                getattr(self.config, "worldflow_target_type", "legacy_eef")
+                == "object_centered_motion"
+            )
             self.ego_scene_to_expert = nn.Linear(self.config.pointseg_feature_dim, expert_dim)
             self.world_scene_to_expert = nn.Linear(self.config.worldflow_feature_dim, expert_dim)
-            self.world_action_out_proj = nn.Linear(expert_dim, WorldFlowActionBranch.pose_dim)
+            self.world_action_out_proj = (
+                None
+                if object_worldflow
+                else nn.Linear(expert_dim, WorldFlowActionBranch.pose_dim)
+            )
             self.world_se3_action_out_proj = (
                 nn.Linear(expert_dim, 6)
-                if self.config.se3_enable
+                if object_worldflow
+                or self.config.se3_enable
                 and (
                     self.config.se3_twist_head_mode == "direct_twist"
                     or self.config.worldflow_se3_head_enable
                 )
                 else None
             )
-            self.world_twist_residual_out_proj = nn.Linear(expert_dim, 6)
-            nn.init.zeros_(self.world_twist_residual_out_proj.weight)
-            nn.init.zeros_(self.world_twist_residual_out_proj.bias)
+            if object_worldflow:
+                # A true independent object-flow checkpoint has no physical
+                # residual head at all. World can affect Ego only through the
+                # explicit token cross-attention path below.
+                self.world_twist_residual_out_proj = None
+            else:
+                self.world_twist_residual_out_proj = nn.Linear(expert_dim, 6)
+                nn.init.zeros_(self.world_twist_residual_out_proj.weight)
+                nn.init.zeros_(self.world_twist_residual_out_proj.bias)
             # Explicit identities distinguish the appended scene and World
             # action blocks. Ego actions remain byte-for-byte unchanged for
             # checkpoint compatibility.
@@ -3341,6 +3367,13 @@ class VLAFlowMatching(nn.Module):
     ) -> Tensor:
         """Decode World expert features as a spatial twist."""
 
+        if (
+            getattr(self.config, "worldflow_target_type", "legacy_eef")
+            == "object_centered_motion"
+        ):
+            if self.world_se3_action_out_proj is None:
+                raise RuntimeError("Object WorldFlow SE(3) twist head is not initialized.")
+            return self.world_se3_action_out_proj(expert_out)
         if self.config.worldflow_se3_head_enable:
             if self.world_se3_action_out_proj is None:
                 raise RuntimeError("Dedicated World SE(3) twist head is not initialized.")
@@ -4473,7 +4506,12 @@ class VLAFlowMatching(nn.Module):
     ) -> dict[str, Tensor | dict[str, Tensor]]:
         if self.worldflow_branch is None:
             raise RuntimeError("WorldFlow is disabled.")
-        required = ("current_ee_pose", "ee_poses", "step_is_pad")
+        object_motion = (
+            getattr(self.config, "worldflow_target_type", "legacy_eef")
+            == "object_centered_motion"
+        )
+        target_context_key = "object_centered_motion" if object_motion else "ee_poses"
+        required = ("current_ee_pose", target_context_key, "step_is_pad")
         missing = [key for key in required if key not in worldflow_context]
         if missing:
             raise ValueError(f"WorldFlow training context is missing required keys: {missing}")
@@ -4481,7 +4519,7 @@ class VLAFlowMatching(nn.Module):
         point_cloud_world, point_is_pad, current_pose = self._prepare_worldflow_foreground(
             worldflow_context["current_ee_pose"]
         )
-        target_poses = worldflow_context["ee_poses"].to(
+        target_poses = worldflow_context[target_context_key].to(
             device=point_cloud_world.device,
             dtype=torch.float32,
         )
@@ -4523,11 +4561,25 @@ class VLAFlowMatching(nn.Module):
             current = coordinate_frame_transform @ current
         current_inv = invert_transform(current)
         target = pose9_to_matrix(target_poses)
-        body_gt = absolute_current_inv.unsqueeze(1) @ target
-        spatial_gt = current.unsqueeze(1) @ body_gt @ current_inv.unsqueeze(1)
+        if object_motion:
+            # This target is already an EEF-independent motion descriptor in
+            # robot-base axes: translation is object-center displacement and
+            # rotation is the object's orientation delta. It must never be
+            # conjugated through the current EEF carrier.
+            spatial_gt = target
+            identity = torch.eye(
+                4,
+                device=current.device,
+                dtype=current.dtype,
+            ).expand(current.shape[0], -1, -1)
+            current = identity
+            current_inv = identity
+        else:
+            body_gt = absolute_current_inv.unsqueeze(1) @ target
+            spatial_gt = current.unsqueeze(1) @ body_gt @ current_inv.unsqueeze(1)
         spatial_gt_pose9 = matrix_to_pose9(spatial_gt)
 
-        ego_coupled_noise = self.config.worldflow_noise_coupling in {
+        ego_coupled_noise = not object_motion and self.config.worldflow_noise_coupling in {
             "conjugate_ego",
             "projected_ego_chart",
             "projected_ego_path",
@@ -4572,7 +4624,9 @@ class VLAFlowMatching(nn.Module):
             noise_spatial = se3_exp(noise_twist)
             noise_pose9 = matrix_to_pose9(noise_spatial)
 
-        if coordinate_frame_transform is None:
+        if object_motion:
+            expected_conjugate_noise = noise_spatial
+        elif coordinate_frame_transform is None:
             expected_conjugate_noise = pose9_to_matrix(
                 self.conjugate_ego_noise_to_world(ego_noise, current_pose)
             )
@@ -4604,7 +4658,7 @@ class VLAFlowMatching(nn.Module):
                 x_t = matrix_to_pose9(world_h_t)
                 remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
                 u_t = (spatial_gt_pose9 - x_t) / remaining
-        elif self.config.se3_enable:
+        elif self.config.se3_enable or object_motion:
             world_h_t, u_t = se3_geodesic_flow_state(noise_spatial, spatial_gt, time)
             x_t = matrix_to_pose9(world_h_t)
         else:
@@ -4612,7 +4666,7 @@ class VLAFlowMatching(nn.Module):
             x_t = (1.0 - time_expanded) * noise_pose9 + time_expanded * spatial_gt_pose9
             u_t = spatial_gt_pose9 - noise_pose9
 
-        if ego_x_t is None:
+        if object_motion or ego_x_t is None:
             path_conjugacy_error = torch.zeros_like(noise_conjugacy_error)
         else:
             ego_h_t = pose9_to_matrix(ego_x_t[..., :9].to(dtype=torch.float32))
@@ -4646,6 +4700,11 @@ class VLAFlowMatching(nn.Module):
             "u_t": u_t,
             "valid": valid,
             "world_tokens": world_tokens,
+            "object_motion": torch.tensor(
+                object_motion,
+                device=point_cloud_world.device,
+                dtype=torch.bool,
+            ),
         }
         if coordinate_frame_transform is not None:
             state["coordinate_frame_transform"] = coordinate_frame_transform
@@ -4765,8 +4824,12 @@ class VLAFlowMatching(nn.Module):
         if not torch.is_tensor(path_conjugacy_error):
             raise TypeError("WorldFlow state is missing tensor path_conjugacy_error.")
 
+        object_motion = bool(
+            torch.is_tensor(state.get("object_motion"))
+            and bool(state["object_motion"].item())
+        )
         time_expanded = time[:, None, None]
-        if self.config.se3_enable:
+        if self.config.se3_enable or object_motion:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
             pred_spatial = se3_left_apply(remaining * pred_velocity, pose9_to_matrix(x_t))
             pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
@@ -4775,21 +4838,26 @@ class VLAFlowMatching(nn.Module):
             pred_spatial_pose9 = x_t + (1.0 - time_expanded) * pred_velocity
             pred_spatial = pose9_to_matrix(pred_spatial_pose9)
             flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
-        pred_body_from_world = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
-        pred_body = pose9_to_matrix(pred_body_pose9[..., :9])
-
         geo_step = se3_geodesic_loss(
             pred_spatial,
             spatial_gt,
             trans_weight=float(self.config.worldflow_trans_weight),
             rot_weight=float(self.config.worldflow_rot_weight),
         )
-        bridge_step = se3_geodesic_loss(
-            pred_body_from_world,
-            pred_body,
-            trans_weight=float(self.config.worldflow_trans_weight),
-            rot_weight=float(self.config.worldflow_rot_weight),
-        )
+        if object_motion:
+            # Independent object motion has no analytic equality to an EEF
+            # action endpoint. Cross-token interaction is the only bridge.
+            pred_body_from_world = pred_spatial
+            bridge_step = torch.zeros_like(geo_step)
+        else:
+            pred_body_from_world = current_inv.unsqueeze(1) @ pred_spatial @ current.unsqueeze(1)
+            pred_body = pose9_to_matrix(pred_body_pose9[..., :9])
+            bridge_step = se3_geodesic_loss(
+                pred_body_from_world,
+                pred_body,
+                trans_weight=float(self.config.worldflow_trans_weight),
+                rot_weight=float(self.config.worldflow_rot_weight),
+            )
         equiv_step = torch.zeros_like(geo_step)
 
         if augmented_state is not None:
@@ -4800,7 +4868,7 @@ class VLAFlowMatching(nn.Module):
             spatial_gt_aug = augmented_state["spatial_gt"]
             if not all(torch.is_tensor(value) for value in (x_t_aug, u_t_aug, spatial_gt_aug)):
                 raise TypeError("Augmented WorldFlow state contains a non-tensor value.")
-            if self.config.se3_enable:
+            if self.config.se3_enable or object_motion:
                 pred_aug_spatial = se3_left_apply(
                     remaining * pred_aug_velocity,
                     pose9_to_matrix(x_t_aug),
@@ -4907,7 +4975,7 @@ class VLAFlowMatching(nn.Module):
             self.last_worldflow_metrics["worldflow_coordinate_frame_augmentation_active"] = torch.zeros(
                 (), device=point_cloud_world.device, dtype=torch.float32
             )
-        return {
+        result = {
             "loss_flow": per_sample_flow.mean(),
             "loss_geo": per_sample_geo.mean(),
             "loss_bridge": per_sample_bridge.mean(),
@@ -4919,6 +4987,9 @@ class VLAFlowMatching(nn.Module):
             "pred_body_pose9": matrix_to_pose9(pred_body_from_world),
             "pred_velocity": pred_velocity,
         }
+        if object_motion:
+            result["pred_object_centered_motion_pose9"] = pred_spatial_pose9
+        return result
 
     def compute_worldflow_aux_loss(
         self,
@@ -5284,8 +5355,6 @@ class VLAFlowMatching(nn.Module):
                 raise ValueError(
                     "worldflow_enable=True requires current and future world EEF poses during training."
                 )
-            if self.world_action_out_proj is None:
-                raise RuntimeError("WorldFlow output projection is not initialized.")
             world_state = self._prepare_worldflow_training_state(
                 worldflow_context,
                 lang_tokens,
@@ -5308,7 +5377,23 @@ class VLAFlowMatching(nn.Module):
             )
             joint_v_t = self.action_out_proj(ego_expert_out)
             v_t = joint_v_t
-            world_velocity = self.world_action_out_proj(world_expert_out)
+            object_motion = (
+                getattr(self.config, "worldflow_target_type", "legacy_eef")
+                == "object_centered_motion"
+            )
+            if object_motion:
+                world_x_t = world_state.get("x_t")
+                if not torch.is_tensor(world_x_t):
+                    raise TypeError("Object WorldFlow state is missing tensor x_t.")
+                world_velocity = self._predict_world_se3_velocity(
+                    world_expert_out,
+                    world_x_t,
+                    time,
+                )
+            else:
+                if self.world_action_out_proj is None:
+                    raise RuntimeError("WorldFlow pose9 output projection is not initialized.")
+                world_velocity = self.world_action_out_proj(world_expert_out)
             world_to_ego_keep_mask = None
             if x_t.shape[-1] < 9 or v_t.shape[-1] < 9:
                 raise ValueError("World–Ego bridge requires Ego pose9 actions.")
@@ -5406,7 +5491,19 @@ class VLAFlowMatching(nn.Module):
                         detach_ego_for_world_supervision=True,
                     )
                 else:
-                    pred_aug_velocity = self.world_action_out_proj(world_aug_expert_out)
+                    if object_motion:
+                        augmented_world_x_t = augmented_state.get("x_t")
+                        if not torch.is_tensor(augmented_world_x_t):
+                            raise TypeError("Augmented object WorldFlow state is missing tensor x_t.")
+                        pred_aug_velocity = self._predict_world_se3_velocity(
+                            world_aug_expert_out,
+                            augmented_world_x_t,
+                            time,
+                        )
+                    else:
+                        if self.world_action_out_proj is None:
+                            raise RuntimeError("WorldFlow pose9 output projection is not initialized.")
+                        pred_aug_velocity = self.world_action_out_proj(world_aug_expert_out)
 
             self.last_worldflow_aux = self._finalize_worldflow_training_loss(
                 world_state,
@@ -5610,7 +5707,18 @@ class VLAFlowMatching(nn.Module):
                         world_to_ego_transform=world_to_ego_transform,
                     )
                     if self.config.worldflow_noise_coupling != "projected_ego_path":
-                        world_x_t = world_x_t + dt * world_v_t
+                        if (
+                            getattr(self.config, "worldflow_target_type", "legacy_eef")
+                            == "object_centered_motion"
+                        ):
+                            world_x_t = matrix_to_pose9(
+                                se3_left_apply(
+                                    dt * world_v_t,
+                                    pose9_to_matrix(world_x_t),
+                                )
+                            )
+                        else:
+                            world_x_t = world_x_t + dt * world_v_t
 
             x_t = x_t + dt * v_t
 
@@ -5721,10 +5829,16 @@ class VLAFlowMatching(nn.Module):
             if return_pose9_velocity:
                 return joint_ego_velocity, world_velocity, joint_pose9_velocity
             return joint_ego_velocity, world_velocity
-        if self.world_action_out_proj is None:
-            raise RuntimeError("Joint World–Ego pose9 output projection is not initialized.")
         joint_ego_velocity = self.action_out_proj(ego_out)
-        world_velocity = self.world_action_out_proj(world_out)
+        if (
+            getattr(self.config, "worldflow_target_type", "legacy_eef")
+            == "object_centered_motion"
+        ):
+            world_velocity = self._predict_world_se3_velocity(world_out, world_x_t, timestep)
+        else:
+            if self.world_action_out_proj is None:
+                raise RuntimeError("Joint World–Ego pose9 output projection is not initialized.")
+            world_velocity = self.world_action_out_proj(world_out)
         if getattr(self.config, "worldflow_action_fusion", "cross_attention") == "endpoint_residual_boosting":
             if ego_to_world_transform is None or world_to_ego_transform is None:
                 raise RuntimeError("Endpoint residual carrier transforms are not initialized.")

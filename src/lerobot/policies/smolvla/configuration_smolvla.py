@@ -203,6 +203,19 @@ class SmolVLAConfig(PreTrainedConfig):
     # scene block; all World/Ego action tokens form one bidirectional block.
     # The branch is active in training and inference.
     worldflow_enable: bool = False
+    # Supervision semantics for the independent World branch. ``legacy_eef``
+    # retains historical checkpoints whose World target is a reparameterized
+    # EEF action. ``object_centered_motion`` predicts the dominant scene
+    # object's center displacement and rotation delta in the fixed robot-base
+    # axes. The latter is independent of EEF motion and may influence Ego only
+    # through token exchange.
+    worldflow_target_type: str = "legacy_eef"
+    # Canonical fixed frame used by the World branch. Historical checkpoints
+    # used the first fixed camera. New object-flow checkpoints use the robot
+    # base so scene geometry is invariant to camera placement and directly
+    # comparable across calibrated fixed cameras. This frame is never the UMI
+    # episode origin and never the current EEF frame.
+    worldflow_reference_frame: str = "pointcloud_reference_camera"
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
     # Keep the pretrained World LitePT population statistics fixed during
@@ -706,6 +719,51 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_enable=True."
             )
         if self.worldflow_enable:
+            if self.worldflow_target_type not in {
+                "legacy_eef",
+                "object_centered_motion",
+            }:
+                raise ValueError(
+                    "worldflow_target_type must be 'legacy_eef' or "
+                    f"'object_centered_motion', got {self.worldflow_target_type!r}."
+                )
+            if self.worldflow_reference_frame not in {
+                "pointcloud_reference_camera",
+                "robot_base",
+            }:
+                raise ValueError(
+                    "worldflow_reference_frame must be 'pointcloud_reference_camera' or "
+                    f"'robot_base', got {self.worldflow_reference_frame!r}."
+                )
+            if self.worldflow_target_type == "object_centered_motion":
+                object_contract_errors = []
+                if self.worldflow_reference_frame != "robot_base":
+                    object_contract_errors.append("worldflow_reference_frame='robot_base'")
+                if self.worldflow_scene_frame_origin != "global":
+                    object_contract_errors.append("worldflow_scene_frame_origin='global'")
+                if self.worldflow_frame_origin != "global":
+                    object_contract_errors.append("worldflow_frame_origin='global'")
+                if self.worldflow_noise_coupling != "independent":
+                    object_contract_errors.append("worldflow_noise_coupling='independent'")
+                if self.worldflow_action_fusion != "cross_attention":
+                    object_contract_errors.append("worldflow_action_fusion='cross_attention'")
+                if self.worldflow_bridge_loss_weight != 0:
+                    object_contract_errors.append("worldflow_bridge_loss_weight=0")
+                if self.worldflow_equiv_loss_weight != 0:
+                    object_contract_errors.append("worldflow_equiv_loss_weight=0")
+                if self.worldflow_training_coordinate_frame_augmentation:
+                    object_contract_errors.append(
+                        "worldflow_training_coordinate_frame_augmentation=False"
+                    )
+                if self.worldflow_residual_lr_multiplier is not None:
+                    object_contract_errors.append("worldflow_residual_lr_multiplier=None")
+                if self.worldflow_bootstrap_from_ego:
+                    object_contract_errors.append("worldflow_bootstrap_from_ego=False")
+                if object_contract_errors:
+                    raise ValueError(
+                        "object_centered_motion WorldFlow requires the strict independent-object "
+                        "contract: " + ", ".join(object_contract_errors) + "."
+                    )
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(
                     "World/Ego residual gates are unsupported; "
@@ -959,7 +1017,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 )
             )
-            if self.worldflow_noise_coupling == "independent":
+            if (
+                self.worldflow_noise_coupling == "independent"
+                and self.worldflow_target_type == "legacy_eef"
+            ):
                 detail = (
                     " Both priors are valid poses, but their random origins still describe different "
                     "physical trajectories."
@@ -1055,14 +1116,17 @@ class SmolVLAConfig(PreTrainedConfig):
             origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
             flow = "channel_euclidean"
         if self.worldflow_enable:
-            target_contract = (
-                "commanded_required"
-                if self.worldflow_require_action_target_sidecar
-                else "legacy_fallback_allowed"
-            )
+            target_contract = self.worldflow_target_type
+            if target_contract == "legacy_eef":
+                target_contract = (
+                    "legacy_eef_commanded_required"
+                    if self.worldflow_require_action_target_sidecar
+                    else "legacy_eef_fallback_allowed"
+                )
             world = (
                 f",worldflow={self.worldflow_noise_coupling},"
-                f"worldflow_targets={target_contract}"
+                f"worldflow_targets={target_contract},"
+                f"worldflow_reference={self.worldflow_reference_frame}"
             )
         else:
             world = ",worldflow=disabled"

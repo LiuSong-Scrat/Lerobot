@@ -40,6 +40,7 @@ if __package__ and __package__.startswith("benchmarks."):
         pose9_to_homo_np,
         reference_point_cloud_to_current_eff,
         render_camera_names_from_config,
+        robot_base_to_world_matrix,
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,6 +57,7 @@ else:
         pose9_to_homo_np,
         reference_point_cloud_to_current_eff,
         render_camera_names_from_config,
+        robot_base_to_world_matrix,
     )
 
 from tqdm import tqdm
@@ -63,6 +65,8 @@ from tqdm import tqdm
 POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
+WORLD_BASE_EE_POSE_DIR_NAME = "world_base_ee_poses"
+WORLD_OBJECT_CENTERED_MOTION_DIR_NAME = "world_object_centered_motion"
 POINT_CLOUD_CHANNELS = 6
 ACTION_LABEL_SEMANTICS = (
     "causal_same_state_raw_delta_absolute_model_eef_target_"
@@ -425,6 +429,14 @@ def action_target_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / ACTION_TARGET_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
+def world_base_ee_pose_file(root: Path, episode_index: int) -> Path:
+    return root / WORLD_BASE_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
+
+
+def world_object_centered_motion_file(root: Path, episode_index: int) -> Path:
+    return root / WORLD_OBJECT_CENTERED_MOTION_DIR_NAME / f"episode_{episode_index:06d}.npy"
+
+
 def write_point_cloud_meta(
     root: Path,
     storage: str = "zarr",
@@ -523,6 +535,50 @@ def write_action_target_meta(root: Path) -> None:
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+
+
+def write_object_worldflow_meta(root: Path, *, horizon: int) -> None:
+    base_pose_dir = root / WORLD_BASE_EE_POSE_DIR_NAME
+    motion_dir = root / WORLD_OBJECT_CENTERED_MOTION_DIR_NAME
+    base_pose_dir.mkdir(parents=True, exist_ok=True)
+    motion_dir.mkdir(parents=True, exist_ok=True)
+    with open(base_pose_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "key": "worldflow.current_ee_pose",
+                "dtype": "float32",
+                "shape": [9],
+                "layout": "episode_npy",
+                "path_format": (
+                    f"{WORLD_BASE_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy"
+                ),
+                "coordinate_frame": "robot_base",
+                "source": "exact MuJoCo robot root-body transform",
+            },
+            f,
+            indent=2,
+        )
+    with open(motion_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "key": "worldflow.object_centered_motion",
+                "dtype": "float32",
+                "shape": [int(horizon), 9],
+                "layout": "episode_npy",
+                "path_format": (
+                    f"{WORLD_OBJECT_CENTERED_MOTION_DIR_NAME}/"
+                    "episode_{episode_index:06d}.npy"
+                ),
+                "coordinate_frame": "robot_base",
+                "horizon_semantics": "slot h maps observation t to achieved scene state t+h+1",
+                "translation": "selected object-body center displacement in robot-base axes",
+                "rotation": "R_future @ R_current.T in robot-base axes",
+                "object_selection": "maximum non-robot body motion over the complete demonstration",
+                "eef_independent": True,
+            },
+            f,
+            indent=2,
+        )
 
 
 def save_episode_point_clouds(
@@ -672,6 +728,15 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict[str, Any]) -> 
         episode_index,
         episode["action_target_ee_poses"],
     )
+    world_base_path = world_base_ee_pose_file(dataset.root, episode_index)
+    world_base_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(world_base_path, np.ascontiguousarray(episode["world_base_ee_poses"], dtype=np.float32))
+    object_motion_path = world_object_centered_motion_file(dataset.root, episode_index)
+    object_motion_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(
+        object_motion_path,
+        np.ascontiguousarray(episode["world_object_centered_motion"], dtype=np.float32),
+    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
@@ -715,6 +780,14 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
         artifact_dir / "action_target_ee_poses.npy",
         np.ascontiguousarray(episode["action_target_ee_poses"], dtype=np.float32),
     )
+    np.save(
+        artifact_dir / "world_base_ee_poses.npy",
+        np.ascontiguousarray(episode["world_base_ee_poses"], dtype=np.float32),
+    )
+    np.save(
+        artifact_dir / "world_object_centered_motion.npy",
+        np.ascontiguousarray(episode["world_object_centered_motion"], dtype=np.float32),
+    )
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
     np.save(
         artifact_dir / "observation_states.npy",
@@ -739,6 +812,8 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         "timestamps.npy",
         "world_ee_poses.npy",
         "action_target_ee_poses.npy",
+        "world_base_ee_poses.npy",
+        "world_object_centered_motion.npy",
     )
     missing = [name for name in required_files if not (artifact_dir / name).is_file()]
     if missing:
@@ -776,6 +851,12 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
     action_target_ee_poses = np.load(
         artifact_dir / "action_target_ee_poses.npy", mmap_mode="r"
     )
+    world_base_ee_poses = np.load(
+        artifact_dir / "world_base_ee_poses.npy", mmap_mode="r"
+    )
+    world_object_centered_motion = np.load(
+        artifact_dir / "world_object_centered_motion.npy", mmap_mode="r"
+    )
     frames = int(actions.shape[0])
     shape_errors = []
     if actions.ndim != 2 or actions.shape[1] != 10:
@@ -792,6 +873,19 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         shape_errors.append(
             "action_target_ee_poses shape="
             f"{action_target_ee_poses.shape}, expected ({frames}, 9)"
+        )
+    if world_base_ee_poses.shape != (frames, 9):
+        shape_errors.append(
+            f"world_base_ee_poses shape={world_base_ee_poses.shape}, expected ({frames}, 9)"
+        )
+    expected_object_horizon = int(
+        episode_job["cfg"].get("worldflow_object_flow_horizon", 64)
+    )
+    if world_object_centered_motion.shape != (frames, expected_object_horizon, 9):
+        shape_errors.append(
+            "world_object_centered_motion shape="
+            f"{world_object_centered_motion.shape}, expected "
+            f"({frames}, {expected_object_horizon}, 9)"
         )
     if int(record.get("frames", -1)) != frames:
         shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
@@ -814,6 +908,8 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         "observation_states": observation_states,
         "world_ee_poses": world_ee_poses,
         "action_target_ee_poses": action_target_ee_poses,
+        "world_base_ee_poses": world_base_ee_poses,
+        "world_object_centered_motion": world_object_centered_motion,
     }
     for name, array in finite_arrays.items():
         if not np.isfinite(np.asarray(array)).all():
@@ -1507,6 +1603,100 @@ def world_target_to_reference_pose9(
     return homo_to_pose9(target_to_reference).astype(np.float32)
 
 
+def capture_body_poses_in_robot_base(
+    env: Any,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Capture every MuJoCo body pose and the robot-descendant exclusion mask."""
+
+    model = env.sim.model
+    data = env.sim.data
+    body_count = int(model.nbody)
+    names = [str(model.body_id2name(index) or f"__body_{index}") for index in range(body_count)]
+    body_to_world = np.repeat(np.eye(4, dtype=np.float32)[None], body_count, axis=0)
+    body_to_world[:, :3, 3] = np.asarray(data.body_xpos, dtype=np.float32).reshape(body_count, 3)
+    body_to_world[:, :3, :3] = np.asarray(data.body_xmat, dtype=np.float32).reshape(body_count, 3, 3)
+    world_to_base = fast_inverse_homogeneous(robot_base_to_world_matrix(env))
+    body_to_base = world_to_base[None] @ body_to_world
+
+    robots = list(getattr(env, "robots", []))
+    if len(robots) != 1:
+        raise ValueError("Object WorldFlow body filtering requires exactly one robot.")
+    root_name = str(robots[0].robot_model.root_body)
+    root_id = int(model.body_name2id(root_name))
+    parent_ids = np.asarray(model.body_parentid, dtype=np.int64).reshape(body_count)
+    excluded = np.zeros(body_count, dtype=np.bool_)
+    excluded[0] = True
+    for body_id in range(body_count):
+        ancestor = body_id
+        while ancestor > 0:
+            if ancestor == root_id:
+                excluded[body_id] = True
+                break
+            next_ancestor = int(parent_ids[ancestor])
+            if next_ancestor == ancestor:
+                break
+            ancestor = next_ancestor
+    return names, body_to_base.astype(np.float32), excluded
+
+
+def build_centered_object_motion_targets(
+    body_poses_base: np.ndarray,
+    body_names: list[str],
+    excluded_body_mask: np.ndarray,
+    *,
+    horizon: int,
+    rotation_radius_m: float = 0.05,
+) -> tuple[np.ndarray, str, float]:
+    """Build EEF-independent centered rigid-motion targets for one episode.
+
+    The most mobile non-robot MuJoCo body is selected once for the complete
+    demonstration. Translation is its center displacement; rotation is its
+    orientation delta in fixed robot-base axes. This avoids the artificial
+    translation lever arm produced by representing rotation about the global
+    origin while retaining exact simulator object motion.
+    """
+
+    body_poses_base = np.asarray(body_poses_base, dtype=np.float32)
+    excluded_body_mask = np.asarray(excluded_body_mask, dtype=np.bool_).reshape(-1)
+    if body_poses_base.ndim != 4 or body_poses_base.shape[-2:] != (4, 4):
+        raise ValueError(f"Expected body poses shape (T,B,4,4), got {body_poses_base.shape}.")
+    frames, body_count = body_poses_base.shape[:2]
+    if len(body_names) != body_count or excluded_body_mask.shape != (body_count,):
+        raise ValueError("Body names/exclusion mask do not match the body-pose array.")
+    if frames < 2:
+        raise ValueError("Object WorldFlow requires at least two simulator states.")
+    if horizon <= 0:
+        raise ValueError("Object WorldFlow horizon must be positive.")
+
+    translations = body_poses_base[..., :3, 3]
+    rotations = body_poses_base[..., :3, :3]
+    trans_step = np.linalg.norm(np.diff(translations, axis=0), axis=-1)
+    relative_rotation = rotations[1:] @ np.swapaxes(rotations[:-1], -1, -2)
+    rotation_trace = np.trace(relative_rotation, axis1=-2, axis2=-1)
+    rot_step = np.arccos(np.clip((rotation_trace - 1.0) * 0.5, -1.0, 1.0))
+    motion_scores = np.sum(trans_step + float(rotation_radius_m) * rot_step, axis=0)
+    motion_scores[excluded_body_mask] = -np.inf
+    selected_body = int(np.argmax(motion_scores))
+    selected_score = float(motion_scores[selected_body])
+    if not np.isfinite(selected_score) or selected_score <= 1e-7:
+        raise ValueError(
+            "Could not find a moving non-robot MuJoCo body for object WorldFlow supervision."
+        )
+
+    selected = body_poses_base[:, selected_body]
+    targets = np.empty((frames, int(horizon), 9), dtype=np.float32)
+    for frame_index in range(frames):
+        current = selected[frame_index]
+        for horizon_index in range(int(horizon)):
+            future_index = min(frame_index + horizon_index + 1, frames - 1)
+            future = selected[future_index]
+            centered_motion = np.eye(4, dtype=np.float32)
+            centered_motion[:3, 3] = future[:3, 3] - current[:3, 3]
+            centered_motion[:3, :3] = future[:3, :3] @ current[:3, :3].T
+            targets[frame_index, horizon_index] = homo_to_pose9(centered_motion)
+    return targets, body_names[selected_body], selected_score
+
+
 def collect_demo_episode(
     *,
     env: Any,
@@ -1590,6 +1780,7 @@ def collect_demo_episode(
         for camera in pc_camera_names
     }
     reference_ee_poses = reference_ee_poses_by_camera[reference_camera]
+    base_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     observation_grippers = np.empty((frame_count, 1), dtype=np.float32)
     action_grippers = np.empty((frame_count, 1), dtype=np.float32)
@@ -1598,12 +1789,17 @@ def collect_demo_episode(
     image_frames_by_camera: dict[str, list[np.ndarray]] = {
         camera: [] for camera in image_feature_cameras(cfg)
     }
+    body_pose_frames_base: list[np.ndarray] = []
+    body_pose_names: list[str] | None = None
+    excluded_body_mask: np.ndarray | None = None
 
     def collect_observation_frame(
         frame_idx: int,
         raw_obs: dict[str, Any],
     ) -> np.ndarray:
         """Store one pre-action observation and return its model-EEF world pose."""
+
+        nonlocal body_pose_names, excluded_body_mask
 
         if save_video:
             append_video_frames(video_frames, raw_obs, rendered_camera_names(cfg))
@@ -1635,6 +1831,22 @@ def collect_demo_episode(
                 observation_grippers[frame_idx, 0] = pose9_gripper_reference[-1]
                 primary_world_pose = pose9_gripper_sim_world
         assert primary_world_pose is not None
+        base_to_world = robot_base_to_world_matrix(env)
+        base_ee_poses[frame_idx] = homo_to_pose9(
+            fast_inverse_homogeneous(base_to_world)
+            @ pose9_to_homo_np(np.asarray(primary_world_pose, dtype=np.float32)[:9])
+        )
+        captured_names, captured_body_poses, captured_excluded = (
+            capture_body_poses_in_robot_base(env)
+        )
+        if body_pose_names is None:
+            body_pose_names = captured_names
+            excluded_body_mask = captured_excluded
+        elif captured_names != body_pose_names or not np.array_equal(
+            captured_excluded, excluded_body_mask
+        ):
+            raise RuntimeError("MuJoCo body layout changed within one demonstration replay.")
+        body_pose_frames_base.append(captured_body_poses)
         return pose9_to_homo_np(
             np.asarray(primary_world_pose, dtype=np.float32)[:9]
         ).astype(np.float64)
@@ -1773,6 +1985,17 @@ def collect_demo_episode(
         action_target_reference_ee_poses[:, :3] - reference_ee_poses[:, :3],
         axis=-1,
     )
+    if body_pose_names is None or excluded_body_mask is None:
+        raise RuntimeError("Object WorldFlow body poses were not collected.")
+    object_flow_horizon = int(cfg.get("worldflow_object_flow_horizon", 64))
+    object_centered_motion, object_flow_body_name, object_flow_motion_score = (
+        build_centered_object_motion_targets(
+            np.stack(body_pose_frames_base, axis=0),
+            body_pose_names,
+            excluded_body_mask,
+            horizon=object_flow_horizon,
+        )
+    )
 
     if cfg["replay_mode"] == "states":
         source_index_expr = f"i + {state_observation_offset}"
@@ -1812,6 +2035,10 @@ def collect_demo_episode(
         # Legacy key/path retained for the existing WorldFlow dataset wrapper.
         # Values are expressed in the fixed Overview-camera reference frame.
         "world_ee_poses": reference_ee_poses,
+        "world_base_ee_poses": base_ee_poses,
+        "world_object_centered_motion": object_centered_motion,
+        "world_object_flow_body_name": object_flow_body_name,
+        "world_object_flow_motion_score": object_flow_motion_score,
         "action_target_ee_poses": action_target_reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
@@ -1882,9 +2109,20 @@ def make_episode_record(
         "action_target_eef_mapping": str(episode["action_target_eef_mapping"]),
         "observation_state_mapping": str(episode["observation_state_mapping"]),
         "gripper_action_mapping": str(episode["gripper_action_mapping"]),
+        "world_object_flow_body_name": str(
+            episode["world_object_flow_body_name"]
+        ),
+        "world_object_flow_motion_score": float(
+            episode["world_object_flow_motion_score"]
+        ),
         "action_pose_coordinate_frame": "episode_origin_eef",
         "observation_state_coordinate_frame": "episode_origin_eef",
         "absolute_action_target_sidecar_coordinate_frame": "overview_camera",
+        "worldflow_reference_frame": "robot_base",
+        "world_object_flow_body_name": str(episode["world_object_flow_body_name"]),
+        "world_object_flow_motion_score": float(
+            episode["world_object_flow_motion_score"]
+        ),
         "gripper_action_semantics": "next_state_achieved_physical_width_metres",
         "heuristic_action_target_offset": False,
         "target_residual_translation_m_mean": float(
@@ -2084,6 +2322,14 @@ def save_collected_temp_episode(
         artifact_dir / "action_target_ee_poses.npy",
         final_action_target_ee_pose_path,
     )
+    move_episode_array(
+        artifact_dir / "world_base_ee_poses.npy",
+        world_base_ee_pose_file(dataset.root, episode_index),
+    )
+    move_episode_array(
+        artifact_dir / "world_object_centered_motion.npy",
+        world_object_centered_motion_file(dataset.root, episode_index),
+    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
@@ -2167,6 +2413,11 @@ def main() -> None:
         cfg["image_cameras"] = image_feature_cameras(cfg)
     ensure_image_camera_rendered(cfg)
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
+    cfg["worldflow_object_flow_horizon"] = int(
+        cfg.get("worldflow_object_flow_horizon", 64)
+    )
+    if cfg["worldflow_object_flow_horizon"] <= 0:
+        raise ValueError("worldflow_object_flow_horizon must be positive.")
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
     ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
@@ -2217,6 +2468,10 @@ def main() -> None:
     )
     write_worldflow_meta(dataset.root)
     write_action_target_meta(dataset.root)
+    write_object_worldflow_meta(
+        dataset.root,
+        horizon=int(cfg["worldflow_object_flow_horizon"]),
+    )
 
     summary: dict[str, Any] = {
         "created_unix_s": time.time(),
@@ -2228,6 +2483,16 @@ def main() -> None:
         "reference_frame": "overview_camera",
         "reference_camera": selected_camera_names(cfg)[0],
         "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
+        "object_worldflow": {
+            "coordinate_frame": "robot_base",
+            "target": "centered rigid motion of the most mobile non-robot body",
+            "eef_independent": True,
+            "horizon": int(cfg["worldflow_object_flow_horizon"]),
+            "episode_audit_fields": [
+                "world_object_flow_body_name",
+                "world_object_flow_motion_score",
+            ],
+        },
         "render_camera_names": rendered_camera_names(cfg),
         "image_cameras": image_feature_cameras(cfg),
         "image_feature_keys": cfg.get("image_feature_keys", []),

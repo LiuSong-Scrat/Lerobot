@@ -25,6 +25,7 @@
   "camera_names": ["agentview", "robot0_eye_in_hand"],
   "pointcloud_camera_names": ["agentview"],
   "pointcloud_reference_camera": "agentview",
+  "worldflow_object_flow_horizon": 64,
   "observation_height": 256,
   "observation_width": 256,
   "replay_mode": "states",

@@ -252,6 +252,7 @@ def test_batch_to_transition_preserves_worldflow_fields():
         "task": ["pick", "place"],
         "worldflow.current_ee_pose": torch.randn(2, 9),
         "worldflow.ee_poses": torch.randn(2, 8, 9),
+        "worldflow.object_centered_motion": torch.randn(2, 8, 9),
         "worldflow.step_is_pad": torch.zeros(2, 8, dtype=torch.bool),
     }
 
@@ -260,12 +261,20 @@ def test_batch_to_transition_preserves_worldflow_fields():
 
     assert torch.equal(comp_data["worldflow.current_ee_pose"], batch["worldflow.current_ee_pose"])
     assert torch.equal(comp_data["worldflow.ee_poses"], batch["worldflow.ee_poses"])
+    assert torch.equal(
+        comp_data["worldflow.object_centered_motion"],
+        batch["worldflow.object_centered_motion"],
+    )
     assert torch.equal(comp_data["worldflow.step_is_pad"], batch["worldflow.step_is_pad"])
 
     restored = transition_to_batch(transition)
 
     assert torch.equal(restored["worldflow.current_ee_pose"], batch["worldflow.current_ee_pose"])
     assert torch.equal(restored["worldflow.ee_poses"], batch["worldflow.ee_poses"])
+    assert torch.equal(
+        restored["worldflow.object_centered_motion"],
+        batch["worldflow.object_centered_motion"],
+    )
     assert torch.equal(restored["worldflow.step_is_pad"], batch["worldflow.step_is_pad"])
 
 

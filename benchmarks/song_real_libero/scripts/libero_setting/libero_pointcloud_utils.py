@@ -797,6 +797,35 @@ def eef_pose9_world_to_reference_camera(
     return eef_pose9_world_to_reference_np(eef_pose_world, reference_to_world)
 
 
+def robot_base_to_world_matrix(env: Any) -> np.ndarray:
+    """Return the calibrated robot-base pose in the simulator world frame."""
+
+    robots = list(getattr(env, "robots", []))
+    if len(robots) != 1:
+        raise ValueError(
+            "Robot-base WorldFlow currently requires exactly one robot, "
+            f"got {len(robots)}."
+        )
+    root_body = getattr(getattr(robots[0], "robot_model", None), "root_body", None)
+    if not root_body:
+        raise ValueError("Could not resolve the robot model's root body.")
+    position = np.asarray(env.sim.data.get_body_xpos(root_body), dtype=np.float32).reshape(3)
+    rotation = np.asarray(env.sim.data.get_body_xmat(root_body), dtype=np.float32).reshape(3, 3)
+    base_to_world = np.eye(4, dtype=np.float32)
+    base_to_world[:3, :3] = rotation
+    base_to_world[:3, 3] = position
+    return base_to_world
+
+
+def eef_pose9_world_to_robot_base(env: Any, eef_pose_world: np.ndarray) -> np.ndarray:
+    """Express a simulator-world EEF pose in the calibrated robot-base frame."""
+
+    return eef_pose9_world_to_reference_np(
+        eef_pose_world,
+        robot_base_to_world_matrix(env),
+    )
+
+
 def observation_to_camera_point_cloud(
     env: Any,
     raw_obs: dict[str, Any],

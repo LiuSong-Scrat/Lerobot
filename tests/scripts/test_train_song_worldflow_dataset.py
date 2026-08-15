@@ -91,6 +91,17 @@ def _pose_sequence(offset: float) -> np.ndarray:
     return poses
 
 
+def _write_object_worldflow_meta(base_dir, motion_dir) -> None:
+    (base_dir / "meta.json").write_text(
+        json.dumps({"coordinate_frame": "robot_base"}),
+        encoding="utf-8",
+    )
+    (motion_dir / "meta.json").write_text(
+        json.dumps({"coordinate_frame": "robot_base", "eef_independent": True}),
+        encoding="utf-8",
+    )
+
+
 def test_worldflow_dataset_uses_achieved_current_and_commanded_future_targets(tmp_path):
     achieved = _pose_sequence(offset=10.0)
     commanded = _pose_sequence(offset=20.0)
@@ -163,6 +174,54 @@ def test_worldflow_dataset_rejects_mismatched_achieved_and_target_lengths(tmp_pa
     wrapped = WorldFlowMemmapDataset(_TinyDataset(), tmp_path, chunk_size=4)
     with pytest.raises(ValueError, match="achieved/target lengths differ"):
         wrapped[0]
+
+
+def test_object_worldflow_dataset_requires_base_pose_and_never_falls_back_to_eef(tmp_path):
+    base_poses = _pose_sequence(offset=30.0)
+    base_dir = tmp_path / "world_base_ee_poses"
+    motion_dir = tmp_path / "world_object_centered_motion"
+    base_dir.mkdir()
+    motion_dir.mkdir()
+    _write_object_worldflow_meta(base_dir, motion_dir)
+    np.save(base_dir / "episode_000000.npy", base_poses)
+    motion = np.zeros((3, 6, 9), dtype=np.float32)
+    motion[..., 0] = np.arange(6, dtype=np.float32)[None]
+    motion[..., 3] = 1.0
+    motion[..., 7] = 1.0
+    np.save(motion_dir / "episode_000000.npy", motion)
+
+    wrapped = BenchmarkWorldFlowMemmapDataset(
+        _TinyDataset(frame_index=1, chunk_size=4),
+        tmp_path,
+        chunk_size=4,
+        target_type="object_centered_motion",
+    )
+    item = wrapped[0]
+
+    assert torch.equal(item["worldflow.current_ee_pose"], torch.from_numpy(base_poses[1]))
+    assert torch.equal(
+        item["worldflow.object_centered_motion"],
+        torch.from_numpy(motion[1, :4]),
+    )
+    assert "worldflow.ee_poses" not in item
+    assert torch.equal(
+        item["worldflow.step_is_pad"],
+        torch.tensor([False, True, True, True]),
+    )
+
+
+def test_object_worldflow_dataset_rejects_missing_object_motion_sidecar(tmp_path):
+    base_dir = tmp_path / "world_base_ee_poses"
+    base_dir.mkdir()
+    np.save(base_dir / "episode_000000.npy", _pose_sequence(offset=30.0))
+
+    with pytest.raises(FileNotFoundError, match="EEF trajectories are not a valid fallback"):
+        BenchmarkWorldFlowMemmapDataset(
+            _TinyDataset(),
+            tmp_path,
+            chunk_size=4,
+            target_type="object_centered_motion",
+        )
 
 
 @pytest.mark.parametrize(
