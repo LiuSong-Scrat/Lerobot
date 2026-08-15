@@ -204,14 +204,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # The branch is active in training and inference.
     worldflow_enable: bool = False
     # Supervision semantics for the independent World branch. ``legacy_eef``
-    # retains historical checkpoints whose World target is a reparameterized
-    # EEF action. ``object_centered_motion`` predicts the dominant scene
-    # object's center displacement and rotation delta in the fixed robot-base
-    # axes. The latter is independent of EEF motion and may influence Ego only
-    # through token exchange.
+    # retains historical checkpoints whose World target is derived through
+    # the old carrier/conjugacy path. ``world_eef_trajectory`` predicts the
+    # commanded EEF trajectory directly in the fixed robot-base frame. With
+    # the foreground cloud in that same frame, the trajectory acts as sparse,
+    # task-relevant point-flow supervision without explicit object poses or
+    # dense scene-flow labels.
     worldflow_target_type: str = "legacy_eef"
     # Canonical fixed frame used by the World branch. Historical checkpoints
-    # used the first fixed camera. New object-flow checkpoints use the robot
+    # used the first fixed camera. New World-EEF checkpoints use the robot
     # base so scene geometry is invariant to camera placement and directly
     # comparable across calibrated fixed cameras. This frame is never the UMI
     # episode origin and never the current EEF frame.
@@ -721,11 +722,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.worldflow_enable:
             if self.worldflow_target_type not in {
                 "legacy_eef",
-                "object_centered_motion",
+                "world_eef_trajectory",
             }:
                 raise ValueError(
                     "worldflow_target_type must be 'legacy_eef' or "
-                    f"'object_centered_motion', got {self.worldflow_target_type!r}."
+                    f"'world_eef_trajectory', got {self.worldflow_target_type!r}."
                 )
             if self.worldflow_reference_frame not in {
                 "pointcloud_reference_camera",
@@ -735,34 +736,34 @@ class SmolVLAConfig(PreTrainedConfig):
                     "worldflow_reference_frame must be 'pointcloud_reference_camera' or "
                     f"'robot_base', got {self.worldflow_reference_frame!r}."
                 )
-            if self.worldflow_target_type == "object_centered_motion":
-                object_contract_errors = []
+            if self.worldflow_target_type == "world_eef_trajectory":
+                world_trajectory_contract_errors = []
                 if self.worldflow_reference_frame != "robot_base":
-                    object_contract_errors.append("worldflow_reference_frame='robot_base'")
+                    world_trajectory_contract_errors.append("worldflow_reference_frame='robot_base'")
                 if self.worldflow_scene_frame_origin != "global":
-                    object_contract_errors.append("worldflow_scene_frame_origin='global'")
+                    world_trajectory_contract_errors.append("worldflow_scene_frame_origin='global'")
                 if self.worldflow_frame_origin != "global":
-                    object_contract_errors.append("worldflow_frame_origin='global'")
+                    world_trajectory_contract_errors.append("worldflow_frame_origin='global'")
                 if self.worldflow_noise_coupling != "independent":
-                    object_contract_errors.append("worldflow_noise_coupling='independent'")
+                    world_trajectory_contract_errors.append("worldflow_noise_coupling='independent'")
                 if self.worldflow_action_fusion != "cross_attention":
-                    object_contract_errors.append("worldflow_action_fusion='cross_attention'")
+                    world_trajectory_contract_errors.append("worldflow_action_fusion='cross_attention'")
                 if self.worldflow_bridge_loss_weight != 0:
-                    object_contract_errors.append("worldflow_bridge_loss_weight=0")
+                    world_trajectory_contract_errors.append("worldflow_bridge_loss_weight=0")
                 if self.worldflow_equiv_loss_weight != 0:
-                    object_contract_errors.append("worldflow_equiv_loss_weight=0")
+                    world_trajectory_contract_errors.append("worldflow_equiv_loss_weight=0")
                 if self.worldflow_training_coordinate_frame_augmentation:
-                    object_contract_errors.append(
+                    world_trajectory_contract_errors.append(
                         "worldflow_training_coordinate_frame_augmentation=False"
                     )
                 if self.worldflow_residual_lr_multiplier is not None:
-                    object_contract_errors.append("worldflow_residual_lr_multiplier=None")
+                    world_trajectory_contract_errors.append("worldflow_residual_lr_multiplier=None")
                 if self.worldflow_bootstrap_from_ego:
-                    object_contract_errors.append("worldflow_bootstrap_from_ego=False")
-                if object_contract_errors:
+                    world_trajectory_contract_errors.append("worldflow_bootstrap_from_ego=False")
+                if world_trajectory_contract_errors:
                     raise ValueError(
-                        "object_centered_motion WorldFlow requires the strict independent-object "
-                        "contract: " + ", ".join(object_contract_errors) + "."
+                        "world_eef_trajectory WorldFlow requires the strict independent-branch "
+                        "contract: " + ", ".join(world_trajectory_contract_errors) + "."
                     )
             if self.worldflow_ego_residual_gate_init is not None:
                 raise ValueError(

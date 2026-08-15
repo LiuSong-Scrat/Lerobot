@@ -1820,10 +1820,10 @@ def test_worldflow_robot_base_reference_contract():
         )
 
 
-def test_object_worldflow_requires_independent_token_only_contract():
+def test_world_eef_trajectory_requires_independent_token_only_contract():
     cfg = SmolVLAConfig(
         worldflow_enable=True,
-        worldflow_target_type="object_centered_motion",
+        worldflow_target_type="world_eef_trajectory",
         worldflow_reference_frame="robot_base",
         worldflow_frame_origin="global",
         worldflow_scene_frame_origin="global",
@@ -1832,13 +1832,13 @@ def test_object_worldflow_requires_independent_token_only_contract():
         worldflow_bridge_loss_weight=0.0,
         worldflow_equiv_loss_weight=0.0,
     )
-    assert "worldflow_targets=object_centered_motion" in cfg.flow_contract_summary()
+    assert "worldflow_targets=world_eef_trajectory" in cfg.flow_contract_summary()
     assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
 
-    with pytest.raises(ValueError, match="strict independent-object contract"):
+    with pytest.raises(ValueError, match="strict independent-branch contract"):
         SmolVLAConfig(
             worldflow_enable=True,
-            worldflow_target_type="object_centered_motion",
+            worldflow_target_type="world_eef_trajectory",
             worldflow_reference_frame="robot_base",
             worldflow_frame_origin="global",
             worldflow_scene_frame_origin="global",
@@ -2957,14 +2957,14 @@ def test_worldflow_joint_loss_uses_foreground_only_and_backpropagates_bridge():
     assert model.last_worldflow_metrics["worldflow_foreground_points"].item() == cfg.worldflow_max_points
 
 
-def test_object_worldflow_target_is_not_conjugated_through_eef_and_has_no_bridge_loss():
+def test_world_eef_trajectory_is_not_conjugated_or_residualized():
     torch.manual_seed(23)
     cfg = SmolVLAConfig(
         chunk_size=3,
         n_action_steps=3,
         pointseg_enable=True,
         worldflow_enable=True,
-        worldflow_target_type="object_centered_motion",
+        worldflow_target_type="world_eef_trajectory",
         worldflow_reference_frame="robot_base",
         worldflow_frame_origin="global",
         worldflow_scene_frame_origin="global",
@@ -2984,11 +2984,11 @@ def test_object_worldflow_target_is_not_conjugated_through_eef_and_has_no_bridge
     model.last_worldflow_payload = {"foreground_pc_ego": foreground_pc_ego}
 
     current_eef = matrix_to_pose9(se3_exp(torch.randn(2, 6) * 0.4))
-    object_target = matrix_to_pose9(se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.1))
+    world_eef_target = matrix_to_pose9(se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.1))
     state = model._prepare_worldflow_training_state(
         {
             "current_ee_pose": current_eef,
-            "object_centered_motion": object_target,
+            "eef_trajectory": world_eef_target,
             "step_is_pad": torch.zeros(2, cfg.chunk_size, dtype=torch.bool),
         },
         torch.randint(0, 64, (2, 5)),
@@ -2997,7 +2997,7 @@ def test_object_worldflow_target_is_not_conjugated_through_eef_and_has_no_bridge
         actions_is_pad=None,
     )
 
-    assert torch.allclose(state["spatial_gt"], pose9_to_matrix(object_target), atol=1e-6)
+    assert torch.allclose(state["spatial_gt"], pose9_to_matrix(world_eef_target), atol=1e-6)
     current_eef_matrix = pose9_to_matrix(current_eef)
     expected_xyz_base = (
         current_eef_matrix[:, None, :3, :3]
