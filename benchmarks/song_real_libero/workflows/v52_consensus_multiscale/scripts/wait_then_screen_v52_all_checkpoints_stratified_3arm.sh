@@ -22,13 +22,25 @@ PY
   exit 0
 fi
 
+# Phase 1: finish the dual+World 100-episode initial screen for every checkpoint
+# before starting any new causal-control arm.
 step_artifacts=()
 for step in "${steps[@]}"; do
   printf -v step6 '%06d' "$step"
   step_artifact="$artifact_root/v52childenvfix_step${step6}_stratified_3arm_multiview_worldflow_screen.json"
   step_artifacts+=("$step_artifact")
   env LEROBOT_REPO="$repo" EXPERIMENT_ROOT="$root" \
-    V52_STEP="$step" V52_STEP_SCREEN_ARTIFACT="$step_artifact" \
+    V52_STEP="$step" V52_STEP_SCREEN_ARTIFACT="$step_artifact" V52_SCREEN_PHASE=dual_only \
+    bash "$worker"
+done
+
+# Phase 2: only checkpoints above 95/100 proceed to primary+World and then,
+# when still eligible, dual+World->Ego-disabled causal screening.
+for index in "${!steps[@]}"; do
+  step=${steps[$index]}
+  step_artifact=${step_artifacts[$index]}
+  env LEROBOT_REPO="$repo" EXPERIMENT_ROOT="$root" \
+    V52_STEP="$step" V52_STEP_SCREEN_ARTIFACT="$step_artifact" V52_SCREEN_PHASE=causal_only \
     bash "$worker"
 done
 

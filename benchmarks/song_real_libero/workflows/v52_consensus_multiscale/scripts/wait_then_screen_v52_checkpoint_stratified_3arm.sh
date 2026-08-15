@@ -11,6 +11,11 @@ artifact_root="$root/singleview_worldflow/libero10_500ep/artifacts"
 joint_artifact_root="$root/joint_multiview_worldflow/libero10_500ep/artifacts"
 step=${V52_STEP:-1564}
 [[ "$step" =~ ^(260|520|780|1040|1300|1564)$ ]] || { echo "invalid V52_STEP=$step" >&2; exit 2; }
+screen_phase=${V52_SCREEN_PHASE:-full}
+[[ "$screen_phase" =~ ^(full|dual_only|causal_only)$ ]] || {
+  echo "V52_SCREEN_PHASE must be full, dual_only, or causal_only" >&2
+  exit 2
+}
 printf -v step6 '%06d' "$step"
 checkpoint="$train/checkpoints/$step6/pretrained_model"
 aggregate=${V52_STEP_SCREEN_ARTIFACT:-"$joint_artifact_root/v52childenvfix_step${step6}_stratified_3arm_multiview_worldflow_screen.json"}
@@ -172,9 +177,20 @@ stop_arm() {
 }
 
 dual_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_stratified_step5_dual_world.json"
-primary_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_primaryonly_stratified_step5_primary_world.json"
-causal_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_worldtoegoablated_stratified_step5_dual_worldablated.json"
 dual_progress="$root/singleview_worldflow/libero10_500ep/eval_4gpu_10ep/libero10_worldflow_endpoint_residual_${label}_step${step6}_all10tasks10ep_4x4090_total30_b30_codefbfacd7_fixedbarrierv18_stratified_step5_dual_world"
+
+# A causal-only pass is deliberately scheduled only after every checkpoint has
+# completed the dual+World screen.  Use fresh output/cache namespaces so that a
+# previously interrupted eager ablation remains immutable evidence rather than
+# being overwritten by the reordered sweep.
+phase2_tag=
+if [[ "$screen_phase" == causal_only ]]; then phase2_tag=_after_dual_sweep; fi
+primary_suffix="stratified_step5${phase2_tag}_primary_world"
+causal_suffix="stratified_step5${phase2_tag}_dual_worldablated"
+primary_cache="v52childenvfix_step${step6}_primary_world${phase2_tag}_stratified_step5"
+causal_cache="v52childenvfix_step${step6}_dual_worldablated${phase2_tag}_stratified_step5"
+primary_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_primaryonly_${primary_suffix}.json"
+causal_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_worldtoegoablated_${causal_suffix}.json"
 
 if [[ ! -s "$dual_artifact" ]]; then
   run_arm_background checkpoint 0 stratified_step5_dual_world "v52childenvfix_step${step6}_dual_world_stratified_step5"
@@ -223,17 +239,34 @@ PY
 fi
 dual_successes=$(jq -r '.success_count' "$dual_artifact")
 
+if [[ "$screen_phase" == dual_only ]]; then
+  "$python" - "$dual_artifact" "$step" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding="utf-8"))
+assert int(p["step"])==int(sys.argv[2])
+assert int(p["episode_count"])==100
+print(json.dumps({
+    "status":"dual_initial_screen_complete",
+    "step":int(sys.argv[2]),
+    "dual_world_successes":int(p["success_count"]),
+    "passes_absolute_screen":int(p["success_count"])>95,
+    "next_action":"defer causal arms until all checkpoints finish dual initial screening",
+},indent=2))
+PY
+  exit 0
+fi
+
 primary_successes=null
 causal_successes=null
 if (( dual_successes > 95 )); then
   if [[ ! -s "$primary_artifact" ]]; then
-    run_arm primary_only 0 stratified_step5_primary_world "v52childenvfix_step${step6}_primary_world_stratified_step5"
+    run_arm primary_only 0 "$primary_suffix" "$primary_cache"
   fi
   primary_successes=$(jq -r '.success_count' "$primary_artifact")
 fi
 if [[ "$primary_successes" != null ]] && (( dual_successes > primary_successes )); then
   if [[ ! -s "$causal_artifact" ]]; then
-    run_arm checkpoint 1 stratified_step5_dual_worldablated "v52childenvfix_step${step6}_dual_worldablated_stratified_step5"
+    run_arm checkpoint 1 "$causal_suffix" "$causal_cache"
   fi
   causal_successes=$(jq -r '.success_count' "$causal_artifact")
 fi
