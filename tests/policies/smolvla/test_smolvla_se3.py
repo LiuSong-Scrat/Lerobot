@@ -2589,6 +2589,108 @@ def test_joint_input_multiview_worldflow_optimizer_keeps_all_four_paths_trainabl
     assert set(grouped) == set(expected)
 
 
+def test_joint_multiview_worldflow_symmetric_point_adaptation_groups_both_input_paths():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        vla_adapter_enable=True,
+        camera_view_fusion="multiscale_novelty_union",
+        worldflow_enable=True,
+        multiview_input_pretrained_lr_multiplier=0.005,
+        multiview_input_point_lr_multiplier=0.05,
+        multiview_input_symmetric_point_path_adaptation=True,
+        worldflow_pretrained_lr_multiplier=0.005,
+        worldflow_new_lr_multiplier=0.005,
+        worldflow_residual_lr_multiplier=0.005,
+        optimizer_lr=1e-6,
+    )
+    policy.model = nn.Module()
+    policy.model.action_out_proj = nn.Linear(4, 4)
+    policy.model.pointseg_conditioner = nn.Linear(4, 4)
+    policy.model.pointseg_object_proj = nn.Linear(4, 4)
+    policy.model.pointseg_background_proj = nn.Linear(4, 4)
+    policy.model.point_action_fusion = nn.Linear(4, 4)
+    policy.model.worldflow_branch = nn.Module()
+    policy.model.worldflow_branch.scene_encoder = nn.Linear(4, 4)
+    policy.model.worldflow_branch.scene_context_proj = nn.Linear(4, 4)
+    policy.model.worldflow_branch.point_action_adapter = nn.Linear(4, 4)
+    policy.model.worldflow_branch.action_in_proj = nn.Linear(4, 4)
+    policy.model.ego_scene_to_expert = nn.Linear(4, 4)
+    policy.model.world_scene_to_expert = nn.Linear(4, 4)
+    policy.model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    policy.model.world_twist_residual_out_proj = nn.Linear(4, 4)
+
+    groups = policy.get_optim_params()
+
+    assert [group["group_name"] for group in groups] == [
+        "pretrained_ego_shared_nonpoint",
+        "point_input_adaptation_path",
+        "new_world_bidirectional",
+        "world_physical_residual_head",
+    ]
+    assert [group["lr"] for group in groups] == pytest.approx(
+        [5e-9, 5e-8, 5e-9, 5e-9]
+    )
+    point_ids = {id(parameter) for parameter in groups[1]["params"]}
+    for module in (
+        policy.model.point_action_fusion,
+        policy.model.worldflow_branch.scene_encoder,
+        policy.model.worldflow_branch.scene_context_proj,
+        policy.model.worldflow_branch.point_action_adapter,
+        policy.model.ego_scene_to_expert,
+        policy.model.world_scene_to_expert,
+    ):
+        assert {id(parameter) for parameter in module.parameters()} <= point_ids
+    world_action_input_ids = {
+        id(parameter) for parameter in policy.model.worldflow_branch.action_in_proj.parameters()
+    }
+    assert not (world_action_input_ids & point_ids)
+    world_only_role_ids = policy.get_worldflow_ego_tangent_world_only_parameter_ids()
+    for module in (
+        policy.model.worldflow_branch.scene_encoder,
+        policy.model.worldflow_branch.scene_context_proj,
+        policy.model.worldflow_branch.point_action_adapter,
+        policy.model.ego_scene_to_expert,
+        policy.model.world_scene_to_expert,
+    ):
+        assert {id(parameter) for parameter in module.parameters()} <= world_only_role_ids
+    for module in (
+        policy.model.pointseg_conditioner,
+        policy.model.pointseg_object_proj,
+        policy.model.pointseg_background_proj,
+        policy.model.point_action_fusion,
+    ):
+        assert not ({id(parameter) for parameter in module.parameters()} & world_only_role_ids)
+    assert world_only_role_ids < point_ids
+    grouped = [id(parameter) for group in groups for parameter in group["params"]]
+    expected = [id(parameter) for parameter in policy.parameters() if parameter.requires_grad]
+    assert len(grouped) == len(set(grouped)) == len(expected)
+    assert set(grouped) == set(expected)
+
+
+def test_symmetric_point_path_adaptation_requires_worldflow():
+    with pytest.raises(ValueError, match="requires worldflow_enable=True"):
+        SmolVLAConfig(multiview_input_symmetric_point_path_adaptation=True)
+
+    with pytest.raises(ValueError, match="requires a supported input-layer multi-view fusion"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            multiview_input_symmetric_point_path_adaptation=True,
+        )
+
+
+def test_symmetric_world_point_gradient_roles_are_disabled_by_default():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        worldflow_enable=True,
+        multiview_input_symmetric_point_path_adaptation=False,
+    )
+    policy.model = nn.Linear(4, 4)
+
+    assert policy.get_worldflow_ego_tangent_world_only_parameter_ids() == set()
+
+
 def test_joint_input_multiview_worldflow_requires_one_shared_ego_learning_rate():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
@@ -2632,6 +2734,31 @@ def test_input_view_dropout_requires_supported_fusion_and_multiple_views():
         multiview_input_view_dropout_enable=True,
     )
     assert novelty_union_cfg.multiview_input_view_dropout_enable is True
+
+    multiscale_novelty_union_cfg = SmolVLAConfig(
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        multiview_input_view_dropout_enable=True,
+    )
+    assert multiscale_novelty_union_cfg.multiview_input_view_dropout_enable is True
+    assert multiscale_novelty_union_cfg.camera_view_coarse_novelty_scale == 3.0
+
+    conservative_multiscale_cfg = SmolVLAConfig(
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        camera_view_coarse_novelty_scale=4.0,
+    )
+    assert conservative_multiscale_cfg.camera_view_coarse_novelty_scale == 4.0
+    consensus_multiscale_cfg = SmolVLAConfig(
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="consensus_multiscale_novelty_union",
+        camera_view_coarse_novelty_scale=4.0,
+        multiview_input_view_dropout_enable=True,
+    )
+    assert consensus_multiscale_cfg.camera_view_coarse_novelty_scale == 4.0
+    assert consensus_multiscale_cfg.multiview_input_view_dropout_enable is True
+    with pytest.raises(ValueError, match="coarse_novelty_scale"):
+        SmolVLAConfig(camera_view_coarse_novelty_scale=1.0)
 
     transport_novelty_cfg = SmolVLAConfig(
         camera_views="agentview,robot0_eye_in_hand",

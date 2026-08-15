@@ -71,6 +71,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # spatial union, then applies the same FPS contract.
     # ``voxel_cover_fps`` retains one representative of every occupied voxel
     # when possible, then fills remaining detail slots in union-FPS order.
+    # ``multiscale_novelty_union`` protects every primary fine voxel and adds
+    # one secondary representative only for coverage that remains novel at a
+    # configurable coarser scale; the geometry determines the camera share.
+    # ``consensus_multiscale_novelty_union`` additionally lets overlapping
+    # views choose a real union-medoid representative inside each protected
+    # primary fine voxel, while retaining coarse-only secondary novelty.
     # ``transport_novelty_union`` preserves every primary occupied voxel and
     # inserts secondary novel voxels through local one-to-one replacements.
     # ``full_union`` preserves every scene point from every selected view and
@@ -82,6 +88,7 @@ class SmolVLAConfig(PreTrainedConfig):
     camera_view_fps_target_points: int = 10_000
     camera_view_fps_gripper_points: int = 500
     camera_view_voxel_size: float = 0.005
+    camera_view_coarse_novelty_scale: float = 3.0
     multiview_pretrained_lr_multiplier: float = 1.0
     multiview_residual_lr_multiplier: float = 1.0
     # Discriminative fine-tuning for input-layer multi-view fusion. All
@@ -89,6 +96,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # the pretrained action path to reduce catastrophic forgetting.
     multiview_input_pretrained_lr_multiplier: float = 1.0
     multiview_input_point_lr_multiplier: float = 1.0
+    # When jointly adapting an Ego/World double-flow checkpoint to a new
+    # point-cloud input distribution, place both coordinate streams' direct
+    # point consumers in the point-input optimizer group.  This changes only
+    # training-time optimizer membership; the forward graph and old-checkpoint
+    # path are unchanged.  It is opt-in so historical runs remain exact.
+    multiview_input_symmetric_point_path_adaptation: bool = False
     # Training-only input augmentation: deterministically expose roughly half
     # the frames as the original primary view and half as the all-view fused
     # cloud. Inference still uses every configured view. No model module or
@@ -465,6 +478,8 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -472,7 +487,9 @@ class SmolVLAConfig(PreTrainedConfig):
         }:
             raise ValueError(
                 "camera_view_fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
-                "'voxel_cover_fps', 'novelty_union', 'transport_novelty_union', "
+                "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+                "'consensus_multiscale_novelty_union', "
+                "'transport_novelty_union', "
                 "'uniform_union', 'full_union', "
                 "or 'primary_residual'; "
                 f"got {self.camera_view_fusion!r}."
@@ -485,11 +502,18 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not math.isfinite(float(self.camera_view_voxel_size)) or float(self.camera_view_voxel_size) <= 0.0:
             raise ValueError("camera_view_voxel_size must be finite and positive.")
+        if (
+            not math.isfinite(float(self.camera_view_coarse_novelty_scale))
+            or float(self.camera_view_coarse_novelty_scale) <= 1.0
+        ):
+            raise ValueError("camera_view_coarse_novelty_scale must be finite and greater than one.")
         if self.camera_view_fusion in {
             "fps",
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -503,17 +527,39 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("multiview_input_pretrained_lr_multiplier must be positive; zero would freeze parameters.")
         if float(self.multiview_input_point_lr_multiplier) <= 0:
             raise ValueError("multiview_input_point_lr_multiplier must be positive; zero would freeze parameters.")
+        if self.multiview_input_symmetric_point_path_adaptation and not self.worldflow_enable:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires worldflow_enable=True."
+            )
+        if self.multiview_input_symmetric_point_path_adaptation and self.camera_view_fusion not in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+        }:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires a supported "
+                "input-layer multi-view fusion."
+            )
         if self.multiview_input_view_dropout_enable:
             if self.camera_view_fusion not in {
                 "fps",
                 "novelty_union",
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
                 "transport_novelty_union",
                 "uniform_union",
                 "full_union",
             }:
                 raise ValueError(
                     "multiview_input_view_dropout_enable currently requires "
-                    "camera_view_fusion='fps', 'novelty_union', "
+                    "camera_view_fusion='fps', 'novelty_union', 'multiscale_novelty_union', "
+                    "'consensus_multiscale_novelty_union', "
                     "'transport_novelty_union', 'uniform_union', or 'full_union'."
                 )
             views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())

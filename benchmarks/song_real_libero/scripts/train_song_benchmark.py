@@ -49,7 +49,9 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
@@ -193,6 +195,42 @@ def validate_policy_camera_config_matches_training_config(
             "Camera view fusion diverged while loading the policy: "
             f"training={train_fusion!r}, model={model_fusion!r}."
         )
+
+
+def make_policy_on_accelerator_device(
+    *,
+    policy_cfg: Any,
+    ds_meta: Any,
+    rename_map: dict[str, str] | None,
+    accelerator_device: torch.device,
+) -> PreTrainedPolicy:
+    """Materialize a distributed policy directly on its process-local GPU.
+
+    Policy configs intentionally save the portable device value ``"cuda"``.
+    Passing that unindexed value through safetensors while every DDP process can
+    see every GPU may, however, transiently materialize nonzero ranks on GPU 0.
+    The released tensors leave a CUDA context behind and consume enough memory
+    to make a legitimate batch-48 update intermittently OOM on a 24 GiB GPU.
+
+    Temporarily make the load device explicit (for example ``cuda:3``), then
+    restore the portable config value.  This changes neither model parameters
+    nor the device recorded in checkpoints and does not touch LitePT.
+    """
+
+    saved_device = policy_cfg.device
+    if accelerator_device.type == "cuda":
+        policy_cfg.device = str(accelerator_device)
+    try:
+        policy = make_policy(
+            cfg=policy_cfg,
+            ds_meta=ds_meta,
+            rename_map=rename_map,
+        )
+    finally:
+        policy_cfg.device = saved_device
+    return policy
+
+
 def write_training_camera_provenance(
     cfg: TrainPipelineConfig,
     policy: PreTrainedPolicy,
@@ -222,6 +260,8 @@ def write_training_camera_provenance(
                 "camera_view_weights",
                 "gripper_points",
                 "camera_view_fusion",
+                "camera_view_voxel_size",
+                "camera_view_coarse_novelty_scale",
                 "current_points",
                 "future_points",
                 "trajectory_offset_filtering",
@@ -258,6 +298,10 @@ def write_training_camera_provenance(
             "rgb_camera_views": getattr(cfg.policy, "rgb_camera_views", None),
             "camera_view_weights": getattr(cfg.policy, "camera_view_weights", None),
             "camera_view_fusion": getattr(cfg.policy, "camera_view_fusion", None),
+            "camera_view_voxel_size": getattr(cfg.policy, "camera_view_voxel_size", None),
+            "camera_view_coarse_novelty_scale": getattr(
+                cfg.policy, "camera_view_coarse_novelty_scale", None
+            ),
             "multiview_input_view_dropout_enable": getattr(
                 cfg.policy, "multiview_input_view_dropout_enable", False
             ),
@@ -274,6 +318,10 @@ def write_training_camera_provenance(
             "camera_view_weights": getattr(policy.config, "camera_view_weights", None),
             "image_features": sorted(getattr(policy.config, "image_features", {})),
             "camera_view_fusion": getattr(policy.config, "camera_view_fusion", None),
+            "camera_view_voxel_size": getattr(policy.config, "camera_view_voxel_size", None),
+            "camera_view_coarse_novelty_scale": getattr(
+                policy.config, "camera_view_coarse_novelty_scale", None
+            ),
             "multiview_input_view_dropout_enable": getattr(
                 policy.config, "multiview_input_view_dropout_enable", False
             ),
@@ -314,6 +362,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         camera_view_weights: Any = None,
         camera_view_fusion: Any = "legacy_budget",
         camera_view_voxel_size: float = 0.005,
+        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
     ):
         self.dataset = dataset
@@ -326,6 +375,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         )
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -392,6 +442,8 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         if self.camera_view_fusion in {
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             # Raw/no-cache training still obeys the same input-adapter contract:
@@ -399,13 +451,21 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             sampler = {
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
+            sampler_kwargs = {"voxel_size": self.camera_view_voxel_size}
+            if self.camera_view_fusion in {
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+            }:
+                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             sampled, _point_is_pad, _indices = sampler(
                 torch.from_numpy(point_cloud).unsqueeze(0),
                 target_points=10_000,
                 gripper_points=self.gripper_points,
-                voxel_size=self.camera_view_voxel_size,
+                **sampler_kwargs,
             )
             point_cloud = sampled.squeeze(0).numpy().copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
@@ -578,8 +638,12 @@ def _paired_pointseg_cache_contract_mismatches(
     for different point counts.
     """
 
+    # Cache schema versions describe the on-disk reader contract, not the
+    # pseudo-label semantics that must match between paired views.  Each
+    # SongPointSegCachedDataset has already rejected unsupported versions;
+    # allow a compatible immutable primary cache (v11) to pair with a v12
+    # multiscale cache that only adds the coarse-novelty input metadata.
     matching_fields = (
-        "version",
         "num_samples",
         "future_offsets",
         "temporal_offsets",
@@ -648,6 +712,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         camera_view_weights: Any = None,
         camera_view_fusion: Any = "legacy_budget",
         camera_view_voxel_size: float = 0.005,
+        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
         primary_cache_dir: str | Path | None = None,
         view_dropout_enable: bool = False,
@@ -673,6 +738,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         )
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -701,6 +767,8 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             cached_voxel_size = float(self.cache.manifest.get("camera_view_voxel_size", -1.0))
@@ -708,6 +776,19 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     f"PointSeg cache voxel size {cached_voxel_size} does not match training "
                     f"voxel size {self.camera_view_voxel_size}."
+                )
+        if self.camera_view_fusion in {
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+        }:
+            cached_coarse_scale = float(
+                self.cache.manifest.get("camera_view_coarse_novelty_scale", 3.0)
+            )
+            if cached_coarse_scale != self.camera_view_coarse_novelty_scale:
+                raise ValueError(
+                    f"PointSeg cache coarse novelty scale {cached_coarse_scale} does not match "
+                    f"training scale {self.camera_view_coarse_novelty_scale}. Rebuild the cache "
+                    "with the same multiscale input contract."
                 )
         cached_weights = parse_camera_view_weights(
             self.cache.manifest.get("camera_view_weights"),
@@ -930,6 +1011,9 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         self.dataset.camera_view_voxel_size = float(
             getattr(policy_cfg, "camera_view_voxel_size", 0.005)
         )
+        self.dataset.camera_view_coarse_novelty_scale = float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        )
         self.current_points = int(self.dataset.current_points)
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(os.environ.get("SONG_POINTSEG_ONLINE_DEVICE", default_device))
@@ -979,6 +1063,9 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             camera_view_voxel_size=float(
                 getattr(self.dataset, "camera_view_voxel_size", 0.005)
             ),
+            camera_view_coarse_novelty_scale=float(
+                getattr(self.dataset, "camera_view_coarse_novelty_scale", 3.0)
+            ),
             gripper_points=int(self.dataset.gripper_points),
             device=self.device,
             pseudo_config=self.pseudo_config,
@@ -997,6 +1084,7 @@ class OnlinePointSegBatchCollator:
         future_points: int,
         camera_view_fusion: str,
         camera_view_voxel_size: float,
+        camera_view_coarse_novelty_scale: float,
         gripper_points: int,
         device: torch.device,
         pseudo_config: PseudoLabelConfig,
@@ -1005,6 +1093,7 @@ class OnlinePointSegBatchCollator:
         self.future_points = int(future_points)
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.gripper_points = int(gripper_points)
         self.device = torch.device(device)
         self.pseudo_config = pseudo_config
@@ -1037,6 +1126,8 @@ class OnlinePointSegBatchCollator:
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             sampler = {
@@ -1044,6 +1135,8 @@ class OnlinePointSegBatchCollator:
                 "voxel_fps": voxel_fps_sample_fused_point_cloud,
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
             sampler_kwargs = (
@@ -1053,10 +1146,17 @@ class OnlinePointSegBatchCollator:
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else {}
             )
+            if self.camera_view_fusion in {
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+            }:
+                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             current_pc, current_is_pad, _ = sampler(
                 current_pc,
                 target_points=self.current_points,
@@ -1221,6 +1321,9 @@ def maybe_wrap_pointseg_cache_dataset(
         camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
         camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
         camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
+        camera_view_coarse_novelty_scale=float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
         primary_cache_dir=primary_cache_dir,
         view_dropout_enable=view_dropout_enable,
@@ -1259,6 +1362,9 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
         camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
         camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
+        camera_view_coarse_novelty_scale=float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
     )
 
@@ -1978,6 +2084,30 @@ def update_policy(
                 if group.get("group_name") not in world_group_names
                 for parameter in group["params"]
             }
+            world_only_role_resolver = getattr(
+                unwrapped_policy,
+                "get_worldflow_ego_tangent_world_only_parameter_ids",
+                None,
+            )
+            world_only_point_parameter_ids = (
+                set(world_only_role_resolver())
+                if callable(world_only_role_resolver)
+                else set()
+            )
+            optimizer_parameter_ids = {
+                id(parameter)
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            }
+            if not world_only_point_parameter_ids <= optimizer_parameter_ids:
+                raise RuntimeError(
+                    "World-only point-path role resolution returned parameters outside the optimizer."
+                )
+            # Physical roles and learning-rate groups are intentionally
+            # independent.  V49 places World point consumers in the high-LR
+            # point-input group, but they must still retain the gradients from
+            # samples where World-to-Ego is active.
+            protected_parameter_ids.difference_update(world_only_point_parameter_ids)
             if not protected_parameter_ids:
                 raise RuntimeError(
                     "Ego-tangent projection requires a non-empty pretrained/common optimizer group."
@@ -2038,6 +2168,9 @@ def update_policy(
             ).detach().item()
             output_dict["worldflow_ego_tangent_gradient_protected_parameter_count"] = len(
                 protected_ego_gradients
+            )
+            output_dict["worldflow_ego_tangent_gradient_world_only_point_parameter_count"] = len(
+                world_only_point_parameter_ids
             )
     else:
         # Use accelerator's backward method. Scale each micro-batch
@@ -2191,10 +2324,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
-    policy = make_policy(
-        cfg=cfg.policy,
+    policy = make_policy_on_accelerator_device(
+        policy_cfg=cfg.policy,
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
+        accelerator_device=device,
     )
     worldflow_bootstrap_requested = bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False))
     if worldflow_bootstrap_requested and not cfg.resume:

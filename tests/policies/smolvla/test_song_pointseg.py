@@ -20,7 +20,9 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
@@ -266,6 +268,152 @@ def test_novelty_union_replaces_only_redundant_primary_voxel_points():
         sampled,
         torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
     )
+
+
+def test_multiscale_novelty_union_keeps_fine_primary_cover_and_only_coarse_novel_secondary():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.010, 0.011, 0.040, 0.041,
+         0.002, 0.012, 0.050, 0.091, 0.092, 0.130]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+    repeated, _, repeated_indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert indices.tolist() == [[0, 9, 2, 11, 4, 5, 12, 13]]
+    assert torch.equal(indices, repeated_indices)
+    assert torch.equal(sampled, repeated)
+    assert {0, 2, 4}.issubset(set(indices[0, :-2].tolist()))
+    assert set(indices[0, :-2].tolist()) & {6, 7, 8, 10} == set()
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+
+
+def test_multiscale_novelty_union_is_exact_identity_for_single_view():
+    cloud = torch.randn(2, 8, 6)
+    sampled, sampled_pad, indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+
+    assert sampled_pad is None
+    assert torch.equal(sampled, cloud)
+    assert indices.tolist() == [list(range(8)), list(range(8))]
+
+
+def test_multiscale_novelty_union_supports_more_conservative_coarse_scale():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.010, 0.011, 0.080, 0.081,
+         0.002, 0.012, 0.035, 0.091, 0.092, 0.130]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    _, _, default_indices = multiscale_novelty_union_sample_fused_point_cloud(
+        cloud, target_points=8, gripper_points=2, voxel_size=0.01
+    )
+    sampled, sampled_pad, conservative_indices = (
+        multiscale_novelty_union_sample_fused_point_cloud(
+            cloud,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    assert default_indices.tolist() == [[0, 8, 2, 9, 4, 11, 12, 13]]
+    assert conservative_indices.tolist() == [[0, 11, 2, 3, 4, 5, 12, 13]]
+    assert torch.equal(
+        sampled,
+        torch.gather(
+            cloud,
+            1,
+            conservative_indices.unsqueeze(-1).expand(-1, -1, 6),
+        ),
+    )
+
+
+def test_consensus_multiscale_uses_real_union_medoids_and_preserves_fine_cover():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.020, 0.040, 0.060, 0.080,
+         0.004, 0.005, 0.006, 0.021, 0.160, 0.161]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = (
+        consensus_multiscale_novelty_union_sample_fused_point_cloud(
+            cloud,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    # Index 6 is the real union medoid of the primary-occupied first fine
+    # voxel. Index 10 is the stable medoid of the secondary-only 4 cm cell.
+    assert indices.tolist() == [[6, 10, 9, 3, 4, 5, 12, 13]]
+    assert indices.unique().numel() == 8
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+    primary_fine_cells = set(torch.floor(cloud[0, :6, 0] / 0.01).long().tolist())
+    sampled_fine_cells = set(torch.floor(sampled[0, :-2, 0] / 0.01).long().tolist())
+    assert primary_fine_cells.issubset(sampled_fine_cells)
+    assert torch.equal(sampled[0, -2:], cloud[0, -2:])
+
+
+def test_consensus_multiscale_is_deterministic_and_single_view_exact_identity():
+    single = torch.randn(2, 8, 6)
+    sampled, sampled_pad, indices = (
+        consensus_multiscale_novelty_union_sample_fused_point_cloud(
+            single,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    assert torch.equal(sampled, single)
+    assert indices.tolist() == [list(range(8)), list(range(8))]
+
+
+def test_consensus_multiscale_keeps_dual_view_batches_isolated():
+    cloud = torch.zeros(2, 14, 6)
+    pattern = torch.tensor(
+        [0.000, 0.001, 0.020, 0.040, 0.060, 0.080,
+         0.004, 0.005, 0.006, 0.021, 0.160, 0.161]
+    )
+    cloud[0, :12, 0] = pattern
+    cloud[1, :12, 0] = pattern
+    cloud[1, :12, 3] = 1.0
+    cloud[:, -2:, :3] = 7.0
+
+    sampled, _, indices = consensus_multiscale_novelty_union_sample_fused_point_cloud(
+        cloud,
+        target_points=8,
+        gripper_points=2,
+        voxel_size=0.01,
+        coarse_novelty_scale=4.0,
+    )
+
+    assert indices.tolist() == [[6, 10, 9, 3, 4, 5, 12, 13]] * 2
+    assert torch.equal(sampled[0, :-2, 3], torch.zeros(6))
+    assert torch.equal(sampled[1, :-2, 3], torch.ones(6))
 
 
 def test_transport_novelty_union_uses_local_one_to_one_replacements():
@@ -716,6 +864,14 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
     assert tuple(sample["pointseg.role_scores"].shape) == (n_points, 3)
     assert sample["episode_index"].item() == 4
     assert sample["dataset_index"].item() == 1
+
+    # V51 writes schema 12, while the immutable primary-view and V46 caches
+    # remain schema 11. Both contain the same label arrays and stay readable.
+    legacy_manifest = json.loads((cache_dir / "manifest.json").read_text())
+    legacy_manifest["version"] = 11
+    (cache_dir / "manifest.json").write_text(json.dumps(legacy_manifest))
+    legacy_sample = SongPointSegCachedDataset(cache_dir)[1]
+    assert legacy_sample["pointseg.labels"].tolist() == [1, 1, 0, -100]
 
 
 def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):

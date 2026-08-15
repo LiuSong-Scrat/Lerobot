@@ -22,7 +22,9 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
     transport_novelty_union_sample_fused_point_cloud,
     open_episode_point_clouds,
@@ -871,6 +873,8 @@ class SmolVLA_ModelInference:
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             sampler = {
@@ -878,6 +882,8 @@ class SmolVLA_ModelInference:
                 "voxel_fps": voxel_fps_sample_fused_point_cloud,
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[fusion]
             sampler_kwargs = {}
@@ -885,10 +891,16 @@ class SmolVLA_ModelInference:
                 "voxel_fps",
                 "voxel_cover_fps",
                 "novelty_union",
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
                 "transport_novelty_union",
             }:
                 sampler_kwargs["voxel_size"] = float(
                     getattr(self.policy.config, "camera_view_voxel_size", 0.005)
+                )
+            if fusion in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}:
+                sampler_kwargs["coarse_novelty_scale"] = float(
+                    getattr(self.policy.config, "camera_view_coarse_novelty_scale", 3.0)
                 )
             pc, _point_is_pad, _indices = sampler(
                 pc,

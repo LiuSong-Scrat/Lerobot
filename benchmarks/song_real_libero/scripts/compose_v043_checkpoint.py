@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "primary_residual",
@@ -158,6 +160,8 @@ def main() -> None:
             "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
         }

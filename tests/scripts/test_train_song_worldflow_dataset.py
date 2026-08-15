@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
+from benchmarks.song_real_libero.scripts.song_cache_pointseg_samples import (
+    _fps_sample_cache_batch,
+)
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
+    PointSegCacheInjectedDataset,
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
+    make_policy_on_accelerator_device,
+    update_policy,
     worldflow_ego_priority_projection_statistics,
 )
+from lerobot.policies.smolvla.song_pointseg import POINTSEG_CACHE_LABEL_FIELDS
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
 from lerobot.scripts.train_song_libero import (
     WorldFlowMemmapDataset as LiberoWorldFlowMemmapDataset,
@@ -30,6 +41,46 @@ class _TinyDataset(torch.utils.data.Dataset):
             "frame_index": torch.tensor(self.frame_index),
             "action": torch.zeros(self.chunk_size, 10),
         }
+
+
+def test_policy_materialization_uses_explicit_local_cuda_then_restores_portable_config(monkeypatch):
+    class _Config:
+        device = "cuda"
+
+    class _Policy:
+        pass
+
+    config = _Config()
+    policy = _Policy()
+    policy.config = config
+    observed = {}
+
+    def fake_make_policy(*, cfg, ds_meta, rename_map):
+        observed["device_during_load"] = cfg.device
+        observed["ds_meta"] = ds_meta
+        observed["rename_map"] = rename_map
+        return policy
+
+    monkeypatch.setattr(
+        "benchmarks.song_real_libero.scripts.train_song_benchmark.make_policy",
+        fake_make_policy,
+    )
+
+    result = make_policy_on_accelerator_device(
+        policy_cfg=config,
+        ds_meta="metadata",
+        rename_map={"old": "new"},
+        accelerator_device=torch.device("cuda:3"),
+    )
+
+    assert result is policy
+    assert observed == {
+        "device_during_load": "cuda:3",
+        "ds_meta": "metadata",
+        "rename_map": {"old": "new"},
+    }
+    assert config.device == "cuda"
+    assert policy.config.device == "cuda"
 
 
 def _pose_sequence(offset: float) -> np.ndarray:
@@ -163,6 +214,23 @@ def test_full_union_paired_cache_contract_allows_native_primary_point_count_and_
     assert mismatches == {}
 
 
+def test_paired_cache_contract_allows_compatible_storage_schema_versions():
+    all_view = _pointseg_manifest(10_000)
+    primary = _pointseg_manifest(10_000)
+    all_view["version"] = 12
+    primary["version"] = 11
+
+    mismatches = _paired_pointseg_cache_contract_mismatches(
+        all_view,
+        primary,
+        camera_view_fusion="multiscale_novelty_union",
+        num_views=2,
+        gripper_points=500,
+    )
+
+    assert mismatches == {}
+
+
 def test_full_union_paired_cache_contract_rejects_point_loss_or_semantic_prior_drift():
     all_view = _pointseg_manifest(19_499, nn_chunk_size=512)
     primary = _pointseg_manifest(10_000, nn_chunk_size=1024)
@@ -208,3 +276,167 @@ def test_worldflow_ego_priority_projection_removes_only_conflicting_component():
     assert torch.dot(projected_shared, ego[0]).item() == pytest.approx(0.0)
     # A World-only tensor never enters the projection inner product.
     assert torch.equal(world[1], torch.tensor([7.0]))
+
+
+class _GradientRecordingAccelerator:
+    def autocast(self):
+        return nullcontext()
+
+    def unwrap_model(self, policy, keep_fp32_wrapper=True):
+        assert keep_fp32_wrapper is True
+        return policy
+
+    def backward(self, loss, **kwargs):
+        loss.backward(**kwargs)
+
+    def clip_grad_norm_(self, parameters, max_norm):
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
+class _MixedPointRolePolicy(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ego_point = torch.nn.Parameter(torch.tensor(1.0))
+        self.world_point = torch.nn.Parameter(torch.tensor(1.0))
+        self.config = SimpleNamespace(
+            worldflow_training_ego_priority_gradient_projection=False,
+            worldflow_training_shared_gradient_ego_tangent_projection=True,
+        )
+        self.model = SimpleNamespace(
+            last_worldflow_world_to_ego_keep_mask=torch.tensor([False, True])
+        )
+
+    def get_worldflow_ego_tangent_world_only_parameter_ids(self) -> set[int]:
+        return {id(self.world_point)}
+
+    def forward(self, batch, reduction="mean"):
+        assert batch == {}
+        per_sample = torch.stack((self.ego_point.square(), self.world_point.square()))
+        assert reduction == "none"
+        return per_sample, {}
+
+
+def test_ego_tangent_merge_retains_world_gradient_inside_mixed_point_lr_group():
+    policy = _MixedPointRolePolicy()
+    optimizer = torch.optim.SGD(
+        [
+            {
+                "params": [policy.ego_point, policy.world_point],
+                "lr": 5e-8,
+                "group_name": "point_input_adaptation_path",
+            }
+        ]
+    )
+    captured = {}
+
+    def record_gradients_without_updating(closure=None):
+        assert closure is None
+        captured["ego"] = policy.ego_point.grad.detach().clone()
+        captured["world"] = policy.world_point.grad.detach().clone()
+
+    optimizer.step = record_gradients_without_updating
+    metrics = SimpleNamespace(loss=None, grad_norm=None, lr=None, update_s=None)
+
+    _, output = update_policy(
+        metrics,
+        policy,
+        {},
+        optimizer,
+        grad_clip_norm=0.0,
+        accelerator=_GradientRecordingAccelerator(),
+    )
+
+    assert captured["ego"].item() == pytest.approx(1.0)
+    assert captured["world"].item() == pytest.approx(1.0)
+    assert output["worldflow_ego_tangent_gradient_world_only_point_parameter_count"] == 1
+    # The optimizer step above only records gradients; the weights are unchanged.
+    assert policy.ego_point.item() == pytest.approx(1.0)
+    assert policy.world_point.item() == pytest.approx(1.0)
+
+
+def test_cache_sampling_applies_same_conservative_scale_to_current_and_future():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [
+            0.000,
+            0.001,
+            0.010,
+            0.011,
+            0.080,
+            0.081,
+            0.002,
+            0.012,
+            0.035,
+            0.091,
+            0.092,
+            0.130,
+        ]
+    )
+    cloud[0, -2:, :3] = 7.0
+    batch = {
+        "observation.point_cloud": cloud.clone(),
+        "observation.point_cloud_indices": torch.arange(14).unsqueeze(0),
+        "observation.point_cloud_future": cloud[:, None].clone(),
+    }
+
+    _fps_sample_cache_batch(
+        batch,
+        target_current_points=8,
+        target_future_points=8,
+        gripper_points=2,
+        fusion="multiscale_novelty_union",
+        voxel_size=0.01,
+        coarse_novelty_scale=4.0,
+    )
+
+    expected_indices = [0, 11, 2, 3, 4, 5, 12, 13]
+    assert batch["observation.point_cloud_indices"].tolist() == [expected_indices]
+    assert torch.equal(
+        batch["observation.point_cloud"], cloud[:, expected_indices]
+    )
+    assert torch.equal(
+        batch["observation.point_cloud_future"],
+        cloud[:, None, expected_indices],
+    )
+
+
+def test_multiscale_training_rejects_legacy_scale3_cache_for_scale4(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    manifest = {
+        "version": 12,
+        "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+        "cache_mode": "indices",
+        "variable_num_points": True,
+        "shards": [{"path": "shard_000000", "length": 1}],
+        "camera_views": ["agentview", "robot0_eye_in_hand"],
+        "camera_view_weights": None,
+        "camera_view_fusion": "multiscale_novelty_union",
+        "camera_view_voxel_size": 0.01,
+    }
+    (cache / "manifest.json").write_text(json.dumps(manifest))
+    dataset = SimpleNamespace(root=tmp_path)
+
+    with pytest.raises(ValueError, match="coarse novelty scale 3.0.*training scale 4.0"):
+        PointSegCacheInjectedDataset(
+            dataset,
+            cache,
+            strict=False,
+            camera_views="agentview,robot0_eye_in_hand",
+            camera_view_fusion="multiscale_novelty_union",
+            camera_view_voxel_size=0.01,
+            camera_view_coarse_novelty_scale=4.0,
+        )
+
+    manifest["camera_view_coarse_novelty_scale"] = 4.0
+    (cache / "manifest.json").write_text(json.dumps(manifest))
+    wrapped = PointSegCacheInjectedDataset(
+        dataset,
+        cache,
+        strict=False,
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        camera_view_voxel_size=0.01,
+        camera_view_coarse_novelty_scale=4.0,
+    )
+    assert wrapped.camera_view_coarse_novelty_scale == 4.0

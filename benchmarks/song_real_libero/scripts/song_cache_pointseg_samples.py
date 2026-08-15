@@ -29,6 +29,8 @@ from lerobot.policies.smolvla.song_pointseg import (
     ROLE_NAMES,
     PseudoLabelConfig,
     fps_sample_fused_point_cloud,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
+    multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
@@ -106,6 +108,7 @@ def parse_args() -> argparse.Namespace:
         default=parse_camera_view_fusion(os.environ.get("SONG_CAMERA_VIEW_FUSION")),
     )
     parser.add_argument("--camera-view-voxel-size", type=float, default=0.005)
+    parser.add_argument("--camera-view-coarse-novelty-scale", type=float, default=3.0)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=256)
@@ -128,6 +131,8 @@ def parse_args() -> argparse.Namespace:
         "voxel_fps",
         "voxel_cover_fps",
         "novelty_union",
+        "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union",
         "transport_novelty_union",
         "uniform_union",
         "full_union",
@@ -140,6 +145,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--camera-view-fusion=primary_residual requires equal --current-points and --future-points"
         )
+    if (
+        not np.isfinite(float(args.camera_view_coarse_novelty_scale))
+        or float(args.camera_view_coarse_novelty_scale) <= 1.0
+    ):
+        parser.error("--camera-view-coarse-novelty-scale must be finite and greater than one")
     return args
 
 
@@ -723,6 +733,7 @@ def _fps_sample_cache_batch(
     gripper_points: int,
     fusion: str = "fps",
     voxel_size: float = 0.005,
+    coarse_novelty_scale: float = 3.0,
 ) -> None:
     """Apply the same FPS contract used by online inference before pseudo labels."""
 
@@ -733,9 +744,13 @@ def _fps_sample_cache_batch(
         "voxel_fps": voxel_fps_sample_fused_point_cloud,
         "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
         "novelty_union": novelty_union_sample_fused_point_cloud,
+        "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+        "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
         "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
     }[fusion]
     sampler_kwargs = {"voxel_size": float(voxel_size)} if fusion != "fps" else {}
+    if fusion in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}:
+        sampler_kwargs["coarse_novelty_scale"] = float(coarse_novelty_scale)
     sampled, sampled_pad, selected = sampler(
         current,
         target_points=target_current_points,
@@ -898,8 +913,16 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
+                else None
+            ),
+            "camera_view_coarse_novelty_scale": (
+                float(args.camera_view_coarse_novelty_scale)
+                if full_dataset.camera_view_fusion
+                in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}
                 else None
             ),
             "gripper_points": full_dataset.gripper_points,
@@ -907,6 +930,10 @@ def cache_samples(args: argparse.Namespace) -> None:
             "point_count_policy": (
                 "primary_unique_voxels_plus_local_transport_secondary_novel_voxels_preserve_primary_gripper"
                 if full_dataset.camera_view_fusion == "transport_novelty_union"
+                else ("fine_primary_voxel_consensus_medoid_plus_coarse_persistent_secondary_novel_voxels_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "consensus_multiscale_novelty_union"
+                else ("fine_primary_voxel_cover_plus_coarse_persistent_secondary_novel_voxels_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "multiscale_novelty_union"
                 else ("primary_unique_voxels_plus_secondary_novel_voxels_preserve_primary_gripper"
                 if full_dataset.camera_view_fusion == "novelty_union"
                 else ("cover_all_unique_voxels_then_union_fps_detail_preserve_primary_gripper"
@@ -923,7 +950,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "primary_exact_labels_secondary_residual_raw_union"
                     if full_dataset.camera_view_fusion == "primary_residual"
                     else "cap_without_repeat"
-                )))))))
+                )))))))))
             ),
             "fps_contract": (
                 {
@@ -938,6 +965,8 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else None
@@ -1031,6 +1060,8 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_fps",
                     "voxel_cover_fps",
                     "novelty_union",
+                    "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }:
                     _fps_sample_cache_batch(
@@ -1040,6 +1071,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                         gripper_points=full_dataset.gripper_points,
                         fusion=args.camera_view_fusion,
                         voxel_size=args.camera_view_voxel_size,
+                        coarse_novelty_scale=args.camera_view_coarse_novelty_scale,
                     )
                 elif args.camera_view_fusion == "primary_residual":
                     _primary_view_cache_batch(
