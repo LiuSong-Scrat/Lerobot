@@ -99,7 +99,7 @@ build_cache() {
     fi
     mkdir -p "$cache"
     cd "$repo"
-    SONG_POINTCLOUD_GRIPPER_POINTS=500 OMP_NUM_THREADS=1 "$torchrun" \
+    PYTHONPATH="$repo/src" SONG_POINTCLOUD_GRIPPER_POINTS=500 OMP_NUM_THREADS=1 "$torchrun" \
         --standalone --nproc_per_node=4 \
         benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
         --dataset.repo_id="$dataset" \
@@ -148,6 +148,7 @@ train() {
     cd "$repo"
     ulimit -n 65535
     CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    PYTHONPATH="$repo/src" \
     SONG_POINTSEG_REQUIRE_POINTOPS=1 \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     "$python" -m accelerate.commands.launch \
@@ -231,6 +232,7 @@ eval_checkpoint() {
     cd "$repo"
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
+    PYTHONPATH="$repo/src" \
     MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 \
     "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
         --config benchmarks/song_real_libero/configs/libero.json \

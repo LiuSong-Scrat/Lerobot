@@ -246,6 +246,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--worker-scope",
+        choices=("task", "episode"),
+        default=None,
+        help=(
+            "Parallel work unit. 'task' reuses one environment for all selected demos of a task; "
+            "'episode' creates an isolated environment per demo and can use more workers when only "
+            "a few tasks are selected."
+        ),
+    )
+    parser.add_argument(
+        "--resume-temp-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Validate and reuse complete episode artifacts already present in --tmp-dir. "
+            "Any existing artifact that fails strict validation aborts the run."
+        ),
+    )
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
@@ -2281,6 +2300,16 @@ def main() -> None:
         cfg["image_cameras"] = image_feature_cameras(cfg)
     ensure_image_camera_rendered(cfg)
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
+    cfg["worker_scope"] = str(cfg_get(cfg, args.worker_scope, "worker_scope", "task"))
+    cfg["resume_temp_artifacts"] = bool(
+        cfg_get(cfg, args.resume_temp_artifacts, "resume_temp_artifacts", False)
+    )
+    if cfg["num_workers"] < 1:
+        raise ValueError(f"num_workers must be at least 1, got {cfg['num_workers']}.")
+    if cfg["worker_scope"] not in {"task", "episode"}:
+        raise ValueError(
+            f"worker_scope must be 'task' or 'episode', got {cfg['worker_scope']!r}."
+        )
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
     ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
@@ -2363,11 +2392,16 @@ def main() -> None:
             "execution_mode": (
                 "spawn_process_pool" if int(cfg["num_workers"]) > 1 else "in_process_serial"
             ),
-            "worker_scope": "one isolated environment per task",
+            "worker_scope": (
+                "one isolated environment per episode"
+                if str(cfg["worker_scope"]) == "episode"
+                else "one isolated environment per task"
+            ),
             "worker_output": "unique temporary directory per episode job",
             "dataset_commit": "single parent process in deterministic job order",
             "episode_seed": "independent of worker count and completion order",
             "demo_model_runtime_verification": bool(cfg["restore_demo_model"]),
+            "resume_temp_artifacts": bool(cfg["resume_temp_artifacts"]),
         },
         "fps": int(cfg["fps"]),
         "state_observation_alignment": {
@@ -2480,7 +2514,7 @@ def main() -> None:
             )
             task_job_index += 1
 
-    if tmp_dir.exists():
+    if tmp_dir.exists() and not bool(cfg["resume_temp_artifacts"]):
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2504,20 +2538,78 @@ def main() -> None:
         verify_episode_artifact(actual_path, expected_job)
         results[result_index] = actual_path
 
-    if int(cfg["num_workers"]) <= 1:
-        for task_job in tqdm(task_jobs, desc="Collecting LIBERO tasks", unit="task"):
+    if bool(cfg["resume_temp_artifacts"]):
+        for episode_job in episode_jobs:
+            artifact_path = Path(episode_job["tmp_path"])
+            if not artifact_path.exists():
+                continue
+            register_result(
+                {
+                    "job_index": int(episode_job["job_index"]),
+                    "tmp_path": str(artifact_path),
+                }
+            )
+        if results:
+            print(
+                f"[info] resumed {len(results)}/{len(episode_jobs)} strictly validated "
+                f"temporary episode artifact(s) from {tmp_dir}"
+            )
+
+    pending_indices = set(expected_jobs) - set(results)
+    pending_episode_jobs = [
+        job for job in episode_jobs if int(job["job_index"]) in pending_indices
+    ]
+    pending_task_jobs = []
+    for task_job in task_jobs:
+        pending_for_task = [
+            job
+            for job in task_job["episodes"]
+            if int(job["job_index"]) in pending_indices
+        ]
+        if pending_for_task:
+            pending_task_jobs.append({**task_job, "episodes": pending_for_task})
+
+    if not pending_episode_jobs:
+        print("[info] all requested episodes were restored from validated temporary artifacts")
+    elif int(cfg["num_workers"]) <= 1:
+        for task_job in tqdm(pending_task_jobs, desc="Collecting LIBERO tasks", unit="task"):
             for result in collect_task_worker(task_job):
                 register_result(result)
+    elif str(cfg["worker_scope"]) == "episode":
+        worker_count = min(int(cfg["num_workers"]), len(pending_episode_jobs))
+        print(
+            f"[info] collecting {len(pending_episode_jobs)} remaining LIBERO episode(s) "
+            f"with {worker_count} episode-scoped worker(s)"
+        )
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
+            futures = [
+                executor.submit(collect_episode_worker, episode_job)
+                for episode_job in pending_episode_jobs
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Collecting LIBERO episodes",
+                unit="episode",
+            ):
+                register_result(future.result())
     else:
         print(
-            f"[info] collecting {len(episode_jobs)} LIBERO episode(s) across {len(task_jobs)} task job(s) "
+            f"[info] collecting {len(pending_episode_jobs)} remaining LIBERO episode(s) "
+            f"across {len(pending_task_jobs)} task job(s) "
             f"with {cfg['num_workers']} worker(s)"
         )
         with ProcessPoolExecutor(
             max_workers=int(cfg["num_workers"]),
             mp_context=mp.get_context("spawn"),
         ) as executor:
-            futures = [executor.submit(collect_task_worker, task_job) for task_job in task_jobs]
+            futures = [
+                executor.submit(collect_task_worker, task_job)
+                for task_job in pending_task_jobs
+            ]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO tasks", unit="task"):
                 for result in future.result():
                     register_result(result)
