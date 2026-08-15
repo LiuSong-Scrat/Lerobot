@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "worldflow_robot_base_reference_v20_20260816"
+EVAL_BUILD_TAG = "worldflow_robot_base_process_proxy_v21_20260816"
 
 import argparse
 import atexit
@@ -5018,6 +5018,8 @@ class ProcessInferenceProxy:
         response_queue: Any,
         vla_adapter_enable: bool,
         image_feature_keys: list[str],
+        worldflow_enable: bool = False,
+        worldflow_reference_frame: str = "pointcloud_reference_camera",
     ) -> None:
         self.worker_id = int(worker_id)
         self.request_queue = request_queue
@@ -5027,6 +5029,8 @@ class ProcessInferenceProxy:
             config=SimpleNamespace(
                 vla_adapter_enable=bool(vla_adapter_enable),
                 image_features={str(key): None for key in image_feature_keys},
+                worldflow_enable=bool(worldflow_enable),
+                worldflow_reference_frame=str(worldflow_reference_frame),
             )
         )
 
@@ -5102,6 +5106,8 @@ def _process_task_worker_entry(
     start_event: Any,
     vla_adapter_enable: bool,
     image_feature_keys: list[str],
+    worldflow_enable: bool,
+    worldflow_reference_frame: str,
 ) -> None:
     """Own one MuJoCo task environment in a process that never loads the policy."""
     try:
@@ -5113,6 +5119,8 @@ def _process_task_worker_entry(
             response_queue=response_queue,
             vla_adapter_enable=vla_adapter_enable,
             image_feature_keys=image_feature_keys,
+            worldflow_enable=worldflow_enable,
+            worldflow_reference_frame=worldflow_reference_frame,
         )
 
         def _announce_ready_and_wait() -> None:
@@ -8505,6 +8513,14 @@ def evaluate_suite_process_parallel(
     context = mp.get_context("spawn")
     adapter_enabled = bool(infer.policy.config.vla_adapter_enable)
     image_feature_keys = [str(key) for key in infer.policy.config.image_features]
+    worldflow_enabled = bool(getattr(infer.policy.config, "worldflow_enable", False))
+    worldflow_reference_frame = str(
+        getattr(
+            infer.policy.config,
+            "worldflow_reference_frame",
+            "pointcloud_reference_camera",
+        )
+    )
     max_batch_size = max(1, int(cfg["inference_batch_size"]))
     batch_wait_s = max(0.0, float(cfg["inference_batch_wait_ms"])) / 1000.0
     batching_mode = str(cfg.get("inference_batching_mode", "dynamic"))
@@ -8593,6 +8609,8 @@ def evaluate_suite_process_parallel(
                         "start_event": start_event,
                         "vla_adapter_enable": adapter_enabled,
                         "image_feature_keys": image_feature_keys,
+                        "worldflow_enable": worldflow_enabled,
+                        "worldflow_reference_frame": worldflow_reference_frame,
                     },
                     name=(
                         f"libero-{suite_name}-task-{job.task_id}-"

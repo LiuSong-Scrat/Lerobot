@@ -10,6 +10,7 @@ os.environ.setdefault("SONG_LIBERO_ENV_WORKER", "1")
 
 from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval import (  # noqa: E402
     FixedBatchInferenceCache,
+    ProcessInferenceProxy,
     _ProcessInferenceRequest,
     _execute_process_inference_fixed_slots,
     _process_worker_environment,
@@ -24,6 +25,21 @@ class _FakeInference:
         self.calls.append((observation, kwargs))
         values = np.asarray(observation["value"], dtype=np.float32).reshape(-1)
         return values[:, None, None]
+
+
+def test_process_proxy_preserves_worldflow_frame_contract():
+    proxy = ProcessInferenceProxy(
+        worker_id=0,
+        request_queue=queue.Queue(),
+        response_queue=queue.Queue(),
+        vla_adapter_enable=True,
+        image_feature_keys=["observation.images.agentview"],
+        worldflow_enable=True,
+        worldflow_reference_frame="robot_base",
+    )
+
+    assert proxy.policy.config.worldflow_enable is True
+    assert proxy.policy.config.worldflow_reference_frame == "robot_base"
 
 
 def _request(worker_id: int, value: float, seed: int) -> _ProcessInferenceRequest:
