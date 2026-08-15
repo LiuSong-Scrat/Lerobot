@@ -484,6 +484,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - 完整 paired 训练已由原 tmux `wep_v043_v52_audit_then_paired_train` 自动启动，未重复创建 output。训练进程固定 executable commit `9447a43a0e2ed3130a578618ac92225f71eb8a31`，4 GPUs、batch44/GPU、global176、1564 steps、完整 paired epoch、checkpoint `260/520/780/1040/1300/1564`；进程环境为 `WANDB_MODE=online`。启动后已通过 step1--11，无 OOM、NaN 或 traceback，四卡显存约21--22 GB。训练日志：`joint_multiview_worldflow/libero10_500ep/logs/train_v52_from_v32step100_consensus_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_4gpu_b44_w12_1564steps.log`。
 - 收敛/漂移 monitor、six-checkpoint Broad 和候选 Full500 2×2 waiters 继续存活。当前仍没有 Broad 或 Full500 性能证据，不能标记 `/goal` 完成。
 
+## 6.13 2026-08-15：V52 完整训练、首个 Broad 候选与主分支运行时合入（覆盖 6.12 的运行状态）
+
+- V52 paired 训练已完整完成 `1564/1564` steps 和一个 task-balanced paired epoch，六个 checkpoint `260/520/780/1040/1300/1564` 均已原子发布。最终 `v52_training_convergence_complete.json` 为 `training_complete=true`、`maximum_parsed_step=1564`，状态 `short_tail_decline_epoch_scale_plateau`；最终参数漂移审计证明 exact architecture key match、四个 optimizer groups、全部 architecture roles、Ego/World 对称 point path 和 optimizer state 全部通过。训练与 monitor tmux 均正常退出，无 OOM、NaN 或 traceback。
+- child-env-fixed Broad 使用固定 IDs `0,5,...,45`、fixed-barrier-v18、policy-noise seed0、每臂100 episodes。step260 三臂为 dual+World `96`、primary+World `93`、dual+World-to-Ego-disabled `96`，因 WorldFlow delta `0` 被筛除。step520 三臂为 `98/95/96`，多视角 delta `+3`、WorldFlow delta `+2`，`passes_joint_screen=true`，是首个正式 Full500 候选。step780 在 `72/77` 时累计5失败、理论最高95；step1040 在 `75/80` 时累计5失败、理论最高95；二者均数学早停且未运行消融。step1300/1564 继续由原 Broad waiter 顺序筛查；Full500 waiter 必须等待六点聚合后按预注册排名执行，当前不得宣称最终门禁通过。
+- 按用户要求，V52 executable 历史已通过 merge commit `664f14e` 合入 `wep_vla_v0.4.3_multiview_doubleflow`，同时保留主分支已有的默认关闭 WorldFlow 能力和全部较新 handoff。合并后的主分支可从自身 `src/lerobot` 直接解析 step520 的 `camera_view_coarse_novelty_scale=4.0`、`multiview_input_symmetric_point_path_adaptation=true` 并导入 `consensus_multiscale_novelty_union_sample_fused_point_cloud`；配置/导入 preflight 通过，四个正式测试文件回归为 `144 passed, 8 warnings`。这只证明运行时兼容与回归正确，不替代剩余 Broad 或 Full500 性能门禁。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；

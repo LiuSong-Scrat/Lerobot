@@ -135,7 +135,7 @@ network_access = true
 
 1. 上一行仅保留最初恢复点的历史记录。V51 后续已完成正式 cache、审计、完整 paired 训练和全部 six-checkpoint Broad；所有 checkpoint 均未严格超过 `95/100`，正式归档为 `screened_out`，没有 Full500。详见 `PROJECT_HANDOFF_2026-08-11.md` 的 6.10。
 2. 当前继续方案为 V52 纯输入级 `1 cm voxel consensus + 4 cm persistent novelty`，fusion 名为 `consensus_multiscale_novelty_union`。可执行 branch/commit：`wep_vla_v0.4.3_v52_consensus_multiscale@9447a43a0e2ed3130a578618ac92225f71eb8a31`。workflow branch/commit：`wep_vla_v0.4.3_v52_workflow_archive@179fd1a8a52345ea3d270e37a55b978a2de73d5e`。详见 handoff 6.11。
-3. V52 回归 `137 passed`，4-sample smoke、正式 `137590` samples/36-shard v12 cache、36-shard online/cache exact-index audit 和真实 V32 optimizer/gradient-role preflight 已通过。完整1564-step paired epoch 当前正在原 tmux 链路运行；必须继续等待训练→six-checkpoint Broad→候选 Full500 2×2，不要重复启动已有目录或会话。最新证据详见 handoff 6.12。
-4. 续跑时以实时文件系统、origin 和 handoff 6.10/6.11 为准；不得把 V51 launch-era commit pin 或“尚未启动”覆盖到更晚的 V51/V52 证据上。最终 Full500 门禁、安全边界和所有方法约束保持完全不变。
+3. V52 回归、4-sample smoke、正式 `137590` samples/36-shard v12 cache、36-shard online/cache exact-index audit、真实 V32 optimizer/gradient-role preflight、完整1564-step paired epoch和最终参数漂移审计均已通过。child-env-fixed Broad 中 step520 已以三臂 `98/95/96` 成为首个候选；step260、780、1040已筛除，1300/1564继续由原 waiter 顺序运行。必须继续等待 six-checkpoint 聚合→候选 Full500 2×2，不要重复启动已有目录或会话。最新证据详见 handoff 6.13。
+4. 按用户要求，V52 runtime 已通过 merge commit `664f14e` 合入 `wep_vla_v0.4.3_multiview_doubleflow`，合并后回归 `144 passed` 且可直接解析 step520 checkpoint。续跑时以实时文件系统、origin 和 handoff 6.10--6.13 为准；不得把 V51/V52 launch-era 状态覆盖到更晚证据上。最终 Full500 门禁、安全边界和所有方法约束保持完全不变。
 ```
 ````
