@@ -2021,6 +2021,30 @@ def update_policy(
                 if group.get("group_name") not in world_group_names
                 for parameter in group["params"]
             }
+            world_only_role_resolver = getattr(
+                unwrapped_policy,
+                "get_worldflow_ego_tangent_world_only_parameter_ids",
+                None,
+            )
+            world_only_point_parameter_ids = (
+                set(world_only_role_resolver())
+                if callable(world_only_role_resolver)
+                else set()
+            )
+            optimizer_parameter_ids = {
+                id(parameter)
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            }
+            if not world_only_point_parameter_ids <= optimizer_parameter_ids:
+                raise RuntimeError(
+                    "World-only point-path role resolution returned parameters outside the optimizer."
+                )
+            # Physical roles and learning-rate groups are intentionally
+            # independent.  V49 places World point consumers in the high-LR
+            # point-input group, but they must still retain the gradients from
+            # samples where World-to-Ego is active.
+            protected_parameter_ids.difference_update(world_only_point_parameter_ids)
             if not protected_parameter_ids:
                 raise RuntimeError(
                     "Ego-tangent projection requires a non-empty pretrained/common optimizer group."
@@ -2081,6 +2105,9 @@ def update_policy(
             ).detach().item()
             output_dict["worldflow_ego_tangent_gradient_protected_parameter_count"] = len(
                 protected_ego_gradients
+            )
+            output_dict["worldflow_ego_tangent_gradient_world_only_point_parameter_count"] = len(
+                world_only_point_parameter_ids
             )
     else:
         # Use accelerator's backward method. Scale each micro-batch

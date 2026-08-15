@@ -100,6 +100,15 @@ from lerobot.utils.utils import get_safe_dtype
 from .litept.model import LitePT
 
 
+SYMMETRIC_MULTIVIEW_WORLD_POINT_PREFIXES = (
+    "model.worldflow_branch.scene_encoder.",
+    "model.worldflow_branch.scene_context_proj.",
+    "model.worldflow_branch.point_action_adapter.",
+    "model.ego_scene_to_expert.",
+    "model.world_scene_to_expert.",
+)
+
+
 @contextmanager
 def _batchnorm_eval_on_single_value(module: nn.Module):
     batchnorm_modules = [
@@ -825,6 +834,49 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
+    def get_worldflow_ego_tangent_world_only_parameter_ids(self) -> set[int]:
+        """Return World point-path parameters that must retain World gradients.
+
+        Symmetric multi-view adaptation intentionally moves the direct World
+        point consumers into the high-LR point-input optimizer group.  The
+        historical Ego-tangent gradient protection used optimizer group names
+        as a proxy for physical roles, so it would otherwise misclassify these
+        World-only parameters as Ego/shared and erase their World-sample
+        gradients.  Keeping this role query on the policy decouples physical
+        gradient semantics from learning-rate grouping without changing the
+        forward graph or objective.
+        """
+
+        if not bool(
+            getattr(
+                self.config,
+                "multiview_input_symmetric_point_path_adaptation",
+                False,
+            )
+        ):
+            return set()
+        if not bool(getattr(self.config, "worldflow_enable", False)):
+            raise RuntimeError("Symmetric World point-path roles require WorldFlow.")
+        matches = {
+            prefix: [
+                parameter
+                for name, parameter in self.named_parameters()
+                if name.startswith(prefix) and parameter.requires_grad
+            ]
+            for prefix in SYMMETRIC_MULTIVIEW_WORLD_POINT_PREFIXES
+        }
+        missing = [prefix for prefix, parameters in matches.items() if not parameters]
+        if missing:
+            raise RuntimeError(
+                "Symmetric World point-path role resolution found no trainable parameters for "
+                f"{missing}."
+            )
+        return {
+            id(parameter)
+            for parameters in matches.values()
+            for parameter in parameters
+        }
+
     def get_optim_params(self):
         if self.config.vla_adapter_enable:
             trainable = [
@@ -892,13 +944,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "model.pointseg_background_proj.",
                     "model.point_action_fusion.",
                 )
-                world_point_prefixes = (
-                    "model.worldflow_branch.scene_encoder.",
-                    "model.worldflow_branch.scene_context_proj.",
-                    "model.worldflow_branch.point_action_adapter.",
-                    "model.ego_scene_to_expert.",
-                    "model.world_scene_to_expert.",
-                )
                 symmetric_point_adaptation = bool(
                     getattr(
                         self.config,
@@ -907,7 +952,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     )
                 )
                 point_prefixes = ego_point_prefixes + (
-                    world_point_prefixes if symmetric_point_adaptation else ()
+                    SYMMETRIC_MULTIVIEW_WORLD_POINT_PREFIXES
+                    if symmetric_point_adaptation
+                    else ()
                 )
                 point_input = [
                     parameter

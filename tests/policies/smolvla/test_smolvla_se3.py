@@ -2315,6 +2315,23 @@ def test_joint_multiview_worldflow_symmetric_point_adaptation_groups_both_input_
         id(parameter) for parameter in policy.model.worldflow_branch.action_in_proj.parameters()
     }
     assert not (world_action_input_ids & point_ids)
+    world_only_role_ids = policy.get_worldflow_ego_tangent_world_only_parameter_ids()
+    for module in (
+        policy.model.worldflow_branch.scene_encoder,
+        policy.model.worldflow_branch.scene_context_proj,
+        policy.model.worldflow_branch.point_action_adapter,
+        policy.model.ego_scene_to_expert,
+        policy.model.world_scene_to_expert,
+    ):
+        assert {id(parameter) for parameter in module.parameters()} <= world_only_role_ids
+    for module in (
+        policy.model.pointseg_conditioner,
+        policy.model.pointseg_object_proj,
+        policy.model.pointseg_background_proj,
+        policy.model.point_action_fusion,
+    ):
+        assert not ({id(parameter) for parameter in module.parameters()} & world_only_role_ids)
+    assert world_only_role_ids < point_ids
     grouped = [id(parameter) for group in groups for parameter in group["params"]]
     expected = [id(parameter) for parameter in policy.parameters() if parameter.requires_grad]
     assert len(grouped) == len(set(grouped)) == len(expected)
@@ -2330,6 +2347,18 @@ def test_symmetric_point_path_adaptation_requires_worldflow():
             worldflow_enable=True,
             multiview_input_symmetric_point_path_adaptation=True,
         )
+
+
+def test_symmetric_world_point_gradient_roles_are_disabled_by_default():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        worldflow_enable=True,
+        multiview_input_symmetric_point_path_adaptation=False,
+    )
+    policy.model = nn.Linear(4, 4)
+
+    assert policy.get_worldflow_ego_tangent_world_only_parameter_ids() == set()
 
 
 def test_joint_input_multiview_worldflow_requires_one_shared_ego_learning_rate():
