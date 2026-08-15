@@ -45,6 +45,6 @@ done
 
 install_if_missing_or_identical \
   "$bundle_dir/CURRENT_CONVERSATION_ARCHIVE_2026-08-15.md" \
-  "$root/CURRENT_CONVERSATION_ARCHIVE_2026-08-15.md" 0644
+  "$root/CURRENT_CONVERSATION_ARCHIVE_2026-08-15_V51R1.md" 0644
 
 echo "V51 runtime bundle is present under: $root"
