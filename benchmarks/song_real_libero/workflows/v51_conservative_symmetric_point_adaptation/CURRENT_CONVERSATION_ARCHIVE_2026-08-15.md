@@ -274,10 +274,26 @@ joint_multiview_worldflow/libero10_500ep/artifacts/v51_preregistered_training_an
 6. 训练完成后按预注册顺序做 Broad 三臂筛选；只有同时证明 multiview 和 WorldFlow 正贡献的 checkpoint 才进入 Full500 2×2。
 7. Full500 若未同时满足 `>=475`、高于主视角臂、高于 World 消融臂，则 V51 不作为最终候选；保留全部输出，不删除任何 `/opt/data/private` 文件。
 
+## 8.1 新容器实际恢复进展（2026-08-15）
+
+- 三组回归重新通过：`78 + 35 + 16`。
+- 4-sample smoke 与正式 v12 cache 已完成；正式 cache 为 `137590`
+  samples、`36` shards、1 cm 基准、scale4 副视角新颖性。
+- 36-shard online/cache exact-index audit 全部通过：严格 10k、unique
+  indices、gripper exact 均为 true。
+- 首次训练启动在 step 0 的 dataset 构建阶段停止：paired contract 将
+  支持的 dual v12 / primary v11 storage schema 差异误判为语义不兼容；
+  没有 optimizer update 或 checkpoint。
+- 通用修复 commit 为
+  `9db8504a2c575ad386f1d90efa98784c0ea8d701`，只从 paired semantic
+  equality 中移除 schema version；两个 cache 各自仍由 reader 严格限制为
+  supported versions `(11,12)`。新增测试后完整三组为 `130/130`。
+- 原失败 output/log 保留；重启必须使用独立 `v51r1_schemafix` runtime
+  入口、输出目录与 W&B run id，不覆盖原证据。
+
 ## 9. 主要权威文档
 
 - 项目完整交接：`/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/PROJECT_HANDOFF_2026-08-11.md`
 - 单视角 WorldFlow 长期进展：`SINGLEVIEW_WORLDFLOW_PROGRESS_2026-08-13.md`
 - novelty-union 历史归档：`MULTIVIEW_NOVELTY_UNION_ARCHIVE_2026-08-13.md`
 - 本文：`CURRENT_CONVERSATION_ARCHIVE_2026-08-15.md`
-

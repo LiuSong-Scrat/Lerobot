@@ -28,6 +28,8 @@ for name in \
   launch_v51_multiscale_novelty_1cm4cm_cache_4gpu_tmux.sh \
   run_v51_from_v32step100_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_4gpu_b44_w12_1564steps.sh \
   launch_v51_paired_symmetricpoint_training_4gpu_tmux.sh \
+  run_v51r1_from_v32step100_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_4gpu_b44_w12_1564steps.sh \
+  launch_v51r1_schemafix_paired_symmetricpoint_training_4gpu_tmux.sh \
   audit_v46_cache_exact_indices.py \
   audit_v49_real_checkpoint_optimizer_preflight.py \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30.sh; do

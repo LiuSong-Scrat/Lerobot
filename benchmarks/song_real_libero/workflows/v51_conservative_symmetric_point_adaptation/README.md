@@ -33,7 +33,18 @@ LEROBOT_REPO="$LEROBOT_REPO" EXPERIMENT_ROOT="$EXPERIMENT_ROOT" \
   bash "$EXPERIMENT_ROOT/scripts/launch_v51_paired_symmetricpoint_training_4gpu_tmux.sh"
 ```
 
+The first post-recovery launch exposed a step-0 preflight bug: the paired
+semantic-contract check rejected the supported v12 dual-view/v11 primary
+storage-schema combination. No optimizer update ran. Executable commit
+`9db8504a2c575ad386f1d90efa98784c0ea8d701` fixes only that compatibility
+check and adds a regression test. Preserve the failed original output and use
+the separate restart entry:
+
+```bash
+LEROBOT_REPO="$LEROBOT_REPO" EXPERIMENT_ROOT="$EXPERIMENT_ROOT" \
+  bash "$EXPERIMENT_ROOT/scripts/launch_v51r1_schemafix_paired_symmetricpoint_training_4gpu_tmux.sh"
+```
+
 The cache uses a 1 cm base voxel contract. The 4 cm value is only the secondary-view novelty threshold. Model input remains exactly 10,000 points.
 
 Large checkpoints, datasets, cache shards, videos, and W&B runtime files are not stored in Git. Their authoritative paths and hashes are recorded in `CURRENT_CONVERSATION_ARCHIVE_2026-08-15.md` and the preregistration JSON.
-
