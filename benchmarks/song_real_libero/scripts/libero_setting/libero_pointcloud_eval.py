@@ -8360,6 +8360,25 @@ def _build_episode_worker_jobs(
     return jobs
 
 
+def _process_worker_environment() -> dict[str, str]:
+    environment = {
+        "SONG_LIBERO_ENV_WORKER": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "MALLOC_ARENA_MAX": "2",
+    }
+    for override_name, child_name in (
+        ("SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
+        ("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", "MUJOCO_EGL_DEVICE_ID"),
+    ):
+        override = os.environ.get(override_name)
+        if override is not None:
+            environment[child_name] = override
+    return environment
+
+
 def serialize_libero_task(task: Any) -> dict[str, str]:
     required_fields = ("name", "language", "problem_folder", "bddl_file")
     missing = [field for field in required_fields if not hasattr(task, field)]
@@ -8522,14 +8541,7 @@ def evaluate_suite_process_parallel(
         processes: dict[int, Any] = {}
         job_by_worker = {job.worker_id: job for job in jobs}
 
-        worker_environment = {
-            "SONG_LIBERO_ENV_WORKER": "1",
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
-            "MALLOC_ARENA_MAX": "2",
-        }
+        worker_environment = _process_worker_environment()
         previous_worker_environment = {
             key: os.environ.get(key) for key in worker_environment
         }

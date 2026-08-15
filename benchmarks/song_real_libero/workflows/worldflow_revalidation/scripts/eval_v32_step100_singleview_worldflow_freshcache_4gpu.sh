@@ -13,7 +13,7 @@ python=/home/liusong/anaconda3/envs/reap/bin/python3.10
 root=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811
 checkpoint=$root/singleview_worldflow/libero10_500ep/training/v32_from_v14_worldbnfixed_w2e_p75_anchor_residual_rate_coordframe_bodyframe_ego_tangent_common005_world02_residual4_4gpu_b32_w12_1080steps/checkpoints/000100/pretrained_model
 merger=$root/scripts/merge_libero10_task_partitions.py
-run_id=v32step100_singleview_worldflow_revalidation_freshcache_seed0_egl0fix_${arm}
+run_id=v32step100_singleview_worldflow_revalidation_freshcache_seed0_childenvfix_${arm}
 output=$root/singleview_worldflow/libero10_500ep/eval_4gpu_50ep/$run_id
 cache=$root/singleview_worldflow/libero10_500ep/inference_cache/4gpu_total30_b30/$run_id
 log_root=$root/singleview_worldflow/libero10_500ep/logs/4gpu_50ep/$run_id
@@ -21,7 +21,6 @@ artifact=$root/singleview_worldflow/libero10_500ep/artifacts/${run_id}.json
 
 git -C "$repo" merge-base --is-ancestor "$required_code_ancestor" HEAD
 [[ -z "$(git -C "$repo" status --short)" ]]
-[[ "$(sha256sum "$repo/benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py" | awk '{print $1}')" == 7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28 ]]
 [[ "$(sha256sum "$repo/benchmarks/song_real_libero/scripts/smolvla_model_inference.py" | awk '{print $1}')" == 9e2d770bbff738d4aa883dd9dff156c3e204ee0e452c933b699d71a0d1ce95d0 ]]
 [[ "$(sha256sum "$checkpoint/model.safetensors" | awk '{print $1}')" == c258303b70d4cab64f89d93c825905813f6f49fbb08cf282b5d4321e1fdf1fb4 ]]
 test -x "$python"
@@ -69,13 +68,14 @@ for gpu in 0 1 2 3; do
   (
     cd "$repo"
     env PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}" \
-      CUDA_VISIBLE_DEVICES="$gpu" MUJOCO_EGL_DEVICE_ID=0 \
+      CUDA_VISIBLE_DEVICES="$gpu" MUJOCO_EGL_DEVICE_ID="$gpu" \
+      SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES=0 SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID=0 \
       MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
       VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
       "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
         --config benchmarks/song_real_libero/configs/libero.json \
-        --policy.path "$checkpoint" --device cuda --render-gpu-device-id 0 \
+        --policy.path "$checkpoint" --device cuda --render-gpu-device-id "$gpu" \
         --suite libero_10 --no-all-tasks "${args[@]}" --episodes 50 \
         --policy-noise-seed 0 --env-seed 7 --strict-official-init \
         --gripper-control-mode delta_width_initial_sync --gripper-delta-threshold 0.002 \
@@ -132,6 +132,7 @@ p = {
     "checkpoint_step": 100,
     "git_commit": commit,
     "required_code_ancestor": code_ancestor,
+    "evaluator_change_scope": "episode-child CUDA/EGL environment remapping only",
     "pointcloud_cameras": ["agentview"],
     "image_cameras": ["agentview"],
     "episode_count": int(d["overall"]["episode_count"]),

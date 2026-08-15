@@ -12,6 +12,7 @@ from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval i
     FixedBatchInferenceCache,
     _ProcessInferenceRequest,
     _execute_process_inference_fixed_slots,
+    _process_worker_environment,
 )
 
 
@@ -128,3 +129,17 @@ def test_fixed_slot_exact_cache_reuses_original_action_without_second_forward(tm
     assert readonly_cache.hit_count == 1
     for first, second in zip(first_actions, second_actions, strict=True):
         np.testing.assert_array_equal(first, second)
+
+
+def test_process_worker_environment_can_override_parent_cuda_and_egl_namespaces(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "3")
+    monkeypatch.setenv("SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", "0")
+
+    environment = _process_worker_environment()
+
+    assert environment["CUDA_VISIBLE_DEVICES"] == "0"
+    assert environment["MUJOCO_EGL_DEVICE_ID"] == "0"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
+    assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "3"
