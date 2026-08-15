@@ -99,6 +99,8 @@ build_cache() {
     fi
     mkdir -p "$cache"
     cd "$repo"
+    # Four ranks plus six DataLoader workers per rank keep the host close to
+    # the 30-thread allocation without oversubscribing it.
     PYTHONPATH="$repo/src" SONG_POINTCLOUD_GRIPPER_POINTS=500 OMP_NUM_THREADS=1 "$torchrun" \
         --standalone --nproc_per_node=4 \
         benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
@@ -107,7 +109,7 @@ build_cache() {
         --camera-view-fusion=legacy_budget \
         --output-dir="$cache" \
         --current-points=10000 --future-points=10000 \
-        --batch-size=24 --num-workers=4 \
+        --batch-size=24 --num-workers=6 \
         --shard-size=2048 --storage-dtype=float16 \
         --nn-chunk-size=1024 --vis-count=4 \
         2>&1 | tee -a "$log_dir/cache.log"
@@ -162,7 +164,7 @@ train() {
         --batch_size=24 --gradient_accumulation_steps=1 \
         --steps=1564 --save_freq=1564 \
         --save_steps='[100,260,520,780,1040,1300,1564]' \
-        --log_freq=1 --eval_freq=1564 --num_workers=12 \
+        --log_freq=1 --eval_freq=1564 --num_workers=6 \
         --output_dir="$training" \
         --job_name=world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps \
         --policy.device=cuda --wandb.enable=false --wandb.disable_artifact=true \
@@ -243,8 +245,8 @@ eval_checkpoint() {
         --gripper-delta-threshold 0.002 \
         --gripper-delta-alignment current_minus_previous \
         --waypoint-max-hold-steps 1 \
-        --isolated-policy-workers 1 --task-workers 10 \
-        --episode-workers-per-task 2 --task-worker-backend process \
+        --isolated-policy-workers 1 --task-workers 2 \
+        --episode-workers-per-task 14 --task-worker-backend process \
         --inference-batch-size 80 --inference-batching-mode fixed_barrier \
         --no-release-event-exec-enable \
         --control-freq 20 --action-index 0 \
