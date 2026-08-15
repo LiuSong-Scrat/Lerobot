@@ -3,7 +3,6 @@ set -euo pipefail
 
 repo=/home/liusong/ProgramFiles/Huggingface/lerobot
 python=/home/liusong/anaconda3/envs/reap/bin/python
-torchrun=/home/liusong/anaconda3/envs/reap/bin/torchrun
 dataset=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep
 cache=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep_pointseg_cache
 baseline=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model
@@ -101,7 +100,8 @@ build_cache() {
     cd "$repo"
     # Four ranks plus six DataLoader workers per rank keep the host close to
     # the 30-thread allocation without oversubscribing it.
-    PYTHONPATH="$repo/src" SONG_POINTCLOUD_GRIPPER_POINTS=500 OMP_NUM_THREADS=1 "$torchrun" \
+    PYTHONPATH="$repo/src" SONG_POINTCLOUD_GRIPPER_POINTS=500 OMP_NUM_THREADS=1 \
+    "$python" -m torch.distributed.run \
         --standalone --nproc_per_node=4 \
         benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
         --dataset.repo_id="$dataset" \
