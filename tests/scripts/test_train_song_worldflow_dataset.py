@@ -214,6 +214,23 @@ def test_full_union_paired_cache_contract_allows_native_primary_point_count_and_
     assert mismatches == {}
 
 
+def test_paired_cache_contract_allows_compatible_storage_schema_versions():
+    all_view = _pointseg_manifest(10_000)
+    primary = _pointseg_manifest(10_000)
+    all_view["version"] = 12
+    primary["version"] = 11
+
+    mismatches = _paired_pointseg_cache_contract_mismatches(
+        all_view,
+        primary,
+        camera_view_fusion="multiscale_novelty_union",
+        num_views=2,
+        gripper_points=500,
+    )
+
+    assert mismatches == {}
+
+
 def test_full_union_paired_cache_contract_rejects_point_loss_or_semantic_prior_drift():
     all_view = _pointseg_manifest(19_499, nn_chunk_size=512)
     primary = _pointseg_manifest(10_000, nn_chunk_size=1024)

@@ -632,8 +632,12 @@ def _paired_pointseg_cache_contract_mismatches(
     for different point counts.
     """
 
+    # Cache schema versions describe the on-disk reader contract, not the
+    # pseudo-label semantics that must match between paired views.  Each
+    # SongPointSegCachedDataset has already rejected unsupported versions;
+    # allow a compatible immutable primary cache (v11) to pair with a v12
+    # multiscale cache that only adds the coarse-novelty input metadata.
     matching_fields = (
-        "version",
         "num_samples",
         "future_offsets",
         "temporal_offsets",
