@@ -1135,7 +1135,10 @@ def test_world_to_ego_causal_ablation_removes_cross_attention_and_residual_corre
 def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(worldflow_se3_head_enable=False)
+    model.config = SimpleNamespace(
+        worldflow_se3_head_enable=False,
+        worldflow_target_type="legacy_eef",
+    )
     model.action_in_proj = nn.Linear(12, 4)
     model.action_out_proj = nn.Linear(4, 12)
     model.action_time_mlp_in = nn.Linear(8, 4)
@@ -1180,6 +1183,54 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert torch.count_nonzero(model.ego_to_world_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_twist_residual_out_proj.weight) == 0
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_direct_world_trajectory_bootstrap_keeps_independent_se3_head():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_se3_head_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+    )
+    model.action_in_proj = nn.Linear(12, 4)
+    model.action_out_proj = nn.Linear(4, 12)
+    model.action_time_mlp_in = nn.Linear(8, 4)
+    model.action_time_mlp_out = nn.Linear(4, 4)
+    model.ego_scene_to_expert = nn.Linear(3, 4)
+    model.world_scene_to_expert = nn.Linear(3, 4)
+    model.world_action_out_proj = None
+    model.world_se3_action_out_proj = nn.Linear(4, 6)
+    model.point_action_fusion = nn.Linear(3, 4)
+    model.pointseg_conditioner = SimpleNamespace(foreground_encoder=nn.Linear(6, 3))
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_twist_residual_out_proj = None
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
+    world = SimpleNamespace(
+        scene_encoder=nn.Linear(6, 3),
+        point_action_adapter=nn.Linear(3, 4),
+        action_in_proj=nn.Linear(9, 4),
+        action_time_mlp_in=nn.Linear(8, 4),
+        action_time_mlp_out=nn.Linear(4, 4),
+        scene_context_proj=nn.Linear(3, 4),
+        language_embedding=nn.Embedding(11, 4),
+        language_norm=nn.LayerNorm(4),
+    )
+    model.worldflow_branch = world
+
+    direct_head_weight = model.world_se3_action_out_proj.weight.detach().clone()
+    direct_head_bias = model.world_se3_action_out_proj.bias.detach().clone()
+    report = model.bootstrap_worldflow_from_ego()
+
+    assert report["world_output_head"] == "independently_initialized_direct_se3"
+    assert model.world_action_out_proj is None
+    assert torch.equal(model.world_se3_action_out_proj.weight, direct_head_weight)
+    assert torch.equal(model.world_se3_action_out_proj.bias, direct_head_bias)
+    assert torch.equal(world.scene_encoder.weight, model.pointseg_conditioner.foreground_encoder.weight)
+    assert world.scene_encoder.weight.data_ptr() != model.pointseg_conditioner.foreground_encoder.weight.data_ptr()
+    assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
     assert all(parameter.requires_grad for parameter in model.parameters())
 
 

@@ -2945,13 +2945,22 @@ class VLAFlowMatching(nn.Module):
             raise RuntimeError("WorldFlow must be enabled before bootstrapping from Ego.")
         if self.pointseg_conditioner is None or self.point_action_fusion is None:
             raise RuntimeError("WorldFlow bootstrap requires the trained Ego point modules.")
+        direct_world_trajectory = (
+            getattr(self.config, "worldflow_target_type", "legacy_eef")
+            == "world_eef_trajectory"
+        )
         required = (
             self.ego_scene_to_expert,
             self.world_scene_to_expert,
-            self.world_action_out_proj,
             self.ego_to_world_cross_attn,
             self.world_to_ego_cross_attn,
         )
+        if not direct_world_trajectory:
+            required = (*required, self.world_action_out_proj)
+        elif self.world_se3_action_out_proj is None:
+            raise RuntimeError(
+                "Direct world_eef_trajectory bootstrap requires the independent World SE(3) head."
+            )
         if any(module is None for module in required):
             raise RuntimeError("WorldFlow bootstrap modules are not initialized.")
 
@@ -2969,12 +2978,13 @@ class VLAFlowMatching(nn.Module):
         world.action_time_mlp_out.load_state_dict(self.action_time_mlp_out.state_dict(), strict=True)
         world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
-        self.world_action_out_proj.weight.copy_(
-            self.action_out_proj.weight[: WorldFlowActionBranch.pose_dim]
-        )
-        self.world_action_out_proj.bias.copy_(
-            self.action_out_proj.bias[: WorldFlowActionBranch.pose_dim]
-        )
+        if self.world_action_out_proj is not None:
+            self.world_action_out_proj.weight.copy_(
+                self.action_out_proj.weight[: WorldFlowActionBranch.pose_dim]
+            )
+            self.world_action_out_proj.bias.copy_(
+                self.action_out_proj.bias[: WorldFlowActionBranch.pose_dim]
+            )
 
         # The VLM language table has a different hidden width. A zero language
         # residual is the identity-compatible initialization; it learns jointly.
@@ -2990,7 +3000,11 @@ class VLAFlowMatching(nn.Module):
         if self.world_twist_residual_out_proj is not None:
             self.world_twist_residual_out_proj.weight.zero_()
             self.world_twist_residual_out_proj.bias.zero_()
-        if self.world_se3_action_out_proj is not None and self.config.worldflow_se3_head_enable:
+        if (
+            self.world_se3_action_out_proj is not None
+            and self.config.worldflow_se3_head_enable
+            and not direct_world_trajectory
+        ):
             self.world_se3_action_out_proj.weight.zero_()
             self.world_se3_action_out_proj.bias.zero_()
 
@@ -2999,6 +3013,11 @@ class VLAFlowMatching(nn.Module):
             "source": "trained_ego_action_point_modules",
             "world_parameters_shared": False,
             "ego_frozen": False,
+            "world_output_head": (
+                "independently_initialized_direct_se3"
+                if direct_world_trajectory
+                else "copied_legacy_pose9"
+            ),
             "bidirectional_cross_attention_zero_output_init": True,
         }
 

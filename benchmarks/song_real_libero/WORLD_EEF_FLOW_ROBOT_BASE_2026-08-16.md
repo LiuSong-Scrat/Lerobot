@@ -39,10 +39,18 @@ flow.
 - independent World and Ego flow priors
 - token cross-attention as the only World/Ego interaction
 - no endpoint residual/rate, analytic bridge loss, coordinate augmentation, or
-  Ego-to-World weight bootstrap
+  shared parameters
 
 World uses an SE(3) geodesic flow and a direct six-dimensional twist head even
 when the pretrained Ego branch retains its legacy pose chart.
+
+For the focused 100-demo experiment, `worldflow_bootstrap_from_ego=true` is a
+one-shot initialization only: compatible trained point encoders, adapters, and
+time embeddings are copied by value into distinct World parameters before
+training. No storage is shared and neither branch is frozen. The direct World
+SE(3) output head remains independently initialized, and both cross-attention
+output projections start at zero so enabling the branch initially preserves
+the loaded baseline policy function.
 
 ## Dataset sidecars
 

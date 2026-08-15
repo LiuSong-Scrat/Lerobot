@@ -758,8 +758,6 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 if self.worldflow_residual_lr_multiplier is not None:
                     world_trajectory_contract_errors.append("worldflow_residual_lr_multiplier=None")
-                if self.worldflow_bootstrap_from_ego:
-                    world_trajectory_contract_errors.append("worldflow_bootstrap_from_ego=False")
                 if world_trajectory_contract_errors:
                     raise ValueError(
                         "world_eef_trajectory WorldFlow requires the strict independent-branch "
