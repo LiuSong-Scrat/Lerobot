@@ -8,7 +8,7 @@ fi
 arm=$1
 
 repo=/home/liusong/ProgramFiles/Huggingface/lerobot_worldflow_v32_revalidation
-required_commit=dba65f7e0466364dcb43eaa016a7d7fb3c05c90d
+required_code_ancestor=dba65f7e0466364dcb43eaa016a7d7fb3c05c90d
 python=/home/liusong/anaconda3/envs/reap/bin/python3.10
 root=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811
 checkpoint=$root/singleview_worldflow/libero10_500ep/training/v32_from_v14_worldbnfixed_w2e_p75_anchor_residual_rate_coordframe_bodyframe_ego_tangent_common005_world02_residual4_4gpu_b32_w12_1080steps/checkpoints/000100/pretrained_model
@@ -19,7 +19,7 @@ cache=$root/singleview_worldflow/libero10_500ep/inference_cache/4gpu_total30_b30
 log_root=$root/singleview_worldflow/libero10_500ep/logs/4gpu_50ep/$run_id
 artifact=$root/singleview_worldflow/libero10_500ep/artifacts/${run_id}.json
 
-[[ "$(git -C "$repo" rev-parse HEAD)" == "$required_commit" ]]
+git -C "$repo" merge-base --is-ancestor "$required_code_ancestor" HEAD
 [[ -z "$(git -C "$repo" status --short)" ]]
 [[ "$(sha256sum "$repo/benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py" | awk '{print $1}')" == 7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28 ]]
 [[ "$(sha256sum "$repo/benchmarks/song_real_libero/scripts/smolvla_model_inference.py" | awk '{print $1}')" == 9e2d770bbff738d4aa883dd9dff156c3e204ee0e452c933b699d71a0d1ce95d0 ]]
@@ -109,7 +109,7 @@ fi
   --output-dir "$output" --episodes-per-task 50 --partition-layout legacy4 \
   "${merge_args[@]}" "${parts[@]}" | tee "$log_root/merge.log"
 
-"$python" - "$output/summary.json" "$artifact" "$arm" "$required_commit" <<'PY'
+"$python" - "$output/summary.json" "$artifact" "$arm" "$(git -C "$repo" rev-parse HEAD)" "$required_code_ancestor" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -119,6 +119,7 @@ summary_path = pathlib.Path(sys.argv[1])
 artifact_path = pathlib.Path(sys.argv[2])
 arm = sys.argv[3]
 commit = sys.argv[4]
+code_ancestor = sys.argv[5]
 d = json.loads(summary_path.read_text(encoding="utf-8"))
 assert d["pointcloud_camera_names"] == ["agentview"]
 assert d["image_camera_names"] == ["agentview"]
@@ -131,6 +132,7 @@ p = {
     "world_to_ego_causal_ablation": arm == "disabled",
     "checkpoint_step": 100,
     "git_commit": commit,
+    "required_code_ancestor": code_ancestor,
     "pointcloud_cameras": ["agentview"],
     "image_cameras": ["agentview"],
     "episode_count": int(d["overall"]["episode_count"]),
