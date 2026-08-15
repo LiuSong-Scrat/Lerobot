@@ -29,6 +29,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     ROLE_NAMES,
     PseudoLabelConfig,
     fps_sample_fused_point_cloud,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
@@ -131,6 +132,7 @@ def parse_args() -> argparse.Namespace:
         "voxel_cover_fps",
         "novelty_union",
         "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union",
         "transport_novelty_union",
         "uniform_union",
         "full_union",
@@ -743,10 +745,11 @@ def _fps_sample_cache_batch(
         "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
         "novelty_union": novelty_union_sample_fused_point_cloud,
         "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+        "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
         "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
     }[fusion]
     sampler_kwargs = {"voxel_size": float(voxel_size)} if fusion != "fps" else {}
-    if fusion == "multiscale_novelty_union":
+    if fusion in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}:
         sampler_kwargs["coarse_novelty_scale"] = float(coarse_novelty_scale)
     sampled, sampled_pad, selected = sampler(
         current,
@@ -911,13 +914,15 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_cover_fps",
                     "novelty_union",
                     "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else None
             ),
             "camera_view_coarse_novelty_scale": (
                 float(args.camera_view_coarse_novelty_scale)
-                if full_dataset.camera_view_fusion == "multiscale_novelty_union"
+                if full_dataset.camera_view_fusion
+                in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}
                 else None
             ),
             "gripper_points": full_dataset.gripper_points,
@@ -925,6 +930,8 @@ def cache_samples(args: argparse.Namespace) -> None:
             "point_count_policy": (
                 "primary_unique_voxels_plus_local_transport_secondary_novel_voxels_preserve_primary_gripper"
                 if full_dataset.camera_view_fusion == "transport_novelty_union"
+                else ("fine_primary_voxel_consensus_medoid_plus_coarse_persistent_secondary_novel_voxels_preserve_primary_gripper"
+                if full_dataset.camera_view_fusion == "consensus_multiscale_novelty_union"
                 else ("fine_primary_voxel_cover_plus_coarse_persistent_secondary_novel_voxels_preserve_primary_gripper"
                 if full_dataset.camera_view_fusion == "multiscale_novelty_union"
                 else ("primary_unique_voxels_plus_secondary_novel_voxels_preserve_primary_gripper"
@@ -943,7 +950,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "primary_exact_labels_secondary_residual_raw_union"
                     if full_dataset.camera_view_fusion == "primary_residual"
                     else "cap_without_repeat"
-                ))))))))
+                )))))))))
             ),
             "fps_contract": (
                 {
@@ -959,6 +966,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_cover_fps",
                     "novelty_union",
                     "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else None
@@ -1053,6 +1061,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                     "voxel_cover_fps",
                     "novelty_union",
                     "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }:
                     _fps_sample_cache_batch(

@@ -74,6 +74,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # ``multiscale_novelty_union`` protects every primary fine voxel and adds
     # one secondary representative only for coverage that remains novel at a
     # configurable coarser scale; the geometry determines the camera share.
+    # ``consensus_multiscale_novelty_union`` additionally lets overlapping
+    # views choose a real union-medoid representative inside each protected
+    # primary fine voxel, while retaining coarse-only secondary novelty.
     # ``transport_novelty_union`` preserves every primary occupied voxel and
     # inserts secondary novel voxels through local one-to-one replacements.
     # ``full_union`` preserves every scene point from every selected view and
@@ -456,6 +459,7 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -464,6 +468,7 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "camera_view_fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
                 "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+                "'consensus_multiscale_novelty_union', "
                 "'transport_novelty_union', "
                 "'uniform_union', 'full_union', "
                 "or 'primary_residual'; "
@@ -488,6 +493,7 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -511,6 +517,7 @@ class SmolVLAConfig(PreTrainedConfig):
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
             "uniform_union",
             "full_union",
@@ -524,6 +531,7 @@ class SmolVLAConfig(PreTrainedConfig):
                 "fps",
                 "novelty_union",
                 "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
                 "transport_novelty_union",
                 "uniform_union",
                 "full_union",
@@ -531,6 +539,7 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "multiview_input_view_dropout_enable currently requires "
                     "camera_view_fusion='fps', 'novelty_union', 'multiscale_novelty_union', "
+                    "'consensus_multiscale_novelty_union', "
                     "'transport_novelty_union', 'uniform_union', or 'full_union'."
                 )
             views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())

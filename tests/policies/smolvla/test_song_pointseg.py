@@ -20,6 +20,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
     multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
@@ -339,6 +340,80 @@ def test_multiscale_novelty_union_supports_more_conservative_coarse_scale():
             conservative_indices.unsqueeze(-1).expand(-1, -1, 6),
         ),
     )
+
+
+def test_consensus_multiscale_uses_real_union_medoids_and_preserves_fine_cover():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [0.000, 0.001, 0.020, 0.040, 0.060, 0.080,
+         0.004, 0.005, 0.006, 0.021, 0.160, 0.161]
+    )
+    cloud[0, -2:, :3] = 7.0
+
+    sampled, sampled_pad, indices = (
+        consensus_multiscale_novelty_union_sample_fused_point_cloud(
+            cloud,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    # Index 6 is the real union medoid of the primary-occupied first fine
+    # voxel. Index 10 is the stable medoid of the secondary-only 4 cm cell.
+    assert indices.tolist() == [[6, 10, 9, 3, 4, 5, 12, 13]]
+    assert indices.unique().numel() == 8
+    assert torch.equal(
+        sampled,
+        torch.gather(cloud, 1, indices.unsqueeze(-1).expand(-1, -1, 6)),
+    )
+    primary_fine_cells = set(torch.floor(cloud[0, :6, 0] / 0.01).long().tolist())
+    sampled_fine_cells = set(torch.floor(sampled[0, :-2, 0] / 0.01).long().tolist())
+    assert primary_fine_cells.issubset(sampled_fine_cells)
+    assert torch.equal(sampled[0, -2:], cloud[0, -2:])
+
+
+def test_consensus_multiscale_is_deterministic_and_single_view_exact_identity():
+    single = torch.randn(2, 8, 6)
+    sampled, sampled_pad, indices = (
+        consensus_multiscale_novelty_union_sample_fused_point_cloud(
+            single,
+            target_points=8,
+            gripper_points=2,
+            voxel_size=0.01,
+            coarse_novelty_scale=4.0,
+        )
+    )
+
+    assert sampled_pad is None
+    assert torch.equal(sampled, single)
+    assert indices.tolist() == [list(range(8)), list(range(8))]
+
+
+def test_consensus_multiscale_keeps_dual_view_batches_isolated():
+    cloud = torch.zeros(2, 14, 6)
+    pattern = torch.tensor(
+        [0.000, 0.001, 0.020, 0.040, 0.060, 0.080,
+         0.004, 0.005, 0.006, 0.021, 0.160, 0.161]
+    )
+    cloud[0, :12, 0] = pattern
+    cloud[1, :12, 0] = pattern
+    cloud[1, :12, 3] = 1.0
+    cloud[:, -2:, :3] = 7.0
+
+    sampled, _, indices = consensus_multiscale_novelty_union_sample_fused_point_cloud(
+        cloud,
+        target_points=8,
+        gripper_points=2,
+        voxel_size=0.01,
+        coarse_novelty_scale=4.0,
+    )
+
+    assert indices.tolist() == [[6, 10, 9, 3, 4, 5, 12, 13]] * 2
+    assert torch.equal(sampled[0, :-2, 3], torch.zeros(6))
+    assert torch.equal(sampled[1, :-2, 3], torch.ones(6))
 
 
 def test_transport_novelty_union_uses_local_one_to_one_replacements():

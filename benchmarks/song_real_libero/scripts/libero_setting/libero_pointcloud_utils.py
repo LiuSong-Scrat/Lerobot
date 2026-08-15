@@ -926,6 +926,7 @@ def observation_to_model_point_cloud(
         "voxel_cover_fps",
         "novelty_union",
         "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union",
         "transport_novelty_union",
         "full_union",
         "primary_residual",

@@ -49,6 +49,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
     multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
@@ -442,6 +443,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             # Raw/no-cache training still obeys the same input-adapter contract:
@@ -450,10 +452,14 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
                 "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
             sampler_kwargs = {"voxel_size": self.camera_view_voxel_size}
-            if self.camera_view_fusion == "multiscale_novelty_union":
+            if self.camera_view_fusion in {
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+            }:
                 sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             sampled, _point_is_pad, _indices = sampler(
                 torch.from_numpy(point_cloud).unsqueeze(0),
@@ -762,6 +768,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             cached_voxel_size = float(self.cache.manifest.get("camera_view_voxel_size", -1.0))
@@ -770,7 +777,10 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
                     f"PointSeg cache voxel size {cached_voxel_size} does not match training "
                     f"voxel size {self.camera_view_voxel_size}."
                 )
-        if self.camera_view_fusion == "multiscale_novelty_union":
+        if self.camera_view_fusion in {
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+        }:
             cached_coarse_scale = float(
                 self.cache.manifest.get("camera_view_coarse_novelty_scale", 3.0)
             )
@@ -1117,6 +1127,7 @@ class OnlinePointSegBatchCollator:
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
             "transport_novelty_union",
         }:
             sampler = {
@@ -1125,6 +1136,7 @@ class OnlinePointSegBatchCollator:
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
                 "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
             sampler_kwargs = (
@@ -1135,11 +1147,15 @@ class OnlinePointSegBatchCollator:
                     "voxel_cover_fps",
                     "novelty_union",
                     "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
                     "transport_novelty_union",
                 }
                 else {}
             )
-            if self.camera_view_fusion == "multiscale_novelty_union":
+            if self.camera_view_fusion in {
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+            }:
                 sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             current_pc, current_is_pad, _ = sampler(
                 current_pc,
