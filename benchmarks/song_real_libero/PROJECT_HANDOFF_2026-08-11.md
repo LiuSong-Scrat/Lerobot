@@ -2,6 +2,8 @@
 
 更新时间：2026-08-15
 
+容器迁移恢复入口：`benchmarks/song_real_libero/CONTAINER_RECOVERY_2026-08-15.md`。V51 的完整 Git-tracked 运行包位于远端分支 `wep_vla_v0.4.3_v51_workflow_archive`，可执行模型代码严格固定在 `wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation@93e2d8a3177a8addc40229da00962fcc2e7b7100`。
+
 ## 当前强制覆盖项（2026-08-14）
 
 - 此后所有 A800 测评只使用物理 GPU `3,4,5`；不得再按历史 6 卡配置启动新测评。
