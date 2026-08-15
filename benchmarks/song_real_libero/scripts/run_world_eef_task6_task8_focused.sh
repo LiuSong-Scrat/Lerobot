@@ -180,15 +180,20 @@ train() {
 }
 
 eval_checkpoint() {
-    local checkpoint=${2:?usage: $0 eval CHECKPOINT [TAG] [EPISODES] [ABLATED]}
-    local tag=${3:-$(basename "$(dirname "$(dirname "$checkpoint")")")}
-    local episodes=${4:-50}
-    local ablated=${5:-false}
+    local checkpoint=${1:?usage: $0 eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}
+    local tag=${2:-$(basename "$(dirname "$(dirname "$checkpoint")")")}
+    local episodes=${3:-50}
+    local ablated=${4:-false}
+    local save_video=${5:-true}
     local output="$experiment/eval/${tag}_dual_${episodes}ep"
     local ablation_flag=--no-world-to-ego-causal-ablation
+    local video_flag=--save-video
     if [[ "$ablated" == true ]]; then
         output="$experiment/eval/${tag}_world_to_ego_disabled_${episodes}ep"
         ablation_flag=--world-to-ego-causal-ablation
+    fi
+    if [[ "$save_video" != true ]]; then
+        video_flag=--no-save-video
     fi
     if [[ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
         echo "evaluation output is not empty; refusing to overwrite: $output" >&2
@@ -215,19 +220,139 @@ eval_checkpoint() {
         --control-freq 20 --action-index 0 \
         --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
         --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
-        --render-mode offscreen --no-visualize-foreground --save-video \
+        --render-mode offscreen --no-visualize-foreground "$video_flag" \
         "$ablation_flag" --output-dir "$output" \
         2>&1 | tee -a "$log_dir/eval_${tag}_${episodes}ep_${ablated}.log"
+}
+
+eval_grid() {
+    local steps=(100 260 520 780 1040 1300 1564)
+    local step
+    for step in "${steps[@]}"; do
+        local step_padded
+        printf -v step_padded '%06d' "$step"
+        local checkpoint="$training/checkpoints/$step_padded/pretrained_model"
+        test -s "$checkpoint/model.safetensors"
+        eval_checkpoint "$checkpoint" "step${step_padded}" 50 false false
+    done
+
+    local selection="$experiment/checkpoint_selection.json"
+    "$python" - "$experiment/eval" "$selection" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+eval_root = Path(sys.argv[1])
+output = Path(sys.argv[2])
+baseline_failures = {6: {2, 26, 36, 43}, 8: {7, 20, 23, 30, 34}}
+baseline_successes = {6: 46, 8: 45}
+records = []
+for summary_path in sorted(eval_root.glob("step*_dual_50ep/summary.json")):
+    summary = json.loads(summary_path.read_text())
+    by_task = {
+        int(result["task_id"]): result
+        for result in summary["results"]
+        if result["suite"] == "libero_10" and int(result["task_id"]) in {6, 8}
+    }
+    assert set(by_task) == {6, 8}, (summary_path, sorted(by_task))
+    task_records = {}
+    for task_id in (6, 8):
+        result = by_task[task_id]
+        failures = {
+            int(episode["episode_index"])
+            for episode in result["episodes"]
+            if not bool(episode["success"])
+        }
+        successes = 50 - len(failures)
+        task_records[str(task_id)] = {
+            "successes": successes,
+            "baseline_successes": baseline_successes[task_id],
+            "delta": successes - baseline_successes[task_id],
+            "failure_indices": sorted(failures),
+            "recovered_baseline_failures": sorted(baseline_failures[task_id] - failures),
+            "new_regressions": sorted(failures - baseline_failures[task_id]),
+        }
+    total = sum(task_records[str(task_id)]["successes"] for task_id in (6, 8))
+    qualified = all(
+        task_records[str(task_id)]["successes"] > baseline_successes[task_id]
+        for task_id in (6, 8)
+    )
+    strong = (
+        task_records["6"]["successes"] >= 48
+        and task_records["8"]["successes"] >= 48
+        and total >= 96
+    )
+    records.append(
+        {
+            "tag": summary_path.parent.name.removesuffix("_dual_50ep"),
+            "summary": str(summary_path),
+            "tasks": task_records,
+            "total_successes": total,
+            "baseline_total_successes": 91,
+            "total_delta": total - 91,
+            "qualified_both_tasks_improve": qualified,
+            "strong_gate": strong,
+        }
+    )
+
+records.sort(
+    key=lambda item: (
+        item["total_successes"],
+        min(item["tasks"]["6"]["delta"], item["tasks"]["8"]["delta"]),
+        item["tag"],
+    ),
+    reverse=True,
+)
+qualified = [item["tag"] for item in records if item["qualified_both_tasks_improve"]]
+strong = [item["tag"] for item in records if item["strong_gate"]]
+report = {
+    "baseline": {
+        "task6": {"successes": 46, "episodes": 50, "failure_indices": [2, 26, 36, 43]},
+        "task8": {"successes": 45, "episodes": 50, "failure_indices": [7, 20, 23, 30, 34]},
+        "total_successes": 91,
+        "total_episodes": 100,
+    },
+    "selection_rule": {
+        "qualified": "both task success counts strictly exceed their baseline",
+        "strong": "task6>=48/50, task8>=48/50, aggregate>=96/100",
+        "stable_checkpoint_consistency": "at least two checkpoints pass the strong gate",
+    },
+    "stable_checkpoint_consistency": len(strong) >= 2,
+    "qualified_tags": qualified,
+    "strong_tags": strong,
+    "ranked_results": records,
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(report, indent=2) + "\n")
+print(json.dumps(report, indent=2))
+PY
+
+    mapfile -t candidates < <(
+        "$python" - "$selection" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+source = report["strong_tags"] or report["qualified_tags"]
+for tag in source[:2]:
+    print(tag)
+PY
+    )
+    local tag
+    for tag in "${candidates[@]}"; do
+        local step_padded=${tag#step}
+        eval_checkpoint \
+            "$training/checkpoints/$step_padded/pretrained_model" \
+            "$tag" 50 true false
+    done
 }
 
 case "${1:-}" in
     audit) audit_dataset ;;
     cache) build_cache; audit_cache ;;
     train) train ;;
-    pipeline) build_cache; audit_cache; train ;;
-    eval) eval_checkpoint "$@" ;;
+    pipeline) build_cache; audit_cache; train; eval_grid ;;
+    eval) shift; eval_checkpoint "$@" ;;
     *)
-        echo "usage: $0 {audit|cache|train|pipeline|eval CHECKPOINT [TAG] [EPISODES] [ABLATED]}" >&2
+        echo "usage: $0 {audit|cache|train|pipeline|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
         exit 2
         ;;
 esac
