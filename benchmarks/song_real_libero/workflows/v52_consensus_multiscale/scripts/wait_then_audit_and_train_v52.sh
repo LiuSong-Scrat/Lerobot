@@ -11,6 +11,10 @@ while [[ ! -s "$cache/manifest.json" ]]; do
   printf '[%s] waiting for V52 cache manifest\n' "$(date --iso-8601=seconds)" >>"$log"
   sleep 30
 done
+while pgrep -f '[s]ong_cache_pointseg_samples.py.*pointseg_cache_consensus_multiscale_novelty_union_1cm4cm' >/dev/null; do
+  printf '[%s] waiting for V52 cache workers to exit\n' "$(date --iso-8601=seconds)" >>"$log"
+  sleep 10
+done
 
 EXPERIMENT_ROOT="$root" LEROBOT_REPO="$repo" \
   "$workflow_root/scripts/run_v52_cache_exact_index_audit.sh" 2>&1 | tee -a "$log"
