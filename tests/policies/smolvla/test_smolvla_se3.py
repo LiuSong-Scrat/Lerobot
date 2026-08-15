@@ -2325,6 +2325,12 @@ def test_symmetric_point_path_adaptation_requires_worldflow():
     with pytest.raises(ValueError, match="requires worldflow_enable=True"):
         SmolVLAConfig(multiview_input_symmetric_point_path_adaptation=True)
 
+    with pytest.raises(ValueError, match="requires a supported input-layer multi-view fusion"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            multiview_input_symmetric_point_path_adaptation=True,
+        )
+
 
 def test_joint_input_multiview_worldflow_requires_one_shared_ego_learning_rate():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)

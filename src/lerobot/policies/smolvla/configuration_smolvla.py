@@ -499,6 +499,20 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "multiview_input_symmetric_point_path_adaptation requires worldflow_enable=True."
             )
+        if self.multiview_input_symmetric_point_path_adaptation and self.camera_view_fusion not in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+        }:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires a supported "
+                "input-layer multi-view fusion."
+            )
         if self.multiview_input_view_dropout_enable:
             if self.camera_view_fusion not in {
                 "fps",
