@@ -1,0 +1,49 @@
+{
+  "ego_point_role_tensor_count": 829,
+  "ego_point_roles_remain_ego_tangent_protected": true,
+  "ego_tangent_protected_tensor_count": 982,
+  "exact_no_overlap_no_omission": true,
+  "expected_repo_head": "93e2d8a3177a8addc40229da00962fcc2e7b7100",
+  "group_rows": [
+    {
+      "element_count": 99817610,
+      "group_name": "pretrained_ego_shared_nonpoint",
+      "lr": 5e-09,
+      "tensor_count": 153
+    },
+    {
+      "element_count": 64229865,
+      "group_name": "point_input_adaptation_path",
+      "lr": 5e-08,
+      "tensor_count": 1063
+    },
+    {
+      "element_count": 41212089,
+      "group_name": "new_world_bidirectional",
+      "lr": 5e-09,
+      "tensor_count": 25
+    },
+    {
+      "element_count": 4326,
+      "group_name": "world_physical_residual_head",
+      "lr": 5e-09,
+      "tensor_count": 2
+    }
+  ],
+  "passes_v49_real_checkpoint_optimizer_preflight": true,
+  "required_point_prefix_tensor_counts": {
+    "model.ego_scene_to_expert.": 2,
+    "model.point_action_fusion.": 20,
+    "model.world_scene_to_expert.": 2,
+    "model.worldflow_branch.point_action_adapter.": 20,
+    "model.worldflow_branch.scene_context_proj.": 2,
+    "model.worldflow_branch.scene_encoder.": 208
+  },
+  "schema_version": 2,
+  "source": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/singleview_worldflow/libero10_500ep/training/v32_from_v14_worldbnfixed_w2e_p75_anchor_residual_rate_coordframe_bodyframe_ego_tangent_common005_world02_residual4_4gpu_b32_w12_1080steps/checkpoints/000100/pretrained_model",
+  "source_model_sha256": "c258303b70d4cab64f89d93c825905813f6f49fbb08cf282b5d4321e1fdf1fb4",
+  "symmetric_point_path_adaptation": true,
+  "trainable_tensor_count": 1243,
+  "world_only_point_role_tensor_count": 234,
+  "world_only_point_roles_excluded_from_ego_tangent_protection": true
+}

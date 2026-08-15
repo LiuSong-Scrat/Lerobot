@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "status": "preregistered_unrun",
+  "registered_at": "2026-08-15",
+  "variant": "v51_from_v32step100_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9",
+  "purpose": "Combine the least-disruptive tested multiview coreset with symmetric Ego/World point-path adaptation, then prove positive multiview and WorldFlow contributions on the same checkpoint.",
+  "cache_generation_started": false,
+  "training_started": false,
+  "source_checkpoint": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/singleview_worldflow/libero10_500ep/training/v32_from_v14_worldbnfixed_w2e_p75_anchor_residual_rate_coordframe_bodyframe_ego_tangent_common005_world02_residual4_4gpu_b32_w12_1080steps/checkpoints/000100/pretrained_model",
+  "source_model_sha256": "c258303b70d4cab64f89d93c825905813f6f49fbb08cf282b5d4321e1fdf1fb4",
+  "implementation": {
+    "worktree": "/home/liusong/ProgramFiles/Huggingface/lerobot_v51_conservative_symmetric_point_adaptation",
+    "branch": "wep_vla_v0.4.3_v51_conservative_symmetric_point_adaptation",
+    "commit": "93e2d8a3177a8addc40229da00962fcc2e7b7100",
+    "model_architecture_changed_from_v32": false,
+    "forward_model_changed_from_v32": false,
+    "action_loss_changed_from_v32": false,
+    "learned_gate": false,
+    "litept_modified": false,
+    "world_point_gradient_role_decoupled_from_lr_group": true,
+    "world_point_gradient_role_preflight": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/joint_multiview_worldflow/libero10_500ep/artifacts/v51_real_checkpoint_optimizer_and_gradient_role_preflight_v2.json"
+  },
+  "input_contract": {
+    "pointcloud_views": ["agentview", "robot0_eye_in_hand"],
+    "rgb_views": ["agentview"],
+    "fusion": "multiscale_novelty_union",
+    "primary_fine_voxel_size_m": 0.01,
+    "secondary_coarse_novelty_scale": 4.0,
+    "secondary_coarse_voxel_size_m": 0.04,
+    "model_input_points": 10000,
+    "scene_points": 9500,
+    "gripper_points": 500,
+    "fixed_camera_quota": false,
+    "selection_evidence": {
+      "scale4_zero_shot_maximum_final_successes": 96,
+      "scale5_zero_shot_maximum_final_successes": 95,
+      "scale3_zero_shot_maximum_final_successes": 95,
+      "reason": "Scale4 was the only tested zero-training coreset able to match the V32 Broad upper bound while reducing mean secondary insertions from 89.3 to 53.1."
+    }
+  },
+  "cache_contract": {
+    "required_manifest_version": 12,
+    "required_num_samples": 137590,
+    "required_shard_count": 36,
+    "required_camera_view_coarse_novelty_scale": 4.0,
+    "online_cache_exact_index_audit_required_before_training": true,
+    "cache_output": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/joint_multiview_worldflow/libero10_500ep/pointseg_cache_multiscale_novelty_union_1cm4cm",
+    "audit_output": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/joint_multiview_worldflow/libero10_500ep/artifacts/v51_cache_online_exact_index_audit_36shards.json",
+    "status": "prepared_not_generated"
+  },
+  "training_contract": {
+    "paired_entries_per_original_frame": 2,
+    "paired_domains": ["primary_only", "dual_view"],
+    "original_frames": 137590,
+    "paired_samples": 275180,
+    "physical_gpus": 4,
+    "batch_size_per_gpu": 44,
+    "global_batch_size": 176,
+    "steps": 1564,
+    "covered_samples": 275264,
+    "num_workers": 12,
+    "wandb_enable": true,
+    "checkpoint_steps": [260, 520, 780, 1040, 1300, 1564],
+    "point_path_lr": 5e-8,
+    "other_jointly_trained_path_lr": 5e-9,
+    "optimizer_group_tensor_counts": [153, 1063, 25, 2],
+    "world_only_point_tensor_count": 234,
+    "ego_point_tensor_count": 829,
+    "all_trainable_tensor_count": 1243,
+    "all_parameters_have_nonzero_lr": true
+  },
+  "fixed_evaluation_protocol": {
+    "suite": "libero_10",
+    "tasks": 10,
+    "env_seed": 7,
+    "policy_noise_seed": 0,
+    "inference_batching_mode": "fixed_barrier",
+    "physical_gpus": 4,
+    "environment_workers": 30,
+    "inference_batch_size": 30,
+    "canonical_exact_action_cache_mode": "read_write",
+    "evaluator_sha256": "7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28"
+  },
+  "stratified_screen": {
+    "episode_ids_per_task": [0, 5, 10, 15, 20, 25, 30, 35, 40, 45],
+    "episode_count_per_arm": 100,
+    "arms": [
+      "dual_view_worldflow",
+      "primary_view_worldflow",
+      "dual_view_world_to_ego_ablated"
+    ],
+    "broad_baseline_successes": 95,
+    "v32_worldflow_successes_on_same_ids": 96,
+    "candidate_formula": "dual_view_worldflow > 95 and dual_view_worldflow > primary_view_worldflow and dual_view_worldflow > dual_view_world_to_ego_ablated"
+  },
+  "full500_gate": {
+    "episode_ids_per_task": "0..49",
+    "episode_count_per_arm": 500,
+    "arms": [
+      "dual_view_worldflow",
+      "primary_view_worldflow",
+      "dual_view_world_to_ego_ablated",
+      "primary_view_world_to_ego_ablated"
+    ],
+    "matched_ego_only_baseline_successes": 472,
+    "v32_singleview_worldflow_successes": 475,
+    "required_dual_view_worldflow_successes": 475,
+    "pass_formula": "dual_view_worldflow > 472 and dual_view_worldflow >= 475 and dual_view_worldflow > primary_view_worldflow and dual_view_worldflow > dual_view_world_to_ego_ablated",
+    "reported_factorial_effects": {
+      "multiview_with_worldflow": "dual_view_worldflow - primary_view_worldflow",
+      "worldflow_with_multiview": "dual_view_worldflow - dual_view_world_to_ego_ablated",
+      "worldflow_with_primary_view": "primary_view_worldflow - primary_view_world_to_ego_ablated",
+      "multiview_with_worldflow_ablated": "dual_view_world_to_ego_ablated - primary_view_world_to_ego_ablated",
+      "interaction": "dual_view_worldflow - primary_view_worldflow - dual_view_world_to_ego_ablated + primary_view_world_to_ego_ablated"
+    },
+    "mathematical_early_stop": {
+      "dual_view_worldflow": "stop after 26 failures because at most 474/500 remains possible",
+      "delete_partial_outputs": false
+    }
+  },
+  "authoritative_sources": {
+    "matched_baseline_artifact": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/singleview_worldflow/libero10_500ep/artifacts/taskbalanced_baseline_v042_fixed_action_step030000_4gpu_total30_b30_alltasks50ep_codefbfacd7_fixedbarrierv18_canonical_fixed_action_v34protocol.json",
+    "v32_gate_artifact": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/singleview_worldflow/libero10_500ep/artifacts/taskbalanced_v32_residual_rate_coordframe_bodyframe_ego_tangent_p75_local4_fixedbarrier_full500_matched_worldflow_gate_step000100_baseline472_recheck.json",
+    "v48_interaction_diagnostic": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/joint_multiview_worldflow/libero10_500ep/artifacts/v48_step000520_postscreen_failure_set_interaction_analysis.json",
+    "v50_scale4_rejection": "/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811/joint_multiview_worldflow/libero10_500ep/artifacts/v50_v32step100_zeroshot_conservative_multiscale_stratified_rejection.json"
+  },
+  "script_sha256": {
+    "cache_generation": "e99509b715d87f6e0075d48854514dd4fc5b3f666bada77b61d1a9ea2d928344",
+    "cache_exact_index_auditor": "9976f1548f7f657be12d431a3dbf2eb5a54c807a96e3e193471a5b7cb86c187d",
+    "training": "cebbd935c9da81caeab8a2615034132fa1f256633a06f2cc52d8347d12aa7858",
+    "evaluation_runner": "d2685d292f90d3d1b112e32237d73628c5e45f9adc72f609d481f72031d457db"
+  },
+  "files_under_opt_data_private_deleted": false
+}
