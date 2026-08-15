@@ -790,6 +790,14 @@ def test_cached_pointseg_dataset_reads_sharded_memmap(tmp_path):
     assert sample["episode_index"].item() == 4
     assert sample["dataset_index"].item() == 1
 
+    # V51 writes schema 12, while the immutable primary-view and V46 caches
+    # remain schema 11. Both contain the same label arrays and stay readable.
+    legacy_manifest = json.loads((cache_dir / "manifest.json").read_text())
+    legacy_manifest["version"] = 11
+    (cache_dir / "manifest.json").write_text(json.dumps(legacy_manifest))
+    legacy_sample = SongPointSegCachedDataset(cache_dir)[1]
+    assert legacy_sample["pointseg.labels"].tolist() == [1, 1, 0, -100]
+
 
 def test_cached_pointseg_dataset_reads_index_cache_role_scores(tmp_path):
     cache_dir = tmp_path / "cache"

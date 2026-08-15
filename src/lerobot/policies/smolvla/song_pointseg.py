@@ -42,7 +42,8 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 11
+POINTSEG_CACHE_VERSION = 12
+POINTSEG_CACHE_COMPATIBLE_VERSIONS = (11, 12)
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -1751,9 +1752,10 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             self.manifest = json.load(f)
 
         version = int(self.manifest.get("version", -1))
-        if version != POINTSEG_CACHE_VERSION:
+        if version not in POINTSEG_CACHE_COMPATIBLE_VERSIONS:
             raise ValueError(
-                f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}. "
+                f"Unsupported Song pointseg cache version {version}; expected one of "
+                f"{POINTSEG_CACHE_COMPATIBLE_VERSIONS}. "
                 "Rebuild the cache because motion-prior semantics changed."
             )
 

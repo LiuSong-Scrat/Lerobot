@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from benchmarks.song_real_libero.scripts.song_cache_pointseg_samples import (
+    _fps_sample_cache_batch,
+)
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
+    PointSegCacheInjectedDataset,
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
     make_policy_on_accelerator_device,
     update_policy,
     worldflow_ego_priority_projection_statistics,
 )
+from lerobot.policies.smolvla.song_pointseg import POINTSEG_CACHE_LABEL_FIELDS
 from lerobot.scripts.train_song import WorldFlowMemmapDataset
 from lerobot.scripts.train_song_libero import (
     WorldFlowMemmapDataset as LiberoWorldFlowMemmapDataset,
@@ -329,3 +335,91 @@ def test_ego_tangent_merge_retains_world_gradient_inside_mixed_point_lr_group():
     # The optimizer step above only records gradients; the weights are unchanged.
     assert policy.ego_point.item() == pytest.approx(1.0)
     assert policy.world_point.item() == pytest.approx(1.0)
+
+
+def test_cache_sampling_applies_same_conservative_scale_to_current_and_future():
+    cloud = torch.zeros(1, 14, 6)
+    cloud[0, :12, 0] = torch.tensor(
+        [
+            0.000,
+            0.001,
+            0.010,
+            0.011,
+            0.080,
+            0.081,
+            0.002,
+            0.012,
+            0.035,
+            0.091,
+            0.092,
+            0.130,
+        ]
+    )
+    cloud[0, -2:, :3] = 7.0
+    batch = {
+        "observation.point_cloud": cloud.clone(),
+        "observation.point_cloud_indices": torch.arange(14).unsqueeze(0),
+        "observation.point_cloud_future": cloud[:, None].clone(),
+    }
+
+    _fps_sample_cache_batch(
+        batch,
+        target_current_points=8,
+        target_future_points=8,
+        gripper_points=2,
+        fusion="multiscale_novelty_union",
+        voxel_size=0.01,
+        coarse_novelty_scale=4.0,
+    )
+
+    expected_indices = [0, 11, 2, 3, 4, 5, 12, 13]
+    assert batch["observation.point_cloud_indices"].tolist() == [expected_indices]
+    assert torch.equal(
+        batch["observation.point_cloud"], cloud[:, expected_indices]
+    )
+    assert torch.equal(
+        batch["observation.point_cloud_future"],
+        cloud[:, None, expected_indices],
+    )
+
+
+def test_multiscale_training_rejects_legacy_scale3_cache_for_scale4(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    manifest = {
+        "version": 12,
+        "fields": list(POINTSEG_CACHE_LABEL_FIELDS),
+        "cache_mode": "indices",
+        "variable_num_points": True,
+        "shards": [{"path": "shard_000000", "length": 1}],
+        "camera_views": ["agentview", "robot0_eye_in_hand"],
+        "camera_view_weights": None,
+        "camera_view_fusion": "multiscale_novelty_union",
+        "camera_view_voxel_size": 0.01,
+    }
+    (cache / "manifest.json").write_text(json.dumps(manifest))
+    dataset = SimpleNamespace(root=tmp_path)
+
+    with pytest.raises(ValueError, match="coarse novelty scale 3.0.*training scale 4.0"):
+        PointSegCacheInjectedDataset(
+            dataset,
+            cache,
+            strict=False,
+            camera_views="agentview,robot0_eye_in_hand",
+            camera_view_fusion="multiscale_novelty_union",
+            camera_view_voxel_size=0.01,
+            camera_view_coarse_novelty_scale=4.0,
+        )
+
+    manifest["camera_view_coarse_novelty_scale"] = 4.0
+    (cache / "manifest.json").write_text(json.dumps(manifest))
+    wrapped = PointSegCacheInjectedDataset(
+        dataset,
+        cache,
+        strict=False,
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        camera_view_voxel_size=0.01,
+        camera_view_coarse_novelty_scale=4.0,
+    )
+    assert wrapped.camera_view_coarse_novelty_scale == 4.0

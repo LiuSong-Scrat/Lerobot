@@ -107,6 +107,7 @@ def parse_args() -> argparse.Namespace:
         default=parse_camera_view_fusion(os.environ.get("SONG_CAMERA_VIEW_FUSION")),
     )
     parser.add_argument("--camera-view-voxel-size", type=float, default=0.005)
+    parser.add_argument("--camera-view-coarse-novelty-scale", type=float, default=3.0)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=256)
@@ -142,6 +143,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--camera-view-fusion=primary_residual requires equal --current-points and --future-points"
         )
+    if (
+        not np.isfinite(float(args.camera_view_coarse_novelty_scale))
+        or float(args.camera_view_coarse_novelty_scale) <= 1.0
+    ):
+        parser.error("--camera-view-coarse-novelty-scale must be finite and greater than one")
     return args
 
 
@@ -725,6 +731,7 @@ def _fps_sample_cache_batch(
     gripper_points: int,
     fusion: str = "fps",
     voxel_size: float = 0.005,
+    coarse_novelty_scale: float = 3.0,
 ) -> None:
     """Apply the same FPS contract used by online inference before pseudo labels."""
 
@@ -739,6 +746,8 @@ def _fps_sample_cache_batch(
         "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
     }[fusion]
     sampler_kwargs = {"voxel_size": float(voxel_size)} if fusion != "fps" else {}
+    if fusion == "multiscale_novelty_union":
+        sampler_kwargs["coarse_novelty_scale"] = float(coarse_novelty_scale)
     sampled, sampled_pad, selected = sampler(
         current,
         target_points=target_current_points,
@@ -906,6 +915,11 @@ def cache_samples(args: argparse.Namespace) -> None:
                 }
                 else None
             ),
+            "camera_view_coarse_novelty_scale": (
+                float(args.camera_view_coarse_novelty_scale)
+                if full_dataset.camera_view_fusion == "multiscale_novelty_union"
+                else None
+            ),
             "gripper_points": full_dataset.gripper_points,
             "variable_num_points": True,
             "point_count_policy": (
@@ -1048,6 +1062,7 @@ def cache_samples(args: argparse.Namespace) -> None:
                         gripper_points=full_dataset.gripper_points,
                         fusion=args.camera_view_fusion,
                         voxel_size=args.camera_view_voxel_size,
+                        coarse_novelty_scale=args.camera_view_coarse_novelty_scale,
                     )
                 elif args.camera_view_fusion == "primary_residual":
                     _primary_view_cache_batch(

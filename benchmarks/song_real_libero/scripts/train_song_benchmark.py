@@ -259,6 +259,8 @@ def write_training_camera_provenance(
                 "camera_view_weights",
                 "gripper_points",
                 "camera_view_fusion",
+                "camera_view_voxel_size",
+                "camera_view_coarse_novelty_scale",
                 "current_points",
                 "future_points",
                 "trajectory_offset_filtering",
@@ -295,6 +297,10 @@ def write_training_camera_provenance(
             "rgb_camera_views": getattr(cfg.policy, "rgb_camera_views", None),
             "camera_view_weights": getattr(cfg.policy, "camera_view_weights", None),
             "camera_view_fusion": getattr(cfg.policy, "camera_view_fusion", None),
+            "camera_view_voxel_size": getattr(cfg.policy, "camera_view_voxel_size", None),
+            "camera_view_coarse_novelty_scale": getattr(
+                cfg.policy, "camera_view_coarse_novelty_scale", None
+            ),
             "multiview_input_view_dropout_enable": getattr(
                 cfg.policy, "multiview_input_view_dropout_enable", False
             ),
@@ -311,6 +317,10 @@ def write_training_camera_provenance(
             "camera_view_weights": getattr(policy.config, "camera_view_weights", None),
             "image_features": sorted(getattr(policy.config, "image_features", {})),
             "camera_view_fusion": getattr(policy.config, "camera_view_fusion", None),
+            "camera_view_voxel_size": getattr(policy.config, "camera_view_voxel_size", None),
+            "camera_view_coarse_novelty_scale": getattr(
+                policy.config, "camera_view_coarse_novelty_scale", None
+            ),
             "multiview_input_view_dropout_enable": getattr(
                 policy.config, "multiview_input_view_dropout_enable", False
             ),
@@ -351,6 +361,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         camera_view_weights: Any = None,
         camera_view_fusion: Any = "legacy_budget",
         camera_view_voxel_size: float = 0.005,
+        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
     ):
         self.dataset = dataset
@@ -363,6 +374,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         )
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -440,11 +452,14 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
                 "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
+            sampler_kwargs = {"voxel_size": self.camera_view_voxel_size}
+            if self.camera_view_fusion == "multiscale_novelty_union":
+                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             sampled, _point_is_pad, _indices = sampler(
                 torch.from_numpy(point_cloud).unsqueeze(0),
                 target_points=10_000,
                 gripper_points=self.gripper_points,
-                voxel_size=self.camera_view_voxel_size,
+                **sampler_kwargs,
             )
             point_cloud = sampled.squeeze(0).numpy().copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
@@ -687,6 +702,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         camera_view_weights: Any = None,
         camera_view_fusion: Any = "legacy_budget",
         camera_view_voxel_size: float = 0.005,
+        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
         primary_cache_dir: str | Path | None = None,
         view_dropout_enable: bool = False,
@@ -712,6 +728,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         )
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -748,6 +765,16 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     f"PointSeg cache voxel size {cached_voxel_size} does not match training "
                     f"voxel size {self.camera_view_voxel_size}."
+                )
+        if self.camera_view_fusion == "multiscale_novelty_union":
+            cached_coarse_scale = float(
+                self.cache.manifest.get("camera_view_coarse_novelty_scale", 3.0)
+            )
+            if cached_coarse_scale != self.camera_view_coarse_novelty_scale:
+                raise ValueError(
+                    f"PointSeg cache coarse novelty scale {cached_coarse_scale} does not match "
+                    f"training scale {self.camera_view_coarse_novelty_scale}. Rebuild the cache "
+                    "with the same multiscale input contract."
                 )
         cached_weights = parse_camera_view_weights(
             self.cache.manifest.get("camera_view_weights"),
@@ -970,6 +997,9 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         self.dataset.camera_view_voxel_size = float(
             getattr(policy_cfg, "camera_view_voxel_size", 0.005)
         )
+        self.dataset.camera_view_coarse_novelty_scale = float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        )
         self.current_points = int(self.dataset.current_points)
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(os.environ.get("SONG_POINTSEG_ONLINE_DEVICE", default_device))
@@ -1019,6 +1049,9 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
             camera_view_voxel_size=float(
                 getattr(self.dataset, "camera_view_voxel_size", 0.005)
             ),
+            camera_view_coarse_novelty_scale=float(
+                getattr(self.dataset, "camera_view_coarse_novelty_scale", 3.0)
+            ),
             gripper_points=int(self.dataset.gripper_points),
             device=self.device,
             pseudo_config=self.pseudo_config,
@@ -1037,6 +1070,7 @@ class OnlinePointSegBatchCollator:
         future_points: int,
         camera_view_fusion: str,
         camera_view_voxel_size: float,
+        camera_view_coarse_novelty_scale: float,
         gripper_points: int,
         device: torch.device,
         pseudo_config: PseudoLabelConfig,
@@ -1045,6 +1079,7 @@ class OnlinePointSegBatchCollator:
         self.future_points = int(future_points)
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
+        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.gripper_points = int(gripper_points)
         self.device = torch.device(device)
         self.pseudo_config = pseudo_config
@@ -1100,6 +1135,8 @@ class OnlinePointSegBatchCollator:
                 }
                 else {}
             )
+            if self.camera_view_fusion == "multiscale_novelty_union":
+                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             current_pc, current_is_pad, _ = sampler(
                 current_pc,
                 target_points=self.current_points,
@@ -1264,6 +1301,9 @@ def maybe_wrap_pointseg_cache_dataset(
         camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
         camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
         camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
+        camera_view_coarse_novelty_scale=float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
         primary_cache_dir=primary_cache_dir,
         view_dropout_enable=view_dropout_enable,
@@ -1302,6 +1342,9 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
         camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
         camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
+        camera_view_coarse_novelty_scale=float(
+            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
+        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
     )
 
