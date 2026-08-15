@@ -3,9 +3,9 @@ set -euo pipefail
 
 root=${EXPERIMENT_ROOT:-/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811}
 repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
-session=wep_v043_v51r1eglglobal_all_candidates_full500_2x2_gate
+session=wep_v043_v51r1egl0shared_all_candidates_full500_2x2_gate
 worker="$root/scripts/wait_then_run_v51r1_all_candidates_full500_2x2_causal_gate.sh"
-log="$root/joint_multiview_worldflow/libero10_500ep/logs/eval_v51r1eglglobal_all_candidates_full500_2x2_gate.log"
+log="$root/joint_multiview_worldflow/libero10_500ep/logs/eval_v51r1egl0shared_all_candidates_full500_2x2_gate.log"
 
 test -x "$worker"
 if tmux has-session -t "=$session" 2>/dev/null; then

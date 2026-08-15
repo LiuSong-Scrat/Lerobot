@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "status": "runtime_contract_verified_pending_valid_rollout",
+  "recorded_at": "2026-08-15",
+  "container_probe": {
+    "cuda_devices_visible_to_nvidia_smi": 4,
+    "egl_devices_returned_by_eglQueryDevicesEXT": 1,
+    "tested_cuda_visible_devices_values": ["0", "1", "0,1,2,3", ""],
+    "egl_device_count_for_every_test": 1
+  },
+  "invalid_namespaces_excluded_from_performance_evidence": [
+    "v51r1",
+    "v51r1eglfix",
+    "v51r1eglglobal"
+  ],
+  "authoritative_rerun": {
+    "namespace": "v51r1egl0shared",
+    "runner": "eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_sharedegl0.sh",
+    "runner_sha256": "810d3f7add4dd79ce1bf750f1bb95310f59d30e4916accd2d18d9ce57b41a139",
+    "cuda_visible_devices": "0,1,2,3",
+    "policy_devices_by_partition": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "mujoco_egl_device_id_for_all_partitions": 0,
+    "render_gpu_device_id_for_all_partitions": 0,
+    "core_evaluator_changed": false,
+    "core_evaluator_sha256": "7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28",
+    "fresh_inference_cache_namespace": true
+  },
+  "all_invalid_outputs_preserved": true,
+  "files_under_opt_data_private_deleted": false
+}
+

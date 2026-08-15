@@ -6,7 +6,7 @@ repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
 python=${PYTHON_BIN:-/home/liusong/anaconda3/envs/reap/bin/python3.10}
 worker="$root/scripts/wait_then_screen_v51r1_checkpoint_stratified_3arm.sh"
 artifact_root="$root/joint_multiview_worldflow/libero10_500ep/artifacts"
-aggregate="$artifact_root/v51r1eglglobal_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"
+aggregate="$artifact_root/v51r1egl0shared_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"
 steps=(260 520 780 1040 1300 1564)
 
 test -x "$worker"
@@ -24,7 +24,7 @@ fi
 step_artifacts=()
 for step in "${steps[@]}"; do
   printf -v step6 '%06d' "$step"
-  step_artifact="$artifact_root/v51r1eglglobal_step${step6}_stratified_3arm_multiview_worldflow_screen.json"
+  step_artifact="$artifact_root/v51r1egl0shared_step${step6}_stratified_3arm_multiview_worldflow_screen.json"
   step_artifacts+=("$step_artifact")
   env LEROBOT_REPO="$repo" EXPERIMENT_ROOT="$root" \
     V51R1_STEP="$step" V51R1_STEP_SCREEN_ARTIFACT="$step_artifact" \
