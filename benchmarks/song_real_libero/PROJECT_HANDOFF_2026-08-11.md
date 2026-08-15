@@ -476,6 +476,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - 后续 tmux 已预注册但当前仅等待：`wep_v043_v52_convergence_monitor`、`wep_v043_v52childenvfix_all_checkpoints_stratified_3arm`、`wep_v043_v52childenvfix_all_candidates_full500_2x2_gate`。它们依次要求完整训练收敛/参数漂移证据、所有 six-checkpoint Broad 三臂筛查，以及仅对候选执行同 checkpoint/episode/seed/fixed-barrier canonical exact-action-cache 的 Full500 2×2 因果门禁。Broad aggregate 目标为 `v52childenvfix_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json`；Full aggregate 目标为 `v52childenvfix_all_candidates_full500_2x2_multiview_worldflow_causal_gate.json`。
 - 当前 V52 尚无正式 cache manifest、训练 checkpoint、Broad 或 Full500 结果，因此不得宣称性能完成。最终门禁仍是双视角+World `>472/500` 且 `>=475/500`，并严格高于同 checkpoint 主视角+World和双视角+World→Ego-disabled；只有完整2×2通过后才能完成 `/goal`。
 
+## 6.12 2026-08-15：V52 正式 cache/audit 通过并启动 paired 训练（覆盖 6.11 的运行状态）
+
+- 正式 cache 已由四个 ranks 全部完成并发布 manifest：version `12`、`137590` samples、`36` shards、fusion `consensus_multiscale_novelty_union`、fine voxel `0.01 m`、coarse novelty scale `4.0`、current/future 各 `10000` 点、gripper `500` 点。cache tmux 在所有 rank done markers 收齐后正常退出，没有手工合并或绕过分布式完成协议。
+- 权威36-shard exact-index audit 已通过并写入 `joint_multiview_worldflow/libero10_500ep/artifacts/v52_cache_online_exact_index_audit_36shards.json`。它从每个 shard 取一个 midpoint，共审计36个真实样本；online/cache exact index、10k、unique、primary fine-cell coverage、secondary geometry contract、gripper exact 全为真。副视角插入数量 min/max/mean 为 `208/1273/544.31`；其中 overlap consensus medoids 为 `128/952/462.47`，coarse-novel medoids 为 `7/914/81.83`。
+- 真实 V32 checkpoint optimizer/gradient-role artifact 已正式写入 `joint_multiview_worldflow/libero10_500ep/artifacts/v52_real_checkpoint_optimizer_and_gradient_role_preflight.json`，状态 `passes_v52_real_checkpoint_optimizer_preflight=true`。1243个 trainable tensors 无重叠或遗漏；四组分别为153 tensors@`5e-9`、1063@`5e-8`、25@`5e-9`、2@`5e-9`；Ego point roles 829 tensors，World-only point roles 234 tensors，对称 point-path adaptation 和 Ego-tangent 保护边界均通过。
+- 完整 paired 训练已由原 tmux `wep_v043_v52_audit_then_paired_train` 自动启动，未重复创建 output。训练进程固定 executable commit `9447a43a0e2ed3130a578618ac92225f71eb8a31`，4 GPUs、batch44/GPU、global176、1564 steps、完整 paired epoch、checkpoint `260/520/780/1040/1300/1564`；进程环境为 `WANDB_MODE=online`。启动后已通过 step1--11，无 OOM、NaN 或 traceback，四卡显存约21--22 GB。训练日志：`joint_multiview_worldflow/libero10_500ep/logs/train_v52_from_v32step100_consensus_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_4gpu_b44_w12_1564steps.log`。
+- 收敛/漂移 monitor、six-checkpoint Broad 和候选 Full500 2×2 waiters 继续存活。当前仍没有 Broad 或 Full500 性能证据，不能标记 `/goal` 完成。
+
 ## 7. 禁止事项与设计边界
 
 - 不引入人工分割、人工指定目标点或人工光流监督；
