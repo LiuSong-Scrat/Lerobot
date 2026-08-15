@@ -38,6 +38,7 @@ for name in \
   launch_wait_then_run_v51r1_all_candidates_full500_2x2_causal_gate_tmux.sh \
   audit_v46_cache_exact_indices.py \
   audit_v49_real_checkpoint_optimizer_preflight.py \
+  eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_globalvisibleegl.sh \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_localvisibleegl.sh \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30.sh; do
   install_if_missing_or_identical "$bundle_dir/scripts/$name" "$root/scripts/$name" 0755
@@ -46,6 +47,7 @@ done
 artifact_dir=$root/joint_multiview_worldflow/libero10_500ep/artifacts
 for name in \
   v51_preregistered_training_and_2x2_causal_gate_protocol.json \
+  v51r1_egl_global_visibility_correction.json \
   v51r1_egl_visible_device_mapping_correction.json \
   v51_real_checkpoint_optimizer_and_gradient_role_preflight_v2.json; do
   install_if_missing_or_identical "$bundle_dir/artifacts/$name" "$artifact_dir/$name" 0644

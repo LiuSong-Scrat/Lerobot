@@ -4,7 +4,7 @@ set -euo pipefail
 repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
 root=${EXPERIMENT_ROOT:-/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811}
 python=${PYTHON_BIN:-/home/liusong/anaconda3/envs/reap/bin/python3.10}
-runner="$root/scripts/eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_localvisibleegl.sh"
+runner="$root/scripts/eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_globalvisibleegl.sh"
 train="$root/joint_multiview_worldflow/libero10_500ep/training/v51r1_from_v32step100_multiscale_novelty1cm4cm_paired_symmetricpoint5e8_policy5e9_devicebound_schemafix_4gpu_b44_w12_1564steps"
 artifact_root="$root/singleview_worldflow/libero10_500ep/artifacts"
 joint_artifact_root="$root/joint_multiview_worldflow/libero10_500ep/artifacts"
@@ -12,11 +12,11 @@ step=${V51R1_STEP:-1564}
 [[ "$step" =~ ^(260|520|780|1040|1300|1564)$ ]] || { echo "invalid V51R1_STEP=$step" >&2; exit 2; }
 printf -v step6 '%06d' "$step"
 checkpoint="$train/checkpoints/$step6/pretrained_model"
-aggregate=${V51R1_STEP_SCREEN_ARTIFACT:-"$joint_artifact_root/v51r1eglfix_step${step6}_stratified_3arm_multiview_worldflow_screen.json"}
+aggregate=${V51R1_STEP_SCREEN_ARTIFACT:-"$joint_artifact_root/v51r1eglglobal_step${step6}_stratified_3arm_multiview_worldflow_screen.json"}
 convergence_artifact="$joint_artifact_root/v51r1_training_convergence_complete.json"
 drift_artifact="$joint_artifact_root/v51r1_parameter_drift_source_v32step100_to_step001564.json"
 episode_ids=0,5,10,15,20,25,30,35,40,45
-label=v51r1eglfix_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44
+label=v51r1eglglobal_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44
 train_session=wep_v043_v51r1_schemafix_conservative_symmetricpoint_paired_train
 cache_session=wep_v043_v46_multiscale_novelty_cache_4gpu
 cache_waiter_session=wep_v043_v51r1_wait_cache_then_train
@@ -176,7 +176,7 @@ causal_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_
 dual_progress="$root/singleview_worldflow/libero10_500ep/eval_4gpu_10ep/libero10_worldflow_endpoint_residual_${label}_step${step6}_all10tasks10ep_4x4090_total30_b30_codefbfacd7_fixedbarrierv18_stratified_step5_dual_world"
 
 if [[ ! -s "$dual_artifact" ]]; then
-  run_arm_background checkpoint 0 stratified_step5_dual_world "v51r1eglfix_step${step6}_dual_world_stratified_step5"
+  run_arm_background checkpoint 0 stratified_step5_dual_world "v51r1eglglobal_step${step6}_dual_world_stratified_step5"
   rejected=0
   while kill -0 "$arm_pid" 2>/dev/null; do
     sleep 10
@@ -226,13 +226,13 @@ primary_successes=null
 causal_successes=null
 if (( dual_successes > 95 )); then
   if [[ ! -s "$primary_artifact" ]]; then
-    run_arm primary_only 0 stratified_step5_primary_world "v51r1eglfix_step${step6}_primary_world_stratified_step5"
+    run_arm primary_only 0 stratified_step5_primary_world "v51r1eglglobal_step${step6}_primary_world_stratified_step5"
   fi
   primary_successes=$(jq -r '.success_count' "$primary_artifact")
 fi
 if [[ "$primary_successes" != null ]] && (( dual_successes > primary_successes )); then
   if [[ ! -s "$causal_artifact" ]]; then
-    run_arm checkpoint 1 stratified_step5_dual_worldablated "v51r1eglfix_step${step6}_dual_worldablated_stratified_step5"
+    run_arm checkpoint 1 stratified_step5_dual_worldablated "v51r1eglglobal_step${step6}_dual_worldablated_stratified_step5"
   fi
   causal_successes=$(jq -r '.success_count' "$causal_artifact")
 fi
@@ -277,4 +277,3 @@ payload={
 out.write_text(json.dumps(payload,indent=2)+"\n",encoding="utf-8")
 print(json.dumps(payload,indent=2))
 PY
-

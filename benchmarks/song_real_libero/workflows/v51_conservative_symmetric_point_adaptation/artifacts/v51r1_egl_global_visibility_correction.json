@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "status": "runtime_compatibility_corrected_pending_valid_rollout",
+  "recorded_at": "2026-08-15",
+  "invalid_attempts": [
+    {
+      "namespace": "v51r1",
+      "reason": "Physical EGL indices 1, 2, and 3 were passed after each process exposed only one CUDA device; the current EGL driver enumerated only local device 0.",
+      "performance_evidence": false
+    },
+    {
+      "namespace": "v51r1eglfix",
+      "reason": "Local EGL index 0 was valid for the driver but rejected by robosuite because its legacy assertion requires the EGL string to appear in CUDA_VISIBLE_DEVICES.",
+      "performance_evidence": false
+    }
+  ],
+  "final_correction": {
+    "namespace": "v51r1eglglobal",
+    "runner": "eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_globalvisibleegl.sh",
+    "runner_sha256": "dfb9bd991daa00521ff0e1b336d2ebc90fce8bd75472ee83a55e1ff376915f87",
+    "cuda_visible_devices": "0,1,2,3",
+    "policy_device": "cuda:<physical partition gpu>",
+    "mujoco_egl_device_id": "<physical partition gpu>",
+    "render_gpu_device_id": "<physical partition gpu>",
+    "core_evaluator_changed": false,
+    "core_evaluator_sha256": "7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28",
+    "fresh_inference_cache_namespace": true
+  },
+  "all_invalid_outputs_preserved": true,
+  "invalid_outputs_are_excluded_from_broad_and_full500_gates": true
+}
+
