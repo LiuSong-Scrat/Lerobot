@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "status": "infrastructure_attempt_invalidated_and_corrected",
+  "recorded_at": "2026-08-15",
+  "reason": "Each evaluation partition exports CUDA_VISIBLE_DEVICES to one physical GPU, so MuJoCo EGL must address local visible device 0. The inherited historical runner instead passed the physical GPU index to MUJOCO_EGL_DEVICE_ID and --render-gpu-device-id. Partitions 1, 2, and 3 therefore failed environment construction before policy rollout.",
+  "invalid_attempt": {
+    "runner_sha256": "d2685d292f90d3d1b112e32237d73628c5e45f9adc72f609d481f72031d457db",
+    "step260_screen_artifact": "joint_multiview_worldflow/libero10_500ep/artifacts/v51r1_step000260_stratified_3arm_multiview_worldflow_screen.json",
+    "step260_partial_output_tag": "v51r1_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44",
+    "step520_partial_output_tag": "v51r1_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44",
+    "observed_exception": "MUJOCO_EGL_DEVICE_ID must be between 0 and 0 inclusive",
+    "performance_evidence": false,
+    "outputs_deleted": false
+  },
+  "correction": {
+    "runner": "eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_localvisibleegl.sh",
+    "runner_sha256": "b7a515dfc15a366b85279a1ef3cf6dff9f064dc347671d333265d9b4dffb36fa",
+    "cuda_visible_devices": "physical partition GPU index",
+    "mujoco_egl_device_id": 0,
+    "render_gpu_device_id": 0,
+    "core_evaluator_changed": false,
+    "core_evaluator_sha256": "7229c3047aa488c1df8b236542f31df0726ea702d102958eff173ddeefc3bd28",
+    "rerun_namespace": "v51r1eglfix",
+    "fresh_inference_cache_namespace": true
+  }
+}
+

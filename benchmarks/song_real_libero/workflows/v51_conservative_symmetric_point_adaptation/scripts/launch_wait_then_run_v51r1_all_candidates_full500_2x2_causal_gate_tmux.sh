@@ -3,9 +3,9 @@ set -euo pipefail
 
 root=${EXPERIMENT_ROOT:-/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811}
 repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
-session=wep_v043_v51r1_all_candidates_full500_2x2_gate
-worker="$root/scripts/wait_then_run_v51r1_all_candidates_full500_2x2_causal_gate.sh"
-log="$root/joint_multiview_worldflow/libero10_500ep/logs/eval_v51r1_all_candidates_full500_2x2_gate.log"
+session=wep_v043_v51r1eglfix_all_candidates_full500_2x2_gate
+worker="$root/scripts/wait_then_run_v51r1eglfix_all_candidates_full500_2x2_causal_gate.sh"
+log="$root/joint_multiview_worldflow/libero10_500ep/logs/eval_v51r1eglfix_all_candidates_full500_2x2_gate.log"
 
 test -x "$worker"
 if tmux has-session -t "=$session" 2>/dev/null; then
@@ -17,5 +17,4 @@ tmux new-session -d -s "$session" \
   "set -o pipefail; LEROBOT_REPO='$repo' EXPERIMENT_ROOT='$root' bash '$worker' 2>&1 | tee -a '$log'"
 echo "launched tmux session: $session"
 echo "Full500 runs ranked V51R1 checkpoints only after each passes the fixed stratified three-arm gate"
-
 
