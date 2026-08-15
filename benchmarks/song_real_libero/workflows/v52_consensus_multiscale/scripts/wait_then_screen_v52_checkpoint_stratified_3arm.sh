@@ -183,12 +183,19 @@ dual_progress="$root/singleview_worldflow/libero10_500ep/eval_4gpu_10ep/libero10
 # completed the dual+World screen.  Use fresh output/cache namespaces so that a
 # previously interrupted eager ablation remains immutable evidence rather than
 # being overwritten by the reordered sweep.
-phase2_tag=
-if [[ "$screen_phase" == causal_only ]]; then phase2_tag=_after_dual_sweep; fi
-primary_suffix="stratified_step5${phase2_tag}_primary_world"
-causal_suffix="stratified_step5${phase2_tag}_dual_worldablated"
-primary_cache="v52childenvfix_step${step6}_primary_world${phase2_tag}_stratified_step5"
-causal_cache="v52childenvfix_step${step6}_dual_worldablated${phase2_tag}_stratified_step5"
+if [[ "$screen_phase" == causal_only ]]; then
+  # Keep basenames safely below NAME_MAX=255; s5p2 means stratified-step5,
+  # phase 2.  The artifact itself retains the full protocol description.
+  primary_suffix=s5p2_primary_world
+  causal_suffix=s5p2_dual_worldablated
+  primary_cache="v52childenvfix_step${step6}_s5p2_primary_world"
+  causal_cache="v52childenvfix_step${step6}_s5p2_dual_worldablated"
+else
+  primary_suffix=stratified_step5_primary_world
+  causal_suffix=stratified_step5_dual_worldablated
+  primary_cache="v52childenvfix_step${step6}_primary_world_stratified_step5"
+  causal_cache="v52childenvfix_step${step6}_dual_worldablated_stratified_step5"
+fi
 primary_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_primaryonly_${primary_suffix}.json"
 causal_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu_total30_b30_alltasks10ep_codefbfacd7_fixedbarrierv18_worldtoegoablated_${causal_suffix}.json"
 
