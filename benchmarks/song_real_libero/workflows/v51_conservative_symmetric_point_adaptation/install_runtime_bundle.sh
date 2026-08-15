@@ -38,6 +38,7 @@ for name in \
   launch_wait_then_run_v51r1_all_candidates_full500_2x2_causal_gate_tmux.sh \
   audit_v46_cache_exact_indices.py \
   audit_v49_real_checkpoint_optimizer_preflight.py \
+  eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_childenvfix.sh \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_sharedegl0.sh \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_globalvisibleegl.sh \
   eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_localvisibleegl.sh \
@@ -48,6 +49,7 @@ done
 artifact_dir=$root/joint_multiview_worldflow/libero10_500ep/artifacts
 for name in \
   v51_preregistered_training_and_2x2_causal_gate_protocol.json \
+  v51r1_child_environment_device_namespace_fix.json \
   v51r1_shared_egl0_runtime_contract.json \
   v51r1_egl_global_visibility_correction.json \
   v51r1_egl_visible_device_mapping_correction.json \

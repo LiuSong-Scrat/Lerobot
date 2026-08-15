@@ -4,7 +4,7 @@ set -euo pipefail
 root=${EXPERIMENT_ROOT:-/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/wep_vla_v042_general_dataset_multiview/runs/wep_vla_v043_dualview_baseline_guard_20260811}
 repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
 python=${PYTHON_BIN:-/home/liusong/anaconda3/envs/reap/bin/python3.10}
-runner="$root/scripts/eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_sharedegl0.sh"
+runner="$root/scripts/eval_libero10_v12_one_checkpoint_4gpu_alltasks10ep_b30_childenvfix.sh"
 train="$root/joint_multiview_worldflow/libero10_500ep/training/v51r1_from_v32step100_multiscale_novelty1cm4cm_paired_symmetricpoint5e8_policy5e9_devicebound_schemafix_4gpu_b44_w12_1564steps"
 artifact_root="$root/singleview_worldflow/libero10_500ep/artifacts"
 joint_artifact_root="$root/joint_multiview_worldflow/libero10_500ep/artifacts"
@@ -12,12 +12,12 @@ step=${V51R1_STEP:-1564}
 [[ "$step" =~ ^(260|520|780|1040|1300|1564)$ ]] || { echo "invalid V51R1_STEP=$step" >&2; exit 2; }
 printf -v step6 '%06d' "$step"
 checkpoint="$train/checkpoints/$step6/pretrained_model"
-screen_session=wep_v043_v51r1egl0shared_all_checkpoints_stratified_3arm
-screen=${V51R1_SCREEN_ARTIFACT:-"$joint_artifact_root/v51r1egl0shared_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"}
-gate=${V51R1_STEP_GATE_ARTIFACT:-"$joint_artifact_root/v51r1egl0shared_step${step6}_full500_2x2_multiview_worldflow_causal_gate.json"}
+screen_session=wep_v043_v51r1childenvfix_all_checkpoints_stratified_3arm
+screen=${V51R1_SCREEN_ARTIFACT:-"$joint_artifact_root/v51r1childenvfix_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"}
+gate=${V51R1_STEP_GATE_ARTIFACT:-"$joint_artifact_root/v51r1childenvfix_step${step6}_full500_2x2_multiview_worldflow_causal_gate.json"}
 baseline_artifact="$artifact_root/taskbalanced_baseline_v042_fixed_action_step030000_4gpu_total30_b30_alltasks50ep_codefbfacd7_fixedbarrierv18_canonical_fixed_action_v34protocol.json"
 v32_gate="$artifact_root/taskbalanced_v32_residual_rate_coordframe_bodyframe_ego_tangent_p75_local4_fixedbarrier_full500_matched_worldflow_gate_step000100_baseline472_recheck.json"
-label=v51r1egl0shared_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44
+label=v51r1childenvfix_v32_multiscale1cm4cm_paired_symmetricpoint5e8_policy5e9_schemafix_b44
 baseline_successes=472
 v32_worldflow_successes=475
 required_dual_successes=475
@@ -149,7 +149,7 @@ primary_ablated_artifact="$artifact_root/taskbalanced_${label}_step${step6}_4gpu
 
 dual_progress="${base_output}_full500_dual_world"
 if [[ ! -s "$dual_artifact" ]]; then
-  run_arm_background checkpoint 0 full500_dual_world "v51r1egl0shared_step${step6}_full500_dual_world"
+  run_arm_background checkpoint 0 full500_dual_world "v51r1childenvfix_step${step6}_full500_dual_world"
   rejected=0
   while kill -0 "$arm_pid" 2>/dev/null; do
     sleep 10
@@ -182,7 +182,7 @@ fi
 
 primary_progress="${base_output}_primaryonly_full500_primary_world"
 if [[ ! -s "$primary_artifact" ]]; then
-  run_arm_background primary_only 0 full500_primary_world "v51r1egl0shared_step${step6}_full500_primary_world"
+  run_arm_background primary_only 0 full500_primary_world "v51r1childenvfix_step${step6}_full500_primary_world"
   rejected=0
   while kill -0 "$arm_pid" 2>/dev/null; do
     sleep 10
@@ -213,7 +213,7 @@ fi
 
 dual_ablated_progress="${base_output}_worldtoegoablated_full500_dual_worldablated"
 if [[ ! -s "$dual_ablated_artifact" ]]; then
-  run_arm_background checkpoint 1 full500_dual_worldablated "v51r1egl0shared_step${step6}_full500_dual_worldablated"
+  run_arm_background checkpoint 1 full500_dual_worldablated "v51r1childenvfix_step${step6}_full500_dual_worldablated"
   rejected=0
   while kill -0 "$arm_pid" 2>/dev/null; do
     sleep 10
@@ -243,7 +243,7 @@ if (( dual_successes <= dual_ablated_successes )); then
 fi
 
 if [[ ! -s "$primary_ablated_artifact" ]]; then
-  run_arm_background primary_only 1 full500_primary_worldablated "v51r1egl0shared_step${step6}_full500_primary_worldablated"
+  run_arm_background primary_only 1 full500_primary_worldablated "v51r1childenvfix_step${step6}_full500_primary_worldablated"
   wait "$arm_pid"
 fi
 primary_ablated_successes=$(jq -r '.success_count' "$primary_ablated_artifact")

@@ -6,9 +6,9 @@ repo=${LEROBOT_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot_v51}
 python=${PYTHON_BIN:-/home/liusong/anaconda3/envs/reap/bin/python3.10}
 worker="$root/scripts/wait_then_run_v51r1_checkpoint_full500_2x2_causal_gate.sh"
 artifact_root="$root/joint_multiview_worldflow/libero10_500ep/artifacts"
-screen="$artifact_root/v51r1egl0shared_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"
-screen_session=wep_v043_v51r1egl0shared_all_checkpoints_stratified_3arm
-aggregate="$artifact_root/v51r1egl0shared_all_candidates_full500_2x2_multiview_worldflow_causal_gate.json"
+screen="$artifact_root/v51r1childenvfix_all_checkpoints_stratified_3arm_multiview_worldflow_screen.json"
+screen_session=wep_v043_v51r1childenvfix_all_checkpoints_stratified_3arm
+aggregate="$artifact_root/v51r1childenvfix_all_candidates_full500_2x2_multiview_worldflow_causal_gate.json"
 
 test -x "$worker"
 test -x "$python"
@@ -53,7 +53,7 @@ step_gates=()
 winner=
 for step in "${candidate_steps[@]}"; do
   printf -v step6 '%06d' "$step"
-  step_gate="$artifact_root/v51r1egl0shared_step${step6}_full500_2x2_multiview_worldflow_causal_gate.json"
+  step_gate="$artifact_root/v51r1childenvfix_step${step6}_full500_2x2_multiview_worldflow_causal_gate.json"
   step_gates+=("$step_gate")
   env LEROBOT_REPO="$repo" EXPERIMENT_ROOT="$root" \
     V51R1_STEP="$step" V51R1_SCREEN_ARTIFACT="$screen" V51R1_STEP_GATE_ARTIFACT="$step_gate" \
