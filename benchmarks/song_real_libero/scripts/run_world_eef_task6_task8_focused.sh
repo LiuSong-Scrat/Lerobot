@@ -162,9 +162,9 @@ train() {
         --pointseg_sample_cache_dir="$cache" \
         --task_balanced_sampling=true \
         --batch_size=24 --gradient_accumulation_steps=1 \
-        --steps=1564 --save_freq=1564 \
-        --save_steps='[100,260,520,780,1040,1300,1564]' \
-        --log_freq=1 --eval_freq=1564 --num_workers=6 \
+        --steps=1300 --save_freq=1300 \
+        --save_steps='[100,260,520,780,1040,1300]' \
+        --log_freq=1 --eval_freq=1300 --num_workers=6 \
         --output_dir="$training" \
         --job_name=world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps \
         --policy.device=cuda --wandb.enable=false --wandb.disable_artifact=true \
@@ -207,7 +207,7 @@ train() {
         --policy.worldflow_se3_head_enable=false \
         --policy.se3_enable=false --policy.se3_final_correction_enable=false \
         2>&1 | tee -a "$log_dir/train.log"
-    test -s "$training/checkpoints/001564/pretrained_model/model.safetensors"
+    test -s "$training/checkpoints/001300/pretrained_model/model.safetensors"
 }
 
 eval_checkpoint() {
@@ -258,7 +258,7 @@ eval_checkpoint() {
 }
 
 eval_grid() {
-    local steps=(100 260 520 780 1040 1300 1564)
+    local steps=(100 260 520 780 1040 1300)
     local step
     for step in "${steps[@]}"; do
         local step_padded
@@ -382,9 +382,10 @@ case "${1:-}" in
     cache) build_cache; audit_cache ;;
     train) train ;;
     pipeline) build_cache; audit_cache; train; eval_grid ;;
+    eval-grid) eval_grid ;;
     eval) shift; eval_checkpoint "$@" ;;
     *)
-        echo "usage: $0 {audit|cache|train|pipeline|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
+        echo "usage: $0 {audit|cache|train|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
         exit 2
         ;;
 esac
