@@ -2309,6 +2309,16 @@ def test_input_view_dropout_requires_supported_fusion_and_multiple_views():
         multiview_input_view_dropout_enable=True,
     )
     assert multiscale_novelty_union_cfg.multiview_input_view_dropout_enable is True
+    assert multiscale_novelty_union_cfg.camera_view_coarse_novelty_scale == 3.0
+
+    conservative_multiscale_cfg = SmolVLAConfig(
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion="multiscale_novelty_union",
+        camera_view_coarse_novelty_scale=4.0,
+    )
+    assert conservative_multiscale_cfg.camera_view_coarse_novelty_scale == 4.0
+    with pytest.raises(ValueError, match="coarse_novelty_scale"):
+        SmolVLAConfig(camera_view_coarse_novelty_scale=1.0)
 
     transport_novelty_cfg = SmolVLAConfig(
         camera_views="agentview,robot0_eye_in_hand",
