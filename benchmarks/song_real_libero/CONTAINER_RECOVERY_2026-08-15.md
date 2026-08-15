@@ -2,6 +2,8 @@
 
 当前代码、历史结构分支和 V51 可复现运行包已推送到 `git@github.com:LiuSong-Scrat/Lerobot.git`。
 
+新容器可直接粘贴的完整 `/goal` 与 `~/.codex/config.toml` 权限配置见：`benchmarks/song_real_libero/GOAL_RESUME_MULTIVIEW_WORLDFLOW_2026-08-15.md`。
+
 ## 最短恢复流程
 
 ```bash
