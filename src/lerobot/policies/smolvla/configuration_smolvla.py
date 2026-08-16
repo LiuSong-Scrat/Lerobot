@@ -237,6 +237,13 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_bridge_loss_weight: float = 0.05
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
+    # Physical radius of the symmetric rigid probes used to supervise an
+    # absolute robot-base EEF trajectory.  Translation and angular errors have
+    # incompatible units (metres versus radians); evaluating the velocity and
+    # endpoint displacement of points attached to the EEF converts both to
+    # metres without a tunable scalar loss balance.  Ten centimetres is a
+    # robot/tool geometry constant, not an optimization multiplier.
+    worldflow_eef_probe_radius_m: float = 0.10
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
     # Discriminative fine-tuning keeps every path plastic while permitting an
@@ -825,6 +832,13 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 if self.worldflow_residual_lr_multiplier is not None:
                     world_trajectory_contract_errors.append("worldflow_residual_lr_multiplier=None")
+                if self.worldflow_world_eef_velocity_mode == "base_decoupled" and (
+                    not math.isclose(self.worldflow_trans_weight, 1.0)
+                    or not math.isclose(self.worldflow_rot_weight, 1.0)
+                ):
+                    world_trajectory_contract_errors.append(
+                        "worldflow_trans_weight=worldflow_rot_weight=1 for the fixed physical-probe metric"
+                    )
                 if world_trajectory_contract_errors:
                     raise ValueError(
                         "world_eef_trajectory WorldFlow requires the strict independent-branch "
@@ -881,6 +895,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_noise_trans_scale must be non-negative.")
             if self.worldflow_noise_rot_scale < 0:
                 raise ValueError("worldflow_noise_rot_scale must be non-negative.")
+            if self.worldflow_eef_probe_radius_m <= 0:
+                raise ValueError("worldflow_eef_probe_radius_m must be positive.")
             if self.worldflow_augmentation_trans_scale < 0:
                 raise ValueError("worldflow_augmentation_trans_scale must be non-negative.")
             if self.worldflow_augmentation_rot_scale < 0:
@@ -1276,7 +1292,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"worldflow_reference={self.worldflow_reference_frame},"
                 f"worldflow_action_expert={self.worldflow_action_expert_mode},"
                 f"worldflow_action_fusion={self.worldflow_action_fusion},"
-                f"worldflow_current_pose_token={self.worldflow_current_ee_pose_token}"
+                f"worldflow_current_pose_token={self.worldflow_current_ee_pose_token},"
+                f"worldflow_eef_probe_radius_m={self.worldflow_eef_probe_radius_m}"
             )
         else:
             world = ",worldflow=disabled"

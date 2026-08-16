@@ -35,6 +35,7 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     so3_exp,
     so3_log,
     transform_se3_twist,
+    world_eef_rigid_probe_losses,
     world_trajectory_to_current_ego_pose9,
     _ego_point_cloud_to_world,
 )
@@ -83,6 +84,59 @@ def test_decoupled_base_pose_flow_reaches_endpoint_without_rate_amplification():
 
     assert torch.allclose(recovered, target, atol=4e-5, rtol=4e-5)
     assert torch.allclose(velocity[..., :3], target[..., :3, 3] - noise[..., :3, 3])
+
+
+def test_world_eef_rigid_probe_loss_has_physical_metre_units_and_no_origin_coupling():
+    state = torch.eye(4).reshape(1, 1, 4, 4)
+    state[..., :3, 3] = torch.tensor([0.7, -0.4, 0.5])
+    target_velocity = torch.zeros(1, 1, 6)
+    pred_velocity = torch.tensor([[[0.02, 0.0, 0.0, 0.0, 0.0, 0.0]]])
+    target_endpoint = state.clone()
+    pred_endpoint = state.clone()
+    pred_endpoint[..., 0, 3] += 0.02
+
+    losses = world_eef_rigid_probe_losses(
+        pred_velocity,
+        target_velocity,
+        state,
+        pred_endpoint,
+        target_endpoint,
+        probe_radius_m=0.10,
+    )
+
+    assert torch.allclose(losses["flow"], torch.tensor([[0.02]]), atol=1e-7)
+    assert torch.allclose(losses["endpoint"], torch.tensor([[0.02]]), atol=1e-7)
+    assert torch.allclose(losses["flow_translation_m"], torch.tensor([[0.02]]), atol=1e-7)
+    assert torch.count_nonzero(losses["flow_rotation_probe_m"]) == 0
+    assert torch.count_nonzero(losses["endpoint_rotation_probe_m"]) == 0
+
+
+def test_world_eef_rigid_probe_loss_supervises_rotation_without_moving_eef_origin():
+    state = torch.eye(4).reshape(1, 1, 4, 4)
+    state[..., :3, 3] = torch.tensor([0.8, 0.3, -0.2])
+    pred_velocity = torch.zeros(1, 1, 6, requires_grad=True)
+    target_velocity = torch.tensor([[[0.0, 0.0, 0.0, 0.0, 0.0, 0.10]]])
+    pred_endpoint = state.clone()
+    target_endpoint = state.clone()
+    target_endpoint[..., :3, :3] = so3_exp(torch.tensor([[[0.0, 0.0, 0.10]]]))
+
+    losses = world_eef_rigid_probe_losses(
+        pred_velocity,
+        target_velocity,
+        state,
+        pred_endpoint,
+        target_endpoint,
+        probe_radius_m=0.10,
+    )
+    (losses["flow"].mean() + losses["endpoint"].mean()).backward()
+
+    assert torch.count_nonzero(losses["flow_translation_m"]) == 0
+    assert torch.count_nonzero(losses["endpoint_translation_m"]) == 0
+    assert losses["flow_rotation_probe_m"].item() > 0
+    assert losses["endpoint_rotation_probe_m"].item() > 0
+    assert torch.allclose(pred_endpoint[..., :3, 3], target_endpoint[..., :3, 3])
+    assert pred_velocity.grad is not None
+    assert pred_velocity.grad[..., 3:6].abs().sum().item() > 0
 
 
 def test_twist_adjoint_matches_exact_se3_conjugation():
@@ -3570,6 +3624,7 @@ def test_world_eef_trajectory_left_composes_ego_prior_in_robot_base():
     target = current.unsqueeze(1) @ se3_exp(
         torch.randn(2, cfg.chunk_size, 6) * 0.1
     )
+    time = torch.tensor([0.2, 0.7])
     state = model._prepare_worldflow_training_state(
         {
             "current_ee_pose": matrix_to_pose9(current),
@@ -3578,7 +3633,7 @@ def test_world_eef_trajectory_left_composes_ego_prior_in_robot_base():
         },
         torch.randint(0, 64, (2, 5)),
         torch.ones(2, 5, dtype=torch.bool),
-        torch.tensor([0.2, 0.7]),
+        time,
         actions_is_pad=None,
         ego_noise=ego_noise,
     )
@@ -3592,6 +3647,17 @@ def test_world_eef_trajectory_left_composes_ego_prior_in_robot_base():
         torch.zeros_like(state["noise_conjugacy_error"]),
         atol=1e-6,
     )
+    output = model._finalize_worldflow_training_loss(
+        state,
+        state["u_t"].clone().requires_grad_(True),
+        matrix_to_pose9(target),
+        time,
+    )
+    assert output["per_sample_loss"].abs().max().item() < 1e-5
+    assert model.last_worldflow_metrics["worldflow_flow_translation_err_m"].item() < 1e-6
+    assert model.last_worldflow_metrics["worldflow_flow_rotation_probe_err_m"].item() < 1e-6
+    assert model.last_worldflow_metrics["worldflow_endpoint_translation_err_m"].item() < 1e-6
+    assert model.last_worldflow_metrics["worldflow_endpoint_rotation_probe_err_m"].item() < 1e-6
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():

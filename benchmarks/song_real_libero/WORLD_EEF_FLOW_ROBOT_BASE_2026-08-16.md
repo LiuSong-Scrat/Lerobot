@@ -426,3 +426,52 @@ while the Ego Action Expert/head and the independent World Expert/scene path
 all changed. The first-update physical errors were 8.99 mm for Ego and 423.8 mm
 for the newly initialized World head, which is intentionally isolated until it
 passes the physical gate.
+
+## Independent calibration result and physical-metric correction
+
+The complete 1300-update independent calibration run is stored at
+`world_eef_task6_task8_100ep_independent_parallel_strict_equal_4gpu_b24_schedule1564_stop1300`.
+Its final 100-update audit failed the interaction gate:
+
+| stream | translation | rotation |
+|---|---:|---:|
+| Ego | 7.20 mm | 0.585 degrees |
+| World | 56.69 mm | 7.115 degrees |
+| World / Ego | 7.87x | 12.16x |
+
+The run stopped without environment evaluation. More training with the same
+objective is not justified: World translation remained near 5.5--5.7 cm for
+hundreds of updates while the schedule decayed to its terminal learning rate.
+
+The scalar logs expose the underlying dimensional error. Near step 520,
+`loss_worldflow_geo=0.1263` was almost exactly the World rotation error of
+7.19 degrees expressed in radians (0.1255). A 4.5 cm translation error entered
+the old Smooth-L1 endpoint term at only about `1e-3`. Thus "translation
+weight 1, rotation weight 1" was not physical equality: it added squared
+metres to radians and allowed rotation to account for virtually the entire
+objective.
+
+Corrected robot-base World-EEF calibration now uses a rigid-probe metric. Six
+symmetric points at the fixed 10 cm EEF/tool radius convert both parts of the
+base-decoupled field to physical point velocity:
+
+```text
+flow error = norm(delta p_dot_base)
+           + mean_probe norm(delta omega_base x (R_state r_probe))
+```
+
+The endpoint term likewise adds the EEF-origin translation error to the mean
+orientation-induced displacement of the same EEF-attached probes. Keeping the
+two symmetric components additive prevents accidental cancellation between a
+translation and a rotation at an individual probe. Consequently:
+
+- translation and rotation supervision share one physical unit (metres);
+- rotation never moves the EEF origin around the robot-base origin;
+- the metric contains no learned gate, residual rate, loss-balance sweep, or
+  coordinate-dependent conjugation;
+- separate translation and rotation-probe metre errors are logged so another
+  dimensional imbalance cannot hide behind a scalar total.
+
+The interaction gate remains unchanged and still uses the unweighted EEF
+translation/rotation errors. Passing the new training objective alone is not
+evidence of success.

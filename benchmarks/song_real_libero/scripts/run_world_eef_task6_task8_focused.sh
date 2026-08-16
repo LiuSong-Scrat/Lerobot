@@ -257,6 +257,7 @@ train() {
         --policy.worldflow_pretrained_lr_multiplier="$pretrained_lr_multiplier" \
         --policy.worldflow_new_lr_multiplier=1.0 \
         --policy.worldflow_trans_weight=1.0 --policy.worldflow_rot_weight=1.0 \
+        --policy.worldflow_eef_probe_radius_m=0.10 \
         --policy.worldflow_require_action_target_sidecar=true \
         --policy.worldflow_se3_head_enable=false \
         --policy.se3_enable=false --policy.se3_final_correction_enable=false \

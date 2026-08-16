@@ -349,6 +349,118 @@ def decoupled_base_pose_flow_state(
     return state, velocity
 
 
+def _symmetric_eef_probe_offsets(
+    *,
+    radius_m: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Return an isotropic set of EEF-attached probes in physical metres."""
+
+    if radius_m <= 0:
+        raise ValueError(f"EEF probe radius must be positive, got {radius_m}.")
+    axes = torch.eye(3, device=device, dtype=dtype) * float(radius_m)
+    return torch.cat([axes, -axes], dim=0)
+
+
+def world_eef_rigid_probe_losses(
+    pred_velocity: Tensor,
+    target_velocity: Tensor,
+    flow_state: Tensor,
+    pred_endpoint: Tensor,
+    target_endpoint: Tensor,
+    *,
+    probe_radius_m: float,
+) -> dict[str, Tensor]:
+    """Measure World-EEF vector-field and endpoint errors in metres.
+
+    A base-decoupled World velocity is ``[p_dot_base, omega_base]``.  Adding a
+    raw metre error to a raw radian error is dimensionally invalid and caused
+    rotation to account for virtually the complete historical World loss.
+    Instead, this function evaluates six symmetric points rigidly attached to
+    the EEF.  For an offset ``r`` their velocity error is
+
+    ``delta_p_dot + delta_omega x (R_state r)``.
+
+    Symmetric probes make translation and rotation contributions independent;
+    both the flow loss and endpoint loss are literal point displacements in
+    metres.  Rotation therefore never moves the EEF origin around the robot
+    base, while still supervising orientation through the finite tool radius.
+    """
+
+    expected_velocity_shape = (*flow_state.shape[:-2], 6)
+    if (
+        pred_velocity.shape != expected_velocity_shape
+        or target_velocity.shape != expected_velocity_shape
+    ):
+        raise ValueError(
+            "Expected World EEF velocities with shape "
+            f"{expected_velocity_shape}, got {pred_velocity.shape} and {target_velocity.shape}."
+        )
+    expected_transform_shape = (*pred_velocity.shape[:-1], 4, 4)
+    if (
+        flow_state.shape != expected_transform_shape
+        or pred_endpoint.shape != expected_transform_shape
+        or target_endpoint.shape != expected_transform_shape
+    ):
+        raise ValueError(
+            "Expected World EEF state/endpoints with shape "
+            f"{expected_transform_shape}, got {flow_state.shape}, "
+            f"{pred_endpoint.shape}, and {target_endpoint.shape}."
+        )
+
+    dtype = pred_velocity.dtype
+    device = pred_velocity.device
+    probes = _symmetric_eef_probe_offsets(
+        radius_m=probe_radius_m,
+        device=device,
+        dtype=dtype,
+    )
+
+    translation_velocity_error = pred_velocity[..., :3] - target_velocity[..., :3]
+    angular_velocity_error = pred_velocity[..., 3:6] - target_velocity[..., 3:6]
+    state_rotation = flow_state[..., :3, :3].to(device=device, dtype=dtype)
+    rotated_probes = torch.einsum("...ij,pj->...pi", state_rotation, probes)
+    angular_point_velocity_error = torch.cross(
+        angular_velocity_error.unsqueeze(-2).expand_as(rotated_probes),
+        rotated_probes,
+        dim=-1,
+    )
+    flow_translation_m = torch.linalg.vector_norm(translation_velocity_error, dim=-1)
+    flow_rotation_probe_m = torch.linalg.vector_norm(
+        angular_point_velocity_error,
+        dim=-1,
+    ).mean(dim=-1)
+    # Keep the two symmetric rigid-motion components additive.  Summing point
+    # speeds before taking their norm could let translation and rotation cancel
+    # on individual probes, weakening exactly the Cartesian supervision this
+    # metric is intended to restore.
+    flow_step = flow_translation_m + flow_rotation_probe_m
+
+    pred_rotation = pred_endpoint[..., :3, :3].to(device=device, dtype=dtype)
+    target_rotation = target_endpoint[..., :3, :3].to(device=device, dtype=dtype)
+    pred_translation = pred_endpoint[..., :3, 3].to(device=device, dtype=dtype)
+    target_translation = target_endpoint[..., :3, 3].to(device=device, dtype=dtype)
+    endpoint_translation_m = torch.linalg.vector_norm(
+        pred_translation - target_translation,
+        dim=-1,
+    )
+    endpoint_rotation_probe_m = torch.linalg.vector_norm(
+        torch.einsum("...ij,pj->...pi", pred_rotation - target_rotation, probes),
+        dim=-1,
+    ).mean(dim=-1)
+    endpoint_step = endpoint_translation_m + endpoint_rotation_probe_m
+
+    return {
+        "flow": flow_step,
+        "endpoint": endpoint_step,
+        "flow_translation_m": flow_translation_m,
+        "flow_rotation_probe_m": flow_rotation_probe_m,
+        "endpoint_translation_m": endpoint_translation_m,
+        "endpoint_rotation_probe_m": endpoint_rotation_probe_m,
+    }
+
+
 def transform_se3_twist(twist: Tensor, transform: Tensor) -> Tensor:
     """Apply the SE(3) adjoint for twists ordered as ``[v, omega]``."""
 
@@ -5525,14 +5637,24 @@ class VLAFlowMatching(nn.Module):
             independent_world_trajectory
             and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
         )
+        rigid_probe_losses: dict[str, Tensor] | None = None
         if decoupled_world_eef:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
+            flow_state = pose9_to_matrix(x_t)
             pred_spatial = decoupled_base_pose_apply(
                 remaining * pred_velocity,
-                pose9_to_matrix(x_t),
+                flow_state,
+            )
+            rigid_probe_losses = world_eef_rigid_probe_losses(
+                pred_velocity,
+                u_t,
+                flow_state,
+                pred_spatial,
+                spatial_gt,
+                probe_radius_m=float(self.config.worldflow_eef_probe_radius_m),
             )
             pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
-            flow_step = F.smooth_l1_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
+            flow_step = rigid_probe_losses["flow"]
         elif self.config.se3_enable or independent_world_trajectory:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
             pred_spatial = se3_left_apply(remaining * pred_velocity, pose9_to_matrix(x_t))
@@ -5542,12 +5664,15 @@ class VLAFlowMatching(nn.Module):
             pred_spatial_pose9 = x_t + (1.0 - time_expanded) * pred_velocity
             pred_spatial = pose9_to_matrix(pred_spatial_pose9)
             flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
-        geo_step = se3_geodesic_loss(
-            pred_spatial,
-            spatial_gt,
-            trans_weight=float(self.config.worldflow_trans_weight),
-            rot_weight=float(self.config.worldflow_rot_weight),
-        )
+        if rigid_probe_losses is not None:
+            geo_step = rigid_probe_losses["endpoint"]
+        else:
+            geo_step = se3_geodesic_loss(
+                pred_spatial,
+                spatial_gt,
+                trans_weight=float(self.config.worldflow_trans_weight),
+                rot_weight=float(self.config.worldflow_rot_weight),
+            )
         if independent_world_trajectory:
             # The World target and Ego action use different coordinate
             # parameterizations. Cross-token interaction is the only bridge;
@@ -5663,6 +5788,23 @@ class VLAFlowMatching(nn.Module):
                 valid,
             ).mean().detach(),
         }
+        if rigid_probe_losses is not None:
+            self.last_worldflow_metrics.update(
+                {
+                    "worldflow_flow_translation_err_m": _masked_step_mean(
+                        rigid_probe_losses["flow_translation_m"], valid
+                    ).mean().detach(),
+                    "worldflow_flow_rotation_probe_err_m": _masked_step_mean(
+                        rigid_probe_losses["flow_rotation_probe_m"], valid
+                    ).mean().detach(),
+                    "worldflow_endpoint_translation_err_m": _masked_step_mean(
+                        rigid_probe_losses["endpoint_translation_m"], valid
+                    ).mean().detach(),
+                    "worldflow_endpoint_rotation_probe_err_m": _masked_step_mean(
+                        rigid_probe_losses["endpoint_rotation_probe_m"], valid
+                    ).mean().detach(),
+                }
+            )
         coordinate_frame_transform = state.get("coordinate_frame_transform")
         if torch.is_tensor(coordinate_frame_transform):
             identity_rotation = torch.eye(
