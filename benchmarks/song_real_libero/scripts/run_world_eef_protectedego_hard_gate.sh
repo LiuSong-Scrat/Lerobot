@@ -90,6 +90,18 @@ run_step() {
     wait "$leader" || true
 
     if [[ -n "$reason" ]]; then
+        # In-flight workers can finish while SIGINT is being propagated.  Read
+        # the atomically updated progress one final time so the preserved
+        # directory name describes the actual on-disk episode set rather than
+        # the earlier gate sample.
+        if [[ -s "$progress" ]]; then
+            c6=$(jq -r '.tasks["6"].completed_episode_count // 0' "$progress")
+            s6=$(jq -r '.tasks["6"].success_count // 0' "$progress")
+            c8=$(jq -r '.tasks["8"].completed_episode_count // 0' "$progress")
+            s8=$(jq -r '.tasks["8"].success_count // 0' "$progress")
+            f6=$((c6 - s6))
+            f8=$((c8 - s8))
+        fi
         local renamed
         if [[ "$reason" == task6 ]]; then
             renamed="$experiment/eval/DISQUALIFIED_PARTIAL_${tag}_dual_task6_${s6}of${c6}_${f6}fail"
