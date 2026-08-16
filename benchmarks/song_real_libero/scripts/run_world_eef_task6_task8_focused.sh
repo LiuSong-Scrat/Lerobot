@@ -246,6 +246,41 @@ resume_train_1564() {
     test -s "$training/checkpoints/001564/pretrained_model/model.safetensors"
 }
 
+resume_train_to() {
+    local source_step=${1:?usage: $0 resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS}
+    local target_step=${2:?usage: $0 resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS}
+    local resume_save_steps=${3:?usage: $0 resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS}
+    local source_padded target_padded
+    printf -v source_padded '%06d' "$source_step"
+    printf -v target_padded '%06d' "$target_step"
+    if ((target_step <= source_step)); then
+        echo "TARGET_STEP must be greater than SOURCE_STEP" >&2
+        exit 2
+    fi
+    local checkpoint="$training/checkpoints/$source_padded"
+    local config="$checkpoint/pretrained_model/train_config.json"
+    test -s "$checkpoint/pretrained_model/model.safetensors"
+    test -s "$checkpoint/training_state/optimizer_state.safetensors"
+    test -s "$checkpoint/training_state/scheduler_state.json"
+    test -s "$checkpoint/training_state/rng_state.safetensors"
+    test -s "$config"
+    cd "$repo"
+    ulimit -n 65535
+    CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    PYTHONPATH="$repo/src" \
+    SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    "$python" -m accelerate.commands.launch \
+        --multi_gpu --num_processes=4 --num_machines=1 \
+        --mixed_precision=no --dynamo_backend=no --main_process_port=0 \
+        benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+        --config_path="$config" --resume=true \
+        --steps="$target_step" --save_freq="$target_step" \
+        --save_steps="$resume_save_steps" \
+        2>&1 | tee -a "$log_dir/train_resume_${source_padded}_to_${target_padded}.log"
+    test -s "$training/checkpoints/$target_padded/pretrained_model/model.safetensors"
+}
+
 eval_checkpoint() {
     local checkpoint=${1:?usage: $0 eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}
     local tag=${2:-$(basename "$(dirname "$(dirname "$checkpoint")")")}
@@ -418,11 +453,12 @@ case "${1:-}" in
     cache) build_cache; audit_cache ;;
     train) train ;;
     resume-1564) resume_train_1564 ;;
+    resume-train) shift; resume_train_to "$@" ;;
     pipeline) build_cache; audit_cache; train; eval_grid ;;
     eval-grid) eval_grid ;;
     eval) shift; eval_checkpoint "$@" ;;
     *)
-        echo "usage: $0 {audit|cache|train|resume-1564|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
+        echo "usage: $0 {audit|cache|train|resume-1564|resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
         exit 2
         ;;
 esac
