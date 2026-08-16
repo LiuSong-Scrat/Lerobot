@@ -831,7 +831,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """
 
         super().train(mode)
-        if mode and bool(getattr(self.config, "pointseg_freeze_batchnorm_stats", False)):
+        if mode and (
+            bool(getattr(self.config, "pointseg_freeze_batchnorm_stats", False))
+            or bool(getattr(self.config, "worldflow_freeze_pretrained_ego", False))
+        ):
             conditioner = getattr(getattr(self, "model", None), "pointseg_conditioner", None)
             if conditioner is not None:
                 for module in conditioner.modules():
@@ -2912,6 +2915,7 @@ class VLAFlowMatching(nn.Module):
             self.register_parameter("world_ego_action_type_embedding", None)
 
         self.set_requires_grad()
+        self._apply_worldflow_pretrained_ego_freeze()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
         self.global_image_start_token = torch.tensor(
@@ -3012,7 +3016,9 @@ class VLAFlowMatching(nn.Module):
             "status": "bootstrapped",
             "source": "trained_ego_action_point_modules",
             "world_parameters_shared": False,
-            "ego_frozen": False,
+            "ego_frozen": bool(
+                getattr(self.config, "worldflow_freeze_pretrained_ego", False)
+            ),
             "world_output_head": (
                 "independently_initialized_direct_se3"
                 if direct_world_trajectory
@@ -3027,6 +3033,53 @@ class VLAFlowMatching(nn.Module):
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = bool(self.config.encode_robot_state and self.config.train_state_proj)
+
+    def _apply_worldflow_pretrained_ego_freeze(self) -> None:
+        """Freeze the loaded Ego policy while retaining every World interaction path.
+
+        The World branch is an independently parameterized learner bootstrapped
+        from Ego.  Its point encoder, action inputs, trajectory head, scene
+        adapters, and both directions of cross-attention remain trainable.  All
+        parameters that existed in the source Ego checkpoint are frozen, so
+        neither the World objective nor focused Ego behavior cloning can erase
+        the baseline policy on a small dataset.
+        """
+
+        if not bool(getattr(self.config, "worldflow_freeze_pretrained_ego", False)):
+            return
+        if self.worldflow_branch is None:
+            raise RuntimeError(
+                "worldflow_freeze_pretrained_ego=True requires an initialized WorldFlow branch."
+            )
+        world_prefixes = (
+            "worldflow_branch.",
+            "ego_scene_to_expert.",
+            "world_scene_to_expert.",
+            "world_action_out_proj.",
+            "world_se3_action_out_proj.",
+            "world_twist_residual_out_proj.",
+            "ego_to_world_cross_norm.",
+            "world_to_ego_cross_norm.",
+            "ego_to_world_cross_attn.",
+            "world_to_ego_cross_attn.",
+        )
+        world_exact = {
+            "world_ego_scene_type_embedding",
+            "world_ego_action_type_embedding",
+        }
+        trainable_world_parameters = 0
+        frozen_ego_parameters = 0
+        for name, parameter in self.named_parameters():
+            is_world = name in world_exact or name.startswith(world_prefixes)
+            parameter.requires_grad = is_world
+            if is_world:
+                trainable_world_parameters += parameter.numel()
+            else:
+                frozen_ego_parameters += parameter.numel()
+        if trainable_world_parameters <= 0 or frozen_ego_parameters <= 0:
+            raise RuntimeError(
+                "WorldFlow protected-Ego training requires non-empty frozen Ego and trainable World roles."
+            )
 
     def sample_noise(self, shape, device):
         noise = torch.normal(

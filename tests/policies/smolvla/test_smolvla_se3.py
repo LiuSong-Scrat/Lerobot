@@ -2434,6 +2434,49 @@ def test_bidirectional_cross_attention_is_function_preserving_without_a_gate():
     assert model.ego_to_world_cross_attn.out_proj.weight.grad.abs().sum() > 0
 
 
+def test_worldflow_protected_ego_freezes_only_pretrained_roles():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(worldflow_freeze_pretrained_ego=True)
+    model.action_out_proj = nn.Linear(4, 4)
+    model.pointseg_conditioner = nn.Linear(4, 4)
+    model.vlm_with_expert = nn.Linear(4, 4)
+    model.worldflow_branch = nn.Linear(4, 4)
+    model.ego_scene_to_expert = nn.Linear(4, 4)
+    model.world_scene_to_expert = nn.Linear(4, 4)
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
+
+    model._apply_worldflow_pretrained_ego_freeze()
+
+    for module in (model.action_out_proj, model.pointseg_conditioner, model.vlm_with_expert):
+        assert not any(parameter.requires_grad for parameter in module.parameters())
+    for module in (
+        model.worldflow_branch,
+        model.ego_scene_to_expert,
+        model.world_scene_to_expert,
+        model.ego_to_world_cross_attn,
+        model.world_to_ego_cross_attn,
+    ):
+        assert all(parameter.requires_grad for parameter in module.parameters())
+    assert model.world_ego_scene_type_embedding.requires_grad
+    assert model.world_ego_action_type_embedding.requires_grad
+
+
+def test_worldflow_protected_ego_config_requires_worldflow_and_no_nominal_ego_lr():
+    with pytest.raises(ValueError, match="requires worldflow_enable=True"):
+        SmolVLAConfig(worldflow_freeze_pretrained_ego=True)
+
+    with pytest.raises(ValueError, match="worldflow_pretrained_lr_multiplier=1.0"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_freeze_pretrained_ego=True,
+            worldflow_pretrained_lr_multiplier=0.2,
+        )
+
+
 def test_worldflow_two_timescale_optimizer_keeps_both_branches_trainable():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
@@ -2927,6 +2970,26 @@ def test_pointseg_batchnorm_stats_can_be_frozen_without_freezing_parameters():
     assert linear.training
     assert batchnorm.weight.requires_grad
     assert batchnorm.bias.requires_grad
+
+
+def test_worldflow_protected_ego_also_freezes_ego_pointseg_batchnorm_stats():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        pointseg_freeze_batchnorm_stats=False,
+        worldflow_freeze_pretrained_ego=True,
+        worldflow_freeze_batchnorm_stats=False,
+    )
+    policy.model = nn.Module()
+    policy.model.pointseg_conditioner = nn.Sequential(
+        nn.BatchNorm1d(4),
+        nn.Linear(4, 4),
+    )
+
+    policy.train(True)
+
+    assert not policy.model.pointseg_conditioner[0].training
+    assert policy.model.pointseg_conditioner[1].training
 
 
 def test_worldflow_batchnorm_stats_can_be_frozen_without_freezing_parameters():

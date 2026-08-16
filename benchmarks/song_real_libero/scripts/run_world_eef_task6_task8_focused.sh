@@ -6,8 +6,18 @@ python=/home/liusong/anaconda3/envs/reap/bin/python
 dataset=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep
 cache=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep_pointseg_cache
 baseline=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v042_general_dataset_toolseg_after32k_mul3_after28k_lr5/checkpoints/030000/pretrained_model
-training=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps
-experiment=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816
+training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps}
+experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816}
+freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
+train_steps=${WORLD_EEF_TRAIN_STEPS:-1300}
+save_steps=${WORLD_EEF_SAVE_STEPS:-'[100,260,520,780,1040,1300]'}
+pretrained_lr_multiplier=0.2
+if [[ "$freeze_pretrained_ego" == true ]]; then
+    pretrained_lr_multiplier=1.0
+elif [[ "$freeze_pretrained_ego" != false ]]; then
+    echo "WORLD_EEF_FREEZE_PRETRAINED_EGO must be true or false" >&2
+    exit 2
+fi
 log_dir="$experiment/logs"
 mkdir -p "$log_dir"
 
@@ -162,11 +172,11 @@ train() {
         --pointseg_sample_cache_dir="$cache" \
         --task_balanced_sampling=true \
         --batch_size=24 --gradient_accumulation_steps=1 \
-        --steps=1300 --save_freq=1300 \
-        --save_steps='[100,260,520,780,1040,1300]' \
-        --log_freq=1 --eval_freq=1300 --num_workers=6 \
+        --steps="$train_steps" --save_freq="$train_steps" \
+        --save_steps="$save_steps" \
+        --log_freq=1 --eval_freq="$train_steps" --num_workers=6 \
         --output_dir="$training" \
-        --job_name=world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps \
+        --job_name="$(basename "$training")" \
         --policy.device=cuda --wandb.enable=false --wandb.disable_artifact=true \
         --policy.optimizer_lr=0.000025 \
         --policy.scheduler_warmup_steps=50 \
@@ -193,6 +203,7 @@ train() {
         --policy.worldflow_noise_coupling=independent \
         --policy.worldflow_action_fusion=cross_attention \
         --policy.worldflow_bootstrap_from_ego=true \
+        --policy.worldflow_freeze_pretrained_ego="$freeze_pretrained_ego" \
         --policy.worldflow_feature_dim=64 --policy.worldflow_grid_size=0.01 \
         --policy.worldflow_max_points=2048 \
         --policy.worldflow_loss_weight=0.02 \
@@ -200,14 +211,16 @@ train() {
         --policy.worldflow_bridge_loss_weight=0.0 \
         --policy.worldflow_equiv_loss_weight=0.0 \
         --policy.worldflow_training_coordinate_frame_augmentation=false \
-        --policy.worldflow_pretrained_lr_multiplier=0.2 \
+        --policy.worldflow_pretrained_lr_multiplier="$pretrained_lr_multiplier" \
         --policy.worldflow_new_lr_multiplier=1.0 \
         --policy.worldflow_trans_weight=1.0 --policy.worldflow_rot_weight=1.0 \
         --policy.worldflow_require_action_target_sidecar=true \
         --policy.worldflow_se3_head_enable=false \
         --policy.se3_enable=false --policy.se3_final_correction_enable=false \
         2>&1 | tee -a "$log_dir/train.log"
-    test -s "$training/checkpoints/001300/pretrained_model/model.safetensors"
+    local final_step
+    printf -v final_step '%06d' "$train_steps"
+    test -s "$training/checkpoints/$final_step/pretrained_model/model.safetensors"
 }
 
 resume_train_1564() {

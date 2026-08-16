@@ -240,6 +240,13 @@ class SmolVLAConfig(PreTrainedConfig):
     worldflow_pretrained_lr_multiplier: float = 1.0
     worldflow_new_lr_multiplier: float = 1.0
     worldflow_residual_lr_multiplier: float | None = None
+    # Preserve an already strong Ego policy while learning the independent
+    # World branch and the explicit bidirectional interaction modules.  This
+    # prevents a small focused dataset (for example 100 demonstrations) from
+    # rewriting the pretrained Action Expert, Ego point path, or action head.
+    # World remains fully trainable and can still affect Ego through the
+    # zero-initialized World-to-Ego cross-attention path.
+    worldflow_freeze_pretrained_ego: bool = False
     # Training-only stochastic depth for the physical World-to-Ego correction.
     # A dropped sample is optimized through the unchanged Ego action path;
     # retained samples use the complete bidirectional World/Ego path. This adds
@@ -719,6 +726,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_body_velocity_residual_parameterization=True requires "
                 "worldflow_enable=True."
             )
+        if self.worldflow_freeze_pretrained_ego and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_freeze_pretrained_ego=True requires worldflow_enable=True."
+            )
         if self.worldflow_enable:
             if self.worldflow_target_type not in {
                 "legacy_eef",
@@ -767,6 +778,17 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     "World/Ego residual gates are unsupported; "
                     "worldflow_ego_residual_gate_init must be None."
+                )
+            if self.worldflow_freeze_pretrained_ego and not math.isclose(
+                self.worldflow_pretrained_lr_multiplier,
+                1.0,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            ):
+                raise ValueError(
+                    "worldflow_freeze_pretrained_ego=True requires "
+                    "worldflow_pretrained_lr_multiplier=1.0 because frozen parameters "
+                    "are excluded from the optimizer rather than assigned a nominal learning rate."
                 )
             if self.worldflow_pretrained_lr_multiplier <= 0:
                 raise ValueError("worldflow_pretrained_lr_multiplier must be positive; zero would freeze Ego.")
