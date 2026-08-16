@@ -418,6 +418,11 @@ class SmolVLAConfig(PreTrainedConfig):
     # original pose9 chart.  It has no fixed mixing coefficient: World learns a
     # physical correction, not a second absolute policy to average with Ego.
     # These are deterministic geometry/fixed fusion contracts, not learned gates.
+    # ``independent_parallel`` is the calibration phase for a true dual-flow
+    # model: both complete trajectories are directly supervised and every
+    # non-VLM module remains trainable, but neither flow can alter the other.
+    # Physical interaction is enabled only after their unweighted endpoint
+    # errors are comparable. This is a curriculum, not a learned gate.
     worldflow_action_fusion: str = "cross_attention"
     # ``shared`` is the historical implementation: World owns its geometric
     # front-end but its action tokens are processed by the Ego Action Expert.
@@ -800,12 +805,13 @@ class SmolVLAConfig(PreTrainedConfig):
                         "worldflow_noise_coupling='independent' or 'left_compose_ego'"
                     )
                 if self.worldflow_action_fusion not in {
+                    "independent_parallel",
                     "cross_attention",
                     "physical_trajectory_cross_attention",
                     "world_trajectory_arm_ego_gripper",
                 }:
                     world_trajectory_contract_errors.append(
-                        "worldflow_action_fusion='cross_attention', "
+                        "worldflow_action_fusion='independent_parallel', 'cross_attention', "
                         "'physical_trajectory_cross_attention', or "
                         "'world_trajectory_arm_ego_gripper'"
                     )
@@ -911,6 +917,7 @@ class SmolVLAConfig(PreTrainedConfig):
                     "the intended information source."
                 )
             if self.worldflow_action_fusion not in {
+                "independent_parallel",
                 "cross_attention",
                 "symmetric_twist",
                 "conjugate_residual",
@@ -922,7 +929,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 "world_trajectory_arm_ego_gripper",
             }:
                 raise ValueError(
-                    "worldflow_action_fusion must be 'cross_attention', 'symmetric_twist', "
+                    "worldflow_action_fusion must be 'independent_parallel', 'cross_attention', "
+                    "'symmetric_twist', "
                     "'conjugate_residual', 'conjugate_residual_consensus', or "
                     "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
                     "'endpoint_residual_boosting', or "
@@ -930,6 +938,25 @@ class SmolVLAConfig(PreTrainedConfig):
                     "'world_trajectory_arm_ego_gripper'; "
                     f"got {self.worldflow_action_fusion!r}."
                 )
+            if self.worldflow_action_fusion == "independent_parallel":
+                calibration_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    calibration_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    calibration_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    calibration_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.worldflow_freeze_pretrained_ego:
+                    calibration_contract_errors.append("worldflow_freeze_pretrained_ego=False")
+                if self.se3_enable:
+                    calibration_contract_errors.append("se3_enable=False")
+                if calibration_contract_errors:
+                    raise ValueError(
+                        "independent_parallel requires two independently supervised, fully trainable "
+                        "action flows before interaction: "
+                        + ", ".join(calibration_contract_errors)
+                        + "."
+                    )
             if self.worldflow_current_ee_pose_token and (
                 self.worldflow_target_type != "world_eef_trajectory"
                 or self.worldflow_action_expert_mode != "independent"

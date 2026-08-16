@@ -1480,6 +1480,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for key, value in self.model.last_worldflow_metrics.items():
             if torch.is_tensor(value):
                 loss_dict[key] = value.detach().item()
+        ego_trans_error = loss_dict.get("action_endpoint_trans_err")
+        world_trans_error = loss_dict.get("worldflow_trans_err")
+        if ego_trans_error is not None and world_trans_error is not None:
+            loss_dict["worldflow_to_ego_trans_err_ratio"] = float(world_trans_error) / max(
+                float(ego_trans_error), 1e-12
+            )
+        ego_rot_error = loss_dict.get("action_endpoint_rot_err_deg")
+        world_rot_error = loss_dict.get("worldflow_rot_err_deg")
+        if ego_rot_error is not None and world_rot_error is not None:
+            loss_dict["worldflow_to_ego_rot_err_ratio"] = float(world_rot_error) / max(
+                float(ego_rot_error), 1e-12
+            )
 
         # Remove padding
         original_action_dim = self.config.action_feature.shape[0]
@@ -3005,6 +3017,7 @@ class VLAFlowMatching(nn.Module):
         self.last_point_action_mask: Tensor | None = None
         self.last_ego_scene_global_feat: Tensor | None = None
         self.last_ego_scene_global_mask: Tensor | None = None
+        self.last_ego_point_prefix_slices: tuple[slice, ...] = ()
         self.last_body_pose9_prediction: Tensor | None = None
         self.last_worldflow_aux: dict[str, Tensor] | None = None
         # Runtime-only diagnostics. These are plain Python attributes so they
@@ -3098,10 +3111,12 @@ class VLAFlowMatching(nn.Module):
                 dropout=0.0,
                 batch_first=True,
             )
-            physical_trajectory_interaction = (
-                getattr(self.config, "worldflow_action_fusion", "cross_attention")
-                == "physical_trajectory_cross_attention"
-            )
+            physical_trajectory_interaction = getattr(
+                self.config, "worldflow_action_fusion", "cross_attention"
+            ) in {
+                "independent_parallel",
+                "physical_trajectory_cross_attention",
+            }
             self.ego_physical_trajectory_in_proj = (
                 nn.Linear(9, expert_dim) if physical_trajectory_interaction else None
             )
@@ -4230,6 +4245,7 @@ class VLAFlowMatching(nn.Module):
         self.last_point_action_mask = None
         self.last_ego_scene_global_feat = None
         self.last_ego_scene_global_mask = None
+        self.last_ego_point_prefix_slices = ()
         self.last_pointseg_visualization = None
         # Some lightweight unit-test / export shells construct this module
         # without running the full initializer.
@@ -4449,7 +4465,12 @@ class VLAFlowMatching(nn.Module):
             if ablate_point:
                 pc_mask = torch.zeros_like(pc_mask, dtype=torch.bool)
 
+            point_prefix_start = sum(embedding.shape[1] for embedding in embs)
             embs.append(pc_emb)
+            self.last_ego_point_prefix_slices = (
+                *self.last_ego_point_prefix_slices,
+                slice(point_prefix_start, point_prefix_start + num_pc_tokens),
+            )
             pad_masks.append(pc_mask)
             att_masks += [0] * num_pc_tokens
 
@@ -4874,23 +4895,20 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Build the World-only suffix consumed by its independent expert.
 
-        The World expert receives both global scene summaries followed by its
-        own point-conditioned action chunk.  It never processes Ego action
-        tokens; trajectory exchange happens only in the explicit cross-
-        attention module after both experts have produced complete action
-        representations.
+        The World expert receives only its robot-base scene/current-pose
+        conditions followed by its own point-conditioned action chunk. It
+        never consumes Ego scene or action tokens; trajectory exchange happens
+        only in the explicit cross-attention module after both experts have
+        produced complete action representations.
         """
 
         required_modules = (
-            self.ego_scene_to_expert,
             self.world_scene_to_expert,
             self.world_ego_scene_type_embedding,
             self.world_ego_action_type_embedding,
         )
         if any(module is None for module in required_modules):
             raise RuntimeError("Independent World expert scene modules are not initialized.")
-        if self.last_ego_scene_global_feat is None or self.last_ego_scene_global_mask is None:
-            raise ValueError("Independent World expert requires the Ego global scene feature.")
 
         world_global_feat = world_tokens.get("global_feat")
         world_point_mask = world_tokens.get("scene_mask")
@@ -4909,12 +4927,7 @@ class VLAFlowMatching(nn.Module):
                 "Independent World expert requires global/point masks and action tokens/masks."
             )
 
-        ego_scene = self.ego_scene_to_expert(self.last_ego_scene_global_feat).unsqueeze(1)
         world_scene = self.world_scene_to_expert(world_global_feat).unsqueeze(1)
-        ego_scene_mask = self.last_ego_scene_global_mask.to(
-            device=ego_scene.device,
-            dtype=torch.bool,
-        ).unsqueeze(1)
         world_scene_mask = world_point_mask.to(
             device=world_scene.device,
             dtype=torch.bool,
@@ -4928,7 +4941,6 @@ class VLAFlowMatching(nn.Module):
             world_scene_mask = torch.zeros_like(world_scene_mask)
             world_action_mask = torch.zeros_like(world_action_mask)
 
-        ego_scene = ego_scene + self.world_ego_scene_type_embedding[0]
         world_scene = world_scene + self.world_ego_scene_type_embedding[1]
         world_action_tokens = world_action_tokens + self.world_ego_action_type_embedding[1]
         if world_action_tokens.shape[1] != self.config.chunk_size:
@@ -4937,8 +4949,8 @@ class VLAFlowMatching(nn.Module):
                 f"{self.config.chunk_size}, got {world_action_tokens.shape[1]}."
             )
 
-        condition_tokens = [ego_scene, world_scene]
-        condition_masks = [ego_scene_mask, world_scene_mask]
+        condition_tokens = [world_scene]
+        condition_masks = [world_scene_mask]
         if bool(getattr(self.config, "worldflow_current_ee_pose_token", False)):
             current_pose_token = world_tokens.get("current_ee_pose_token")
             current_pose_mask = world_tokens.get("current_ee_pose_mask")
@@ -4966,6 +4978,23 @@ class VLAFlowMatching(nn.Module):
         )[None, :].expand(suffix_embs.shape[0], -1)
         return suffix_embs, suffix_pad_masks, suffix_att_masks
 
+    def _independent_world_prefix_mask(self, prefix_pad_masks: Tensor) -> Tensor:
+        """Hide Ego point tokens from the independent World Expert.
+
+        RGB/language VLM tokens remain common frozen context. World geometry is
+        supplied exclusively by the World branch in robot-base coordinates, so
+        World loss cannot update or silently communicate through the Ego point
+        path before the explicit interaction phase.
+        """
+
+        point_slices = getattr(self, "last_ego_point_prefix_slices", ())
+        if not point_slices:
+            return prefix_pad_masks
+        world_prefix_mask = prefix_pad_masks.clone()
+        for point_slice in point_slices:
+            world_prefix_mask[:, point_slice] = False
+        return world_prefix_mask
+
     def _run_independent_world_suffix_expert(
         self,
         prefix_embs: Tensor | None,
@@ -4981,10 +5010,11 @@ class VLAFlowMatching(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks = self._build_independent_world_suffix(
             world_tokens
         )
+        world_prefix_pad_masks = self._independent_world_prefix_mask(prefix_pad_masks)
         if prefix_embs is not None:
             if prefix_att_masks is None:
                 raise ValueError("prefix_att_masks are required when prefix_embs are provided.")
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            pad_masks = torch.cat([world_prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
             attention_mask = make_att_2d_masks(pad_masks, att_masks)
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
@@ -5001,13 +5031,13 @@ class VLAFlowMatching(nn.Module):
             if past_key_values is None:
                 raise ValueError("Cached World expert inference requires past_key_values.")
             suffix_len = suffix_pad_masks.shape[1]
-            prefix_len = prefix_pad_masks.shape[1]
-            prefix_attention = prefix_pad_masks[:, None, :].expand(
-                prefix_pad_masks.shape[0], suffix_len, prefix_len
+            prefix_len = world_prefix_pad_masks.shape[1]
+            prefix_attention = world_prefix_pad_masks[:, None, :].expand(
+                world_prefix_pad_masks.shape[0], suffix_len, prefix_len
             )
             suffix_attention = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
             attention_mask = torch.cat([prefix_attention, suffix_attention], dim=2)
-            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            prefix_offsets = torch.sum(world_prefix_pad_masks, dim=-1)[:, None]
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
@@ -5058,6 +5088,16 @@ class VLAFlowMatching(nn.Module):
                 world_tokens,
                 past_key_values=past_key_values,
             )
+            if (
+                getattr(self.config, "worldflow_action_fusion", "cross_attention")
+                == "independent_parallel"
+            ):
+                # Calibration phase: both experts learn complete direct
+                # targets, but an immature coordinate stream cannot contaminate
+                # the other one. No tensor is detached and no active module is
+                # frozen; interaction is enabled only after the physical-error
+                # gate passes.
+                return ego_out, world_out
             if (
                 getattr(self.config, "worldflow_action_fusion", "cross_attention")
                 == "physical_trajectory_cross_attention"

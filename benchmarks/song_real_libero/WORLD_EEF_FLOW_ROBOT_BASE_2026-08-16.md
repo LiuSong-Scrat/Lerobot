@@ -378,3 +378,51 @@ bash benchmarks/song_real_libero/scripts/run_world_eef_multicheckpoint_eval.sh
 
 Set `WORLD_EEF_DRY_RUN=1` to inspect GPU assignment, worker allocation, paths,
 and complete evaluator commands without launching an evaluation.
+
+## Independent dual-flow calibration after the rejection
+
+The rejected run exposed a more basic violation than interaction quality. Its
+last 100 updates averaged 7.20 mm / 0.63 degrees for Ego but 46.51 mm / 6.60
+degrees for World (6.46x / 10.49x worse). The run froze the complete pretrained
+Ego path, weighted the direct World flow and endpoint objectives by only
+0.02/0.002, and nevertheless enabled physical bidirectional interaction from
+the first update. A centimetre-accuracy stream cannot provide a useful control
+correction to a millimetre-accuracy stream.
+
+The target is not the source of this gap. On 16 uniformly spaced frames (416
+valid chunk targets), the post-UMI Ego target transformed analytically by the
+current EEF-to-base pose matches the stored robot-base World target to
+4.45e-8 m mean translation error and zero measured rotation error. The frozen
+baseline's prediction has identical error in either coordinate system: 9.73 mm
+mean translation and 1.26 degrees mean rotation. Thus an approximately 10 mm
+World predictor is demonstrably reachable with the existing labels.
+
+The new `independent_parallel` calibration contract therefore does the
+following before any interaction training:
+
+- freezes only the pretrained VLM; both Action Experts, both point/action
+  paths, both output heads, and all other active non-VLM modules are trainable;
+- gives Ego and World their own complete direct trajectory supervision while
+  bypassing both directions of cross-attention;
+- uses equal base learning rates and no 0.02/0.002 attenuation of World direct
+  supervision (`worldflow_loss_weight=1`, `worldflow_geo_loss_weight=1`);
+- retains identity-initialized physical interaction modules in the checkpoint
+  so they can be enabled after calibration without reinitializing either flow;
+- gates interaction on unweighted physical endpoint errors, never on weighted
+  scalar losses. The default 100-update gate requires Ego and World mean
+  translation errors <=12 mm, World/Ego translation ratio <=1.5, World mean
+  rotation <=2 degrees, and World/Ego rotation ratio <=1.5.
+
+The gate implementation is
+`benchmarks/song_real_libero/scripts/audit_worldflow_error_alignment.py`.
+`run_world_eef_task6_task8_focused.sh pipeline` now stops after this gate and no
+longer evaluates an uncalibrated World model.
+
+A four-GPU one-update smoke run is stored at
+`/opt/data/private/liusong/benchmarks/song_real_libero/outputs/SMOKE_world_eef_independent_parallel_equal_1step_20260816`.
+It loaded 304M trainable parameters out of 666M total. Byte-level checkpoint
+comparison found zero changed elements in all 350,165,184 VLM parameters,
+while the Ego Action Expert/head and the independent World Expert/scene path
+all changed. The first-update physical errors were 8.99 mm for Ego and 423.8 mm
+for the newly initialized World head, which is intentionally isolated until it
+passes the physical gate.

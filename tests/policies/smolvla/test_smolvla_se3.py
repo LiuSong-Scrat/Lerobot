@@ -1939,6 +1939,40 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     assert physically_coupled_cfg.worldflow_noise_coupling == "left_compose_ego"
     assert physically_coupled_cfg.worldflow_world_eef_velocity_mode == "base_decoupled"
 
+    calibration_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_decoupled",
+        worldflow_action_fusion="independent_parallel",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_freeze_pretrained_ego=False,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert calibration_cfg.worldflow_action_fusion == "independent_parallel"
+
+    with pytest.raises(ValueError, match="fully trainable action flows"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_target_type="world_eef_trajectory",
+            worldflow_reference_frame="robot_base",
+            worldflow_frame_origin="global",
+            worldflow_scene_frame_origin="global",
+            worldflow_noise_coupling="left_compose_ego",
+            worldflow_world_eef_velocity_mode="base_decoupled",
+            worldflow_action_fusion="independent_parallel",
+            worldflow_action_expert_mode="independent",
+            worldflow_current_ee_pose_token=True,
+            worldflow_freeze_pretrained_ego=True,
+            worldflow_bridge_loss_weight=0.0,
+            worldflow_equiv_loss_weight=0.0,
+        )
+
     independent_cfg = SmolVLAConfig(
         worldflow_enable=True,
         worldflow_target_type="world_eef_trajectory",
@@ -2603,7 +2637,7 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
     assert model.world_ego_action_type_embedding.requires_grad
 
 
-def test_independent_world_suffix_contains_scenes_and_only_world_actions():
+def test_independent_world_suffix_contains_only_world_scene_and_actions():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(chunk_size=3)
@@ -2627,10 +2661,40 @@ def test_independent_world_suffix_contains_scenes_and_only_world_actions():
         }
     )
 
-    assert suffix.shape == (1, 5, 4)
+    assert suffix.shape == (1, 4, 4)
     assert torch.equal(suffix[:, -3:], world_actions)
-    assert valid.tolist() == [[True, True, True, True, True]]
-    assert blocks.tolist() == [[1, 0, 1, 0, 0]]
+    assert valid.tolist() == [[True, True, True, True]]
+    assert blocks.tolist() == [[1, 1, 0, 0]]
+
+
+def test_independent_parallel_runs_both_experts_without_cross_interaction():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_action_expert_mode="independent",
+        worldflow_action_fusion="independent_parallel",
+    )
+    ego_expected = torch.randn(2, 3, 4)
+    world_expected = torch.randn(2, 3, 4)
+    model._run_ego_suffix_expert = lambda *_args, **_kwargs: ego_expected
+    model._run_independent_world_suffix_expert = lambda *_args, **_kwargs: world_expected
+
+    def fail_if_interacted(*_args, **_kwargs):
+        raise AssertionError("independent calibration must not invoke cross-attention")
+
+    model._bidirectional_world_ego_cross_attention = fail_if_interacted
+    actual_ego, actual_world = model._run_world_ego_joint_expert(
+        None,
+        torch.ones(2, 5, dtype=torch.bool),
+        None,
+        torch.randn(2, 3, 4),
+        torch.ones(2, 3, dtype=torch.bool),
+        {"action_mask": torch.ones(2, 3, dtype=torch.bool)},
+        past_key_values=object(),
+    )
+
+    assert actual_ego is ego_expected
+    assert actual_world is world_expected
 
 
 def test_independent_world_suffix_prepends_current_robot_base_eef_token():
@@ -2658,11 +2722,27 @@ def test_independent_world_suffix_prepends_current_robot_base_eef_token():
         }
     )
 
-    assert suffix.shape == (1, 5, 4)
+    assert suffix.shape == (1, 4, 4)
     assert torch.equal(suffix[:, :1], current_token)
     assert torch.equal(suffix[:, -2:], world_actions)
-    assert valid.tolist() == [[True, True, True, True, True]]
-    assert blocks.tolist() == [[1, 0, 0, 1, 0]]
+    assert valid.tolist() == [[True, True, True, True]]
+    assert blocks.tolist() == [[1, 0, 1, 0]]
+
+
+def test_independent_world_prefix_masks_ego_point_tokens_only():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.last_ego_point_prefix_slices = (slice(3, 5), slice(8, 10))
+    prefix_mask = torch.ones(2, 12, dtype=torch.bool)
+
+    world_mask = model._independent_world_prefix_mask(prefix_mask)
+
+    assert world_mask[:, :3].all()
+    assert not world_mask[:, 3:5].any()
+    assert world_mask[:, 5:8].all()
+    assert not world_mask[:, 8:10].any()
+    assert world_mask[:, 10:].all()
+    assert prefix_mask.all()
 
 
 def test_world_trajectory_execution_is_left_coordinate_change_not_conjugation():

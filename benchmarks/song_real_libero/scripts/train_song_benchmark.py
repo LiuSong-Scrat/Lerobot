@@ -2736,6 +2736,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "loss_worldflow_equiv",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
+                    "worldflow_to_ego_trans_err_ratio",
+                    "worldflow_to_ego_rot_err_ratio",
                     "worldflow_valid_ratio",
                     "worldflow_foreground_points",
                     "worldflow_noise_conjugacy_error",

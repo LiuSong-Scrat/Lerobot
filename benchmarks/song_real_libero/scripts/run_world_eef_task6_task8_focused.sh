@@ -9,17 +9,17 @@ baseline=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v
 training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps}
 experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816}
 freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
-action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
-action_fusion=${WORLD_EEF_ACTION_FUSION:-cross_attention}
-current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-false}
+action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-independent}
+action_fusion=${WORLD_EEF_ACTION_FUSION:-independent_parallel}
+current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-true}
 noise_coupling=${WORLD_EEF_NOISE_COUPLING:-left_compose_ego}
 world_eef_velocity_mode=${WORLD_EEF_VELOCITY_MODE:-base_decoupled}
 eval_fusion_override=${WORLD_EEF_EVAL_FUSION_OVERRIDE:-}
-worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-0.02}
-worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-0.002}
+worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-1.0}
+worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-1.0}
 train_steps=${WORLD_EEF_TRAIN_STEPS:-1300}
 save_steps=${WORLD_EEF_SAVE_STEPS:-'[100,260,520,780,1040,1300]'}
-pretrained_lr_multiplier=0.2
+pretrained_lr_multiplier=1.0
 if [[ "$freeze_pretrained_ego" == true ]]; then
     pretrained_lr_multiplier=1.0
 elif [[ "$freeze_pretrained_ego" != false ]]; then
@@ -30,10 +30,15 @@ if [[ "$action_expert_mode" != shared && "$action_expert_mode" != independent ]]
     echo "WORLD_EEF_ACTION_EXPERT_MODE must be shared or independent" >&2
     exit 2
 fi
-if [[ "$action_fusion" != cross_attention \
+if [[ "$action_fusion" != independent_parallel \
+    && "$action_fusion" != cross_attention \
     && "$action_fusion" != physical_trajectory_cross_attention \
     && "$action_fusion" != world_trajectory_arm_ego_gripper ]]; then
-    echo "WORLD_EEF_ACTION_FUSION must be cross_attention, physical_trajectory_cross_attention, or world_trajectory_arm_ego_gripper" >&2
+    echo "WORLD_EEF_ACTION_FUSION must be independent_parallel, cross_attention, physical_trajectory_cross_attention, or world_trajectory_arm_ego_gripper" >&2
+    exit 2
+fi
+if [[ "$action_fusion" == independent_parallel && "$freeze_pretrained_ego" != false ]]; then
+    echo "independent_parallel requires WORLD_EEF_FREEZE_PRETRAINED_EGO=false" >&2
     exit 2
 fi
 if [[ "$current_pose_token" != true && "$current_pose_token" != false ]]; then
@@ -259,6 +264,22 @@ train() {
     local final_step
     printf -v final_step '%06d' "$train_steps"
     test -s "$training/checkpoints/$final_step/pretrained_model/model.safetensors"
+}
+
+audit_alignment() {
+    local train_log="$log_dir/train.log"
+    local output="$experiment/worldflow_error_alignment.json"
+    test -s "$train_log"
+    "$python" \
+        "$repo/benchmarks/song_real_libero/scripts/audit_worldflow_error_alignment.py" \
+        --train-log "$train_log" \
+        --output-json "$output" \
+        --window "${WORLD_EEF_ALIGNMENT_WINDOW:-100}" \
+        --ego-trans-max-m "${WORLD_EEF_EGO_TRANS_MAX_M:-0.012}" \
+        --world-trans-max-m "${WORLD_EEF_WORLD_TRANS_MAX_M:-0.012}" \
+        --world-to-ego-trans-ratio-max "${WORLD_EEF_TRANS_RATIO_MAX:-1.5}" \
+        --world-rot-max-deg "${WORLD_EEF_WORLD_ROT_MAX_DEG:-2.0}" \
+        --world-to-ego-rot-ratio-max "${WORLD_EEF_ROT_RATIO_MAX:-1.5}"
 }
 
 resume_train_1564() {
@@ -497,11 +518,12 @@ case "${1:-}" in
     train) train ;;
     resume-1564) resume_train_1564 ;;
     resume-train) shift; resume_train_to "$@" ;;
-    pipeline) build_cache; audit_cache; train; eval_grid ;;
+    alignment) audit_alignment ;;
+    pipeline) build_cache; audit_cache; train; audit_alignment ;;
     eval-grid) eval_grid ;;
     eval) shift; eval_checkpoint "$@" ;;
     *)
-        echo "usage: $0 {audit|cache|train|resume-1564|resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
+        echo "usage: $0 {audit|cache|train|alignment|resume-1564|resume-train SOURCE_STEP TARGET_STEP SAVE_STEPS|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
         exit 2
         ;;
 esac
