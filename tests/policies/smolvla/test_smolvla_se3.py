@@ -2546,6 +2546,8 @@ def test_shared_expert_world_frontend_matches_ego_litept_point_action_path():
         point_action_fusion_heads=4,
     )
     branch = _make_tiny_worldflow_branch(cfg)
+    assert branch.action_dim == 10
+    assert branch.action_in_proj.in_features == 10
     assert isinstance(branch.point_action_adapter, PointActionSelfAttention)
     assert branch.scene_context_proj is None
     assert branch.language_embedding is None
@@ -2556,7 +2558,7 @@ def test_shared_expert_world_frontend_matches_ego_litept_point_action_path():
         "scene_mask": torch.ones(2, 7, dtype=torch.bool),
         "global_feat": torch.randn(2, 16),
     }
-    actions = torch.randn(2, cfg.chunk_size, 9)
+    actions = torch.randn(2, cfg.chunk_size, 10)
     time = torch.rand(2)
     first, _ = branch.embed_action_tokens(
         scene,
@@ -2685,7 +2687,7 @@ def test_world_ego_joint_attention_preserves_ego_block_and_lets_world_read_ego()
     assert mask[world_action[:, None], world_action].all()
 
 
-def test_joint_point_action_expert_prefix_does_not_duplicate_ego_scene_tokens():
+def test_joint_point_action_expert_prefix_preserves_pretrained_ego_scene_tokens():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -2724,9 +2726,45 @@ def test_joint_point_action_expert_prefix_does_not_duplicate_ego_scene_tokens():
         torch.ones_like(language, dtype=torch.bool),
     )
 
-    assert prefix.shape[1] == language.shape[1]
-    assert pad_mask.shape[1] == language.shape[1]
-    assert model.last_ego_point_prefix_slices == ()
+    assert prefix.shape[1] == language.shape[1] + 1
+    assert pad_mask.shape[1] == language.shape[1] + 1
+    assert model.last_ego_point_prefix_slices == (slice(0, 1),)
+
+
+def test_shared_expert_world_scene_prefix_keeps_ego_values_and_pairs_positions():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.world_pointseg_object_proj = nn.Identity()
+    model.world_pointseg_background_proj = nn.Identity()
+    model.world_point_prefix_type_embedding = nn.Parameter(torch.zeros(3))
+    model.last_ego_point_prefix_slices = (slice(1, 3),)
+    model.inference_ablation_modalities = frozenset()
+
+    prefix = torch.randn(1, 5, 3)
+    original = prefix.clone()
+    prefix_mask = torch.tensor([[True, True, True, True, False]])
+    prefix_blocks = torch.tensor([[False, False, False, False, True]])
+    world_features = torch.tensor(
+        [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]
+    )
+
+    combined, valid, blocks, positions = model._append_shared_expert_world_scene_prefix(
+        prefix,
+        prefix_mask,
+        prefix_blocks,
+        {
+            "scene_global_tokens": world_features,
+            "scene_global_mask": torch.tensor([[True, False]]),
+        },
+    )
+
+    assert torch.equal(combined[:, :5], original)
+    assert torch.allclose(combined[:, 5:], world_features * (3.0**0.5))
+    assert valid.tolist() == [[True, True, True, True, False, True, False]]
+    assert not blocks.any()
+    # Appended World fore/back reuse the pretrained Ego fore/back rotary ids;
+    # original image/Ego/language positions do not move.
+    assert positions.tolist() == [[0, 1, 2, 3, 3, 1, 2]]
 
 
 def test_shared_point_action_expert_uses_two_bidirectional_domains_with_block_causality():
@@ -2793,34 +2831,22 @@ def test_shared_point_action_expert_uses_two_bidirectional_domains_with_block_ca
     assert len(calls) == 1
     assert torch.equal(actual_ego, ego_actions)
     assert torch.equal(actual_world, world_actions)
-    # Exact order: Ego fore/back, Ego actions, World fore/back, World actions.
-    assert calls[0]["suffix"].shape == (1, 8, 9)
-    assert calls[0]["position_ids"].tolist() == [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8]
-    ]
-    assert torch.equal(calls[0]["suffix"][:, 0], torch.ones(1, 9))
-    assert torch.equal(calls[0]["suffix"][:, 1], torch.full((1, 9), 2.0))
-    assert torch.equal(calls[0]["suffix"][:, 4], torch.ones(1, 9))
-    assert torch.equal(calls[0]["suffix"][:, 5], torch.full((1, 9), 2.0))
+    # Fore/back now remain in the VLM prefix; the suffix contains only paired
+    # Ego actions followed by World actions.
+    assert calls[0]["suffix"].shape == (1, 4, 9)
+    assert calls[0]["position_ids"].tolist() == [[0, 1, 2, 3, 4, 5, 6, 5, 6]]
     full_attention = calls[0]["attention_mask"]
     suffix_attention = full_attention[:, 5:, 5:]
-    scene = torch.tensor([0, 1, 4, 5])
-    action = torch.tensor([2, 3, 6, 7])
-    # All non-action tokens (prefix plus both scene streams) are bidirectional.
+    action = torch.arange(4)
+    # All non-action prefix tokens are bidirectional and cannot read actions.
     assert full_attention[0, :5, :5].all()
-    assert full_attention[0, :5, 5 + scene].all()
-    assert full_attention[0, 5 + scene[:, None], :5].all()
-    assert suffix_attention[0, scene[:, None], scene].all()
-    # Non-action queries cannot read noisy action tokens.
     assert not full_attention[0, :5, 5 + action].any()
-    assert not suffix_attention[0, scene[:, None], action].any()
     # All 2T action tokens read every non-action and action token.
     assert full_attention[0, 5 + action[:, None], :5].all()
-    assert suffix_attention[0, action[:, None], scene].all()
     assert suffix_attention[0, action[:, None], action].all()
     # Ego and World action outputs can attend each other in the same Expert call.
-    assert suffix_attention[0, 2:4, 6:8].all()
-    assert suffix_attention[0, 6:8, 2:4].all()
+    assert suffix_attention[0, :2, 2:4].all()
+    assert suffix_attention[0, 2:4, :2].all()
 
     model._run_world_ego_joint_expert(
         None,
@@ -2832,10 +2858,7 @@ def test_shared_point_action_expert_uses_two_bidirectional_domains_with_block_ca
         past_key_values=object(),
     )
     cached_attention = calls[1]["attention_mask"]
-    assert cached_attention.shape == (1, 8, 13)
-    assert cached_attention[0, scene, :5].all()
-    assert cached_attention[0, scene[:, None], 5 + scene].all()
-    assert not cached_attention[0, scene[:, None], 5 + action].any()
+    assert cached_attention.shape == (1, 4, 9)
     assert cached_attention[0, action].all()
 
 
@@ -4089,8 +4112,14 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
         [ego_noise_pose9, torch.randn(2, cfg.chunk_size, 1) * 0.1], dim=-1
     )
     ego_target = matrix_to_pose9(ego_target_h)
-    world_target_h = current.unsqueeze(1) @ ego_target_h
     time = torch.tensor([0.25, 0.75])
+    ego_gripper_target = torch.randn(2, cfg.chunk_size, 1) * 0.1
+    ego_action_target = torch.cat([ego_target, ego_gripper_target], dim=-1)
+    ego_action_x_t = (
+        (1.0 - time[:, None, None]) * ego_noise
+        + time[:, None, None] * ego_action_target
+    )
+    world_target_h = current.unsqueeze(1) @ ego_target_h
     state = model._prepare_worldflow_training_state(
         {
             "current_ee_pose": matrix_to_pose9(current),
@@ -4102,6 +4131,8 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
         time,
         actions_is_pad=None,
         ego_noise=ego_noise,
+        ego_x_t=ego_action_x_t,
+        ego_target=ego_action_target,
     )
 
     ego_x_t = (1.0 - time[:, None, None]) * ego_noise[..., :9] + time[
@@ -4130,10 +4161,15 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
         current.unsqueeze(1) @ pose9_to_matrix(ego_noise[..., :9])
     )
 
-    assert torch.allclose(state["x_t"], expected_x_t, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(state["x_t"][..., :9], expected_x_t, atol=2e-5, rtol=2e-5)
+    assert torch.equal(state["x_t"][..., 9:10], ego_action_x_t[..., 9:10])
     assert torch.allclose(raw_world_noise, expected_x_t - time[:, None, None] * expected_u_t, atol=2e-5, rtol=2e-5)
     assert not torch.allclose(raw_world_noise, projected_world_noise, atol=1e-4, rtol=1e-4)
-    assert torch.allclose(state["u_t"], expected_u_t, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(state["u_t"][..., :9], expected_u_t, atol=2e-5, rtol=2e-5)
+    assert torch.equal(
+        state["u_t"][..., 9:10],
+        ego_action_target[..., 9:10] - ego_noise[..., 9:10],
+    )
     output = model._finalize_worldflow_training_loss(
         state,
         state["u_t"].clone().requires_grad_(True),
@@ -4142,6 +4178,21 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
     )
     assert output["per_sample_loss"].abs().max().item() < 2e-5
     assert model.last_worldflow_metrics["worldflow_flow_rotation6d_rmse"].item() < 1e-7
+
+    gripper_offset_prediction = state["u_t"].clone()
+    gripper_offset_prediction[..., 9] += 0.2
+    gripper_output = model._finalize_worldflow_training_loss(
+        state,
+        gripper_offset_prediction,
+        ego_target,
+        time,
+    )
+    # One erroneous channel among ten: 0.2^2 / 10.
+    assert gripper_output["loss_flow"].item() == pytest.approx(0.004, abs=1e-7)
+    assert model.last_worldflow_metrics["loss_worldflow_gripper"].item() == pytest.approx(
+        0.04,
+        abs=1e-7,
+    )
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():
