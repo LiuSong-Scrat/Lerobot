@@ -245,8 +245,8 @@ eval_checkpoint() {
         --gripper-delta-threshold 0.002 \
         --gripper-delta-alignment current_minus_previous \
         --waypoint-max-hold-steps 1 \
-        --isolated-policy-workers 1 --task-workers 2 \
-        --episode-workers-per-task 14 --task-worker-backend process \
+        --isolated-policy-workers 1 --task-workers 1 \
+        --episode-workers-per-task 28 --task-worker-backend process \
         --inference-batch-size 80 --inference-batching-mode fixed_barrier \
         --no-release-event-exec-enable \
         --control-freq 20 --action-index 0 \
