@@ -623,37 +623,67 @@ branch semantics and remains prohibited.
 
 ## Symmetric PointActionExpert conjugate bridge
 
-The final architecture follows the original point-cloud VLA topology rather
-than adding a second complete Action Expert after the World front-end:
+The formal architecture uses two coordinate-specific but structurally matched
+point front-ends and exactly one joint Action Expert call:
 
 ```text
-Ego point cloud  -> Ego LitePT  -> Ego PointActionAdapter  --\
-                                                           +-> shared PointActionExpert -> Ego/World heads
-World point cloud -> World LitePT -> World PointActionAdapter --/
+Ego XYZRGB -> PointSeg -> Ego foreground/background
+             -> Ego LitePT + Ego PointActionAdapter -> Ego action tokens ----\
+                                                                              +-> one joint
+World XYZRGB (robot-base) -> World foreground/background                      |   PointActionExpert
+             -> World LitePT + World PointActionAdapter -> World action tokens-/       |
+                                                                                 Ego/World heads
 ```
 
-Before the shared `PointActionExpert`, the current flow states produce two
-additional conditioning sequences:
+The original selected foreground and background clouds are both retained.
+Foreground LitePT tokens condition each branch's PointActionAdapter.  The
+foreground and background global features become two scene tokens per branch,
+so the joint Expert receives symmetric `{foreground, background}` sensory
+roles instead of silently dropping World background.
+
+The unchanged flow states also produce two coordinate-alignment encodings:
 
 ```text
-Ego bridge token   = pose9(C B_t C^-1)
-World bridge token = pose9(W_t C^-1)
+Ego common motion   = pose9(C B_t C^-1)
+World common motion = pose9(W_t C^-1)
 ```
 
 They are computed after each branch has retained its own input representation;
-they do not replace `B_t` or `W_t`.  Two zero-initialized full-matrix adapters
-combine the source action token and both conjugated motion tokens into an
-additive token correction for the opposite stream.  They are matrices over
-the complete feature vector, not scalar gates or residual rates.
+they do not replace `B_t` or `W_t`.  One shared zero-initialized full matrix
+projects either pose9 representation into the Expert width and adds it to the
+corresponding point-conditioned action token as a coordinate tag.  It is not
+a scalar gate, residual rate, target conversion, or learned replacement for
+either flow.
 
-Both corrected action sequences then traverse the *same parameter instance*
-of `PointActionExpert`, each with the original checkpoint action length,
-block mask and position layout.  This preserves the Ego function exactly at
-bootstrap while letting the two matrix adapters learn bidirectional exchange.
-The World call masks the Ego point-cloud prefix because its own PointAction
-adapter already supplies robot-base geometry.  There is no independent
-`world_lm_expert`, no extra scene/action token block that perturbs pretrained
-attention normalization, and no post-Expert latent cross-attention.
+The exact Expert input sequence is:
+
+```text
+unchanged pretrained image/language prefix
+-> Ego foreground -> Ego background -> Ego action[0:T]
+-> World foreground -> World background -> World action[0:T]
+```
+
+The pretrained VLM keeps its established internal image/language ordering;
+the formal mode does not append a duplicate copy of the Ego scene globals to
+that prefix.  Every scene token receives both a flow identity embedding
+(`Ego`/`World`) and a shared role embedding (`foreground`/`background`).
+Paired explicit positions are `foreground=0`, `background=1`, and
+`action[t]=2+t` for both flows.  Therefore corresponding roles and time steps
+have the same geometric position while their flow embeddings remain distinct.
+
+The sequence is processed in **one** `PointActionExpert` forward with two
+attention domains. The non-action domain contains image/language plus both
+flows' foreground/background tokens and is globally bidirectional. The action
+domain contains all 64 Ego/World action tokens and is also globally
+bidirectional: it is not causal over trajectory time. Cross-domain visibility
+is block-causal: every action query can read every valid non-action key, while
+non-action queries cannot read action keys. This prevents noisy flow states
+from rewriting perceptual conditioning while still allowing every action token
+to jointly use both coordinate streams and all observations. Separate Ego and
+World output heads consume only their own action slices and preserve the two
+complete targets and losses; scene outputs are conditioning states only. There
+is no independent `world_lm_expert`, no historical pre-Expert linear residual
+bridge, and no post-Expert latent cross-attention.
 
 The formal mode name is
 `point_action_expert_conjugate_bridge`.  Its enforced contract is:
@@ -663,23 +693,50 @@ The formal mode name is
 - `worldflow_world_eef_velocity_mode=base_pose9_euclidean`;
 - robot-base World scene/action semantics and current-EEF Ego semantics;
 - only the VLM is frozen; both LitePT paths, both PointActionAdapters, the
-  shared Action Expert, both heads and the bridge projection are trainable.
+  shared Action Expert, both heads, scene projections and the conjugate
+  coordinate projection are trainable.
 
 The previous proposal-after-Expert interaction remains loadable only for old
 checkpoint compatibility and is no longer the formal successor design.
 
-Two four-GPU one-update smokes distinguished the correct shared-Expert layout:
+The earlier implementation that invoked the same Expert parameter instance
+twice was rejected after code audit: parameter sharing is not token fusion and
+does not permit per-sample layer-wise interaction. Its partial training output
+was stopped and retained.
 
-| layout | Ego translation | Ego rotation | World translation | World rotation |
+Two real four-GPU 10-step smokes then separated an over-complete joint suffix
+from the compact formal layout:
+
+| layout at step 10 | Ego translation | Ego rotation | World translation | World rotation |
 |---|---:|---:|---:|---:|
-| concatenate all scene/bridge/action tokens in one new block (rejected) | 54.38 mm | 4.665 degrees | 225.2 mm | 100.1 degrees |
-| original-length dual calls through one shared Expert + zero-init matrix bridges | 8.143 mm | 0.731 degrees | 245.6 mm | 106.2 degrees |
+| separate Ego/World motion sequences, 132 suffix tokens (rejected) | 45.93 mm | 3.440 degrees | 177.8 mm | 107.5 degrees |
+| four scene + paired Ego/World action tokens, 68 suffix tokens | 37.69 mm | 3.251 degrees | 194.3 mm | 93.3 degrees |
 
-The first layout altered the pretrained attention normalization and positions,
-so it was rejected despite using a shared Expert.  The second preserves the
-Ego bootstrap while leaving World honestly untrained.  After its first update,
-both `ego_to_world_point_action_bridge` and
-`world_to_ego_point_action_bridge` had all `1,555,200` weight elements nonzero;
-the saved checkpoint contained one 145-tensor shared Action Expert and no
-`world_lm_expert` or post-Expert cross-attention tensors.  Artifacts are under
-`SMOKE_world_eef_shared_pointactionexpert_conjugate_bridge_v2_4gpu_b24_1step_20260816`.
+These short runs are execution diagnostics, not convergence or policy evidence.
+The compact run completed multiple DDP updates with no unused parameters. Its
+saved checkpoint has 145 shared-Expert tensors, zero independent-World Expert
+or historical bridge tensors, and all `6480/6480` entries of the initially-zero
+conjugate coordinate matrix changed after ten updates. Artifacts are under
+`SMOKE_world_eef_joint_pointactionexpert_fg_bg_pairedpos_compact_4gpu_b24_10steps_20260816`.
+
+After enforcing the exact Ego-scene/Ego-action/World-scene/World-action order,
+removing the duplicate Ego globals from the VLM prefix, and adding the shared
+foreground/background role embedding, a fresh four-GPU 10-step smoke also
+completed without unused parameters or OOM. The saved role embedding changed
+in all `1440/1440` entries, the conjugate projection changed in all
+`6480/6480` weight entries, and the checkpoint still contains 145 shared-Expert
+tensors with no independent World Expert or historical linear bridge. A real
+cached-inference environment smoke loaded this checkpoint and completed 11
+model calls / 10 environment steps. These artifacts are under
+`SMOKE_world_eef_joint_pointactionexpert_exact_sequence_4gpu_b24_10steps_20260816`
+and
+`SMOKE_world_eef_joint_pointactionexpert_exact_sequence_cached_inference_process_20steps_20260816`.
+
+That exact-sequence run still used one fully bidirectional suffix and is
+superseded by the final two-domain block-causal visibility contract above. A
+third fresh four-GPU 10-step smoke verified the final mask in DDP, and its
+checkpoint completed a real cached-inference environment smoke with 11 model
+calls / 10 environment steps. Final-mask artifacts are under
+`SMOKE_world_eef_joint_pointactionexpert_blockcausal_4gpu_b24_10steps_20260816`
+and
+`SMOKE_world_eef_joint_pointactionexpert_blockcausal_cached_inference_20steps_20260816`.

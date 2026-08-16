@@ -1236,14 +1236,21 @@ def test_world_pose9_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     model.world_action_out_proj = nn.Linear(4, 9)
     model.world_se3_action_out_proj = None
     model.point_action_fusion = nn.Linear(3, 4)
-    model.pointseg_conditioner = SimpleNamespace(foreground_encoder=nn.Linear(6, 3))
+    model.pointseg_conditioner = SimpleNamespace(
+        foreground_encoder=nn.Linear(6, 3),
+        background_encoder=nn.Linear(6, 3),
+        null_background_feat=nn.Parameter(torch.randn(3)),
+    )
     model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_twist_residual_out_proj = None
     model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_scene_role_embedding = nn.Parameter(torch.randn(2, 4))
     model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
     world = SimpleNamespace(
         scene_encoder=nn.Linear(6, 3),
+        background_encoder=nn.Linear(6, 3),
+        null_background_feat=nn.Parameter(torch.randn(3)),
         point_action_adapter=nn.Linear(3, 4),
         action_in_proj=nn.Linear(9, 4),
         action_time_mlp_in=nn.Linear(8, 4),
@@ -1296,14 +1303,21 @@ def test_direct_world_trajectory_bootstrap_keeps_independent_se3_head():
     model.world_action_out_proj = None
     model.world_se3_action_out_proj = nn.Linear(4, 6)
     model.point_action_fusion = nn.Linear(3, 4)
-    model.pointseg_conditioner = SimpleNamespace(foreground_encoder=nn.Linear(6, 3))
+    model.pointseg_conditioner = SimpleNamespace(
+        foreground_encoder=nn.Linear(6, 3),
+        background_encoder=nn.Linear(6, 3),
+        null_background_feat=nn.Parameter(torch.randn(3)),
+    )
     model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_twist_residual_out_proj = None
     model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_scene_role_embedding = nn.Parameter(torch.randn(2, 4))
     model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
     world = SimpleNamespace(
         scene_encoder=nn.Linear(6, 3),
+        background_encoder=nn.Linear(6, 3),
+        null_background_feat=nn.Parameter(torch.randn(3)),
         point_action_adapter=nn.Linear(3, 4),
         action_in_proj=nn.Linear(9, 4),
         action_time_mlp_in=nn.Linear(8, 4),
@@ -2206,6 +2220,54 @@ def test_worldflow_global_scene_keeps_absolute_translation_with_local_action_car
     )
 
 
+def test_worldflow_background_uses_the_same_robot_base_transform_and_validity_mask():
+    cfg = SmolVLAConfig(
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_max_points=8,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    foreground = torch.tensor(
+        [[[0.10, 0.00, 0.02, 1.0, 2.0, 3.0]]],
+        dtype=torch.float32,
+    )
+    background = torch.tensor(
+        [
+            [
+                [-0.12, 0.04, 0.01, 4.0, 5.0, 6.0],
+                [0.50, 0.50, 0.50, 7.0, 8.0, 9.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    background_pad = torch.tensor([[False, True]])
+    model.last_worldflow_payload = {
+        "foreground_pc_ego": foreground,
+        "background_pc_ego": background,
+        "background_point_is_pad_ego": background_pad,
+    }
+    current = se3_exp(torch.tensor([[0.31, -0.22, 0.18, 0.17, -0.08, 0.11]]))
+    current_pose9 = matrix_to_pose9(current)
+
+    transformed, transformed_pad = model._prepare_worldflow_background(current_pose9)
+    expected_input = background.clone()
+    expected_input[:, 1] = 0
+    expected = _ego_point_cloud_to_world(
+        expected_input,
+        current_pose9,
+        frame_origin="global",
+    )
+
+    assert torch.equal(transformed_pad, background_pad)
+    assert torch.allclose(transformed, expected, atol=2e-6, rtol=2e-6)
+    assert torch.equal(transformed[..., 3:], expected_input[..., 3:])
+
+
 def test_worldflow_global_scene_rejects_random_coordinate_reparameterization():
     with pytest.raises(ValueError, match="fixed global scene frame"):
         SmolVLAConfig(
@@ -2623,28 +2685,78 @@ def test_world_ego_joint_attention_preserves_ego_block_and_lets_world_read_ego()
     assert mask[world_action[:, None], world_action].all()
 
 
-def test_shared_point_action_expert_bridge_preserves_ego_layout_and_reuses_one_expert():
+def test_joint_point_action_expert_prefix_does_not_duplicate_ego_scene_tokens():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        vla_adapter_enable=False,
+        worldflow_action_fusion="point_action_expert_conjugate_bridge",
+        encode_robot_state=False,
+    )
+    model.prefix_length = 0
+    model.pointseg_conditioner = None
+    model.point_action_fusion = None
+    model.worldflow_branch = nn.Identity()
+    model.inference_ablation_modalities = frozenset()
+
+    class MeanExtractor(nn.Module):
+        def forward(self, points, _point_is_pad=None):
+            return points.mean(dim=1)
+
+    class LanguageEmbedding(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(16, 4)
+
+        def embed_language_tokens(self, tokens):
+            return self.embedding(tokens)
+
+    model.extractor = MeanExtractor()
+    model.pointcloud_proj = nn.Identity()
+    model.vlm_with_expert = LanguageEmbedding()
+    point_cloud = torch.randn(1, 5, 4)
+    language = torch.tensor([[1, 2, 3]])
+
+    prefix, pad_mask, _ = model.embed_prefix(
+        [point_cloud],
+        [torch.ones(1, dtype=torch.bool)],
+        language,
+        torch.ones_like(language, dtype=torch.bool),
+    )
+
+    assert prefix.shape[1] == language.shape[1]
+    assert pad_mask.shape[1] == language.shape[1]
+    assert model.last_ego_point_prefix_slices == ()
+
+
+def test_shared_point_action_expert_uses_two_bidirectional_domains_with_block_causality():
     cfg = SimpleNamespace(
         chunk_size=2,
         worldflow_action_fusion="point_action_expert_conjugate_bridge",
+        use_cache=True,
     )
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = cfg
     model.conjugate_motion_in_proj = nn.Linear(9, 9)
-    model.ego_to_world_point_action_bridge = nn.Linear(27, 9)
-    model.world_to_ego_point_action_bridge = nn.Linear(27, 9)
+    nn.init.zeros_(model.conjugate_motion_in_proj.weight)
+    nn.init.zeros_(model.conjugate_motion_in_proj.bias)
+    model.ego_scene_to_expert = nn.Identity()
+    model.world_scene_to_expert = nn.Identity()
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.zeros(2, 9))
+    model.world_ego_scene_role_embedding = nn.Parameter(
+        torch.stack([torch.ones(9), torch.full((9,), 2.0)])
+    )
     model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, 9))
-    nn.init.zeros_(model.ego_to_world_point_action_bridge.weight)
-    nn.init.zeros_(model.ego_to_world_point_action_bridge.bias)
-    nn.init.zeros_(model.world_to_ego_point_action_bridge.weight)
-    nn.init.zeros_(model.world_to_ego_point_action_bridge.bias)
     model.inference_ablation_modalities = frozenset()
-    model.last_ego_point_prefix_slices = (slice(1, 3),)
+    model.last_ego_scene_global_tokens = torch.zeros(1, 2, 9)
+    model.last_ego_scene_global_token_mask = torch.ones(1, 2, dtype=torch.bool)
 
     ego_actions = torch.randn(1, 2, 9)
     world_actions = torch.randn(1, 2, 9)
     world = {
+        "scene_global_tokens": torch.zeros(1, 2, 9),
+        "scene_global_mask": torch.ones(1, 2, dtype=torch.bool),
         "action_tokens": world_actions,
         "action_mask": torch.ones(1, 2, dtype=torch.bool),
         "ego_conjugate_motion_pose9": torch.randn(1, 2, 9),
@@ -2653,25 +2765,64 @@ def test_shared_point_action_expert_bridge_preserves_ego_layout_and_reuses_one_e
     }
     calls = []
 
-    def record_shared_expert(
-        _prefix_embs,
-        prefix_pad_masks,
-        _prefix_att_masks,
-        suffix_embs,
-        suffix_pad_masks,
-        suffix_att_masks,
-        *,
-        past_key_values=None,
-    ):
-        del past_key_values
-        calls.append((prefix_pad_masks.clone(), suffix_embs.clone(), suffix_pad_masks, suffix_att_masks))
-        return suffix_embs
+    class RecordingSharedExpert(nn.Module):
+        def forward(self, **kwargs):
+            calls.append(
+                {
+                    "attention_mask": kwargs["attention_mask"].clone(),
+                    "position_ids": kwargs["position_ids"].clone(),
+                    "suffix": kwargs["inputs_embeds"][1].clone(),
+                }
+            )
+            return [None, kwargs["inputs_embeds"][1]], None
 
-    model._run_ego_suffix_expert = record_shared_expert
+    model.vlm_with_expert = RecordingSharedExpert()
     model._bidirectional_world_ego_cross_attention = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("shared PointActionExpert mode must not use post-Expert cross-attention")
     )
     actual_ego, actual_world = model._run_world_ego_joint_expert(
+        torch.randn(1, 5, 9),
+        torch.ones(1, 5, dtype=torch.bool),
+        torch.zeros(1, 5, dtype=torch.bool),
+        ego_actions,
+        torch.ones(1, 2, dtype=torch.bool),
+        world,
+        past_key_values=object(),
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(actual_ego, ego_actions)
+    assert torch.equal(actual_world, world_actions)
+    # Exact order: Ego fore/back, Ego actions, World fore/back, World actions.
+    assert calls[0]["suffix"].shape == (1, 8, 9)
+    assert calls[0]["position_ids"].tolist() == [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8]
+    ]
+    assert torch.equal(calls[0]["suffix"][:, 0], torch.ones(1, 9))
+    assert torch.equal(calls[0]["suffix"][:, 1], torch.full((1, 9), 2.0))
+    assert torch.equal(calls[0]["suffix"][:, 4], torch.ones(1, 9))
+    assert torch.equal(calls[0]["suffix"][:, 5], torch.full((1, 9), 2.0))
+    full_attention = calls[0]["attention_mask"]
+    suffix_attention = full_attention[:, 5:, 5:]
+    scene = torch.tensor([0, 1, 4, 5])
+    action = torch.tensor([2, 3, 6, 7])
+    # All non-action tokens (prefix plus both scene streams) are bidirectional.
+    assert full_attention[0, :5, :5].all()
+    assert full_attention[0, :5, 5 + scene].all()
+    assert full_attention[0, 5 + scene[:, None], :5].all()
+    assert suffix_attention[0, scene[:, None], scene].all()
+    # Non-action queries cannot read noisy action tokens.
+    assert not full_attention[0, :5, 5 + action].any()
+    assert not suffix_attention[0, scene[:, None], action].any()
+    # All 2T action tokens read every non-action and action token.
+    assert full_attention[0, 5 + action[:, None], :5].all()
+    assert suffix_attention[0, action[:, None], scene].all()
+    assert suffix_attention[0, action[:, None], action].all()
+    # Ego and World action outputs can attend each other in the same Expert call.
+    assert suffix_attention[0, 2:4, 6:8].all()
+    assert suffix_attention[0, 6:8, 2:4].all()
+
+    model._run_world_ego_joint_expert(
         None,
         torch.ones(1, 5, dtype=torch.bool),
         None,
@@ -2680,14 +2831,66 @@ def test_shared_point_action_expert_bridge_preserves_ego_layout_and_reuses_one_e
         world,
         past_key_values=object(),
     )
+    cached_attention = calls[1]["attention_mask"]
+    assert cached_attention.shape == (1, 8, 13)
+    assert cached_attention[0, scene, :5].all()
+    assert cached_attention[0, scene[:, None], 5 + scene].all()
+    assert not cached_attention[0, scene[:, None], 5 + action].any()
+    assert cached_attention[0, action].all()
 
-    assert len(calls) == 2
-    assert torch.equal(actual_ego, ego_actions)
-    assert torch.equal(actual_world, world_actions)
-    assert calls[0][0].all()
-    assert not calls[1][0][:, 1:3].any()
-    assert calls[0][1].shape[1] == calls[1][1].shape[1] == cfg.chunk_size
-    assert calls[0][3].tolist() == calls[1][3].tolist() == [[1.0, 0.0]]
+
+def test_shared_point_action_expert_ego_output_has_direct_world_action_gradient():
+    cfg = SimpleNamespace(
+        chunk_size=2,
+        worldflow_action_fusion="point_action_expert_conjugate_bridge",
+        use_cache=True,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.conjugate_motion_in_proj = nn.Linear(9, 9)
+    model.ego_scene_to_expert = nn.Identity()
+    model.world_scene_to_expert = nn.Identity()
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.zeros(2, 9))
+    model.world_ego_scene_role_embedding = nn.Parameter(torch.zeros(2, 9))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, 9))
+    model.inference_ablation_modalities = frozenset()
+    model.last_ego_scene_global_tokens = torch.randn(1, 2, 9)
+    model.last_ego_scene_global_token_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    class MixingSharedExpert(nn.Module):
+        def forward(self, **kwargs):
+            suffix = kwargs["inputs_embeds"][1]
+            # A minimal stand-in for a fully connected self-attention layer.
+            mixed = suffix + suffix.mean(dim=1, keepdim=True)
+            return [None, mixed], None
+
+    model.vlm_with_expert = MixingSharedExpert()
+    ego_actions = torch.randn(1, 2, 9, requires_grad=True)
+    world_actions = torch.randn(1, 2, 9, requires_grad=True)
+    world = {
+        "scene_global_tokens": torch.randn(1, 2, 9),
+        "scene_global_mask": torch.ones(1, 2, dtype=torch.bool),
+        "action_tokens": world_actions,
+        "action_mask": torch.ones(1, 2, dtype=torch.bool),
+        "ego_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "world_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "conjugate_motion_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    ego_out, _ = model._run_world_ego_joint_expert(
+        None,
+        torch.ones(1, 5, dtype=torch.bool),
+        None,
+        ego_actions,
+        torch.ones(1, 2, dtype=torch.bool),
+        world,
+        past_key_values=object(),
+    )
+    ego_out.sum().backward()
+
+    assert world_actions.grad is not None
+    assert torch.count_nonzero(world_actions.grad) == world_actions.numel()
 
 
 def test_world_stream_ablation_preserves_layout_but_masks_world_tokens():
@@ -2824,6 +3027,7 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
     model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
+    model.world_ego_scene_role_embedding = nn.Parameter(torch.randn(2, 4))
     model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
 
     model._apply_worldflow_pretrained_ego_freeze()
@@ -2840,6 +3044,7 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
     ):
         assert all(parameter.requires_grad for parameter in module.parameters())
     assert model.world_ego_scene_type_embedding.requires_grad
+    assert model.world_ego_scene_role_embedding.requires_grad
     assert model.world_ego_action_type_embedding.requires_grad
 
 
