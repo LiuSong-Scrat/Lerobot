@@ -1045,10 +1045,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         "model.world_to_ego_cross_norm.",
                         "model.ego_to_world_cross_attn.",
                         "model.world_to_ego_cross_attn.",
+                        "model.ego_physical_trajectory_in_proj.",
+                        "model.world_physical_trajectory_in_proj.",
                     )
                     new_world_exact = {
                         "model.world_ego_scene_type_embedding",
                         "model.world_ego_action_type_embedding",
+                        "model.physical_trajectory_position_embedding",
                     }
                     residual_prefix = "model.world_twist_residual_out_proj."
                     residual = [
@@ -1171,10 +1174,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "model.world_to_ego_cross_norm.",
                     "model.ego_to_world_cross_attn.",
                     "model.world_to_ego_cross_attn.",
+                    "model.ego_physical_trajectory_in_proj.",
+                    "model.world_physical_trajectory_in_proj.",
                 )
                 new_world_exact = {
                     "model.world_ego_scene_type_embedding",
                     "model.world_ego_action_type_embedding",
+                    "model.physical_trajectory_position_embedding",
                 }
                 residual_prefix = "model.world_twist_residual_out_proj."
                 residual = [
@@ -2485,6 +2491,66 @@ def world_trajectory_to_current_ego_pose9(
     return matrix_to_pose9(invert_transform(current_world) @ world_target)
 
 
+def physically_aligned_world_ego_trajectory_proposals(
+    ego_state: Tensor,
+    ego_velocity: Tensor,
+    world_state: Tensor,
+    world_velocity: Tensor,
+    timestep: Tensor,
+    current_ee_pose_world: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Build complete, coordinate-aligned trajectory proposals for interaction.
+
+    The Ego proposal is expressed in the robot-base frame for the World
+    Expert. The World proposal is expressed in the current EEF frame for the
+    Ego Expert. Both are predicted endpoints computed by multiplying the
+    vector fields by the remaining path length. No endpoint difference is
+    divided by ``1-t`` and neither proposal is executed or averaged here.
+    """
+
+    if ego_state.ndim != 3 or ego_state.shape[-1] < 9:
+        raise ValueError(f"Expected Ego state shape (B,T,D>=9), got {ego_state.shape}.")
+    if ego_velocity.shape != ego_state.shape:
+        raise ValueError(
+            f"Expected Ego velocity shape {ego_state.shape}, got {ego_velocity.shape}."
+        )
+    expected_world_shape = (*ego_state.shape[:2], 9)
+    if world_state.shape != expected_world_shape or world_velocity.shape != (
+        *ego_state.shape[:2],
+        6,
+    ):
+        raise ValueError(
+            "Expected World state/velocity shapes "
+            f"{expected_world_shape}/{(*ego_state.shape[:2], 6)}, got "
+            f"{world_state.shape}/{world_velocity.shape}."
+        )
+    if timestep.shape != (ego_state.shape[0],):
+        raise ValueError(
+            f"Expected timestep shape {(ego_state.shape[0],)}, got {timestep.shape}."
+        )
+    if current_ee_pose_world.shape != (ego_state.shape[0], 9):
+        raise ValueError(
+            "Expected current robot-base EEF pose shape "
+            f"{(ego_state.shape[0], 9)}, got {current_ee_pose_world.shape}."
+        )
+
+    remaining = (1.0 - timestep).clamp_min(1e-4)[:, None, None]
+    ego_endpoint_current = pose9_to_matrix(
+        ego_state[..., :9] + remaining * ego_velocity[..., :9]
+    )
+    world_endpoint_base = se3_left_apply(
+        remaining * world_velocity,
+        pose9_to_matrix(world_state),
+    )
+    current_base = pose9_to_matrix(
+        current_ee_pose_world.to(device=ego_state.device, dtype=torch.float32)
+    ).unsqueeze(1)
+    current_inv = invert_transform(current_base)
+    ego_proposal_base = current_base @ ego_endpoint_current
+    world_proposal_current = current_inv @ world_endpoint_base
+    return matrix_to_pose9(ego_proposal_base), matrix_to_pose9(world_proposal_current)
+
+
 def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
     mask = lang_masks.to(device=lang_emb.device, dtype=torch.bool)
     weights = mask.unsqueeze(-1).to(dtype=lang_emb.dtype)
@@ -2970,6 +3036,22 @@ class VLAFlowMatching(nn.Module):
                 dropout=0.0,
                 batch_first=True,
             )
+            physical_trajectory_interaction = (
+                getattr(self.config, "worldflow_action_fusion", "cross_attention")
+                == "physical_trajectory_cross_attention"
+            )
+            self.ego_physical_trajectory_in_proj = (
+                nn.Linear(9, expert_dim) if physical_trajectory_interaction else None
+            )
+            self.world_physical_trajectory_in_proj = (
+                nn.Linear(9, expert_dim) if physical_trajectory_interaction else None
+            )
+            if physical_trajectory_interaction:
+                self.physical_trajectory_position_embedding = nn.Parameter(
+                    torch.zeros(self.config.chunk_size, expert_dim)
+                )
+            else:
+                self.register_parameter("physical_trajectory_position_embedding", None)
             # Function-preserving expansion: this full matrix starts at zero
             # and learns immediately. It is not a scalar gate, and neither
             # coordinate stream is frozen.
@@ -2986,8 +3068,11 @@ class VLAFlowMatching(nn.Module):
             self.world_to_ego_cross_norm = None
             self.ego_to_world_cross_attn = None
             self.world_to_ego_cross_attn = None
+            self.ego_physical_trajectory_in_proj = None
+            self.world_physical_trajectory_in_proj = None
             self.register_parameter("world_ego_scene_type_embedding", None)
             self.register_parameter("world_ego_action_type_embedding", None)
+            self.register_parameter("physical_trajectory_position_embedding", None)
 
         self.set_requires_grad()
         self._apply_worldflow_pretrained_ego_freeze()
@@ -3060,6 +3145,21 @@ class VLAFlowMatching(nn.Module):
         if current_pose_proj is not None:
             current_pose_proj.load_state_dict(world.action_in_proj.state_dict(), strict=True)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
+        ego_physical_projection = getattr(self, "ego_physical_trajectory_in_proj", None)
+        world_physical_projection = getattr(self, "world_physical_trajectory_in_proj", None)
+        if ego_physical_projection is not None:
+            if world_physical_projection is None:
+                raise RuntimeError("Physical trajectory interaction encoders are incomplete.")
+            ego_pose_weight = self.action_in_proj.weight[:, :9]
+            for physical_projection in (
+                ego_physical_projection,
+                world_physical_projection,
+            ):
+                physical_projection.weight.copy_(ego_pose_weight)
+                physical_projection.bias.copy_(self.action_in_proj.bias)
+            if getattr(self, "physical_trajectory_position_embedding", None) is None:
+                raise RuntimeError("Physical trajectory position embedding is missing.")
+            self.physical_trajectory_position_embedding.zero_()
         world_lm_expert = getattr(self, "world_lm_expert", None)
         if world_lm_expert is not None:
             world_lm_expert.load_state_dict(
@@ -3114,6 +3214,9 @@ class VLAFlowMatching(nn.Module):
                 else "copied_legacy_pose9"
             ),
             "bidirectional_cross_attention_zero_output_init": True,
+            "physical_trajectory_interaction": bool(
+                ego_physical_projection is not None
+            ),
         }
 
     def _rtc_enabled(self):
@@ -3152,10 +3255,13 @@ class VLAFlowMatching(nn.Module):
             "world_to_ego_cross_norm.",
             "ego_to_world_cross_attn.",
             "world_to_ego_cross_attn.",
+            "ego_physical_trajectory_in_proj.",
+            "world_physical_trajectory_in_proj.",
         )
         world_exact = {
             "world_ego_scene_type_embedding",
             "world_ego_action_type_embedding",
+            "physical_trajectory_position_embedding",
         }
         trainable_world_parameters = 0
         frozen_ego_parameters = 0
@@ -4591,6 +4697,93 @@ class VLAFlowMatching(nn.Module):
         )
         return ego_out + ego_delta, world_out
 
+    def _physical_trajectory_cross_attention(
+        self,
+        ego_out: Tensor,
+        world_out: Tensor,
+        ego_state: Tensor,
+        world_state: Tensor,
+        timestep: Tensor,
+        current_ee_pose_world: Tensor,
+        ego_mask: Tensor,
+        world_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Interact only after both experts form complete physical proposals."""
+
+        modules = (
+            self.ego_physical_trajectory_in_proj,
+            self.world_physical_trajectory_in_proj,
+            self.ego_to_world_cross_norm,
+            self.world_to_ego_cross_norm,
+            self.ego_to_world_cross_attn,
+            self.world_to_ego_cross_attn,
+        )
+        if any(module is None for module in modules):
+            raise RuntimeError("Physical World/Ego trajectory interaction is not initialized.")
+        if self.physical_trajectory_position_embedding is None:
+            raise RuntimeError("Physical trajectory position embedding is not initialized.")
+
+        preliminary_ego_velocity = self.action_out_proj(ego_out)
+        preliminary_world_velocity = self._predict_world_se3_velocity(
+            world_out,
+            world_state,
+            timestep,
+        )
+        ego_proposal_base, world_proposal_current = (
+            physically_aligned_world_ego_trajectory_proposals(
+                ego_state,
+                preliminary_ego_velocity,
+                world_state,
+                preliminary_world_velocity,
+                timestep,
+                current_ee_pose_world,
+            )
+        )
+        position = self.physical_trajectory_position_embedding.unsqueeze(0).to(
+            device=ego_out.device,
+            dtype=ego_out.dtype,
+        )
+        ego_physical_tokens = self.ego_physical_trajectory_in_proj(
+            ego_proposal_base.to(dtype=ego_out.dtype)
+        )
+        world_physical_tokens = self.world_physical_trajectory_in_proj(
+            world_proposal_current.to(dtype=world_out.dtype)
+        )
+        ego_physical_tokens = (
+            ego_physical_tokens
+            + position
+            + self.world_ego_action_type_embedding[0]
+        )
+        world_physical_tokens = (
+            world_physical_tokens
+            + position
+            + self.world_ego_action_type_embedding[1]
+        )
+
+        ego_valid = ego_mask.to(device=ego_out.device, dtype=torch.bool)
+        world_valid = world_mask.to(device=world_out.device, dtype=torch.bool)
+        ego_query = self.ego_to_world_cross_norm(ego_out)
+        world_query = self.world_to_ego_cross_norm(world_out)
+        ego_physical_tokens = self.ego_to_world_cross_norm(ego_physical_tokens)
+        world_physical_tokens = self.world_to_ego_cross_norm(world_physical_tokens)
+        world_delta, _ = self.ego_to_world_cross_attn(
+            query=world_query,
+            key=ego_physical_tokens,
+            value=ego_physical_tokens,
+            key_padding_mask=~ego_valid,
+            need_weights=False,
+        )
+        if "world_to_ego" in getattr(self, "inference_ablation_modalities", frozenset()):
+            return ego_out, world_out + world_delta
+        ego_delta, _ = self.world_to_ego_cross_attn(
+            query=ego_query,
+            key=world_physical_tokens,
+            value=world_physical_tokens,
+            key_padding_mask=~world_valid,
+            need_weights=False,
+        )
+        return ego_out + ego_delta, world_out + world_delta
+
     def _build_independent_world_suffix(
         self,
         world_tokens: dict[str, Tensor],
@@ -4781,6 +4974,11 @@ class VLAFlowMatching(nn.Module):
                 world_tokens,
                 past_key_values=past_key_values,
             )
+            if (
+                getattr(self.config, "worldflow_action_fusion", "cross_attention")
+                == "physical_trajectory_cross_attention"
+            ):
+                return ego_out, world_out
             return self._bidirectional_world_ego_cross_attention(
                 ego_out,
                 world_out,
@@ -5038,6 +5236,7 @@ class VLAFlowMatching(nn.Module):
         state = {
             "point_cloud_world": point_cloud_world,
             "point_is_pad": point_is_pad,
+            "current_pose9": current_pose,
             "current": current,
             "current_inv": current_inv,
             "spatial_gt": spatial_gt,
@@ -5724,8 +5923,6 @@ class VLAFlowMatching(nn.Module):
                 suffix_pad_masks,
                 world_tokens,
             )
-            joint_v_t = self.action_out_proj(ego_expert_out)
-            v_t = joint_v_t
             independent_world_trajectory = (
                 getattr(self.config, "worldflow_target_type", "legacy_eef")
                 == "world_eef_trajectory"
@@ -5734,12 +5931,35 @@ class VLAFlowMatching(nn.Module):
                 world_x_t = world_state.get("x_t")
                 if not torch.is_tensor(world_x_t):
                     raise TypeError("World-EEF trajectory state is missing tensor x_t.")
+                if (
+                    self.config.worldflow_action_fusion
+                    == "physical_trajectory_cross_attention"
+                ):
+                    current_pose9 = world_state.get("current_pose9")
+                    if not torch.is_tensor(current_pose9):
+                        raise TypeError(
+                            "Physical trajectory interaction requires the current robot-base EEF pose."
+                        )
+                    ego_expert_out, world_expert_out = (
+                        self._physical_trajectory_cross_attention(
+                            ego_expert_out,
+                            world_expert_out,
+                            x_t,
+                            world_x_t,
+                            time,
+                            current_pose9,
+                            suffix_pad_masks,
+                            world_tokens["action_mask"],
+                        )
+                    )
+                v_t = self.action_out_proj(ego_expert_out)
                 world_velocity = self._predict_world_se3_velocity(
                     world_expert_out,
                     world_x_t,
                     time,
                 )
             else:
+                v_t = self.action_out_proj(ego_expert_out)
                 if self.world_action_out_proj is None:
                     raise RuntimeError("WorldFlow pose9 output projection is not initialized.")
                 world_velocity = self.world_action_out_proj(world_expert_out)
@@ -6131,6 +6351,22 @@ class VLAFlowMatching(nn.Module):
             world_tokens,
             past_key_values=past_key_values,
         )
+        if self.config.worldflow_action_fusion == "physical_trajectory_cross_attention":
+            if ego_to_world_transform is None:
+                raise RuntimeError(
+                    "Physical trajectory interaction requires the current EEF carrier."
+                )
+            current_pose9 = matrix_to_pose9(ego_to_world_transform.squeeze(1))
+            ego_out, world_out = self._physical_trajectory_cross_attention(
+                ego_out,
+                world_out,
+                ego_x_t,
+                world_x_t,
+                timestep,
+                current_pose9,
+                ego_mask,
+                world_action_mask,
+            )
         if self.config.se3_enable:
             joint_prediction = self._predict_ego_se3_velocity(
                 ego_out,

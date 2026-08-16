@@ -198,3 +198,40 @@ diagnostic loads the same immutable checkpoint with
 `--worldflow-action-fusion-override cross_attention`. This changes only the
 final execution route back to the jointly conditioned Ego trajectory; it is
 recorded as a non-benchmark diagnostic and never edits the checkpoint files.
+
+That diagnostic was hard-stopped at task 6 with `37/42` and five failures. Its
+best possible final score was only `45/50`, below the `46/50` baseline, so task
+8 was not run. It proves the direct-World `0/28` result was caused by the final
+execution route rather than a corrupt checkpoint, but it also rejects the old
+unconstrained final-latent World-to-Ego attention.
+
+## Physical trajectory interaction
+
+`physical_trajectory_cross_attention` replaces both rejected paths. At every
+flow step, the two Action Experts first run independently and decode their own
+complete endpoint proposals. Without dividing by the remaining path length:
+
+```text
+Ego endpoint in current EEF  -> T_base_current @ T_current_Ego_endpoint
+World endpoint in robot base -> inverse(T_base_current) @ T_base_World_endpoint
+```
+
+Thus World attends to Ego's complete proposal in robot-base coordinates, while
+Ego attends to World's complete proposal in current-EEF coordinates. Only
+these physically aligned pose9 trajectory tokens enter the bidirectional
+attention. The original raw World/Ego hidden-state attention is bypassed.
+
+The interacted Ego hidden sequence is decoded by the unchanged pretrained Ego
+action head; the World sequence is decoded by its independent SE(3) head. Both
+attention output matrices start at zero, so bootstrap exactly preserves both
+independent predictors, then learns a full token-to-token interaction. This is
+not endpoint residual correction, residual rate, a scalar gate, trajectory
+averaging, or direct World execution.
+
+A real four-GPU one-step training smoke completed with batch 24 per rank and
+six workers per rank, saved and reloaded its checkpoint, and completed one
+online model call. After the first optimizer update, both physical interaction
+attention output matrices were nonzero, while the frozen pretrained Ego action
+head remained byte-identical to the baseline (`max_abs_diff=0.0`). The smoke
+artifacts are under `SMOKE_world_eef_physicaltraj_1step_20260816` and
+`SMOKE_EVAL_world_eef_physicaltraj_1step_20260816`.

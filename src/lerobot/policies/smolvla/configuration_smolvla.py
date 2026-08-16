@@ -777,10 +777,12 @@ class SmolVLAConfig(PreTrainedConfig):
                     world_trajectory_contract_errors.append("worldflow_noise_coupling='independent'")
                 if self.worldflow_action_fusion not in {
                     "cross_attention",
+                    "physical_trajectory_cross_attention",
                     "world_trajectory_arm_ego_gripper",
                 }:
                     world_trajectory_contract_errors.append(
-                        "worldflow_action_fusion='cross_attention' or "
+                        "worldflow_action_fusion='cross_attention', "
+                        "'physical_trajectory_cross_attention', or "
                         "'world_trajectory_arm_ego_gripper'"
                     )
                 if self.worldflow_bridge_loss_weight != 0:
@@ -891,6 +893,7 @@ class SmolVLAConfig(PreTrainedConfig):
                 "conjugate_residual_boosting",
                 "endpoint_geodesic_consensus",
                 "endpoint_residual_boosting",
+                "physical_trajectory_cross_attention",
                 "world_trajectory_arm_ego_gripper",
             }:
                 raise ValueError(
@@ -898,6 +901,7 @@ class SmolVLAConfig(PreTrainedConfig):
                     "'conjugate_residual', 'conjugate_residual_consensus', or "
                     "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
                     "'endpoint_residual_boosting', or "
+                    "'physical_trajectory_cross_attention', or "
                     "'world_trajectory_arm_ego_gripper'; "
                     f"got {self.worldflow_action_fusion!r}."
                 )
@@ -924,6 +928,23 @@ class SmolVLAConfig(PreTrainedConfig):
                     raise ValueError(
                         "world_trajectory_arm_ego_gripper requires the physical execution contract: "
                         + ", ".join(execution_contract_errors)
+                        + "."
+                    )
+            if self.worldflow_action_fusion == "physical_trajectory_cross_attention":
+                interaction_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    interaction_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    interaction_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    interaction_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.se3_enable:
+                    interaction_contract_errors.append("se3_enable=False")
+                if interaction_contract_errors:
+                    raise ValueError(
+                        "physical_trajectory_cross_attention requires independent complete "
+                        "World/Ego trajectories in aligned physical frames: "
+                        + ", ".join(interaction_contract_errors)
                         + "."
                     )
             if (

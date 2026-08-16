@@ -28,8 +28,10 @@ if [[ "$action_expert_mode" != shared && "$action_expert_mode" != independent ]]
     echo "WORLD_EEF_ACTION_EXPERT_MODE must be shared or independent" >&2
     exit 2
 fi
-if [[ "$action_fusion" != cross_attention && "$action_fusion" != world_trajectory_arm_ego_gripper ]]; then
-    echo "WORLD_EEF_ACTION_FUSION must be cross_attention or world_trajectory_arm_ego_gripper" >&2
+if [[ "$action_fusion" != cross_attention \
+    && "$action_fusion" != physical_trajectory_cross_attention \
+    && "$action_fusion" != world_trajectory_arm_ego_gripper ]]; then
+    echo "WORLD_EEF_ACTION_FUSION must be cross_attention, physical_trajectory_cross_attention, or world_trajectory_arm_ego_gripper" >&2
     exit 2
 fi
 if [[ "$current_pose_token" != true && "$current_pose_token" != false ]]; then

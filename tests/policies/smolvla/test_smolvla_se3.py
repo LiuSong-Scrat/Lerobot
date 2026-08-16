@@ -19,6 +19,7 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     VLAFlowMatching,
     WorldFlowActionBranch,
     body_twist_to_pose9_velocity,
+    physically_aligned_world_ego_trajectory_proposals,
     make_att_2d_masks,
     matrix_to_pose9,
     pose9_endpoint_velocity_to_spatial_twist,
@@ -1922,6 +1923,39 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     )
     assert execution_cfg.worldflow_current_ee_pose_token
 
+    physical_interaction_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="physical_trajectory_cross_attention",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert (
+        physical_interaction_cfg.worldflow_action_fusion
+        == "physical_trajectory_cross_attention"
+    )
+
+    with pytest.raises(ValueError, match="aligned physical frames"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_target_type="world_eef_trajectory",
+            worldflow_reference_frame="robot_base",
+            worldflow_frame_origin="global",
+            worldflow_scene_frame_origin="global",
+            worldflow_noise_coupling="independent",
+            worldflow_action_fusion="physical_trajectory_cross_attention",
+            worldflow_action_expert_mode="independent",
+            worldflow_current_ee_pose_token=False,
+            worldflow_bridge_loss_weight=0.0,
+            worldflow_equiv_loss_weight=0.0,
+        )
+
     with pytest.raises(ValueError, match="physical execution contract"):
         SmolVLAConfig(
             worldflow_enable=True,
@@ -2601,6 +2635,93 @@ def test_world_trajectory_execution_is_left_coordinate_change_not_conjugation():
     )
 
     assert torch.allclose(pose9_to_matrix(actual), relative, atol=3e-5, rtol=3e-5)
+
+
+def test_physical_trajectory_proposals_align_complete_predictions_without_residual_rate():
+    current_base = se3_exp(torch.tensor([[0.20, -0.10, 0.30, 0.0, 0.0, 0.35]]))
+    target_current = se3_exp(
+        torch.tensor(
+            [[[0.04, 0.01, -0.02, 0.03, -0.04, 0.02], [0.08, -0.03, 0.01, 0.0, 0.02, -0.05]]]
+        )
+    )
+    target_base = current_base.unsqueeze(1) @ target_current
+    timestep = torch.tensor([0.4])
+    remaining = 1.0 - timestep[:, None, None]
+
+    ego_target_pose9 = matrix_to_pose9(target_current)
+    ego_state = torch.zeros(1, 2, 10)
+    ego_state[..., :9] = ego_target_pose9 - 0.2
+    ego_velocity = torch.zeros(1, 2, 10)
+    ego_velocity[..., :9] = (ego_target_pose9 - ego_state[..., :9]) / remaining
+    world_state_matrix = se3_exp(
+        torch.tensor(
+            [[[0.01, -0.02, 0.03, 0.01, 0.02, -0.01], [0.03, 0.01, 0.02, -0.02, 0.01, 0.03]]]
+        )
+    )
+    world_state = matrix_to_pose9(world_state_matrix)
+    world_velocity = se3_log(target_base @ torch.linalg.inv(world_state_matrix)) / remaining
+
+    ego_proposal_base, world_proposal_current = (
+        physically_aligned_world_ego_trajectory_proposals(
+            ego_state,
+            ego_velocity,
+            world_state,
+            world_velocity,
+            timestep,
+            matrix_to_pose9(current_base),
+        )
+    )
+
+    assert torch.allclose(pose9_to_matrix(ego_proposal_base), target_base, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(
+        pose9_to_matrix(world_proposal_current),
+        target_current,
+        atol=4e-5,
+        rtol=4e-5,
+    )
+
+
+def test_physical_trajectory_cross_attention_zero_output_preserves_both_experts():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(worldflow_target_type="world_eef_trajectory")
+    hidden_dim = 8
+    model.action_out_proj = nn.Linear(hidden_dim, 10)
+    model.world_se3_action_out_proj = nn.Linear(hidden_dim, 6)
+    model.ego_physical_trajectory_in_proj = nn.Linear(9, hidden_dim)
+    model.world_physical_trajectory_in_proj = nn.Linear(9, hidden_dim)
+    model.physical_trajectory_position_embedding = nn.Parameter(torch.zeros(3, hidden_dim))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, hidden_dim))
+    model.ego_to_world_cross_norm = nn.LayerNorm(hidden_dim)
+    model.world_to_ego_cross_norm = nn.LayerNorm(hidden_dim)
+    model.ego_to_world_cross_attn = nn.MultiheadAttention(hidden_dim, 2, batch_first=True)
+    model.world_to_ego_cross_attn = nn.MultiheadAttention(hidden_dim, 2, batch_first=True)
+    for attention in (model.ego_to_world_cross_attn, model.world_to_ego_cross_attn):
+        nn.init.zeros_(attention.out_proj.weight)
+        nn.init.zeros_(attention.out_proj.bias)
+    model.inference_ablation_modalities = frozenset()
+
+    ego_out = torch.randn(2, 3, hidden_dim)
+    world_out = torch.randn(2, 3, hidden_dim)
+    ego_state = torch.randn(2, 3, 10) * 0.1
+    ego_state[..., 3] = 1.0
+    ego_state[..., 7] = 1.0
+    world_state = matrix_to_pose9(se3_exp(torch.randn(2, 3, 6) * 0.1))
+    valid = torch.ones(2, 3, dtype=torch.bool)
+
+    actual_ego, actual_world = model._physical_trajectory_cross_attention(
+        ego_out,
+        world_out,
+        ego_state,
+        world_state,
+        torch.tensor([0.2, 0.7]),
+        matrix_to_pose9(se3_exp(torch.randn(2, 6) * 0.1)),
+        valid,
+        valid,
+    )
+
+    assert torch.equal(actual_ego, ego_out)
+    assert torch.equal(actual_world, world_out)
 
 
 def test_worldflow_protected_ego_config_requires_worldflow_and_no_nominal_ego_lr():
