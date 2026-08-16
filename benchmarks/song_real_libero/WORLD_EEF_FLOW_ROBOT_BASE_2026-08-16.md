@@ -235,3 +235,40 @@ attention output matrices were nonzero, while the frozen pretrained Ego action
 head remained byte-identical to the baseline (`max_abs_diff=0.0`). The smoke
 artifacts are under `SMOKE_world_eef_physicaltraj_1step_20260816` and
 `SMOKE_EVAL_world_eef_physicaltraj_1step_20260816`.
+
+## Focused physical-interaction result
+
+The formal run declared the same 1564-step schedule as the preceding controls,
+saved steps `260/520/780/1040/1300`, and was interrupted only after the complete
+step-1300 checkpoint was durable (the training process reached step 1303 while
+the checkpoint was being written). The output is:
+
+```text
+/opt/data/private/liusong/benchmarks/song_real_libero/outputs/
+world_eef_task6_task8_100ep_physicaltraj_4gpu_b24_schedule1564_stop1300
+```
+
+Every checkpoint used the fixed task6/task8 seeds and 28 same-task episode
+workers. A checkpoint had to strictly exceed task 6 baseline `46/50` before
+task 8 was run, and task 8 then had to strictly exceed `45/50`.
+
+| step | task 6 | task 8 | outcome |
+|---:|---:|---:|---|
+| 260 | 39/43 at 4-failure stop | not run | cannot exceed baseline |
+| 520 | 48/50 | 45/50 | `+2 / +0`, total `93/100`; not qualified |
+| 780 | 44/50 | not run | below baseline |
+| 1040 | 41/45 at 4-failure stop | not run | cannot exceed baseline |
+| 1300 | 45/50 | not run | below baseline |
+
+Step 520 is causal evidence that physically aligned World interaction can help,
+but not stable evidence of a two-task improvement. Against baseline failures
+task6 `{2,26,36,43}` and task8 `{7,20,23,30,34}`, step 520 repaired every one
+of those episodes. It introduced new task6 failures `{3,23}` and new task8
+failures `{13,15,17,36,38}`. World therefore changes decisions in a useful but
+still non-robust way rather than merely reproducing the frozen Ego policy.
+
+Performance was not monotonic after step 520, so extending the same run to step
+1564 cannot be justified as a convergence continuation. No learning-rate,
+gradient, residual-rate, gate, or task-specific patch is applied. Under the
+focused-goal stop rule, this experiment is stopped without advancing to
+multi-view or all-suite evaluation.
