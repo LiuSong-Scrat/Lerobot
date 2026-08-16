@@ -32,6 +32,7 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     so3_exp,
     so3_log,
     transform_se3_twist,
+    world_trajectory_to_current_ego_pose9,
     _ego_point_cloud_to_world,
 )
 
@@ -1906,6 +1907,36 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     )
     assert "worldflow_action_expert=independent" in independent_cfg.flow_contract_summary()
 
+    execution_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="world_trajectory_arm_ego_gripper",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert execution_cfg.worldflow_current_ee_pose_token
+
+    with pytest.raises(ValueError, match="physical execution contract"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_target_type="world_eef_trajectory",
+            worldflow_reference_frame="robot_base",
+            worldflow_frame_origin="global",
+            worldflow_scene_frame_origin="global",
+            worldflow_noise_coupling="independent",
+            worldflow_action_fusion="world_trajectory_arm_ego_gripper",
+            worldflow_action_expert_mode="independent",
+            worldflow_current_ee_pose_token=False,
+            worldflow_bridge_loss_weight=0.0,
+            worldflow_equiv_loss_weight=0.0,
+        )
+
     with pytest.raises(ValueError, match="worldflow_action_expert_mode"):
         SmolVLAConfig(
             worldflow_enable=True,
@@ -2521,6 +2552,55 @@ def test_independent_world_suffix_contains_scenes_and_only_world_actions():
     assert torch.equal(suffix[:, -3:], world_actions)
     assert valid.tolist() == [[True, True, True, True, True]]
     assert blocks.tolist() == [[1, 0, 1, 0, 0]]
+
+
+def test_independent_world_suffix_prepends_current_robot_base_eef_token():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(chunk_size=2, worldflow_current_ee_pose_token=True)
+    model.ego_scene_to_expert = nn.Linear(2, 4, bias=False)
+    model.world_scene_to_expert = nn.Linear(2, 4, bias=False)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.zeros(2, 4))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, 4))
+    model.last_ego_scene_global_feat = torch.tensor([[1.0, 2.0]])
+    model.last_ego_scene_global_mask = torch.tensor([True])
+    model.inference_ablation_modalities = frozenset()
+    current_token = torch.tensor([[[9.0, 8.0, 7.0, 6.0]]])
+    world_actions = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+
+    suffix, valid, blocks = model._build_independent_world_suffix(
+        {
+            "current_ee_pose_token": current_token,
+            "current_ee_pose_mask": torch.ones(1, 1, dtype=torch.bool),
+            "global_feat": torch.tensor([[3.0, 4.0]]),
+            "scene_mask": torch.tensor([[True, True]]),
+            "action_tokens": world_actions,
+            "action_mask": torch.ones(1, 2, dtype=torch.bool),
+        }
+    )
+
+    assert suffix.shape == (1, 5, 4)
+    assert torch.equal(suffix[:, :1], current_token)
+    assert torch.equal(suffix[:, -2:], world_actions)
+    assert valid.tolist() == [[True, True, True, True, True]]
+    assert blocks.tolist() == [[1, 0, 0, 1, 0]]
+
+
+def test_world_trajectory_execution_is_left_coordinate_change_not_conjugation():
+    current = se3_exp(torch.tensor([[0.20, -0.10, 0.30, 0.0, 0.0, 0.35]]))
+    relative = se3_exp(
+        torch.tensor(
+            [[[0.04, 0.01, -0.02, 0.03, -0.04, 0.02], [0.08, -0.03, 0.01, 0.0, 0.02, -0.05]]]
+        )
+    )
+    absolute = current.unsqueeze(1) @ relative
+
+    actual = world_trajectory_to_current_ego_pose9(
+        matrix_to_pose9(absolute),
+        matrix_to_pose9(current),
+    )
+
+    assert torch.allclose(pose9_to_matrix(actual), relative, atol=3e-5, rtol=3e-5)
 
 
 def test_worldflow_protected_ego_config_requires_worldflow_and_no_nominal_ego_lr():

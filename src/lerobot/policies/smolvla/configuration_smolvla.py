@@ -413,6 +413,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # objectives.  Ego and World exchange information only through the explicit
     # bidirectional cross-attention path after their respective experts.
     worldflow_action_expert_mode: str = "shared"
+    # A robot-base trajectory is not Markov without the achieved current EEF
+    # pose: after the foreground cloud is mapped out of the current-EEF frame,
+    # that pose can no longer be recovered from foreground geometry alone.
+    # New World-trajectory models expose it as an explicit World Expert token.
+    # Disabled by default so historical WorldFlow checkpoints remain loadable.
+    worldflow_current_ee_pose_token: bool = False
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -769,8 +775,14 @@ class SmolVLAConfig(PreTrainedConfig):
                     world_trajectory_contract_errors.append("worldflow_frame_origin='global'")
                 if self.worldflow_noise_coupling != "independent":
                     world_trajectory_contract_errors.append("worldflow_noise_coupling='independent'")
-                if self.worldflow_action_fusion != "cross_attention":
-                    world_trajectory_contract_errors.append("worldflow_action_fusion='cross_attention'")
+                if self.worldflow_action_fusion not in {
+                    "cross_attention",
+                    "world_trajectory_arm_ego_gripper",
+                }:
+                    world_trajectory_contract_errors.append(
+                        "worldflow_action_fusion='cross_attention' or "
+                        "'world_trajectory_arm_ego_gripper'"
+                    )
                 if self.worldflow_bridge_loss_weight != 0:
                     world_trajectory_contract_errors.append("worldflow_bridge_loss_weight=0")
                 if self.worldflow_equiv_loss_weight != 0:
@@ -879,14 +891,41 @@ class SmolVLAConfig(PreTrainedConfig):
                 "conjugate_residual_boosting",
                 "endpoint_geodesic_consensus",
                 "endpoint_residual_boosting",
+                "world_trajectory_arm_ego_gripper",
             }:
                 raise ValueError(
                     "worldflow_action_fusion must be 'cross_attention', 'symmetric_twist', "
                     "'conjugate_residual', 'conjugate_residual_consensus', or "
                     "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
-                    "'endpoint_residual_boosting'; "
+                    "'endpoint_residual_boosting', or "
+                    "'world_trajectory_arm_ego_gripper'; "
                     f"got {self.worldflow_action_fusion!r}."
                 )
+            if self.worldflow_current_ee_pose_token and (
+                self.worldflow_target_type != "world_eef_trajectory"
+                or self.worldflow_action_expert_mode != "independent"
+            ):
+                raise ValueError(
+                    "worldflow_current_ee_pose_token=True requires "
+                    "worldflow_target_type='world_eef_trajectory' and "
+                    "worldflow_action_expert_mode='independent'."
+                )
+            if self.worldflow_action_fusion == "world_trajectory_arm_ego_gripper":
+                execution_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    execution_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    execution_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    execution_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.se3_enable:
+                    execution_contract_errors.append("se3_enable=False")
+                if execution_contract_errors:
+                    raise ValueError(
+                        "world_trajectory_arm_ego_gripper requires the physical execution contract: "
+                        + ", ".join(execution_contract_errors)
+                        + "."
+                    )
             if (
                 self.worldflow_endpoint_residual_rate_parameterization
                 and self.worldflow_action_fusion != "endpoint_residual_boosting"
@@ -1160,7 +1199,9 @@ class SmolVLAConfig(PreTrainedConfig):
                 f",worldflow={self.worldflow_noise_coupling},"
                 f"worldflow_targets={target_contract},"
                 f"worldflow_reference={self.worldflow_reference_frame},"
-                f"worldflow_action_expert={self.worldflow_action_expert_mode}"
+                f"worldflow_action_expert={self.worldflow_action_expert_mode},"
+                f"worldflow_action_fusion={self.worldflow_action_fusion},"
+                f"worldflow_current_pose_token={self.worldflow_current_ee_pose_token}"
             )
         else:
             world = ",worldflow=disabled"

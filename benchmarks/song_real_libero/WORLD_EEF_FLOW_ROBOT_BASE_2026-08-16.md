@@ -94,6 +94,57 @@ benefit. Extending training past step 1564 made performance worse, so further
 step-count or learning-rate tuning is not justified. The next experiment must
 change the shared Action Expert bottleneck itself.
 
+## Independent Action Expert result
+
+The corrected independent-Expert run used the same 100 demonstrations, fixed
+evaluation seeds, protected pretrained Ego weights, and the original 1564-step
+schedule. Every pretrained Ego tensor remained byte-identical. The hard-gated
+results were:
+
+| step | task 6 | task 8 | outcome |
+|---:|---:|---:|---|
+| 260 | 44/50 | not run | below `46/50` baseline |
+| 520 | 44/50 | not run | below baseline |
+| 780 | 47/50 | 45/50 | `+1 / +0`, total `92/100` |
+| 1040 | 46/50 | not run | equals baseline |
+| 1300 | 40/44 at hard stop | not run | cannot exceed baseline |
+| 1564 | 42/46 at hard stop | not run | cannot exceed baseline |
+
+This removes the shared-Expert bottleneck but still does not establish a
+stable WorldFlow gain. Paired failures show both genuine repairs and new
+regressions. At step 780, task 6 repairs baseline episodes `2/36/43` but adds
+`23/25`; task 8 repairs `7/20/23/34`, retains `30`, and adds
+`11/13/26/37`. Thus World information changes behavior, but the historical
+final-latent World-to-Ego attention trades one failure set for another.
+
+Two structural causes remain:
+
+1. After the current-EEF foreground cloud is transformed into robot-base
+   coordinates, the achieved current EEF pose is discarded as a model
+   condition. The same nearly static foreground and instruction can then map
+   to different future EEF trajectories at different rollout phases. The
+   final training diagnostic (about `6.1 cm` translation error) confirms that
+   this under-conditioned World branch is not an execution-quality trajectory
+   predictor.
+2. A final hidden-state attention update has no coordinate semantics. It asks
+   the frozen Ego pose9 head to interpret an unconstrained World latent instead
+   of converting the complete World trajectory into the controller's current
+   EEF frame.
+
+The next physical-execution contract therefore adds an explicit
+`worldflow.current_ee_pose` robot-base token to the independent World Expert.
+For arm execution it uses the independently predicted absolute trajectory via
+
+```text
+T_current_EEF_target = inverse(T_base_current_EEF) @ T_base_target_EEF
+```
+
+and retains Ego's gripper trajectory. Ego-to-World and World-to-Ego token
+attention remain available for interaction, but the arm output is no longer
+an unaligned latent perturbation. The equation is a left coordinate change,
+not global-origin conjugation, endpoint residual, residual rate, learned gate,
+or trajectory average.
+
 ## Dataset sidecars
 
 - `world_base_ee_poses/episode_XXXXXX.npy`: achieved current EEF pose in

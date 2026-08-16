@@ -10,6 +10,10 @@ training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_rea
 experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816}
 freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
 action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
+action_fusion=${WORLD_EEF_ACTION_FUSION:-cross_attention}
+current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-false}
+worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-0.02}
+worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-0.002}
 train_steps=${WORLD_EEF_TRAIN_STEPS:-1300}
 save_steps=${WORLD_EEF_SAVE_STEPS:-'[100,260,520,780,1040,1300]'}
 pretrained_lr_multiplier=0.2
@@ -21,6 +25,14 @@ elif [[ "$freeze_pretrained_ego" != false ]]; then
 fi
 if [[ "$action_expert_mode" != shared && "$action_expert_mode" != independent ]]; then
     echo "WORLD_EEF_ACTION_EXPERT_MODE must be shared or independent" >&2
+    exit 2
+fi
+if [[ "$action_fusion" != cross_attention && "$action_fusion" != world_trajectory_arm_ego_gripper ]]; then
+    echo "WORLD_EEF_ACTION_FUSION must be cross_attention or world_trajectory_arm_ego_gripper" >&2
+    exit 2
+fi
+if [[ "$current_pose_token" != true && "$current_pose_token" != false ]]; then
+    echo "WORLD_EEF_CURRENT_POSE_TOKEN must be true or false" >&2
     exit 2
 fi
 log_dir="$experiment/logs"
@@ -206,14 +218,15 @@ train() {
         --policy.worldflow_frame_origin=global \
         --policy.worldflow_scene_frame_origin=global \
         --policy.worldflow_noise_coupling=independent \
-        --policy.worldflow_action_fusion=cross_attention \
+        --policy.worldflow_action_fusion="$action_fusion" \
         --policy.worldflow_action_expert_mode="$action_expert_mode" \
+        --policy.worldflow_current_ee_pose_token="$current_pose_token" \
         --policy.worldflow_bootstrap_from_ego=true \
         --policy.worldflow_freeze_pretrained_ego="$freeze_pretrained_ego" \
         --policy.worldflow_feature_dim=64 --policy.worldflow_grid_size=0.01 \
         --policy.worldflow_max_points=2048 \
-        --policy.worldflow_loss_weight=0.02 \
-        --policy.worldflow_geo_loss_weight=0.002 \
+        --policy.worldflow_loss_weight="$worldflow_loss_weight" \
+        --policy.worldflow_geo_loss_weight="$worldflow_geo_loss_weight" \
         --policy.worldflow_bridge_loss_weight=0.0 \
         --policy.worldflow_equiv_loss_weight=0.0 \
         --policy.worldflow_training_coordinate_frame_augmentation=false \

@@ -2212,6 +2212,11 @@ class WorldFlowActionBranch(nn.Module):
         self.action_time_mlp_in = nn.Linear(self.action_hidden_dim * 2, self.action_hidden_dim)
         self.action_time_mlp_out = nn.Linear(self.action_hidden_dim, self.action_hidden_dim)
         self.scene_context_proj = nn.Linear(self.feature_dim, self.action_hidden_dim)
+        self.current_ee_pose_in_proj = (
+            nn.Linear(self.pose_dim, self.action_hidden_dim)
+            if bool(getattr(config, "worldflow_current_ee_pose_token", False))
+            else None
+        )
 
         # A separate embedding avoids sharing even the language lookup table
         # with the Ego/VLM branch. Masked mean language context is sufficient
@@ -2231,6 +2236,7 @@ class WorldFlowActionBranch(nn.Module):
         point_cloud_world: Tensor,
         *,
         point_is_pad: Tensor | None = None,
+        current_ee_pose_world: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if point_cloud_world.ndim != 3 or point_cloud_world.shape[-1] != 6:
             raise ValueError(f"Expected WorldFlow point cloud shape (B,N,6), got {point_cloud_world.shape}.")
@@ -2241,11 +2247,38 @@ class WorldFlowActionBranch(nn.Module):
                 point_is_pad,
                 return_tokens=True,
             )
-        return {
+        result = {
             "scene_tokens": scene["scene_tok1"],
             "scene_mask": scene["scene_mask1"].to(dtype=torch.bool),
             "global_feat": scene["global_feat"],
         }
+        if self.current_ee_pose_in_proj is not None:
+            if current_ee_pose_world is None:
+                raise ValueError(
+                    "WorldFlow current-EEF pose token is enabled but current_ee_pose_world was not provided."
+                )
+            current_ee_pose_world = current_ee_pose_world.to(
+                device=point_cloud_world.device,
+                dtype=torch.float32,
+            )
+            expected_shape = (point_cloud_world.shape[0], self.pose_dim)
+            if current_ee_pose_world.shape != expected_shape:
+                raise ValueError(
+                    f"Expected current World EEF pose shape {expected_shape}, "
+                    f"got {current_ee_pose_world.shape}."
+                )
+            if not torch.isfinite(current_ee_pose_world).all():
+                raise ValueError("Current World EEF pose contains non-finite values.")
+            result["current_ee_pose_token"] = self.current_ee_pose_in_proj(
+                current_ee_pose_world
+            ).unsqueeze(1)
+            result["current_ee_pose_mask"] = torch.ones(
+                point_cloud_world.shape[0],
+                1,
+                dtype=torch.bool,
+                device=point_cloud_world.device,
+            )
+        return result
 
     def embed_action_tokens(
         self,
@@ -2324,8 +2357,13 @@ class WorldFlowActionBranch(nn.Module):
         *,
         point_is_pad: Tensor | None = None,
         actions_is_pad: Tensor | None = None,
+        current_ee_pose_world: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        scene = self.encode_scene(point_cloud_world, point_is_pad=point_is_pad)
+        scene = self.encode_scene(
+            point_cloud_world,
+            point_is_pad=point_is_pad,
+            current_ee_pose_world=current_ee_pose_world,
+        )
         action_tokens, action_mask = self.embed_action_tokens(
             scene,
             lang_tokens,
@@ -2417,6 +2455,34 @@ def _ego_point_cloud_to_world(
     xyz_world = torch.matmul(point_cloud_ego[..., :3].to(dtype=torch.float32), rot.transpose(-1, -2))
     xyz_world = xyz_world + trans.unsqueeze(1)
     return torch.cat([xyz_world, point_cloud_ego[..., 3:6].to(dtype=torch.float32)], dim=-1)
+
+
+def world_trajectory_to_current_ego_pose9(
+    world_trajectory_pose9: Tensor,
+    current_ee_pose_world: Tensor,
+) -> Tensor:
+    """Express an absolute robot-base trajectory in the current EEF frame.
+
+    This is a change of coordinates, ``T_current^-1 @ T_world_target``.  It is
+    deliberately not a conjugation, residual, rate, or learned mixture.
+    """
+
+    if world_trajectory_pose9.ndim != 3 or world_trajectory_pose9.shape[-1] != 9:
+        raise ValueError(
+            "Expected absolute World trajectory shape (B,T,9), "
+            f"got {world_trajectory_pose9.shape}."
+        )
+    expected_current_shape = (world_trajectory_pose9.shape[0], 9)
+    if current_ee_pose_world.shape != expected_current_shape:
+        raise ValueError(
+            f"Expected current World EEF pose shape {expected_current_shape}, "
+            f"got {current_ee_pose_world.shape}."
+        )
+    current_world = pose9_to_matrix(
+        current_ee_pose_world.to(device=world_trajectory_pose9.device, dtype=torch.float32)
+    ).unsqueeze(1)
+    world_target = pose9_to_matrix(world_trajectory_pose9.to(dtype=torch.float32))
+    return matrix_to_pose9(invert_transform(current_world) @ world_target)
 
 
 def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
@@ -2990,6 +3056,9 @@ class VLAFlowMatching(nn.Module):
         world.action_time_mlp_in.load_state_dict(self.action_time_mlp_in.state_dict(), strict=True)
         world.action_time_mlp_out.load_state_dict(self.action_time_mlp_out.state_dict(), strict=True)
         world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
+        current_pose_proj = getattr(world, "current_ee_pose_in_proj", None)
+        if current_pose_proj is not None:
+            current_pose_proj.load_state_dict(world.action_in_proj.state_dict(), strict=True)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         world_lm_expert = getattr(self, "world_lm_expert", None)
         if world_lm_expert is not None:
@@ -4591,12 +4660,24 @@ class VLAFlowMatching(nn.Module):
                 f"{self.config.chunk_size}, got {world_action_tokens.shape[1]}."
             )
 
-        suffix_embs = torch.cat([ego_scene, world_scene, world_action_tokens], dim=1)
-        suffix_pad_masks = torch.cat(
-            [ego_scene_mask, world_scene_mask, world_action_mask],
-            dim=1,
-        )
-        scene_len = ego_scene.shape[1] + world_scene.shape[1]
+        condition_tokens = [ego_scene, world_scene]
+        condition_masks = [ego_scene_mask, world_scene_mask]
+        if bool(getattr(self.config, "worldflow_current_ee_pose_token", False)):
+            current_pose_token = world_tokens.get("current_ee_pose_token")
+            current_pose_mask = world_tokens.get("current_ee_pose_mask")
+            if not torch.is_tensor(current_pose_token) or not torch.is_tensor(current_pose_mask):
+                raise ValueError(
+                    "Independent World expert requires its current World EEF pose token and mask."
+                )
+            condition_tokens.insert(0, current_pose_token)
+            condition_masks.insert(
+                0,
+                current_pose_mask.to(device=current_pose_token.device, dtype=torch.bool),
+            )
+
+        suffix_embs = torch.cat([*condition_tokens, world_action_tokens], dim=1)
+        suffix_pad_masks = torch.cat([*condition_masks, world_action_mask], dim=1)
+        scene_len = sum(token.shape[1] for token in condition_tokens)
         action_len = world_action_tokens.shape[1]
         suffix_att_masks = torch.tensor(
             [1]
@@ -4952,6 +5033,7 @@ class VLAFlowMatching(nn.Module):
             time,
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
+            current_ee_pose_world=current_pose,
         )
         state = {
             "point_cloud_world": point_cloud_world,
@@ -5888,6 +5970,7 @@ class VLAFlowMatching(nn.Module):
             world_scene = self.worldflow_branch.encode_scene(
                 point_cloud_world,
                 point_is_pad=point_is_pad,
+                current_ee_pose_world=current_ee_pose,
             )
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling in {
@@ -5992,6 +6075,18 @@ class VLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if (
+            self.worldflow_branch is not None
+            and self.config.worldflow_action_fusion == "world_trajectory_arm_ego_gripper"
+        ):
+            if world_x_t is None or current_ee_pose is None:
+                raise RuntimeError("World trajectory execution state was not initialized.")
+            result = x_t.clone()
+            result[..., :9] = world_trajectory_to_current_ego_pose9(
+                world_x_t,
+                current_ee_pose[..., :9],
+            )
+            return result
         return x_t
 
     def denoise_step_world_ego(
@@ -6199,6 +6294,7 @@ class VLAFlowMatching(nn.Module):
             world_scene = self.worldflow_branch.encode_scene(
                 point_cloud_world,
                 point_is_pad=point_is_pad,
+                current_ee_pose_world=current_ee_pose,
             )
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling in {
