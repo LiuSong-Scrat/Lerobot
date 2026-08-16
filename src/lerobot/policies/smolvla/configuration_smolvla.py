@@ -431,6 +431,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # original pose9 chart.  It has no fixed mixing coefficient: World learns a
     # physical correction, not a second absolute policy to average with Ego.
     # These are deterministic geometry/fixed fusion contracts, not learned gates.
+    # ``point_action_expert_conjugate_bridge`` keeps two coordinate-semantic
+    # front-ends (each LitePT + PointAction adapter), converts their current
+    # flow states to the same robot-base motion operator by exact conjugation,
+    # exchanges them through bidirectional full-matrix token adapters, and runs
+    # both action streams through one shared Action Expert parameter instance.
+    # Neither branch's input state or supervision target is rewritten.
     # ``independent_parallel`` is the calibration phase for a true dual-flow
     # model: both complete trajectories are directly supervised and every
     # non-VLM module remains trainable, but neither flow can alter the other.
@@ -822,11 +828,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 if self.worldflow_action_fusion not in {
                     "independent_parallel",
                     "cross_attention",
+                    "point_action_expert_conjugate_bridge",
                     "physical_trajectory_cross_attention",
                     "world_trajectory_arm_ego_gripper",
                 }:
                     world_trajectory_contract_errors.append(
                         "worldflow_action_fusion='independent_parallel', 'cross_attention', "
+                        "'point_action_expert_conjugate_bridge', "
                         "'physical_trajectory_cross_attention', or "
                         "'world_trajectory_arm_ego_gripper'"
                     )
@@ -946,6 +954,7 @@ class SmolVLAConfig(PreTrainedConfig):
             if self.worldflow_action_fusion not in {
                 "independent_parallel",
                 "cross_attention",
+                "point_action_expert_conjugate_bridge",
                 "symmetric_twist",
                 "conjugate_residual",
                 "conjugate_residual_consensus",
@@ -957,6 +966,7 @@ class SmolVLAConfig(PreTrainedConfig):
             }:
                 raise ValueError(
                     "worldflow_action_fusion must be 'independent_parallel', 'cross_attention', "
+                    "'point_action_expert_conjugate_bridge', "
                     "'symmetric_twist', "
                     "'conjugate_residual', 'conjugate_residual_consensus', or "
                     "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
@@ -965,6 +975,29 @@ class SmolVLAConfig(PreTrainedConfig):
                     "'world_trajectory_arm_ego_gripper'; "
                     f"got {self.worldflow_action_fusion!r}."
                 )
+            if self.worldflow_action_fusion == "point_action_expert_conjugate_bridge":
+                shared_expert_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    shared_expert_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "shared":
+                    shared_expert_contract_errors.append("worldflow_action_expert_mode='shared'")
+                if self.worldflow_noise_coupling != "left_compose_ego":
+                    shared_expert_contract_errors.append("worldflow_noise_coupling='left_compose_ego'")
+                if self.worldflow_world_eef_velocity_mode != "base_pose9_euclidean":
+                    shared_expert_contract_errors.append(
+                        "worldflow_world_eef_velocity_mode='base_pose9_euclidean'"
+                    )
+                if self.worldflow_current_ee_pose_token:
+                    shared_expert_contract_errors.append("worldflow_current_ee_pose_token=False")
+                if self.se3_enable:
+                    shared_expert_contract_errors.append("se3_enable=False")
+                if shared_expert_contract_errors:
+                    raise ValueError(
+                        "point_action_expert_conjugate_bridge requires symmetric World/Ego "
+                        "front-ends meeting in one shared Action Expert: "
+                        + ", ".join(shared_expert_contract_errors)
+                        + "."
+                    )
             if self.worldflow_action_fusion == "independent_parallel":
                 calibration_contract_errors = []
                 if self.worldflow_target_type != "world_eef_trajectory":

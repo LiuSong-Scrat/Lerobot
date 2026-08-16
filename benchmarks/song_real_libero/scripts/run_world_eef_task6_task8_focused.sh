@@ -9,9 +9,9 @@ baseline=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v
 training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps}
 experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816}
 freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
-action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-independent}
-action_fusion=${WORLD_EEF_ACTION_FUSION:-independent_parallel}
-current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-true}
+action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
+action_fusion=${WORLD_EEF_ACTION_FUSION:-point_action_expert_conjugate_bridge}
+current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-false}
 noise_coupling=${WORLD_EEF_NOISE_COUPLING:-left_compose_ego}
 world_eef_velocity_mode=${WORLD_EEF_VELOCITY_MODE:-base_pose9_euclidean}
 eval_fusion_override=${WORLD_EEF_EVAL_FUSION_OVERRIDE:-}
@@ -32,9 +32,10 @@ if [[ "$action_expert_mode" != shared && "$action_expert_mode" != independent ]]
 fi
 if [[ "$action_fusion" != independent_parallel \
     && "$action_fusion" != cross_attention \
+    && "$action_fusion" != point_action_expert_conjugate_bridge \
     && "$action_fusion" != physical_trajectory_cross_attention \
     && "$action_fusion" != world_trajectory_arm_ego_gripper ]]; then
-    echo "WORLD_EEF_ACTION_FUSION must be independent_parallel, cross_attention, physical_trajectory_cross_attention, or world_trajectory_arm_ego_gripper" >&2
+    echo "WORLD_EEF_ACTION_FUSION must be independent_parallel, cross_attention, point_action_expert_conjugate_bridge, physical_trajectory_cross_attention, or world_trajectory_arm_ego_gripper" >&2
     exit 2
 fi
 if [[ "$action_fusion" == independent_parallel && "$freeze_pretrained_ego" != false ]]; then

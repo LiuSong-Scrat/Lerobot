@@ -553,18 +553,12 @@ model's current-EEF-to-base left transform is the correct action carrier.  The
 dataset-side relative-pose audit confirms this to approximately `1e-7`; using
 the episode origin again inside the model would apply the transform twice.
 
-The remaining structural problem is architectural equivariance.  Although the
-World target is an exact fixed rotation of the Ego pose9 velocity, copied
-ordinary linear layers and Transformer blocks do not commute with that
-sample-dependent rotation.  The World Expert is therefore forced to relearn a
-known rigid coordinate change from only 100 demonstrations.  A valid successor
-must implement the input/output frame transport analytically (while retaining
-the base-frame point cloud as World context), so the independent World function
-is accurate by construction at initialization.  Training another unconstrained
-base-coordinate Transformer, adding a residual/rate head, or tuning loss weights
-does not address the observed failure.
+The remaining structural question is how the two complete policies should be
+bridged.  It must not be answered by redefining the World policy as an internal
+Ego policy: World is itself a conventional point-cloud VLA whose observation
+and action are both expressed on robot-base axes.
 
-## Raw-chart correction and analytic equivariant World wrapper
+## Raw-chart correction and rejected semantic collapse
 
 The preceding symmetric run still contained a decisive implementation error.
 The formal Ego policy uses an unconstrained Gaussian in all pose9 channels,
@@ -587,39 +581,105 @@ pose9 velocity target without projecting the flow state.  A regression now
 uses deliberately unconstrained Gaussian rotation columns and proves both
 the affine path identity and that the old projected result differs.
 
-The independent World Expert is also wrapped by the inverse/forward analytic
-transport:
-
-- its public point cloud, flow state, target, output and loss remain in the
-  fixed robot-base coordinate system;
-- immediately before the independently parameterized copied action stack,
-  the known current-EEF left transform is removed analytically;
-- the copied local pose9 velocity is rotated back onto robot-base axes after
-  the World output head;
-- the Ego gripper flow state remains an input condition so the copied action
-  projection is function preserving, although World still predicts only the
-  nine pose channels;
-- at bootstrap the World suffix and frozen visual-language prefix have the
-  exact Ego layout, but all World parameters are independent copies;
-- base-frame scene tokens and the current base-frame EEF pose enter the World
-  proposal through a dedicated full-matrix attention residual.  Its output
-  projection is zero initialized, not frozen, and it is neither a scalar gate
-  nor an endpoint/rate residual.
-
-Three otherwise identical four-GPU, one-update smokes show the structural
-effect:
+A diagnostic implementation then converted the World action state back into
+Ego coordinates inside the Expert, reused Ego foreground/action tokens and the
+Ego gripper state, and rotated the copied output back to base axes.  Its smokes
+showed why the loss gap disappeared:
 
 | implementation | Ego translation | World translation | World rotation |
 |---|---:|---:|---:|
 | projected raw noise, unconstrained base Expert | 8.99 mm | 423.8 mm | -- |
 | raw affine noise transport only | 8.85 mm | 212.2 mm | 105.8 degrees |
-| analytic action input/output wrapper | 8.91 mm | 77.9 mm | 5.23 degrees |
-| function-preserving wrapper + base context adapter | 7.98 mm | 7.95 mm | 0.743 degrees |
+| internal World-to-Ego action wrapper | 8.91 mm | 77.9 mm | 5.23 degrees |
+| duplicated Ego function plus base-context adapter | 7.98 mm | 7.95 mm | 0.743 degrees |
 
-For the final smoke, the physical World/Ego ratios were `0.9972` for
-translation and `0.9990` for rotation.  This is the first design that satisfies
-the requested same-scale condition at initialization by construction.  The
-VLM alone is frozen; both Action Experts, both point/action paths, both heads
-and the base-context adapter remain trainable.  A complete calibration is
-still required to prove the two paths remain aligned after optimization before
-any interaction or environment evaluation is allowed.
+The final numerical equality is not a valid World result.  It was obtained by
+collapsing the two policies to the same Ego semantics before their proposals
+were formed.  The associated 1300-step run was stopped immediately and this
+wrapper was removed.
+
+The retained coordinate contract is instead:
+
+- Ego consumes current-EEF-frame geometry and predicts an Ego-frame action;
+- World consumes robot-base-frame geometry and predicts a robot-base-frame
+  action as a conventional point-cloud VLA;
+- each stream owns a same-structure `LitePTEncoder` and `PointActionAdapter`;
+- World has no private language-mean or global-scene residual shortcut;
+- neither flow state nor either supervision target is converted into the other
+  branch's coordinate semantics.
+
+For clarity, absolute poses and motion operators use different maps.  If
+`C=T_base_current`, an Ego absolute-relative proposal `B` and a World absolute
+EEF proposal `W` satisfy `W=C B` (left composition).  The corresponding
+world-frame motion operator is
+
+```text
+G = W C^-1 = C B C^-1
+```
+
+so *this derived motion representation* is where conjugation belongs. Applying
+the conjugation as the World branch's absolute action target would change the
+branch semantics and remains prohibited.
+
+## Symmetric PointActionExpert conjugate bridge
+
+The final architecture follows the original point-cloud VLA topology rather
+than adding a second complete Action Expert after the World front-end:
+
+```text
+Ego point cloud  -> Ego LitePT  -> Ego PointActionAdapter  --\
+                                                           +-> shared PointActionExpert -> Ego/World heads
+World point cloud -> World LitePT -> World PointActionAdapter --/
+```
+
+Before the shared `PointActionExpert`, the current flow states produce two
+additional conditioning sequences:
+
+```text
+Ego bridge token   = pose9(C B_t C^-1)
+World bridge token = pose9(W_t C^-1)
+```
+
+They are computed after each branch has retained its own input representation;
+they do not replace `B_t` or `W_t`.  Two zero-initialized full-matrix adapters
+combine the source action token and both conjugated motion tokens into an
+additive token correction for the opposite stream.  They are matrices over
+the complete feature vector, not scalar gates or residual rates.
+
+Both corrected action sequences then traverse the *same parameter instance*
+of `PointActionExpert`, each with the original checkpoint action length,
+block mask and position layout.  This preserves the Ego function exactly at
+bootstrap while letting the two matrix adapters learn bidirectional exchange.
+The World call masks the Ego point-cloud prefix because its own PointAction
+adapter already supplies robot-base geometry.  There is no independent
+`world_lm_expert`, no extra scene/action token block that perturbs pretrained
+attention normalization, and no post-Expert latent cross-attention.
+
+The formal mode name is
+`point_action_expert_conjugate_bridge`.  Its enforced contract is:
+
+- `worldflow_action_expert_mode=shared`;
+- `worldflow_noise_coupling=left_compose_ego`;
+- `worldflow_world_eef_velocity_mode=base_pose9_euclidean`;
+- robot-base World scene/action semantics and current-EEF Ego semantics;
+- only the VLM is frozen; both LitePT paths, both PointActionAdapters, the
+  shared Action Expert, both heads and the bridge projection are trainable.
+
+The previous proposal-after-Expert interaction remains loadable only for old
+checkpoint compatibility and is no longer the formal successor design.
+
+Two four-GPU one-update smokes distinguished the correct shared-Expert layout:
+
+| layout | Ego translation | Ego rotation | World translation | World rotation |
+|---|---:|---:|---:|---:|
+| concatenate all scene/bridge/action tokens in one new block (rejected) | 54.38 mm | 4.665 degrees | 225.2 mm | 100.1 degrees |
+| original-length dual calls through one shared Expert + zero-init matrix bridges | 8.143 mm | 0.731 degrees | 245.6 mm | 106.2 degrees |
+
+The first layout altered the pretrained attention normalization and positions,
+so it was rejected despite using a shared Expert.  The second preserves the
+Ego bootstrap while leaving World honestly untrained.  After its first update,
+both `ego_to_world_point_action_bridge` and
+`world_to_ego_point_action_bridge` had all `1,555,200` weight elements nonzero;
+the saved checkpoint contained one 145-tensor shared Action Expert and no
+`world_lm_expert` or post-Expert cross-attention tensors.  Artifacts are under
+`SMOKE_world_eef_shared_pointactionexpert_conjugate_bridge_v2_4gpu_b24_1step_20260816`.

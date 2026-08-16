@@ -1243,6 +1243,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         "model.world_to_ego_cross_attn.",
                         "model.ego_physical_trajectory_in_proj.",
                         "model.world_physical_trajectory_in_proj.",
+                        "model.conjugate_motion_in_proj.",
+                        "model.ego_to_world_point_action_bridge.",
+                        "model.world_to_ego_point_action_bridge.",
                     )
                     new_world_exact = {
                         "model.world_ego_scene_type_embedding",
@@ -1372,6 +1375,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     "model.world_to_ego_cross_attn.",
                     "model.ego_physical_trajectory_in_proj.",
                     "model.world_physical_trajectory_in_proj.",
+                    "model.conjugate_motion_in_proj.",
+                    "model.ego_to_world_point_action_bridge.",
+                    "model.world_to_ego_point_action_bridge.",
                 )
                 new_world_exact = {
                     "model.world_ego_scene_type_embedding",
@@ -2400,15 +2406,9 @@ class WorldFlowActionBranch(nn.Module):
         self.action_hidden_dim = int(action_hidden_dim)
         self.min_period = float(config.min_period)
         self.max_period = float(config.max_period)
-        self.base_pose9_equivariant_wrapper = bool(
-            getattr(config, "worldflow_target_type", "legacy_eef")
-            == "world_eef_trajectory"
-            and getattr(
-                config,
-                "worldflow_world_eef_velocity_mode",
-                "legacy_spatial_twist",
-            )
-            == "base_pose9_euclidean"
+        self.symmetric_shared_action_expert = (
+            getattr(config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
         )
         if self.feature_dim % int(config.point_action_fusion_heads) != 0:
             raise ValueError(
@@ -2432,25 +2432,31 @@ class WorldFlowActionBranch(nn.Module):
         ):
             inactive_module.requires_grad_(False)
 
-        # The equivariant World wrapper predicts only the nine pose channels,
-        # but retains the Ego gripper flow state as a conditioning channel so
-        # its copied action stack is exactly function preserving at bootstrap.
-        self.action_input_dim = self.pose_dim + int(self.base_pose9_equivariant_wrapper)
-        self.action_in_proj = nn.Linear(self.action_input_dim, self.action_hidden_dim)
+        self.action_in_proj = nn.Linear(self.pose_dim, self.action_hidden_dim)
         self.action_time_mlp_in = nn.Linear(self.action_hidden_dim * 2, self.action_hidden_dim)
         self.action_time_mlp_out = nn.Linear(self.action_hidden_dim, self.action_hidden_dim)
-        self.scene_context_proj = nn.Linear(self.feature_dim, self.action_hidden_dim)
+        self.scene_context_proj = (
+            None
+            if self.symmetric_shared_action_expert
+            else nn.Linear(self.feature_dim, self.action_hidden_dim)
+        )
         self.current_ee_pose_in_proj = (
             nn.Linear(self.pose_dim, self.action_hidden_dim)
             if bool(getattr(config, "worldflow_current_ee_pose_token", False))
             else None
         )
 
-        # A separate embedding avoids sharing even the language lookup table
-        # with the Ego/VLM branch. Masked mean language context is sufficient
-        # here because WorldFlow is a geometric auxiliary objective.
-        self.language_embedding = nn.Embedding(int(language_vocab_size), self.action_hidden_dim)
-        self.language_norm = nn.LayerNorm(self.action_hidden_dim)
+        # The symmetric shared-Expert design obtains language from the same
+        # VLM prefix as Ego. Older modes retain their private World language
+        # residual for checkpoint compatibility.
+        self.language_embedding = (
+            None
+            if self.symmetric_shared_action_expert
+            else nn.Embedding(int(language_vocab_size), self.action_hidden_dim)
+        )
+        self.language_norm = (
+            None if self.symmetric_shared_action_expert else nn.LayerNorm(self.action_hidden_dim)
+        )
         self.point_action_adapter = PointActionSelfAttention(
             action_dim=self.action_hidden_dim,
             point_dim=self.feature_dim,
@@ -2480,15 +2486,6 @@ class WorldFlowActionBranch(nn.Module):
             "scene_mask": scene["scene_mask1"].to(dtype=torch.bool),
             "global_feat": scene["global_feat"],
         }
-        if self.base_pose9_equivariant_wrapper:
-            if current_ee_pose_world is None:
-                raise ValueError(
-                    "The robot-base pose9 equivariant wrapper requires current_ee_pose_world."
-                )
-            result["current_ee_pose_world"] = current_ee_pose_world.to(
-                device=point_cloud_world.device,
-                dtype=torch.float32,
-            )
         if self.current_ee_pose_in_proj is not None:
             if current_ee_pose_world is None:
                 raise ValueError(
@@ -2526,9 +2523,6 @@ class WorldFlowActionBranch(nn.Module):
         time: Tensor,
         *,
         actions_is_pad: Tensor | None = None,
-        ego_gripper_state: Tensor | None = None,
-        ego_point_tokens: Tensor | None = None,
-        ego_point_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if noisy_spatial_pose9.ndim != 3 or noisy_spatial_pose9.shape[-1] != self.pose_dim:
             raise ValueError(
@@ -2542,44 +2536,7 @@ class WorldFlowActionBranch(nn.Module):
         if time.shape != (noisy_spatial_pose9.shape[0],):
             raise ValueError(f"Expected WorldFlow time shape {(noisy_spatial_pose9.shape[0],)}, got {time.shape}.")
 
-        action_chart = noisy_spatial_pose9.to(dtype=torch.float32)
-        if self.base_pose9_equivariant_wrapper:
-            current_ee_pose_world = scene.get("current_ee_pose_world")
-            if not torch.is_tensor(current_ee_pose_world):
-                raise ValueError(
-                    "The robot-base pose9 equivariant wrapper is missing current_ee_pose_world."
-                )
-            # Keep the public World state in robot-base coordinates, but
-            # remove the known current-EEF left frame transform before the
-            # copied Euclidean action stack.  The independent expert can then
-            # learn task dynamics instead of relearning a per-sample basis
-            # change that is already known analytically.
-            action_chart = _inverse_left_compose_world_pose9_chart_to_ego(
-                action_chart,
-                current_ee_pose_world,
-            )
-            expected_gripper_shape = (*action_chart.shape[:2], 1)
-            if ego_gripper_state is None:
-                ego_gripper_state = torch.zeros(
-                    expected_gripper_shape,
-                    device=action_chart.device,
-                    dtype=action_chart.dtype,
-                )
-            if not torch.is_tensor(ego_gripper_state):
-                raise TypeError("Ego gripper state must be a tensor when provided.")
-            if ego_gripper_state.shape != expected_gripper_shape:
-                raise ValueError(
-                    f"Expected Ego gripper state shape {expected_gripper_shape}, "
-                    f"got {ego_gripper_state.shape}."
-                )
-            action_chart = torch.cat(
-                [
-                    action_chart,
-                    ego_gripper_state.to(device=action_chart.device, dtype=action_chart.dtype),
-                ],
-                dim=-1,
-            )
-        action_tokens = self.action_in_proj(action_chart)
+        action_tokens = self.action_in_proj(noisy_spatial_pose9.to(dtype=torch.float32))
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.action_hidden_dim,
@@ -2592,12 +2549,13 @@ class WorldFlowActionBranch(nn.Module):
             F.silu(self.action_time_mlp_in(torch.cat([action_tokens, time_emb], dim=-1)))
         )
 
-        if self.base_pose9_equivariant_wrapper:
-            point_tokens = (
-                ego_point_tokens if torch.is_tensor(ego_point_tokens) else scene["scene_tokens"]
-            )
-            point_mask = ego_point_mask if torch.is_tensor(ego_point_mask) else scene["scene_mask"]
-        else:
+        if not self.symmetric_shared_action_expert:
+            if (
+                self.language_embedding is None
+                or self.language_norm is None
+                or self.scene_context_proj is None
+            ):
+                raise RuntimeError("Legacy World action context modules are not initialized.")
             lang_emb = self.language_embedding(
                 lang_tokens.to(device=action_tokens.device, dtype=torch.long)
             )
@@ -2610,12 +2568,10 @@ class WorldFlowActionBranch(nn.Module):
                 + self.scene_context_proj(scene["global_feat"]).unsqueeze(1)
                 + self.language_norm(lang_context).unsqueeze(1)
             )
-            point_tokens = scene["scene_tokens"]
-            point_mask = scene["scene_mask"]
         action_tokens = self.point_action_adapter(
             action_tokens,
-            point_tokens,
-            point_mask=point_mask,
+            scene["scene_tokens"],
+            point_mask=scene["scene_mask"],
             actions_is_pad=actions_is_pad,
         )
 
@@ -2645,9 +2601,6 @@ class WorldFlowActionBranch(nn.Module):
         point_is_pad: Tensor | None = None,
         actions_is_pad: Tensor | None = None,
         current_ee_pose_world: Tensor | None = None,
-        ego_gripper_state: Tensor | None = None,
-        ego_point_tokens: Tensor | None = None,
-        ego_point_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         scene = self.encode_scene(
             point_cloud_world,
@@ -2661,9 +2614,6 @@ class WorldFlowActionBranch(nn.Module):
             noisy_spatial_pose9,
             time,
             actions_is_pad=actions_is_pad,
-            ego_gripper_state=ego_gripper_state,
-            ego_point_tokens=ego_point_tokens,
-            ego_point_mask=ego_point_mask,
         )
         return {
             **scene,
@@ -2780,37 +2730,6 @@ def _left_compose_ego_pose9_chart_to_world(
     return world_chart
 
 
-def _inverse_left_compose_world_pose9_chart_to_ego(
-    world_chart: Tensor,
-    current_pose_world: Tensor,
-) -> Tensor:
-    """Remove the current-EEF left frame transform from a raw pose9 chart."""
-
-    if world_chart.ndim != 3 or world_chart.shape[-1] != 9:
-        raise ValueError(f"Expected World pose9 chart shape (B,T,9), got {world_chart.shape}.")
-    if current_pose_world.shape != (world_chart.shape[0], 9):
-        raise ValueError(
-            f"Expected current pose shape {(world_chart.shape[0], 9)}, got {current_pose_world.shape}."
-        )
-    current = pose9_to_matrix(
-        current_pose_world.to(device=world_chart.device, dtype=torch.float32)
-    )
-    rotation_inv = current[:, None, :3, :3].transpose(-1, -2)
-    translation = current[:, None, :3, 3]
-    ego_chart = torch.empty_like(world_chart, dtype=torch.float32)
-    ego_chart[..., :3] = (
-        rotation_inv
-        @ (world_chart[..., :3].to(dtype=torch.float32) - translation).unsqueeze(-1)
-    ).squeeze(-1)
-    ego_chart[..., 3:6] = (
-        rotation_inv @ world_chart[..., 3:6].to(dtype=torch.float32).unsqueeze(-1)
-    ).squeeze(-1)
-    ego_chart[..., 6:9] = (
-        rotation_inv @ world_chart[..., 6:9].to(dtype=torch.float32).unsqueeze(-1)
-    ).squeeze(-1)
-    return ego_chart
-
-
 def _rotate_ego_pose9_chart_velocity_to_world(
     ego_velocity: Tensor,
     current_pose_world: Tensor,
@@ -2863,6 +2782,50 @@ def world_trajectory_to_current_ego_pose9(
     return matrix_to_pose9(invert_transform(current_world) @ world_target)
 
 
+def conjugate_world_ego_flow_states_for_shared_expert(
+    ego_state: Tensor,
+    world_state: Tensor,
+    current_ee_pose_world: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Bridge two unchanged flow states as robot-base motion operators.
+
+    Ego keeps its current-EEF absolute-relative state ``B`` and World keeps
+    its robot-base absolute EEF state ``W``.  The shared Action Expert receives
+    two additional, physically comparable tokens:
+
+    ``G_ego = C @ B @ C^-1`` and ``G_world = W @ C^-1``.
+
+    Projecting the raw rotation columns to SE(3) is safe here because these are
+    conditioning tokens only.  It is deliberately not used to construct or
+    transport either Euclidean flow state or supervision target.
+    """
+
+    if ego_state.ndim != 3 or ego_state.shape[-1] < 9:
+        raise ValueError(f"Expected Ego state shape (B,T,D>=9), got {ego_state.shape}.")
+    expected_world_shape = (*ego_state.shape[:2], 9)
+    if world_state.shape != expected_world_shape:
+        raise ValueError(
+            f"Expected World state shape {expected_world_shape}, got {world_state.shape}."
+        )
+    expected_current_shape = (ego_state.shape[0], 9)
+    if current_ee_pose_world.shape != expected_current_shape:
+        raise ValueError(
+            f"Expected current World EEF pose shape {expected_current_shape}, "
+            f"got {current_ee_pose_world.shape}."
+        )
+
+    current = pose9_to_matrix(
+        current_ee_pose_world.to(device=ego_state.device, dtype=torch.float32)
+    ).unsqueeze(1)
+    current_inv = invert_transform(current)
+    ego_pose = pose9_to_matrix(ego_state[..., :9].to(dtype=torch.float32))
+    world_pose = pose9_to_matrix(world_state.to(device=ego_state.device, dtype=torch.float32))
+    return (
+        matrix_to_pose9(current @ ego_pose @ current_inv),
+        matrix_to_pose9(world_pose @ current_inv),
+    )
+
+
 def physically_aligned_world_ego_trajectory_proposals(
     ego_state: Tensor,
     ego_velocity: Tensor,
@@ -2872,13 +2835,15 @@ def physically_aligned_world_ego_trajectory_proposals(
     current_ee_pose_world: Tensor,
     world_velocity_mode: str = "legacy_spatial_twist",
 ) -> tuple[Tensor, Tensor]:
-    """Build complete, coordinate-aligned trajectory proposals for interaction.
+    """Convert complete Ego/World predictions to the same world-motion operator.
 
-    The Ego proposal is expressed in the robot-base frame for the World
-    Expert. The World proposal is expressed in the current EEF frame for the
-    Ego Expert. Both are predicted endpoints computed by multiplying the
-    vector fields by the remaining path length. No endpoint difference is
-    divided by ``1-t`` and neither proposal is executed or averaged here.
+    The branch semantics remain untouched while each Expert forms its full
+    endpoint: Ego predicts ``B`` in the current-EEF frame and World predicts
+    ``W`` in the robot-base frame. Only afterwards are they bridged as
+    ``C @ B @ C^-1`` and ``W @ C^-1``, where ``C`` is the current EEF pose in
+    robot-base coordinates. These two motion operators are equal when the
+    endpoint predictions agree physically. No residual is divided by
+    ``1-t`` and neither proposal is executed or averaged here.
     """
 
     if ego_state.ndim != 3 or ego_state.shape[-1] < 9:
@@ -2931,9 +2896,9 @@ def physically_aligned_world_ego_trajectory_proposals(
         current_ee_pose_world.to(device=ego_state.device, dtype=torch.float32)
     ).unsqueeze(1)
     current_inv = invert_transform(current_base)
-    ego_proposal_base = current_base @ ego_endpoint_current
-    world_proposal_current = current_inv @ world_endpoint_base
-    return matrix_to_pose9(ego_proposal_base), matrix_to_pose9(world_proposal_current)
+    ego_motion_world = current_base @ ego_endpoint_current @ current_inv
+    world_motion_world = world_endpoint_base @ current_inv
+    return matrix_to_pose9(ego_motion_world), matrix_to_pose9(world_motion_world)
 
 
 def _masked_language_mean(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
@@ -3415,39 +3380,53 @@ class VLAFlowMatching(nn.Module):
             self.world_ego_action_type_embedding = nn.Parameter(torch.empty(2, expert_dim))
             nn.init.normal_(self.world_ego_scene_type_embedding, mean=0.0, std=0.02)
             nn.init.normal_(self.world_ego_action_type_embedding, mean=0.0, std=0.02)
-            cross_heads = int(self.config.point_action_fusion_heads)
-            self.ego_to_world_cross_norm = nn.LayerNorm(expert_dim)
-            self.world_to_ego_cross_norm = nn.LayerNorm(expert_dim)
-            self.ego_to_world_cross_attn = nn.MultiheadAttention(
-                expert_dim,
-                cross_heads,
-                dropout=0.0,
-                batch_first=True,
+            shared_expert_conjugate_bridge = (
+                getattr(self.config, "worldflow_action_fusion", "cross_attention")
+                == "point_action_expert_conjugate_bridge"
             )
-            self.world_to_ego_cross_attn = nn.MultiheadAttention(
-                expert_dim,
-                cross_heads,
-                dropout=0.0,
-                batch_first=True,
+            self.conjugate_motion_in_proj = (
+                nn.Linear(9, expert_dim) if shared_expert_conjugate_bridge else None
             )
-            if direct_world_pose9_chart:
-                # Function-preserving World initialization: the copied World
-                # expert first reproduces the Ego action function exactly.
-                # Robot-base scene/current-pose evidence enters through this
-                # full matrix attention residual, whose zero output projection
-                # preserves that initial function while remaining trainable.
-                self.world_base_context_norm = nn.LayerNorm(expert_dim)
-                self.world_base_context_cross_attn = nn.MultiheadAttention(
+            self.ego_to_world_point_action_bridge = (
+                nn.Linear(expert_dim * 3, expert_dim)
+                if shared_expert_conjugate_bridge
+                else None
+            )
+            self.world_to_ego_point_action_bridge = (
+                nn.Linear(expert_dim * 3, expert_dim)
+                if shared_expert_conjugate_bridge
+                else None
+            )
+            if shared_expert_conjugate_bridge:
+                # Interaction occurs inside the shared Action Expert. Keeping
+                # a second post-Expert attention path would double-count the
+                # World stream and move the actual merge point downstream.
+                self.ego_to_world_cross_norm = None
+                self.world_to_ego_cross_norm = None
+                self.ego_to_world_cross_attn = None
+                self.world_to_ego_cross_attn = None
+                for bridge in (
+                    self.ego_to_world_point_action_bridge,
+                    self.world_to_ego_point_action_bridge,
+                ):
+                    nn.init.zeros_(bridge.weight)
+                    nn.init.zeros_(bridge.bias)
+            else:
+                cross_heads = int(self.config.point_action_fusion_heads)
+                self.ego_to_world_cross_norm = nn.LayerNorm(expert_dim)
+                self.world_to_ego_cross_norm = nn.LayerNorm(expert_dim)
+                self.ego_to_world_cross_attn = nn.MultiheadAttention(
                     expert_dim,
                     cross_heads,
                     dropout=0.0,
                     batch_first=True,
                 )
-                nn.init.zeros_(self.world_base_context_cross_attn.out_proj.weight)
-                nn.init.zeros_(self.world_base_context_cross_attn.out_proj.bias)
-            else:
-                self.world_base_context_norm = None
-                self.world_base_context_cross_attn = None
+                self.world_to_ego_cross_attn = nn.MultiheadAttention(
+                    expert_dim,
+                    cross_heads,
+                    dropout=0.0,
+                    batch_first=True,
+                )
             physical_trajectory_interaction = getattr(
                 self.config, "worldflow_action_fusion", "cross_attention"
             ) in {
@@ -3469,8 +3448,9 @@ class VLAFlowMatching(nn.Module):
             # Function-preserving expansion: this full matrix starts at zero
             # and learns immediately. It is not a scalar gate, and neither
             # coordinate stream is frozen.
-            nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.weight)
-            nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.bias)
+            if self.world_to_ego_cross_attn is not None:
+                nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.weight)
+                nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.bias)
         else:
             self.world_lm_expert = None
             self.ego_scene_to_expert = None
@@ -3482,8 +3462,9 @@ class VLAFlowMatching(nn.Module):
             self.world_to_ego_cross_norm = None
             self.ego_to_world_cross_attn = None
             self.world_to_ego_cross_attn = None
-            self.world_base_context_norm = None
-            self.world_base_context_cross_attn = None
+            self.conjugate_motion_in_proj = None
+            self.ego_to_world_point_action_bridge = None
+            self.world_to_ego_point_action_bridge = None
             self.ego_physical_trajectory_in_proj = None
             self.world_physical_trajectory_in_proj = None
             self.register_parameter("world_ego_scene_type_embedding", None)
@@ -3538,12 +3519,27 @@ class VLAFlowMatching(nn.Module):
             )
             == "base_pose9_euclidean"
         )
+        shared_expert_conjugate_bridge = (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
+        )
         required = (
             self.ego_scene_to_expert,
             self.world_scene_to_expert,
-            self.ego_to_world_cross_attn,
-            self.world_to_ego_cross_attn,
         )
+        if shared_expert_conjugate_bridge:
+            required = (
+                *required,
+                getattr(self, "conjugate_motion_in_proj", None),
+                getattr(self, "ego_to_world_point_action_bridge", None),
+                getattr(self, "world_to_ego_point_action_bridge", None),
+            )
+        else:
+            required = (
+                *required,
+                self.ego_to_world_cross_attn,
+                self.world_to_ego_cross_attn,
+            )
         if not direct_world_trajectory or direct_world_pose9_chart:
             required = (*required, self.world_action_out_proj)
         elif self.world_se3_action_out_proj is None:
@@ -3561,23 +3557,27 @@ class VLAFlowMatching(nn.Module):
             self.point_action_fusion.state_dict(),
             strict=True,
         )
-        if world.action_in_proj.in_features == self.action_in_proj.in_features:
-            world.action_in_proj.weight.copy_(self.action_in_proj.weight)
-        else:
-            world.action_in_proj.weight.copy_(
-                self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim]
-            )
+        world.action_in_proj.weight.copy_(self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim])
         world.action_in_proj.bias.copy_(self.action_in_proj.bias)
         world.action_time_mlp_in.load_state_dict(self.action_time_mlp_in.state_dict(), strict=True)
         world.action_time_mlp_out.load_state_dict(self.action_time_mlp_out.state_dict(), strict=True)
-        world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
+        if world.scene_context_proj is not None:
+            world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         current_pose_proj = getattr(world, "current_ee_pose_in_proj", None)
         if current_pose_proj is not None:
-            current_pose_proj.weight.copy_(
-                self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim]
-            )
-            current_pose_proj.bias.copy_(self.action_in_proj.bias)
+            current_pose_proj.load_state_dict(world.action_in_proj.state_dict(), strict=True)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
+        conjugate_motion_in_proj = getattr(self, "conjugate_motion_in_proj", None)
+        if conjugate_motion_in_proj is not None:
+            conjugate_motion_in_proj.weight.copy_(self.action_in_proj.weight[:, :9])
+            conjugate_motion_in_proj.bias.copy_(self.action_in_proj.bias)
+        for bridge in (
+            getattr(self, "ego_to_world_point_action_bridge", None),
+            getattr(self, "world_to_ego_point_action_bridge", None),
+        ):
+            if bridge is not None:
+                bridge.weight.zero_()
+                bridge.bias.zero_()
         ego_physical_projection = getattr(self, "ego_physical_trajectory_in_proj", None)
         world_physical_projection = getattr(self, "world_physical_trajectory_in_proj", None)
         if ego_physical_projection is not None:
@@ -3609,24 +3609,19 @@ class VLAFlowMatching(nn.Module):
 
         # The VLM language table has a different hidden width. A zero language
         # residual is the identity-compatible initialization; it learns jointly.
-        world.language_embedding.weight.zero_()
-        world.language_norm.weight.fill_(1.0)
-        world.language_norm.bias.zero_()
+        if world.language_embedding is not None:
+            world.language_embedding.weight.zero_()
+        if world.language_norm is not None:
+            world.language_norm.weight.fill_(1.0)
+            world.language_norm.bias.zero_()
         self.world_ego_scene_type_embedding.zero_()
         self.world_ego_action_type_embedding.zero_()
         for attention in (self.ego_to_world_cross_attn, self.world_to_ego_cross_attn):
+            if attention is None:
+                continue
             attention.out_proj.weight.zero_()
             if attention.out_proj.bias is not None:
                 attention.out_proj.bias.zero_()
-        world_base_context_cross_attn = getattr(
-            self,
-            "world_base_context_cross_attn",
-            None,
-        )
-        if world_base_context_cross_attn is not None:
-            world_base_context_cross_attn.out_proj.weight.zero_()
-            if world_base_context_cross_attn.out_proj.bias is not None:
-                world_base_context_cross_attn.out_proj.bias.zero_()
         if self.world_twist_residual_out_proj is not None:
             self.world_twist_residual_out_proj.weight.zero_()
             self.world_twist_residual_out_proj.bias.zero_()
@@ -3642,10 +3637,15 @@ class VLAFlowMatching(nn.Module):
             "status": "bootstrapped",
             "source": "trained_ego_action_point_modules",
             "world_parameters_shared": False,
+            "world_frontend_parameters_shared": False,
             "world_action_expert": (
                 "independent_bootstrapped_copy"
                 if world_lm_expert is not None
-                else "legacy_shared_ego_expert"
+                else (
+                    "shared_point_action_expert_conjugate_bridge"
+                    if shared_expert_conjugate_bridge
+                    else "legacy_shared_ego_expert"
+                )
             ),
             "ego_frozen": bool(
                 getattr(self.config, "worldflow_freeze_pretrained_ego", False)
@@ -3659,10 +3659,10 @@ class VLAFlowMatching(nn.Module):
                     else "copied_legacy_pose9"
                 )
             ),
-            "base_pose9_equivariant_wrapper": bool(
-                getattr(world, "base_pose9_equivariant_wrapper", False)
+            "bidirectional_cross_attention_zero_output_init": bool(
+                self.world_to_ego_cross_attn is not None
             ),
-            "bidirectional_cross_attention_zero_output_init": True,
+            "shared_expert_conjugate_bridge": shared_expert_conjugate_bridge,
             "physical_trajectory_interaction": bool(
                 ego_physical_projection is not None
             ),
@@ -3706,6 +3706,9 @@ class VLAFlowMatching(nn.Module):
             "world_to_ego_cross_attn.",
             "ego_physical_trajectory_in_proj.",
             "world_physical_trajectory_in_proj.",
+            "conjugate_motion_in_proj.",
+            "ego_to_world_point_action_bridge.",
+            "world_to_ego_point_action_bridge.",
         )
         world_exact = {
             "world_ego_scene_type_embedding",
@@ -4116,7 +4119,6 @@ class VLAFlowMatching(nn.Module):
         expert_out: Tensor,
         world_x_t: Tensor,
         time: Tensor,
-        current_ee_pose_world: Tensor | None = None,
     ) -> Tensor:
         """Decode World expert features in its configured trajectory chart."""
 
@@ -4134,15 +4136,7 @@ class VLAFlowMatching(nn.Module):
             ):
                 if self.world_action_out_proj is None:
                     raise RuntimeError("World-EEF pose9 chart head is not initialized.")
-                local_velocity = self.world_action_out_proj(expert_out)
-                if current_ee_pose_world is None:
-                    raise RuntimeError(
-                        "Robot-base pose9 decoding requires the current EEF pose."
-                    )
-                return _rotate_ego_pose9_chart_velocity_to_world(
-                    local_velocity,
-                    current_ee_pose_world,
-                )
+                return self.world_action_out_proj(expert_out)
             if self.world_se3_action_out_proj is None:
                 raise RuntimeError("World-EEF trajectory SE(3) twist head is not initialized.")
             return self.world_se3_action_out_proj(expert_out)
@@ -5044,7 +5038,50 @@ class VLAFlowMatching(nn.Module):
         )
         return point_cloud_world, point_is_pad, current_pose
 
+    def _attach_shared_expert_conjugate_bridge(
+        self,
+        world_tokens: dict[str, Tensor],
+        ego_state: Tensor,
+        world_state: Tensor,
+        current_ee_pose_world: Tensor,
+        valid: Tensor,
+    ) -> None:
+        """Attach geometry-only bridge tokens without rewriting either flow."""
+
+        if (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            != "point_action_expert_conjugate_bridge"
+        ):
+            return
+        ego_motion, world_motion = conjugate_world_ego_flow_states_for_shared_expert(
+            ego_state,
+            world_state,
+            current_ee_pose_world,
+        )
+        valid = valid.to(device=ego_motion.device, dtype=torch.bool)
+        if valid.shape != ego_motion.shape[:2]:
+            raise ValueError(
+                f"Expected conjugate bridge mask shape {ego_motion.shape[:2]}, got {valid.shape}."
+            )
+        world_tokens["ego_conjugate_motion_pose9"] = ego_motion
+        world_tokens["world_conjugate_motion_pose9"] = world_motion
+        world_tokens["conjugate_motion_mask"] = valid
+
     def _build_world_ego_joint_suffix(
+        self,
+        ego_action_tokens: Tensor,
+        ego_action_mask: Tensor,
+        world_tokens: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor, dict[str, slice]]:
+        """Build the legacy single-call shared-Expert World–Ego suffix."""
+
+        return self._build_legacy_world_ego_joint_suffix(
+            ego_action_tokens,
+            ego_action_mask,
+            world_tokens,
+        )
+
+    def _build_legacy_world_ego_joint_suffix(
         self,
         ego_action_tokens: Tensor,
         ego_action_mask: Tensor,
@@ -5238,9 +5275,8 @@ class VLAFlowMatching(nn.Module):
             world_out,
             world_state,
             timestep,
-            current_ee_pose_world,
         )
-        ego_proposal_base, world_proposal_current = (
+        ego_motion_world, world_motion_world = (
             physically_aligned_world_ego_trajectory_proposals(
                 ego_state,
                 preliminary_ego_velocity,
@@ -5256,10 +5292,10 @@ class VLAFlowMatching(nn.Module):
             dtype=ego_out.dtype,
         )
         ego_physical_tokens = self.ego_physical_trajectory_in_proj(
-            ego_proposal_base.to(dtype=ego_out.dtype)
+            ego_motion_world.to(dtype=ego_out.dtype)
         )
         world_physical_tokens = self.world_physical_trajectory_in_proj(
-            world_proposal_current.to(dtype=world_out.dtype)
+            world_motion_world.to(dtype=world_out.dtype)
         )
         ego_physical_tokens = (
             ego_physical_tokens
@@ -5334,27 +5370,6 @@ class VLAFlowMatching(nn.Module):
                 "Independent World expert requires global/point masks and action tokens/masks."
             )
 
-        if bool(
-            getattr(
-                getattr(self, "worldflow_branch", None),
-                "base_pose9_equivariant_wrapper",
-                False,
-            )
-        ):
-            # Exact Ego-compatible layout for the independently copied Expert.
-            # Absolute base scene/current-pose information is injected only
-            # after this complete local action proposal is formed.
-            world_action_mask = world_action_mask.to(
-                device=world_action_tokens.device,
-                dtype=torch.bool,
-            )
-            suffix_att_masks = torch.tensor(
-                [1] + [0] * (world_action_tokens.shape[1] - 1),
-                dtype=world_action_tokens.dtype,
-                device=world_action_tokens.device,
-            )[None, :].expand(world_action_tokens.shape[0], -1)
-            return world_action_tokens, world_action_mask, suffix_att_masks
-
         world_scene = self.world_scene_to_expert(world_global_feat).unsqueeze(1)
         world_scene_mask = world_point_mask.to(
             device=world_scene.device,
@@ -5415,17 +5430,6 @@ class VLAFlowMatching(nn.Module):
         path before the explicit interaction phase.
         """
 
-        if bool(
-            getattr(
-                getattr(self, "worldflow_branch", None),
-                "base_pose9_equivariant_wrapper",
-                False,
-            )
-        ):
-            # The independent copied Expert starts from the exact Ego prefix.
-            # Its parameters are not shared; base-frame evidence is added by
-            # the dedicated World-only context attention after this pass.
-            return prefix_pad_masks
         point_slices = getattr(self, "last_ego_point_prefix_slices", ())
         if not point_slices:
             return prefix_pad_masks
@@ -5490,50 +5494,6 @@ class VLAFlowMatching(nn.Module):
             suffix_out = outputs_embeds[1]
         return suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
 
-    def _inject_world_base_context(
-        self,
-        world_out: Tensor,
-        world_tokens: dict[str, Tensor],
-    ) -> Tensor:
-        """Inject base-frame scene evidence after a complete World proposal."""
-
-        world_base_context_cross_attn = getattr(
-            self,
-            "world_base_context_cross_attn",
-            None,
-        )
-        world_base_context_norm = getattr(self, "world_base_context_norm", None)
-        if world_base_context_cross_attn is None or world_base_context_norm is None:
-            return world_out
-        if self.world_scene_to_expert is None:
-            raise RuntimeError("World base-context projection is not initialized.")
-        scene_tokens = world_tokens.get("scene_tokens")
-        scene_mask = world_tokens.get("scene_mask")
-        if not torch.is_tensor(scene_tokens) or not torch.is_tensor(scene_mask):
-            raise ValueError("World base-context attention requires scene tokens and mask.")
-        context_tokens = [self.world_scene_to_expert(scene_tokens)]
-        context_masks = [scene_mask.to(device=scene_tokens.device, dtype=torch.bool)]
-        current_pose_token = world_tokens.get("current_ee_pose_token")
-        current_pose_mask = world_tokens.get("current_ee_pose_mask")
-        if torch.is_tensor(current_pose_token) and torch.is_tensor(current_pose_mask):
-            context_tokens.insert(0, current_pose_token)
-            context_masks.insert(
-                0,
-                current_pose_mask.to(device=current_pose_token.device, dtype=torch.bool),
-            )
-        context = torch.cat(context_tokens, dim=1)
-        context_mask = torch.cat(context_masks, dim=1)
-        normalized_world = world_base_context_norm(world_out)
-        normalized_context = world_base_context_norm(context)
-        delta, _ = world_base_context_cross_attn(
-            query=normalized_world,
-            key=normalized_context,
-            value=normalized_context,
-            key_padding_mask=~context_mask,
-            need_weights=False,
-        )
-        return world_out + delta
-
     def _run_world_ego_joint_expert(
         self,
         prefix_embs: Tensor | None,
@@ -5545,6 +5505,111 @@ class VLAFlowMatching(nn.Module):
         *,
         past_key_values=None,
     ) -> tuple[Tensor, Tensor]:
+        if (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
+        ):
+            required_modules = (
+                getattr(self, "conjugate_motion_in_proj", None),
+                getattr(self, "ego_to_world_point_action_bridge", None),
+                getattr(self, "world_to_ego_point_action_bridge", None),
+                self.world_ego_action_type_embedding,
+            )
+            if any(module is None for module in required_modules):
+                raise RuntimeError("Shared PointActionExpert bridge modules are not initialized.")
+            required_tokens = (
+                "action_tokens",
+                "action_mask",
+                "ego_conjugate_motion_pose9",
+                "world_conjugate_motion_pose9",
+                "conjugate_motion_mask",
+            )
+            if not all(torch.is_tensor(world_tokens.get(name)) for name in required_tokens):
+                raise ValueError(
+                    "Shared PointActionExpert requires World action tokens and both "
+                    "conjugated motion-token sequences."
+                )
+
+            world_action_tokens = world_tokens["action_tokens"]
+            world_action_mask = world_tokens["action_mask"].to(
+                device=world_action_tokens.device,
+                dtype=torch.bool,
+            )
+            ego_action_mask = ego_action_mask.to(device=ego_action_tokens.device, dtype=torch.bool)
+            bridge_mask = world_tokens["conjugate_motion_mask"].to(
+                device=ego_action_tokens.device,
+                dtype=torch.bool,
+            )
+            ego_motion_tokens = self.conjugate_motion_in_proj(
+                world_tokens["ego_conjugate_motion_pose9"].to(dtype=ego_action_tokens.dtype)
+            )
+            world_motion_tokens = self.conjugate_motion_in_proj(
+                world_tokens["world_conjugate_motion_pose9"].to(dtype=world_action_tokens.dtype)
+            )
+            if not (
+                ego_action_tokens.shape
+                == world_action_tokens.shape
+                == ego_motion_tokens.shape
+                == world_motion_tokens.shape
+            ):
+                raise ValueError(
+                    "Shared PointActionExpert action and conjugate-motion tokens must have "
+                    "identical (B,T,C) shapes."
+                )
+
+            world_available = bridge_mask & world_action_mask
+            if "world" in getattr(self, "inference_ablation_modalities", frozenset()):
+                world_available = torch.zeros_like(world_available)
+                world_action_mask = torch.zeros_like(world_action_mask)
+            ego_available = bridge_mask & ego_action_mask
+            ego_cross = self.world_to_ego_point_action_bridge(
+                torch.cat(
+                    [world_action_tokens, world_motion_tokens, ego_motion_tokens],
+                    dim=-1,
+                )
+            )
+            world_cross = self.ego_to_world_point_action_bridge(
+                torch.cat(
+                    [ego_action_tokens, ego_motion_tokens, world_motion_tokens],
+                    dim=-1,
+                )
+            )
+            ego_suffix = (
+                ego_action_tokens
+                + self.world_ego_action_type_embedding[0]
+                + ego_cross * world_available.unsqueeze(-1).to(dtype=ego_cross.dtype)
+            )
+            world_suffix = (
+                world_action_tokens
+                + self.world_ego_action_type_embedding[1]
+                + world_cross * ego_available.unsqueeze(-1).to(dtype=world_cross.dtype)
+            )
+            ego_att_mask = torch.tensor(
+                [1] + [0] * (ego_suffix.shape[1] - 1),
+                dtype=ego_suffix.dtype,
+                device=ego_suffix.device,
+            )[None, :].expand(ego_suffix.shape[0], -1)
+            world_att_mask = ego_att_mask.to(device=world_suffix.device, dtype=world_suffix.dtype)
+            ego_out = self._run_ego_suffix_expert(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                ego_suffix,
+                ego_action_mask,
+                ego_att_mask,
+                past_key_values=past_key_values,
+            )
+            world_out = self._run_ego_suffix_expert(
+                prefix_embs,
+                self._independent_world_prefix_mask(prefix_pad_masks),
+                prefix_att_masks,
+                world_suffix,
+                world_action_mask,
+                world_att_mask,
+                past_key_values=past_key_values,
+            )
+            return ego_out, world_out
+
         if (
             getattr(self.config, "worldflow_action_expert_mode", "shared")
             == "independent"
@@ -5571,7 +5636,6 @@ class VLAFlowMatching(nn.Module):
                 world_tokens,
                 past_key_values=past_key_values,
             )
-            world_out = self._inject_world_base_context(world_out, world_tokens)
             if (
                 getattr(self.config, "worldflow_action_fusion", "cross_attention")
                 == "independent_parallel"
@@ -5641,6 +5705,14 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         ego_out = suffix_out[:, layout["ego_action"]]
         world_out = suffix_out[:, layout["world_action"]]
+        if (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
+        ):
+            # Both flows have already interacted symmetrically inside the
+            # shared PointActionExpert block. There is intentionally no second
+            # post-Expert latent cross-attention stage.
+            return ego_out, world_out
         return self._bidirectional_world_ego_cross_attention(
             ego_out,
             world_out,
@@ -5865,17 +5937,6 @@ class VLAFlowMatching(nn.Module):
                 rot_weight=float(self.config.worldflow_rot_weight),
             )
 
-        ego_gripper_state = None
-        base_pose9_equivariant_wrapper = bool(
-            getattr(self.worldflow_branch, "base_pose9_equivariant_wrapper", False)
-        )
-        if base_pose9_equivariant_wrapper:
-            ego_gripper_source = ego_x_t if ego_x_t is not None else ego_noise
-            if ego_gripper_source.shape[-1] < 10:
-                raise ValueError(
-                    "Robot-base pose9 World training requires an Ego gripper state."
-                )
-            ego_gripper_state = ego_gripper_source[..., 9:10]
         world_tokens = self.worldflow_branch(
             point_cloud_world,
             lang_tokens,
@@ -5885,10 +5946,22 @@ class VLAFlowMatching(nn.Module):
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
             current_ee_pose_world=current_pose,
-            ego_gripper_state=ego_gripper_state,
-            ego_point_tokens=getattr(self, "last_point_action_tokens", None),
-            ego_point_mask=getattr(self, "last_point_action_mask", None),
         )
+        if (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
+        ):
+            if ego_x_t is None:
+                raise ValueError(
+                    "Shared PointActionExpert conjugate bridge requires the current Ego flow state."
+                )
+            self._attach_shared_expert_conjugate_bridge(
+                world_tokens,
+                ego_x_t,
+                x_t,
+                current_pose,
+                valid,
+            )
         state = {
             "point_cloud_world": point_cloud_world,
             "point_is_pad": point_is_pad,
@@ -5901,7 +5974,6 @@ class VLAFlowMatching(nn.Module):
             "path_conjugacy_error": path_conjugacy_error,
             "x_t": x_t,
             "u_t": u_t,
-            "ego_gripper_state": ego_gripper_state,
             "valid": valid,
             "world_tokens": world_tokens,
             "independent_world_trajectory": torch.tensor(
@@ -5930,7 +6002,6 @@ class VLAFlowMatching(nn.Module):
         current_x_t = state["x_t"]
         current_u_t = state.get("u_t")
         current_pose9 = state.get("current_pose9")
-        ego_gripper_state = state.get("ego_gripper_state")
         valid = state["valid"]
         if not all(
             torch.is_tensor(value)
@@ -6043,16 +6114,12 @@ class VLAFlowMatching(nn.Module):
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
             current_ee_pose_world=current_pose9_aug,
-            ego_gripper_state=ego_gripper_state,
-            ego_point_tokens=getattr(self, "last_point_action_tokens", None),
-            ego_point_mask=getattr(self, "last_point_action_mask", None),
         )
         return {
             "spatial_gt": spatial_gt_aug,
             "x_t": x_t_aug,
             "u_t": u_t_aug,
             "current_pose9": current_pose9_aug,
-            "ego_gripper_state": ego_gripper_state,
             "world_tokens": world_tokens_aug,
         }, transform
 
@@ -6521,7 +6588,6 @@ class VLAFlowMatching(nn.Module):
                     world_expert_out,
                     world_x_t,
                     time,
-                    world_state.get("current_pose9"),
                 )
             if self.config.worldflow_action_fusion == "symmetric_twist":
                 pred = symmetric_world_ego_twist_fusion(
@@ -6598,7 +6664,6 @@ class VLAFlowMatching(nn.Module):
                         world_aug_expert_out,
                         world_x_t_aug,
                         time,
-                        augmented_state.get("current_pose9"),
                     )
         twist_pred = pred[..., :6]
         gripper_vel_pred = pred[..., 6:7]
@@ -6775,7 +6840,6 @@ class VLAFlowMatching(nn.Module):
                     world_expert_out,
                     world_x_t,
                     time,
-                    world_state.get("current_pose9"),
                 )
             else:
                 v_t = self.action_out_proj(ego_expert_out)
@@ -6887,7 +6951,6 @@ class VLAFlowMatching(nn.Module):
                             world_aug_expert_out,
                             augmented_world_x_t,
                             time,
-                            augmented_state.get("current_pose9"),
                         )
                     else:
                         if self.world_action_out_proj is None:
@@ -7001,10 +7064,19 @@ class VLAFlowMatching(nn.Module):
             if current_ee_pose is None:
                 raise ValueError("Joint World–Ego inference requires current_ee_pose.")
             current_ee_pose = current_ee_pose.to(device=device, dtype=torch.float32)
-            ego_to_world_transform = _worldflow_carrier_matrix(
-                current_ee_pose,
-                self.config.worldflow_frame_origin,
-            ).unsqueeze(1)
+            if (
+                getattr(self.config, "worldflow_action_fusion", "cross_attention")
+                == "point_action_expert_conjugate_bridge"
+            ):
+                # The shared-Expert bridge needs the physical current EEF pose
+                # C even though the absolute World trajectory carrier itself
+                # is the robot-base identity.
+                ego_to_world_transform = pose9_to_matrix(current_ee_pose).unsqueeze(1)
+            else:
+                ego_to_world_transform = _worldflow_carrier_matrix(
+                    current_ee_pose,
+                    self.config.worldflow_frame_origin,
+                ).unsqueeze(1)
             world_to_ego_transform = invert_transform(ego_to_world_transform)
             point_cloud_world, point_is_pad, _ = self._prepare_worldflow_foreground(current_ee_pose)
             world_scene = self.worldflow_branch.encode_scene(
@@ -7012,13 +7084,6 @@ class VLAFlowMatching(nn.Module):
                 point_is_pad=point_is_pad,
                 current_ee_pose_world=current_ee_pose,
             )
-            if self.worldflow_branch.base_pose9_equivariant_wrapper:
-                if self.last_point_action_tokens is None or self.last_point_action_mask is None:
-                    raise ValueError(
-                        "Robot-base pose9 World inference requires cached Ego point-action tokens."
-                    )
-                world_scene["ego_point_tokens"] = self.last_point_action_tokens
-                world_scene["ego_point_mask"] = self.last_point_action_mask
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling == "left_compose_ego":
                     world_x_t = self.left_compose_ego_pose_to_world(
@@ -7180,23 +7245,28 @@ class VLAFlowMatching(nn.Module):
             lang_masks,
             world_x_t,
             timestep,
-            ego_gripper_state=(
-                ego_x_t[..., 9:10]
-                if getattr(
-                    self.worldflow_branch,
-                    "base_pose9_equivariant_wrapper",
-                    False,
-                )
-                else None
-            ),
-            ego_point_tokens=world_scene.get("ego_point_tokens"),
-            ego_point_mask=world_scene.get("ego_point_mask"),
         )
         world_tokens = {
             **world_scene,
             "action_tokens": world_action_tokens,
             "action_mask": world_action_mask,
         }
+        if (
+            getattr(self.config, "worldflow_action_fusion", "cross_attention")
+            == "point_action_expert_conjugate_bridge"
+        ):
+            if ego_to_world_transform is None:
+                raise RuntimeError(
+                    "Shared PointActionExpert conjugate bridge requires the current EEF transform."
+                )
+            current_pose9 = matrix_to_pose9(ego_to_world_transform.squeeze(1))
+            self._attach_shared_expert_conjugate_bridge(
+                world_tokens,
+                ego_x_t,
+                world_x_t,
+                current_pose9,
+                ego_mask & world_action_mask,
+            )
         ego_out, world_out = self._run_world_ego_joint_expert(
             None,
             prefix_pad_masks,
@@ -7282,7 +7352,6 @@ class VLAFlowMatching(nn.Module):
                     world_out,
                     world_x_t,
                     timestep,
-                    world_scene.get("current_ee_pose_world"),
                 )
             if return_pose9_velocity:
                 return joint_ego_velocity, world_velocity, joint_pose9_velocity
@@ -7296,7 +7365,6 @@ class VLAFlowMatching(nn.Module):
                 world_out,
                 world_x_t,
                 timestep,
-                world_scene.get("current_ee_pose_world"),
             )
         else:
             if self.world_action_out_proj is None:
@@ -7397,13 +7465,6 @@ class VLAFlowMatching(nn.Module):
                 point_is_pad=point_is_pad,
                 current_ee_pose_world=current_ee_pose,
             )
-            if self.worldflow_branch.base_pose9_equivariant_wrapper:
-                if self.last_point_action_tokens is None or self.last_point_action_mask is None:
-                    raise ValueError(
-                        "Robot-base pose9 World inference requires cached Ego point-action tokens."
-                    )
-                world_scene["ego_point_tokens"] = self.last_point_action_tokens
-                world_scene["ego_point_mask"] = self.last_point_action_mask
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling == "left_compose_ego":
                     world_x_t = self.left_compose_ego_pose_to_world(

@@ -14,14 +14,14 @@ def test_action_chunk_start_offset_shifts_dataset_action_indices():
 
     assert cfg.action_delta_indices == [1, 2, 3, 4]
 from lerobot.policies.smolvla.modeling_smolvla import (
-    _inverse_left_compose_world_pose9_chart_to_ego,
     _left_compose_ego_pose9_chart_to_world,
-    _rotate_ego_pose9_chart_velocity_to_world,
     _worldflow_carrier_matrix,
+    PointActionSelfAttention,
     SmolVLAPolicy,
     VLAFlowMatching,
     WorldFlowActionBranch,
     body_twist_to_pose9_velocity,
+    conjugate_world_ego_flow_states_for_shared_expert,
     decoupled_base_pose_apply,
     decoupled_base_pose_flow_state,
     physically_aligned_world_ego_trajectory_proposals,
@@ -1274,7 +1274,6 @@ def test_world_pose9_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert model.world_lm_expert.weight.data_ptr() != model.vlm_with_expert.lm_expert.weight.data_ptr()
     assert report["world_action_expert"] == "independent_bootstrapped_copy"
     assert report["world_output_head"] == "copied_independent_base_pose9"
-    assert report["base_pose9_equivariant_wrapper"] is False
     assert torch.count_nonzero(world.language_embedding.weight) == 0
     assert torch.count_nonzero(model.ego_to_world_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
@@ -1981,6 +1980,37 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     assert "worldflow_targets=world_eef_trajectory" in cfg.flow_contract_summary()
     assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
 
+    shared_expert_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
+        worldflow_action_fusion="point_action_expert_conjugate_bridge",
+        worldflow_action_expert_mode="shared",
+        worldflow_current_ee_pose_token=False,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert shared_expert_cfg.worldflow_action_expert_mode == "shared"
+
+    with pytest.raises(ValueError, match="one shared Action Expert"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_target_type="world_eef_trajectory",
+            worldflow_reference_frame="robot_base",
+            worldflow_frame_origin="global",
+            worldflow_scene_frame_origin="global",
+            worldflow_noise_coupling="left_compose_ego",
+            worldflow_world_eef_velocity_mode="base_pose9_euclidean",
+            worldflow_action_fusion="point_action_expert_conjugate_bridge",
+            worldflow_action_expert_mode="independent",
+            worldflow_bridge_loss_weight=0.0,
+            worldflow_equiv_loss_weight=0.0,
+        )
+
     physically_coupled_cfg = SmolVLAConfig(
         worldflow_enable=True,
         worldflow_target_type="world_eef_trajectory",
@@ -2434,6 +2464,56 @@ def test_worldflow_branch_consumes_xyzrgb_without_role_or_probability_inputs():
     assert not hasattr(branch, "action_expert")
 
 
+def test_shared_expert_world_frontend_matches_ego_litept_point_action_path():
+    cfg = SmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
+        worldflow_action_fusion="point_action_expert_conjugate_bridge",
+        worldflow_action_expert_mode="shared",
+        worldflow_current_ee_pose_token=False,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+    )
+    branch = _make_tiny_worldflow_branch(cfg)
+    assert isinstance(branch.point_action_adapter, PointActionSelfAttention)
+    assert branch.scene_context_proj is None
+    assert branch.language_embedding is None
+    assert branch.language_norm is None
+
+    scene = {
+        "scene_tokens": torch.randn(2, 7, 16),
+        "scene_mask": torch.ones(2, 7, dtype=torch.bool),
+        "global_feat": torch.randn(2, 16),
+    }
+    actions = torch.randn(2, cfg.chunk_size, 9)
+    time = torch.rand(2)
+    first, _ = branch.embed_action_tokens(
+        scene,
+        torch.randint(0, 64, (2, 3)),
+        torch.ones(2, 3, dtype=torch.bool),
+        actions,
+        time,
+    )
+    scene["global_feat"] = torch.randn_like(scene["global_feat"]) * 1000
+    second, _ = branch.embed_action_tokens(
+        scene,
+        torch.randint(0, 64, (2, 9)),
+        torch.zeros(2, 9, dtype=torch.bool),
+        actions,
+        time,
+    )
+    assert torch.equal(first, second)
+
+
 def test_worldflow_point_action_receives_every_litept_token():
     cfg = SmolVLAConfig(
         chunk_size=4,
@@ -2541,6 +2621,73 @@ def test_world_ego_joint_attention_preserves_ego_block_and_lets_world_read_ego()
     assert mask[world_action[:, None], ego_action].all()
     assert mask[world_action[:, None], all_scenes].all()
     assert mask[world_action[:, None], world_action].all()
+
+
+def test_shared_point_action_expert_bridge_preserves_ego_layout_and_reuses_one_expert():
+    cfg = SimpleNamespace(
+        chunk_size=2,
+        worldflow_action_fusion="point_action_expert_conjugate_bridge",
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.conjugate_motion_in_proj = nn.Linear(9, 9)
+    model.ego_to_world_point_action_bridge = nn.Linear(27, 9)
+    model.world_to_ego_point_action_bridge = nn.Linear(27, 9)
+    model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, 9))
+    nn.init.zeros_(model.ego_to_world_point_action_bridge.weight)
+    nn.init.zeros_(model.ego_to_world_point_action_bridge.bias)
+    nn.init.zeros_(model.world_to_ego_point_action_bridge.weight)
+    nn.init.zeros_(model.world_to_ego_point_action_bridge.bias)
+    model.inference_ablation_modalities = frozenset()
+    model.last_ego_point_prefix_slices = (slice(1, 3),)
+
+    ego_actions = torch.randn(1, 2, 9)
+    world_actions = torch.randn(1, 2, 9)
+    world = {
+        "action_tokens": world_actions,
+        "action_mask": torch.ones(1, 2, dtype=torch.bool),
+        "ego_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "world_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "conjugate_motion_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    calls = []
+
+    def record_shared_expert(
+        _prefix_embs,
+        prefix_pad_masks,
+        _prefix_att_masks,
+        suffix_embs,
+        suffix_pad_masks,
+        suffix_att_masks,
+        *,
+        past_key_values=None,
+    ):
+        del past_key_values
+        calls.append((prefix_pad_masks.clone(), suffix_embs.clone(), suffix_pad_masks, suffix_att_masks))
+        return suffix_embs
+
+    model._run_ego_suffix_expert = record_shared_expert
+    model._bidirectional_world_ego_cross_attention = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("shared PointActionExpert mode must not use post-Expert cross-attention")
+    )
+    actual_ego, actual_world = model._run_world_ego_joint_expert(
+        None,
+        torch.ones(1, 5, dtype=torch.bool),
+        None,
+        ego_actions,
+        torch.ones(1, 2, dtype=torch.bool),
+        world,
+        past_key_values=object(),
+    )
+
+    assert len(calls) == 2
+    assert torch.equal(actual_ego, ego_actions)
+    assert torch.equal(actual_world, world_actions)
+    assert calls[0][0].all()
+    assert not calls[1][0][:, 1:3].any()
+    assert calls[0][1].shape[1] == calls[1][1].shape[1] == cfg.chunk_size
+    assert calls[0][3].tolist() == calls[1][3].tolist() == [[1.0, 0.0]]
 
 
 def test_world_stream_ablation_preserves_layout_but_masks_world_tokens():
@@ -2821,7 +2968,33 @@ def test_world_trajectory_execution_is_left_coordinate_change_not_conjugation():
     assert torch.allclose(pose9_to_matrix(actual), relative, atol=3e-5, rtol=3e-5)
 
 
-def test_physical_trajectory_proposals_align_complete_predictions_without_residual_rate():
+def test_shared_expert_bridge_conjugates_unchanged_world_and_ego_flow_states():
+    current_base = se3_exp(torch.tensor([[0.20, -0.10, 0.30, 0.0, 0.0, 0.35]]))
+    ego_state_matrix = se3_exp(
+        torch.tensor(
+            [[[0.04, 0.01, -0.02, 0.03, -0.04, 0.02], [0.08, -0.03, 0.01, 0.0, 0.02, -0.05]]]
+        )
+    )
+    world_state_matrix = current_base.unsqueeze(1) @ ego_state_matrix
+
+    ego_motion, world_motion = conjugate_world_ego_flow_states_for_shared_expert(
+        matrix_to_pose9(ego_state_matrix),
+        matrix_to_pose9(world_state_matrix),
+        matrix_to_pose9(current_base),
+    )
+    expected = current_base.unsqueeze(1) @ ego_state_matrix @ torch.linalg.inv(
+        current_base
+    ).unsqueeze(1)
+
+    assert torch.allclose(pose9_to_matrix(ego_motion), expected, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(pose9_to_matrix(world_motion), expected, atol=4e-5, rtol=4e-5)
+    # The bridge is additional conditioning only: its inputs retain their
+    # original current-EEF and robot-base absolute pose semantics.
+    assert torch.allclose(pose9_to_matrix(matrix_to_pose9(ego_state_matrix)), ego_state_matrix)
+    assert torch.allclose(pose9_to_matrix(matrix_to_pose9(world_state_matrix)), world_state_matrix)
+
+
+def test_physical_trajectory_proposals_bridge_complete_predictions_by_conjugation():
     current_base = se3_exp(torch.tensor([[0.20, -0.10, 0.30, 0.0, 0.0, 0.35]]))
     target_current = se3_exp(
         torch.tensor(
@@ -2855,7 +3028,7 @@ def test_physical_trajectory_proposals_align_complete_predictions_without_residu
         dim=-1,
     )
 
-    ego_proposal_base, world_proposal_current = (
+    ego_motion_world, world_motion_world = (
         physically_aligned_world_ego_trajectory_proposals(
             ego_state,
             ego_velocity,
@@ -2867,10 +3040,16 @@ def test_physical_trajectory_proposals_align_complete_predictions_without_residu
         )
     )
 
-    assert torch.allclose(pose9_to_matrix(ego_proposal_base), target_base, atol=4e-5, rtol=4e-5)
+    target_motion_world = target_base @ torch.linalg.inv(current_base).unsqueeze(1)
     assert torch.allclose(
-        pose9_to_matrix(world_proposal_current),
-        target_current,
+        pose9_to_matrix(ego_motion_world),
+        target_motion_world,
+        atol=4e-5,
+        rtol=4e-5,
+    )
+    assert torch.allclose(
+        pose9_to_matrix(world_motion_world),
+        target_motion_world,
         atol=4e-5,
         rtol=4e-5,
     )
@@ -3758,47 +3937,6 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
     )
     assert output["per_sample_loss"].abs().max().item() < 2e-5
     assert model.last_worldflow_metrics["worldflow_flow_rotation6d_rmse"].item() < 1e-7
-
-
-def test_robot_base_pose9_equivariant_wrapper_round_trips_raw_gaussian_chart():
-    torch.manual_seed(32)
-    current = matrix_to_pose9(se3_exp(torch.randn(4, 6) * 0.3))
-    ego_chart = torch.randn(4, 7, 9) * 0.1
-    ego_velocity = torch.randn(4, 7, 9) * 0.1
-
-    world_chart = _left_compose_ego_pose9_chart_to_world(ego_chart, current)
-    recovered = _inverse_left_compose_world_pose9_chart_to_ego(world_chart, current)
-    world_velocity = _rotate_ego_pose9_chart_velocity_to_world(ego_velocity, current)
-
-    assert torch.allclose(recovered, ego_chart, atol=2e-6, rtol=2e-6)
-    affine_difference = (
-        _left_compose_ego_pose9_chart_to_world(ego_chart + ego_velocity, current)
-        - world_chart
-    )
-    assert torch.allclose(world_velocity, affine_difference, atol=2e-6, rtol=2e-6)
-
-
-def test_robot_base_pose9_world_decoder_rotates_copied_local_head_output():
-    torch.manual_seed(33)
-    model = VLAFlowMatching.__new__(VLAFlowMatching)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(
-        worldflow_target_type="world_eef_trajectory",
-        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
-    )
-    model.world_action_out_proj = nn.Identity()
-    expert_out = torch.randn(3, 5, 9)
-    current = matrix_to_pose9(se3_exp(torch.randn(3, 6) * 0.2))
-
-    actual = model._predict_world_se3_velocity(
-        expert_out,
-        torch.randn(3, 5, 9),
-        torch.tensor([0.2, 0.5, 0.8]),
-        current,
-    )
-    expected = _rotate_ego_pose9_chart_velocity_to_world(expert_out, current)
-
-    assert torch.equal(actual, expected)
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():
