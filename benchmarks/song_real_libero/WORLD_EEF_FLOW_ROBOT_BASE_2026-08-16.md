@@ -332,6 +332,28 @@ Validation completed on 2026-08-16:
   intentionally stopped after the execution path was established; it is not a
   performance measurement.
 
+## Corrected formal checkpoint screen
+
+The left-compose, base-decoupled run was trained with the original 1564-step
+scheduler declaration and stopped after saving step 1300. The fixed task6/task8
+screen produced:
+
+| step | task 6 | task 8 | result |
+|---:|---:|---:|---|
+| 260 | 47/50 | 43/50 | 90/100; rejected |
+| 520 | 45/50 | not run | rejected on task 6 |
+| 780 | 45/50 | not run | rejected on task 6 |
+| 1040 | 44/50 | not run | rejected on task 6 |
+| 1300 | 41/46 observed, 5 failures | not run | best possible 45/50; stopped early |
+
+For step 1300, episodes `{4,9,11,23,25}` completed as genuine failures after
+990 environment steps. Episodes `{32,36,37,39}` were still running when the
+strict-improvement upper bound fell below baseline and were deliberately
+cancelled; their generated `KeyboardInterrupt` records are infrastructure
+cancellations, not additional policy failures. No checkpoint improves both
+tasks, so this corrected structural experiment does not qualify for ablation
+or further training under the focused-goal rule.
+
 ## Four-GPU checkpoint evaluation
 
 Future checkpoint sweeps use

@@ -106,23 +106,40 @@ for task6_summary in sorted(root.glob("step*_task6_50ep/summary.json")):
             item for item in summary["results"]
             if item["suite"] == "libero_10" and int(item["task_id"]) == task_id
         )
-        failures = sorted(
+        policy_failures = sorted(
             int(episode["episode_index"])
             for episode in result["episodes"]
-            if not bool(episode["success"])
+            if not bool(episode["success"]) and not episode.get("error")
         )
+        cancelled = sorted(
+            int(episode["episode_index"])
+            for episode in result["episodes"]
+            if not bool(episode["success"]) and episode.get("error")
+        )
+        observed_successes = sum(
+            bool(episode["success"]) for episode in result["episodes"]
+        )
+        completed_rollouts = len(result["episodes"]) - len(cancelled)
+        maximum_possible_successes = observed_successes + len(cancelled)
         tasks[str(task_id)] = {
-            "successes": 50 - len(failures),
+            "status": "complete" if not cancelled else "stopped_early",
+            "successes": observed_successes if not cancelled else None,
+            "observed_successes": observed_successes,
+            "completed_rollouts": completed_rollouts,
+            "maximum_possible_successes": maximum_possible_successes,
             "baseline_successes": baseline[task_id],
-            "delta": 50 - len(failures) - baseline[task_id],
-            "failure_indices": failures,
+            "delta": observed_successes - baseline[task_id] if not cancelled else None,
+            "failure_indices": policy_failures,
+            "policy_failure_indices": policy_failures,
+            "cancelled_episode_indices": cancelled,
             "summary": str(path),
         }
     qualified = set(tasks) == {"6", "8"} and all(
-        tasks[str(task_id)]["successes"] > baseline[task_id]
+        tasks[str(task_id)]["status"] == "complete"
+        and tasks[str(task_id)]["successes"] > baseline[task_id]
         for task_id in (6, 8)
     )
-    total = sum(item["successes"] for item in tasks.values())
+    total = sum(item["observed_successes"] for item in tasks.values())
     records.append({
         "tag": tag,
         "tasks": tasks,

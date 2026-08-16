@@ -80,7 +80,7 @@ run_checkpoint() {
         --waypoint-max-hold-steps 1
         --isolated-policy-workers 1 --task-workers 1
         --episode-workers-per-task "$episode_workers" --task-worker-backend process
-        --inference-batch-size 80 --inference-batching-mode fixed_barrier
+        --inference-batch-size "$episode_workers" --inference-batching-mode fixed_barrier
         --no-release-event-exec-enable
         --control-freq 20 --action-index 0
         --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24
