@@ -12,6 +12,7 @@ freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
 action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
 action_fusion=${WORLD_EEF_ACTION_FUSION:-cross_attention}
 current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-false}
+eval_fusion_override=${WORLD_EEF_EVAL_FUSION_OVERRIDE:-}
 worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-0.02}
 worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-0.002}
 train_steps=${WORLD_EEF_TRAIN_STEPS:-1300}
@@ -33,6 +34,10 @@ if [[ "$action_fusion" != cross_attention && "$action_fusion" != world_trajector
 fi
 if [[ "$current_pose_token" != true && "$current_pose_token" != false ]]; then
     echo "WORLD_EEF_CURRENT_POSE_TOKEN must be true or false" >&2
+    exit 2
+fi
+if [[ -n "$eval_fusion_override" && "$eval_fusion_override" != cross_attention ]]; then
+    echo "WORLD_EEF_EVAL_FUSION_OVERRIDE must be empty or cross_attention" >&2
     exit 2
 fi
 log_dir="$experiment/logs"
@@ -309,12 +314,16 @@ eval_checkpoint() {
     local output="$experiment/eval/${tag}_dual_${episodes}ep"
     local ablation_flag=--no-world-to-ego-causal-ablation
     local video_flag=--save-video
+    local fusion_override_args=()
     if [[ "$ablated" == true ]]; then
         output="$experiment/eval/${tag}_world_to_ego_disabled_${episodes}ep"
         ablation_flag=--world-to-ego-causal-ablation
     fi
     if [[ "$save_video" != true ]]; then
         video_flag=--no-save-video
+    fi
+    if [[ -n "$eval_fusion_override" ]]; then
+        fusion_override_args=(--worldflow-action-fusion-override "$eval_fusion_override")
     fi
     if [[ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
         echo "evaluation output is not empty; refusing to overwrite: $output" >&2
@@ -329,6 +338,7 @@ eval_checkpoint() {
     "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
         --config benchmarks/song_real_libero/configs/libero.json \
         --policy.path "$checkpoint" \
+        "${fusion_override_args[@]}" \
         --suite libero_10 --task-id 6 --task-id 8 --episodes "$episodes" \
         --policy-noise-seed 0 --env-seed 7 --strict-official-init \
         --gripper-control-mode delta_width_initial_sync \
@@ -344,7 +354,7 @@ eval_checkpoint() {
         --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
         --render-mode offscreen --no-visualize-foreground "$video_flag" \
         "$ablation_flag" --output-dir "$output" \
-        2>&1 | tee -a "$log_dir/eval_${tag}_${episodes}ep_${ablated}.log"
+        2>&1 | tee -a "$log_dir/eval_${tag}_${episodes}ep_${ablated}_${eval_fusion_override:-checkpoint}.log"
 }
 
 eval_grid() {

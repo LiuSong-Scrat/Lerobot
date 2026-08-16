@@ -166,3 +166,35 @@ The authoritative single-flow baseline is
 Double-flow evaluation must reuse baseline environment seed 7, policy-noise
 seed 0, official fixed initialization, control frequency 20, action index 0,
 24 execution steps, and 50 episodes per task.
+
+## Current-pose-conditioned direct-World execution result
+
+The independent World Expert was then conditioned on the achieved current EEF
+pose in robot-base coordinates. Training kept the original 1564-step LR
+schedule but was stopped after the complete step-1300 checkpoint, as required.
+The moving 50-batch World translation error improved from about `7.57 cm` near
+step 353 to `5.39 cm` near step 1229, confirming that the missing current-pose
+condition was a real under-conditioning error.
+
+Directly executing that World trajectory was nevertheless decisively invalid:
+
+| step | task 6 hard-gate result | outcome |
+|---:|---:|---|
+| 260 | 0/28 | disqualified |
+| 520 | 0/28 | disqualified |
+| 780 | 0/28 | disqualified |
+| 1040 | 0/28 | disqualified |
+| 1300 | 0/28 | disqualified |
+
+At step 1300, the median Cartesian controller tracking error was about `5.2
+cm`; all 28 completed episodes consumed the long failure horizon. Thus the
+failure is not a checkpoint-selection or training-duration issue. A roughly
+5-cm World predictor cannot replace the pretrained Ego controller as the
+executed arm trajectory.
+
+The current-pose condition remains necessary, but the
+`world_trajectory_arm_ego_gripper` output route is rejected. The next causal
+diagnostic loads the same immutable checkpoint with
+`--worldflow-action-fusion-override cross_attention`. This changes only the
+final execution route back to the jointly conditioned Ego trajectory; it is
+recorded as a non-benchmark diagnostic and never edits the checkpoint files.

@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "worldflow_robot_base_process_proxy_v21_20260816"
+EVAL_BUILD_TAG = "worldflow_fusion_override_audit_v22_20260816"
 
 import argparse
 import atexit
@@ -80,6 +80,16 @@ FAIR_EVALUATION_PROTOCOL = {
 def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Describe whether this is a standard benchmark or a source-demo domain diagnostic."""
 
+    if cfg.get("worldflow_action_fusion_override") is not None:
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "worldflow_action_fusion_override_rollout",
+            "worldflow_action_fusion_override": str(
+                cfg["worldflow_action_fusion_override"]
+            ),
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
     if bool(cfg.get("secondary_view_causal_ablation", False)):
         return {
             **FAIR_EVALUATION_PROTOCOL,
@@ -588,6 +598,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Diagnostic only: keep the World stream and Ego-to-World path active, but remove "
             "both World-to-Ego cross-attention and the World residual twist correction."
+        ),
+    )
+    parser.add_argument(
+        "--worldflow-action-fusion-override",
+        choices=("cross_attention",),
+        default=None,
+        help=(
+            "Diagnostic only: override a WorldFlow checkpoint's final action routing at load "
+            "time without modifying the checkpoint. Currently only cross_attention is allowed."
         ),
     )
     parser.add_argument("--suite", action="append", default=None)
@@ -3598,7 +3617,8 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             ),
             "benchmark_comparable": not bool(cfg.get("dataset_domain_env", False))
             and not bool(cfg.get("world_to_ego_causal_ablation", False))
-            and not bool(cfg.get("secondary_view_causal_ablation", False)),
+            and not bool(cfg.get("secondary_view_causal_ablation", False))
+            and cfg.get("worldflow_action_fusion_override") is None,
             "demo_root": (
                 str(cfg.get("dataset_domain_demo_root"))
                 if bool(cfg.get("dataset_domain_env", False))
@@ -8544,6 +8564,9 @@ def evaluate_suite_process_parallel(
                 "secondary_view_causal_ablation": bool(
                     cfg.get("secondary_view_causal_ablation", False)
                 ),
+                "worldflow_action_fusion_override": cfg.get(
+                    "worldflow_action_fusion_override"
+                ),
                 "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
                 "image_camera_names": image_camera_names_from_config(cfg),
             },
@@ -8878,6 +8901,9 @@ def _isolated_policy_worker_entry(
             device=cfg["device"],
             visualize_foreground=False,
             foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
+            worldflow_action_fusion_override=cfg.get(
+                "worldflow_action_fusion_override"
+            ),
         )
         reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
         suite = benchmark.get_benchmark_dict()[suite_name]()
@@ -9096,6 +9122,12 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             False,
         )
     )
+    cfg["worldflow_action_fusion_override"] = cfg_get(
+        cfg,
+        args.worldflow_action_fusion_override,
+        "worldflow_action_fusion_override",
+        None,
+    )
     cfg["dataset_domain_oracle_actions"] = bool(
         cfg_get(
             cfg,
@@ -9147,7 +9179,8 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         ),
         "benchmark_comparable": not bool(cfg["dataset_domain_env"])
         and not bool(cfg["world_to_ego_causal_ablation"])
-        and not bool(cfg["secondary_view_causal_ablation"]),
+        and not bool(cfg["secondary_view_causal_ablation"])
+        and cfg["worldflow_action_fusion_override"] is None,
     }
     cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
@@ -9898,7 +9931,16 @@ def main() -> None:
         device=cfg["device"],
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
+        worldflow_action_fusion_override=cfg.get(
+            "worldflow_action_fusion_override"
+        ),
     )
+    if cfg.get("worldflow_action_fusion_override") is not None:
+        print(
+            "[diagnostic] WorldFlow action fusion overridden at load time: "
+            f"{cfg['worldflow_action_fusion_override']}; checkpoint files are unchanged.",
+            flush=True,
+        )
     inference_ablation_modalities: set[str] = set()
     if bool(cfg.get("secondary_view_causal_ablation", False)):
         if getattr(infer.policy.config, "camera_view_fusion", "legacy_budget") != "primary_residual":
@@ -9979,9 +10021,10 @@ def main() -> None:
         f"env_seed={cfg['env_seed']}, "
         f"dataset_domain_env={cfg['dataset_domain_env']}, "
         f"dataset_domain_oracle_actions={cfg['dataset_domain_oracle_actions']}, "
-        f"benchmark_comparable={not cfg['dataset_domain_env'] and not cfg['world_to_ego_causal_ablation'] and not cfg['secondary_view_causal_ablation']}, "
+        f"benchmark_comparable={not cfg['dataset_domain_env'] and not cfg['world_to_ego_causal_ablation'] and not cfg['secondary_view_causal_ablation'] and cfg['worldflow_action_fusion_override'] is None}, "
         f"secondary_view_causal_ablation={cfg['secondary_view_causal_ablation']}, "
         f"world_to_ego_causal_ablation={cfg['world_to_ego_causal_ablation']}, "
+        f"worldflow_action_fusion_override={cfg['worldflow_action_fusion_override']}, "
         f"use_suite_max_steps={cfg['use_suite_max_steps']}, "
         f"episode_horizons={episode_horizons}, "
         f"save_video={cfg['save_video']}, "

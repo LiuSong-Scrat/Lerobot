@@ -309,6 +309,7 @@ class SmolVLA_ModelInference:
         visualize_foreground: bool | None = None,
         foreground_visualizer_max_points: int = 50000,
         camera_views: str | tuple[str, ...] | list[str] | None = None,
+        worldflow_action_fusion_override: str | None = None,
     ) -> None:
         self.policy_path = str(policy_path)
         self.policy_repo_id = str(policy_repo_id) if policy_repo_id is not None else None
@@ -318,6 +319,14 @@ class SmolVLA_ModelInference:
         if camera_views is not None:
             selected_override = ",".join(parse_camera_views(camera_views))
             cli_overrides.append(f"--camera_views={selected_override}")
+        if worldflow_action_fusion_override is not None:
+            selected_fusion = str(worldflow_action_fusion_override).strip()
+            if selected_fusion != "cross_attention":
+                raise ValueError(
+                    "Inference-only worldflow_action_fusion_override currently permits only "
+                    f"'cross_attention', got {selected_fusion!r}."
+                )
+            cli_overrides.append(f"--worldflow_action_fusion={selected_fusion}")
         config = PreTrainedConfig.from_pretrained(
             self.policy_path,
             cli_overrides=cli_overrides,
