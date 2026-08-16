@@ -331,3 +331,27 @@ Validation completed on 2026-08-16:
   the corrected integration path. The long 1-step random-head rollout was
   intentionally stopped after the execution path was established; it is not a
   performance measurement.
+
+## Four-GPU checkpoint evaluation
+
+Future checkpoint sweeps use
+`scripts/run_world_eef_multicheckpoint_eval.sh`. Up to four evaluator parent
+processes run concurrently, with one different checkpoint resident on each
+GPU. Each parent receives both `--task-id 6` and `--task-id 8` while retaining
+`--task-workers 1`, so the two tasks execute sequentially against the same
+loaded model rather than loading the checkpoint twice.
+
+The default four-checkpoint wave assigns seven episode workers to each model,
+keeping aggregate environment concurrency at 28. A smaller final wave divides
+the same 28-worker budget across only the remaining checkpoints. Example:
+
+```bash
+WORLD_EEF_TRAINING_DIR=/path/to/training \
+WORLD_EEF_EXPERIMENT_DIR=/path/to/experiment \
+WORLD_EEF_STEPS='000260 000520 000780 001040 001300' \
+WORLD_EEF_GPU_IDS='0,1,2,3' \
+bash benchmarks/song_real_libero/scripts/run_world_eef_multicheckpoint_eval.sh
+```
+
+Set `WORLD_EEF_DRY_RUN=1` to inspect GPU assignment, worker allocation, paths,
+and complete evaluator commands without launching an evaluation.
