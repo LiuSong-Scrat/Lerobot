@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Evaluate as many checkpoints concurrently as there are GPUs.  Each evaluator
-# loads its checkpoint once, keeps it resident on its assigned GPU, and runs
-# task 6 followed by task 8 in the same process.
+# Preload as many checkpoints concurrently as there are GPUs. Each evaluator
+# stays resident behind a file gate. Evaluators are then released one at a time
+# with the full episode-worker budget, so preloading does not reduce the
+# established single-checkpoint MuJoCo parallelism.
 
 repo=${WORLD_EEF_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot}
 python=${WORLD_EEF_PYTHON:-/home/liusong/anaconda3/envs/reap/bin/python}
@@ -11,7 +12,7 @@ training=${WORLD_EEF_TRAINING_DIR:?WORLD_EEF_TRAINING_DIR is required}
 experiment=${WORLD_EEF_EXPERIMENT_DIR:?WORLD_EEF_EXPERIMENT_DIR is required}
 steps_text=${WORLD_EEF_STEPS:-000260 000520 000780 001040 001300}
 gpu_ids_text=${WORLD_EEF_GPU_IDS:-0 1 2 3}
-total_episode_workers=${WORLD_EEF_TOTAL_EPISODE_WORKERS:-28}
+episode_workers_per_checkpoint=${WORLD_EEF_EPISODE_WORKERS_PER_CHECKPOINT:-28}
 episodes=${WORLD_EEF_EPISODES:-50}
 dry_run=${WORLD_EEF_DRY_RUN:-0}
 
@@ -25,7 +26,7 @@ if ((${#gpu_ids[@]} == 0)); then
     echo "WORLD_EEF_GPU_IDS resolved to an empty list" >&2
     exit 2
 fi
-if ((total_episode_workers < 1 || episodes < 1)); then
+if ((episode_workers_per_checkpoint < 1 || episodes < 1)); then
     echo "worker and episode counts must be positive" >&2
     exit 2
 fi
@@ -41,7 +42,9 @@ cleanup_children() {
         kill "$pid" 2>/dev/null || true
     done
 }
-trap cleanup_children INT TERM
+trap cleanup_children EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 run_checkpoint() {
     local step=${1:?step required}
@@ -51,6 +54,8 @@ run_checkpoint() {
     local output="$eval_root/step${step}_tasks6_8_${episodes}ep"
     local summary="$output/summary.json"
     local log="$log_dir/eval_step${step}_tasks6_8_${episodes}ep_gpu${gpu_id}.log"
+    local ready_file="$output/preload_ready.json"
+    local start_gate="$output/evaluation_start_gate"
 
     test -s "$checkpoint/model.safetensors"
     if [[ -s "$summary" ]]; then
@@ -66,6 +71,7 @@ run_checkpoint() {
         "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py
         --config benchmarks/song_real_libero/configs/libero.json
         --policy.path "$checkpoint"
+        --preload-ready-file "$ready_file" --evaluation-start-gate "$start_gate"
         --suite libero_10 --task-id 6 --task-id 8 --episodes "$episodes"
         --policy-noise-seed 0 --env-seed 7 --strict-official-init
         --gripper-control-mode delta_width_initial_sync
@@ -107,32 +113,75 @@ for ((group_start = 0; group_start < ${#steps[@]}; group_start += ${#gpu_ids[@]}
     if ((group_size > ${#gpu_ids[@]})); then
         group_size=${#gpu_ids[@]}
     fi
-    workers_per_checkpoint=$((total_episode_workers / group_size))
-    if ((workers_per_checkpoint < 1)); then
-        workers_per_checkpoint=1
-    fi
-
     child_pids=()
     group_steps=()
+    ready_files=()
+    start_gates=()
     for ((slot = 0; slot < group_size; slot++)); do
         step=${steps[group_start + slot]}
         gpu_id=${gpu_ids[slot]}
+        output="$eval_root/step${step}_tasks6_8_${episodes}ep"
+        summary="$output/summary.json"
+        if [[ -s "$summary" ]]; then
+            echo "[multi-checkpoint] reuse completed step=$step summary=$summary"
+            continue
+        fi
         group_steps+=("$step")
-        run_checkpoint "$step" "$gpu_id" "$workers_per_checkpoint" &
+        ready_files+=("$output/preload_ready.json")
+        start_gates+=("$output/evaluation_start_gate")
+        run_checkpoint "$step" "$gpu_id" "$episode_workers_per_checkpoint" &
         child_pids+=("$!")
     done
 
+    if [[ "$dry_run" == 1 ]]; then
+        group_failed=0
+        for pid in "${child_pids[@]}"; do
+            if ! wait "$pid"; then
+                group_failed=1
+            fi
+        done
+        child_pids=()
+        if ((group_failed)); then
+            exit 1
+        fi
+        continue
+    fi
+
+    # All checkpoint loads happen concurrently. Do not release any evaluator
+    # until every model in this GPU wave is resident and ready.
+    for ((slot = 0; slot < ${#child_pids[@]}; slot++)); do
+        pid=${child_pids[slot]}
+        ready_file=${ready_files[slot]}
+        while [[ ! -s "$ready_file" ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "checkpoint exited before preload readiness: ${group_steps[slot]}" >&2
+                wait "$pid" || true
+                exit 1
+            fi
+            sleep 1
+        done
+        echo "[multi-checkpoint] preloaded step=${group_steps[slot]} ready=$ready_file"
+    done
+
+    # Preserve full single-checkpoint environment parallelism: only the model
+    # whose gate is open creates its complete MuJoCo episode-worker pool.
     group_failed=0
-    for pid in "${child_pids[@]}"; do
+    for ((slot = 0; slot < ${#child_pids[@]}; slot++)); do
+        pid=${child_pids[slot]}
+        start_gate=${start_gates[slot]}
+        echo "[multi-checkpoint] release step=${group_steps[slot]} workers=$episode_workers_per_checkpoint"
+        touch "$start_gate"
         if ! wait "$pid"; then
             group_failed=1
+            break
         fi
     done
-    child_pids=()
     if ((group_failed)); then
+        cleanup_children
         echo "checkpoint group failed: ${group_steps[*]}" >&2
         exit 1
     fi
+    child_pids=()
 done
 
 if [[ "$dry_run" == 1 ]]; then

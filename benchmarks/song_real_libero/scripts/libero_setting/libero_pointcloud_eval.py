@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "worldflow_fusion_override_audit_v22_20260816"
+EVAL_BUILD_TAG = "checkpoint_preload_gate_v23_20260816"
 
 import argparse
 import atexit
@@ -583,6 +583,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
     parser.add_argument(
+        "--preload-ready-file",
+        type=Path,
+        default=None,
+        help=(
+            "After loading and validating the policy, atomically write this readiness file. "
+            "Must be paired with --evaluation-start-gate."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-start-gate",
+        type=Path,
+        default=None,
+        help=(
+            "After policy preload, wait for this file before creating evaluation environments. "
+            "Must be paired with --preload-ready-file."
+        ),
+    )
+    parser.add_argument(
         "--secondary-view-causal-ablation",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1101,6 +1119,45 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(json_safe(payload), f, indent=2, ensure_ascii=False)
     tmp_path.replace(path)
+
+
+def wait_for_preloaded_evaluation_gate(
+    *,
+    ready_file: Path | None,
+    start_gate: Path | None,
+    policy_path: str,
+) -> None:
+    """Expose model readiness, then preserve it in memory until scheduling starts."""
+
+    if (ready_file is None) != (start_gate is None):
+        raise ValueError(
+            "--preload-ready-file and --evaluation-start-gate must be supplied together"
+        )
+    if ready_file is None or start_gate is None:
+        return
+
+    ready_file = ready_file.expanduser().resolve()
+    start_gate = start_gate.expanduser().resolve()
+    if ready_file == start_gate:
+        raise ValueError("preload readiness and evaluation start gate must be different files")
+    write_json_atomic(
+        ready_file,
+        {
+            "status": "policy_loaded_waiting_for_evaluation",
+            "pid": os.getpid(),
+            "policy_path": policy_path,
+            "ready_unix_s": time.time(),
+            "start_gate": str(start_gate),
+        },
+    )
+    print(
+        f"[preload-gate] policy ready pid={os.getpid()} ready_file={ready_file}; "
+        f"waiting for {start_gate}",
+        flush=True,
+    )
+    while not start_gate.is_file():
+        time.sleep(0.25)
+    print(f"[preload-gate] evaluation released by {start_gate}", flush=True)
 
 
 @contextmanager
@@ -9986,6 +10043,12 @@ def main() -> None:
             "inference requires every configured checkpoint image feature to remain resolvable.",
             flush=True,
         )
+
+    wait_for_preloaded_evaluation_gate(
+        ready_file=args.preload_ready_file,
+        start_gate=args.evaluation_start_gate,
+        policy_path=str(cfg["policy_path"]),
+    )
 
     print(
         "[info] clean absolute-pose eval: "

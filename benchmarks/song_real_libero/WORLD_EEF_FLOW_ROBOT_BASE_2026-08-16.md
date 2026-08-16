@@ -335,15 +335,16 @@ Validation completed on 2026-08-16:
 ## Four-GPU checkpoint evaluation
 
 Future checkpoint sweeps use
-`scripts/run_world_eef_multicheckpoint_eval.sh`. Up to four evaluator parent
-processes run concurrently, with one different checkpoint resident on each
-GPU. Each parent receives both `--task-id 6` and `--task-id 8` while retaining
-`--task-workers 1`, so the two tasks execute sequentially against the same
-loaded model rather than loading the checkpoint twice.
+`scripts/run_world_eef_multicheckpoint_eval.sh`. Up to four evaluator parents
+load different checkpoints concurrently, one per GPU, and then remain resident
+behind an evaluation gate. The scheduler releases one resident model at a time
+with all 28 episode workers. This overlaps checkpoint loading without reducing
+the established single-checkpoint simulation parallelism or oversubscribing
+the 30-thread host with four simultaneous 28-worker environment pools.
 
-The default four-checkpoint wave assigns seven episode workers to each model,
-keeping aggregate environment concurrency at 28. A smaller final wave divides
-the same 28-worker budget across only the remaining checkpoints. Example:
+Each parent receives both `--task-id 6` and `--task-id 8` while retaining
+`--task-workers 1`, so the two tasks execute sequentially against the same
+loaded model rather than loading the checkpoint twice. Example:
 
 ```bash
 WORLD_EEF_TRAINING_DIR=/path/to/training \
