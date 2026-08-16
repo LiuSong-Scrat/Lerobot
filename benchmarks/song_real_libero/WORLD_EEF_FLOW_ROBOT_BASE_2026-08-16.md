@@ -525,3 +525,41 @@ Tests verify the complete raw pose9 path and target velocity are exactly left
 equivariant, and an exact predicted velocity gives zero World flow and endpoint
 loss. Interaction remains disabled until the unchanged physical hard gate
 passes.
+
+### Complete symmetric calibration result
+
+The four-GPU `base_pose9_euclidean` run completed all 1300 updates and was
+stopped by the physical alignment gate before any environment evaluation.  The
+last-100-update audit was:
+
+| stream | translation | rotation |
+|---|---:|---:|
+| Ego | 7.06 mm | 0.583 degrees |
+| World | 23.80 mm | 5.417 degrees |
+| World / Ego | 3.37x | 9.29x |
+
+The representation correction is real: it improved the previous rigid-probe
+World result from 32.43 mm / 20.51 degrees to 23.80 mm / 5.42 degrees.  It did
+not, however, meet the required 12 mm / 2 degree and 1.5x alignment gates.  The
+curve was already effectively flat by steps 780--1300, so extending the same
+optimization or changing a local loss/learning-rate multiplier is not a valid
+next experiment.
+
+One apparent carrier discrepancy was explicitly ruled out.  The serialized
+parquet action is expressed in the episode-first-EEF frame, but the policy
+preprocessor's `UMIProcessor` rebases both the observation state and action
+chunk into the *current* EEF frame before the model forward.  Consequently the
+model's current-EEF-to-base left transform is the correct action carrier.  The
+dataset-side relative-pose audit confirms this to approximately `1e-7`; using
+the episode origin again inside the model would apply the transform twice.
+
+The remaining structural problem is architectural equivariance.  Although the
+World target is an exact fixed rotation of the Ego pose9 velocity, copied
+ordinary linear layers and Transformer blocks do not commute with that
+sample-dependent rotation.  The World Expert is therefore forced to relearn a
+known rigid coordinate change from only 100 demonstrations.  A valid successor
+must implement the input/output frame transport analytically (while retaining
+the base-frame point cloud as World context), so the independent World function
+is accurate by construction at initialization.  Training another unconstrained
+base-coordinate Transformer, adding a residual/rate head, or tuning loss weights
+does not address the observed failure.
