@@ -406,6 +406,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # physical correction, not a second absolute policy to average with Ego.
     # These are deterministic geometry/fixed fusion contracts, not learned gates.
     worldflow_action_fusion: str = "cross_attention"
+    # ``shared`` is the historical implementation: World owns its geometric
+    # front-end but its action tokens are processed by the Ego Action Expert.
+    # ``independent`` gives World a separately parameterized Action Expert,
+    # bootstrapped once from Ego and then trained only by the World/interaction
+    # objectives.  Ego and World exchange information only through the explicit
+    # bidirectional cross-attention path after their respective experts.
+    worldflow_action_expert_mode: str = "shared"
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -731,6 +738,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "worldflow_freeze_pretrained_ego=True requires worldflow_enable=True."
             )
         if self.worldflow_enable:
+            if self.worldflow_action_expert_mode not in {"shared", "independent"}:
+                raise ValueError(
+                    "worldflow_action_expert_mode must be 'shared' or 'independent', "
+                    f"got {self.worldflow_action_expert_mode!r}."
+                )
             if self.worldflow_target_type not in {
                 "legacy_eef",
                 "world_eef_trajectory",
@@ -1147,7 +1159,8 @@ class SmolVLAConfig(PreTrainedConfig):
             world = (
                 f",worldflow={self.worldflow_noise_coupling},"
                 f"worldflow_targets={target_contract},"
-                f"worldflow_reference={self.worldflow_reference_frame}"
+                f"worldflow_reference={self.worldflow_reference_frame},"
+                f"worldflow_action_expert={self.worldflow_action_expert_mode}"
             )
         else:
             world = ",worldflow=disabled"

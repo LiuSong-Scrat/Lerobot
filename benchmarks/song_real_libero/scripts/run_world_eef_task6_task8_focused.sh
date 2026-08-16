@@ -9,6 +9,7 @@ baseline=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v
 training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_bootstrap_4gpu_b24_1564steps}
 experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_20260816}
 freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
+action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
 train_steps=${WORLD_EEF_TRAIN_STEPS:-1300}
 save_steps=${WORLD_EEF_SAVE_STEPS:-'[100,260,520,780,1040,1300]'}
 pretrained_lr_multiplier=0.2
@@ -16,6 +17,10 @@ if [[ "$freeze_pretrained_ego" == true ]]; then
     pretrained_lr_multiplier=1.0
 elif [[ "$freeze_pretrained_ego" != false ]]; then
     echo "WORLD_EEF_FREEZE_PRETRAINED_EGO must be true or false" >&2
+    exit 2
+fi
+if [[ "$action_expert_mode" != shared && "$action_expert_mode" != independent ]]; then
+    echo "WORLD_EEF_ACTION_EXPERT_MODE must be shared or independent" >&2
     exit 2
 fi
 log_dir="$experiment/logs"
@@ -202,6 +207,7 @@ train() {
         --policy.worldflow_scene_frame_origin=global \
         --policy.worldflow_noise_coupling=independent \
         --policy.worldflow_action_fusion=cross_attention \
+        --policy.worldflow_action_expert_mode="$action_expert_mode" \
         --policy.worldflow_bootstrap_from_ego=true \
         --policy.worldflow_freeze_pretrained_ego="$freeze_pretrained_ego" \
         --policy.worldflow_feature_dim=64 --policy.worldflow_grid_size=0.01 \

@@ -1165,6 +1165,9 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
         language_norm=nn.LayerNorm(4),
     )
     model.worldflow_branch = world
+    model.vlm_with_expert = nn.Module()
+    model.vlm_with_expert.lm_expert = nn.Linear(4, 4)
+    model.world_lm_expert = nn.Linear(4, 4)
 
     with torch.no_grad():
         for ordinal, parameter in enumerate(model.parameters(), start=1):
@@ -1179,6 +1182,9 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert torch.equal(world.scene_encoder.weight, model.pointseg_conditioner.foreground_encoder.weight)
     assert torch.equal(world.point_action_adapter.weight, model.point_action_fusion.weight)
     assert torch.equal(model.world_action_out_proj.weight, model.action_out_proj.weight[:9])
+    assert torch.equal(model.world_lm_expert.weight, model.vlm_with_expert.lm_expert.weight)
+    assert model.world_lm_expert.weight.data_ptr() != model.vlm_with_expert.lm_expert.weight.data_ptr()
+    assert report["world_action_expert"] == "independent_bootstrapped_copy"
     assert torch.count_nonzero(world.language_embedding.weight) == 0
     assert torch.count_nonzero(model.ego_to_world_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
@@ -1886,6 +1892,26 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     assert "worldflow_targets=world_eef_trajectory" in cfg.flow_contract_summary()
     assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
 
+    independent_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="cross_attention",
+        worldflow_action_expert_mode="independent",
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert "worldflow_action_expert=independent" in independent_cfg.flow_contract_summary()
+
+    with pytest.raises(ValueError, match="worldflow_action_expert_mode"):
+        SmolVLAConfig(
+            worldflow_enable=True,
+            worldflow_action_expert_mode="partially_shared",
+        )
+
     with pytest.raises(ValueError, match="strict independent-branch contract"):
         SmolVLAConfig(
             worldflow_enable=True,
@@ -2442,6 +2468,7 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
     model.pointseg_conditioner = nn.Linear(4, 4)
     model.vlm_with_expert = nn.Linear(4, 4)
     model.worldflow_branch = nn.Linear(4, 4)
+    model.world_lm_expert = nn.Linear(4, 4)
     model.ego_scene_to_expert = nn.Linear(4, 4)
     model.world_scene_to_expert = nn.Linear(4, 4)
     model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
@@ -2455,6 +2482,7 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
         assert not any(parameter.requires_grad for parameter in module.parameters())
     for module in (
         model.worldflow_branch,
+        model.world_lm_expert,
         model.ego_scene_to_expert,
         model.world_scene_to_expert,
         model.ego_to_world_cross_attn,
@@ -2463,6 +2491,36 @@ def test_worldflow_protected_ego_freezes_only_pretrained_roles():
         assert all(parameter.requires_grad for parameter in module.parameters())
     assert model.world_ego_scene_type_embedding.requires_grad
     assert model.world_ego_action_type_embedding.requires_grad
+
+
+def test_independent_world_suffix_contains_scenes_and_only_world_actions():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(chunk_size=3)
+    model.ego_scene_to_expert = nn.Linear(2, 4, bias=False)
+    model.world_scene_to_expert = nn.Linear(2, 4, bias=False)
+    model.world_ego_scene_type_embedding = nn.Parameter(torch.zeros(2, 4))
+    model.world_ego_action_type_embedding = nn.Parameter(torch.zeros(2, 4))
+    model.last_ego_scene_global_feat = torch.tensor([[1.0, 2.0]])
+    model.last_ego_scene_global_mask = torch.tensor([True])
+    model.inference_ablation_modalities = frozenset()
+    with torch.no_grad():
+        model.ego_scene_to_expert.weight.fill_(1.0)
+        model.world_scene_to_expert.weight.fill_(2.0)
+    world_actions = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    suffix, valid, blocks = model._build_independent_world_suffix(
+        {
+            "global_feat": torch.tensor([[3.0, 4.0]]),
+            "scene_mask": torch.tensor([[True, True]]),
+            "action_tokens": world_actions,
+            "action_mask": torch.ones(1, 3, dtype=torch.bool),
+        }
+    )
+
+    assert suffix.shape == (1, 5, 4)
+    assert torch.equal(suffix[:, -3:], world_actions)
+    assert valid.tolist() == [[True, True, True, True, True]]
+    assert blocks.tolist() == [[1, 0, 1, 0, 0]]
 
 
 def test_worldflow_protected_ego_config_requires_worldflow_and_no_nominal_ego_lr():

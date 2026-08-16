@@ -45,12 +45,54 @@ World uses an SE(3) geodesic flow and a direct six-dimensional twist head even
 when the pretrained Ego branch retains its legacy pose chart.
 
 For the focused 100-demo experiment, `worldflow_bootstrap_from_ego=true` is a
-one-shot initialization only: compatible trained point encoders, adapters, and
-time embeddings are copied by value into distinct World parameters before
-training. No storage is shared and neither branch is frozen. The direct World
-SE(3) output head remains independently initialized, and both cross-attention
-output projections start at zero so enabling the branch initially preserves
-the loaded baseline policy function.
+one-shot initialization only: compatible trained point encoders, adapters,
+time embeddings, and (when configured) the complete Action Expert are copied
+by value into distinct World parameters before training. No storage is shared.
+The direct World SE(3) output head remains independently initialized, and the
+World-to-Ego cross-attention output projection starts at zero so enabling the
+branch initially preserves the loaded baseline policy function.
+
+`worldflow_action_expert_mode="independent"` is required for the corrected
+dual-expert experiment. The historical `"shared"` mode is retained only so old
+checkpoints remain loadable. In shared mode, World owned its token front-end
+but its trajectory tokens were still processed by the Ego Action Expert. Once
+protected-Ego training froze that expert, World had to learn around a fixed
+Ego-specific temporal mapping and could interact with Ego only after the final
+expert layer. This was not a genuinely independent double-flow architecture.
+
+In independent mode:
+
+- Ego uses the frozen pretrained Action Expert and unchanged Ego suffix.
+- World uses a separately parameterized Action Expert bootstrapped from Ego.
+- World Expert input contains Ego/World global scene tokens and only World
+  action tokens; it never consumes Ego action tokens.
+- the completed Ego and World trajectory-token sequences exchange information
+  through explicit bidirectional cross-attention.
+- World supervision updates the World Expert directly, while the baseline Ego
+  weights and buffers remain byte-identical.
+
+## Focused protected-Ego result before the dual-expert correction
+
+The shared-expert protected-Ego run was evaluated with the same fixed seeds and
+hard gate (task 6 stops at its fourth failure because it can no longer exceed
+the `46/50` baseline):
+
+| step | task 6 result at stop | outcome |
+|---:|---:|---|
+| 260 | 41/45, 4 failures | disqualified |
+| 520 | 35/40, 5 failures | disqualified |
+| 780 | 39/44, 5 failures | disqualified |
+| 1040 | 45/50, 5 failures | below baseline |
+| 1300 | 46/50, 4 failures | equals baseline |
+| 1564 | 46/50, 4 failures | equals baseline |
+| 1824 | 39/43, 4 failures | disqualified |
+| 2084 | 39/43, 4 failures | disqualified |
+
+All pretrained Ego tensors were audited byte-identical at step 260. Therefore
+the result rules out catastrophic forgetting but does not establish WorldFlow
+benefit. Extending training past step 1564 made performance worse, so further
+step-count or learning-rate tuning is not justified. The next experiment must
+change the shared Action Expert bottleneck itself.
 
 ## Dataset sidecars
 

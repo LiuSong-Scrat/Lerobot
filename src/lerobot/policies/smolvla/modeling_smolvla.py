@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import copy
 import math
 from collections import deque
 from contextlib import contextmanager
@@ -1034,6 +1035,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                         )
                     new_world_prefixes = (
                         "model.worldflow_branch.",
+                        "model.world_lm_expert.",
                         "model.ego_scene_to_expert.",
                         "model.world_scene_to_expert.",
                         "model.world_action_out_proj.",
@@ -1159,6 +1161,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             ):
                 new_world_prefixes = (
                     "model.worldflow_branch.",
+                    "model.world_lm_expert.",
                     "model.ego_scene_to_expert.",
                     "model.world_scene_to_expert.",
                     "model.world_action_out_proj.",
@@ -2156,14 +2159,13 @@ class PointActionSelfAttention(nn.Module):
 
 
 class WorldFlowActionBranch(nn.Module):
-    """World-frame point/action token front-end for the shared Action Expert.
+    """World-frame point/action token front-end for a configured Action Expert.
 
     The branch is independent from Ego up to its output tokens: it owns a
     dedicated LitePT encoder, PointAction adapter, language embedding and
-    action/time projections.  It deliberately does *not* own another Action
-    Expert. Its single global scene token and point-fused action tokens are
-    joined with the corresponding Ego tokens and processed by the policy's
-    shared Action Expert.
+    action/time projections. The policy can route these tokens through either
+    the historical shared Ego expert or a separately parameterized World
+    expert.
 
     Only predicted foreground XYZRGB points enter this module.  PointSeg
     probabilities, pseudo labels and role/evidence channels are not inputs.
@@ -2844,6 +2846,12 @@ class VLAFlowMatching(nn.Module):
         )
         if self.worldflow_branch is not None:
             expert_dim = self.vlm_with_expert.expert_hidden_size
+            self.world_lm_expert = (
+                copy.deepcopy(self.vlm_with_expert.lm_expert)
+                if getattr(self.config, "worldflow_action_expert_mode", "shared")
+                == "independent"
+                else None
+            )
             direct_world_trajectory = (
                 getattr(self.config, "worldflow_target_type", "legacy_eef")
                 == "world_eef_trajectory"
@@ -2902,6 +2910,7 @@ class VLAFlowMatching(nn.Module):
             nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.weight)
             nn.init.zeros_(self.world_to_ego_cross_attn.out_proj.bias)
         else:
+            self.world_lm_expert = None
             self.ego_scene_to_expert = None
             self.world_scene_to_expert = None
             self.world_action_out_proj = None
@@ -2982,6 +2991,12 @@ class VLAFlowMatching(nn.Module):
         world.action_time_mlp_out.load_state_dict(self.action_time_mlp_out.state_dict(), strict=True)
         world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
+        world_lm_expert = getattr(self, "world_lm_expert", None)
+        if world_lm_expert is not None:
+            world_lm_expert.load_state_dict(
+                self.vlm_with_expert.lm_expert.state_dict(),
+                strict=True,
+            )
         if self.world_action_out_proj is not None:
             self.world_action_out_proj.weight.copy_(
                 self.action_out_proj.weight[: WorldFlowActionBranch.pose_dim]
@@ -3016,6 +3031,11 @@ class VLAFlowMatching(nn.Module):
             "status": "bootstrapped",
             "source": "trained_ego_action_point_modules",
             "world_parameters_shared": False,
+            "world_action_expert": (
+                "independent_bootstrapped_copy"
+                if world_lm_expert is not None
+                else "legacy_shared_ego_expert"
+            ),
             "ego_frozen": bool(
                 getattr(self.config, "worldflow_freeze_pretrained_ego", False)
             ),
@@ -3053,6 +3073,7 @@ class VLAFlowMatching(nn.Module):
             )
         world_prefixes = (
             "worldflow_branch.",
+            "world_lm_expert.",
             "ego_scene_to_expert.",
             "world_scene_to_expert.",
             "world_action_out_proj.",
@@ -4501,6 +4522,147 @@ class VLAFlowMatching(nn.Module):
         )
         return ego_out + ego_delta, world_out
 
+    def _build_independent_world_suffix(
+        self,
+        world_tokens: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build the World-only suffix consumed by its independent expert.
+
+        The World expert receives both global scene summaries followed by its
+        own point-conditioned action chunk.  It never processes Ego action
+        tokens; trajectory exchange happens only in the explicit cross-
+        attention module after both experts have produced complete action
+        representations.
+        """
+
+        required_modules = (
+            self.ego_scene_to_expert,
+            self.world_scene_to_expert,
+            self.world_ego_scene_type_embedding,
+            self.world_ego_action_type_embedding,
+        )
+        if any(module is None for module in required_modules):
+            raise RuntimeError("Independent World expert scene modules are not initialized.")
+        if self.last_ego_scene_global_feat is None or self.last_ego_scene_global_mask is None:
+            raise ValueError("Independent World expert requires the Ego global scene feature.")
+
+        world_global_feat = world_tokens.get("global_feat")
+        world_point_mask = world_tokens.get("scene_mask")
+        world_action_tokens = world_tokens.get("action_tokens")
+        world_action_mask = world_tokens.get("action_mask")
+        if not all(
+            torch.is_tensor(value)
+            for value in (
+                world_global_feat,
+                world_point_mask,
+                world_action_tokens,
+                world_action_mask,
+            )
+        ):
+            raise ValueError(
+                "Independent World expert requires global/point masks and action tokens/masks."
+            )
+
+        ego_scene = self.ego_scene_to_expert(self.last_ego_scene_global_feat).unsqueeze(1)
+        world_scene = self.world_scene_to_expert(world_global_feat).unsqueeze(1)
+        ego_scene_mask = self.last_ego_scene_global_mask.to(
+            device=ego_scene.device,
+            dtype=torch.bool,
+        ).unsqueeze(1)
+        world_scene_mask = world_point_mask.to(
+            device=world_scene.device,
+            dtype=torch.bool,
+        ).any(dim=1, keepdim=True)
+        world_action_mask = world_action_mask.to(
+            device=world_action_tokens.device,
+            dtype=torch.bool,
+        )
+
+        if "world" in getattr(self, "inference_ablation_modalities", frozenset()):
+            world_scene_mask = torch.zeros_like(world_scene_mask)
+            world_action_mask = torch.zeros_like(world_action_mask)
+
+        ego_scene = ego_scene + self.world_ego_scene_type_embedding[0]
+        world_scene = world_scene + self.world_ego_scene_type_embedding[1]
+        world_action_tokens = world_action_tokens + self.world_ego_action_type_embedding[1]
+        if world_action_tokens.shape[1] != self.config.chunk_size:
+            raise ValueError(
+                "Independent World expert requires action chunk_size="
+                f"{self.config.chunk_size}, got {world_action_tokens.shape[1]}."
+            )
+
+        suffix_embs = torch.cat([ego_scene, world_scene, world_action_tokens], dim=1)
+        suffix_pad_masks = torch.cat(
+            [ego_scene_mask, world_scene_mask, world_action_mask],
+            dim=1,
+        )
+        scene_len = ego_scene.shape[1] + world_scene.shape[1]
+        action_len = world_action_tokens.shape[1]
+        suffix_att_masks = torch.tensor(
+            [1]
+            + [0] * (scene_len - 1)
+            + [1]
+            + [0] * (action_len - 1),
+            dtype=suffix_embs.dtype,
+            device=suffix_embs.device,
+        )[None, :].expand(suffix_embs.shape[0], -1)
+        return suffix_embs, suffix_pad_masks, suffix_att_masks
+
+    def _run_independent_world_suffix_expert(
+        self,
+        prefix_embs: Tensor | None,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor | None,
+        world_tokens: dict[str, Tensor],
+        *,
+        past_key_values=None,
+    ) -> Tensor:
+        world_lm_expert = getattr(self, "world_lm_expert", None)
+        if world_lm_expert is None:
+            raise RuntimeError("Independent World Action Expert is not initialized.")
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self._build_independent_world_suffix(
+            world_tokens
+        )
+        if prefix_embs is not None:
+            if prefix_att_masks is None:
+                raise ValueError("prefix_att_masks are required when prefix_embs are provided.")
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            attention_mask = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            (_, suffix_out), _ = self.vlm_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                fill_kv_cache=False,
+                expert_model=world_lm_expert,
+            )
+        else:
+            if past_key_values is None:
+                raise ValueError("Cached World expert inference requires past_key_values.")
+            suffix_len = suffix_pad_masks.shape[1]
+            prefix_len = prefix_pad_masks.shape[1]
+            prefix_attention = prefix_pad_masks[:, None, :].expand(
+                prefix_pad_masks.shape[0], suffix_len, prefix_len
+            )
+            suffix_attention = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            attention_mask = torch.cat([prefix_attention, suffix_attention], dim=2)
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            outputs_embeds, _ = self.vlm_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=False,
+                expert_model=world_lm_expert,
+            )
+            suffix_out = outputs_embeds[1]
+        return suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+
     def _run_world_ego_joint_expert(
         self,
         prefix_embs: Tensor | None,
@@ -4512,6 +4674,39 @@ class VLAFlowMatching(nn.Module):
         *,
         past_key_values=None,
     ) -> tuple[Tensor, Tensor]:
+        if (
+            getattr(self.config, "worldflow_action_expert_mode", "shared")
+            == "independent"
+        ):
+            ego_action_len = ego_action_tokens.shape[1]
+            ego_att_mask = torch.tensor(
+                [1] + [0] * (ego_action_len - 1),
+                dtype=ego_action_tokens.dtype,
+                device=ego_action_tokens.device,
+            )[None, :].expand(ego_action_tokens.shape[0], -1)
+            ego_out = self._run_ego_suffix_expert(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                ego_action_tokens,
+                ego_action_mask,
+                ego_att_mask,
+                past_key_values=past_key_values,
+            )
+            world_out = self._run_independent_world_suffix_expert(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                world_tokens,
+                past_key_values=past_key_values,
+            )
+            return self._bidirectional_world_ego_cross_attention(
+                ego_out,
+                world_out,
+                ego_action_mask,
+                world_tokens["action_mask"],
+            )
+
         suffix_embs, suffix_pad_masks, suffix_att_masks, layout = self._build_world_ego_joint_suffix(
             ego_action_tokens,
             ego_action_mask,
