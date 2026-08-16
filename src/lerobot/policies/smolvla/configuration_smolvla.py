@@ -198,10 +198,11 @@ class SmolVLAConfig(PreTrainedConfig):
     # Joint World–Ego trajectory branch. PointSeg selects foreground XYZRGB in
     # the Ego/body frame, then the current EEF pose analytically maps those
     # exact points into World. World owns an independent LitePT + PointAction
-    # front-end, but both streams share the official Action Expert. One
-    # attention-pooled global scene token per stream forms the causal-prefix
-    # scene block; all World/Ego action tokens form one bidirectional block.
-    # The branch is active in training and inference.
+    # front-end. Historical modes share the official Action Expert; the
+    # calibrated design instead gives World an independently parameterized
+    # copy. Explicit fusion modes may exchange complete trajectory tokens only
+    # after both streams have formed their own proposals. The branch is active
+    # in training and inference.
     worldflow_enable: bool = False
     # Supervision semantics for the independent World branch. ``legacy_eef``
     # retains historical checkpoints whose World target is derived through
@@ -217,7 +218,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # instead predicts [p_dot_base, omega_base]: translation and orientation
     # are integrated independently while both remain expressed on base axes.
     # The legacy default preserves old checkpoints that do not serialize this
-    # field; corrected World-EEF training must request ``base_decoupled``.
+    # field. ``base_pose9_euclidean`` keeps the complete pose in robot-base
+    # coordinates but uses the same 9D position + rotation-6D Euclidean flow
+    # as the pretrained Ego branch. Under the known current-EEF left transform
+    # that path is exactly linearly equivariant to Ego, so an independent World
+    # Expert does not have to relearn an unrelated 6D SO(3) flow and random
+    # output head before the two streams can reach comparable accuracy.
     worldflow_world_eef_velocity_mode: str = "legacy_spatial_twist"
     # Canonical fixed frame used by the World branch. Historical checkpoints
     # used the first fixed camera. New World-EEF checkpoints use the robot
@@ -785,10 +791,12 @@ class SmolVLAConfig(PreTrainedConfig):
             if self.worldflow_world_eef_velocity_mode not in {
                 "legacy_spatial_twist",
                 "base_decoupled",
+                "base_pose9_euclidean",
             }:
                 raise ValueError(
                     "worldflow_world_eef_velocity_mode must be "
-                    "'legacy_spatial_twist' or 'base_decoupled', got "
+                    "'legacy_spatial_twist', 'base_decoupled', or "
+                    "'base_pose9_euclidean', got "
                     f"{self.worldflow_world_eef_velocity_mode!r}."
                 )
             if self.worldflow_reference_frame not in {
@@ -832,7 +840,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 if self.worldflow_residual_lr_multiplier is not None:
                     world_trajectory_contract_errors.append("worldflow_residual_lr_multiplier=None")
-                if self.worldflow_world_eef_velocity_mode == "base_decoupled" and (
+                if self.worldflow_world_eef_velocity_mode in {
+                    "base_decoupled",
+                    "base_pose9_euclidean",
+                } and (
                     not math.isclose(self.worldflow_trans_weight, 1.0)
                     or not math.isclose(self.worldflow_rot_weight, 1.0)
                 ):

@@ -2738,6 +2738,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "worldflow_rot_err_deg",
                     "worldflow_flow_translation_err_m",
                     "worldflow_flow_rotation_probe_err_m",
+                    "worldflow_flow_rotation6d_rmse",
                     "worldflow_endpoint_translation_err_m",
                     "worldflow_endpoint_rotation_probe_err_m",
                     "worldflow_to_ego_trans_err_ratio",

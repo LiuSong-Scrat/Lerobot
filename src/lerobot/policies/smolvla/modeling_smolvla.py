@@ -437,9 +437,45 @@ def world_eef_rigid_probe_losses(
     # metric is intended to restore.
     flow_step = flow_translation_m + flow_rotation_probe_m
 
-    pred_rotation = pred_endpoint[..., :3, :3].to(device=device, dtype=dtype)
+    endpoint_losses = world_eef_rigid_probe_endpoint_losses(
+        pred_endpoint,
+        target_endpoint,
+        probe_radius_m=probe_radius_m,
+    )
+
+    return {
+        "flow": flow_step,
+        "endpoint": endpoint_losses["endpoint"],
+        "flow_translation_m": flow_translation_m,
+        "flow_rotation_probe_m": flow_rotation_probe_m,
+        "endpoint_translation_m": endpoint_losses["endpoint_translation_m"],
+        "endpoint_rotation_probe_m": endpoint_losses["endpoint_rotation_probe_m"],
+    }
+
+
+def world_eef_rigid_probe_endpoint_losses(
+    pred_endpoint: Tensor,
+    target_endpoint: Tensor,
+    *,
+    probe_radius_m: float,
+) -> dict[str, Tensor]:
+    """Return additive translation/orientation endpoint errors in metres."""
+
+    if pred_endpoint.shape != target_endpoint.shape or pred_endpoint.shape[-2:] != (4, 4):
+        raise ValueError(
+            "Expected matching World EEF endpoint transforms (...,4,4), got "
+            f"{pred_endpoint.shape} and {target_endpoint.shape}."
+        )
+    dtype = pred_endpoint.dtype
+    device = pred_endpoint.device
+    probes = _symmetric_eef_probe_offsets(
+        radius_m=probe_radius_m,
+        device=device,
+        dtype=dtype,
+    )
+    pred_rotation = pred_endpoint[..., :3, :3]
     target_rotation = target_endpoint[..., :3, :3].to(device=device, dtype=dtype)
-    pred_translation = pred_endpoint[..., :3, 3].to(device=device, dtype=dtype)
+    pred_translation = pred_endpoint[..., :3, 3]
     target_translation = target_endpoint[..., :3, 3].to(device=device, dtype=dtype)
     endpoint_translation_m = torch.linalg.vector_norm(
         pred_translation - target_translation,
@@ -449,13 +485,8 @@ def world_eef_rigid_probe_losses(
         torch.einsum("...ij,pj->...pi", pred_rotation - target_rotation, probes),
         dim=-1,
     ).mean(dim=-1)
-    endpoint_step = endpoint_translation_m + endpoint_rotation_probe_m
-
     return {
-        "flow": flow_step,
-        "endpoint": endpoint_step,
-        "flow_translation_m": flow_translation_m,
-        "flow_rotation_probe_m": flow_rotation_probe_m,
+        "endpoint": endpoint_translation_m + endpoint_rotation_probe_m,
         "endpoint_translation_m": endpoint_translation_m,
         "endpoint_rotation_probe_m": endpoint_rotation_probe_m,
     }
@@ -2693,13 +2724,15 @@ def physically_aligned_world_ego_trajectory_proposals(
             f"Expected Ego velocity shape {ego_state.shape}, got {ego_velocity.shape}."
         )
     expected_world_shape = (*ego_state.shape[:2], 9)
-    if world_state.shape != expected_world_shape or world_velocity.shape != (
-        *ego_state.shape[:2],
-        6,
+    world_velocity_dim = 9 if world_velocity_mode == "base_pose9_euclidean" else 6
+    expected_world_velocity_shape = (*ego_state.shape[:2], world_velocity_dim)
+    if (
+        world_state.shape != expected_world_shape
+        or world_velocity.shape != expected_world_velocity_shape
     ):
         raise ValueError(
             "Expected World state/velocity shapes "
-            f"{expected_world_shape}/{(*ego_state.shape[:2], 6)}, got "
+            f"{expected_world_shape}/{expected_world_velocity_shape}, got "
             f"{world_state.shape}/{world_velocity.shape}."
         )
     if timestep.shape != (ego_state.shape[0],):
@@ -2721,6 +2754,8 @@ def physically_aligned_world_ego_trajectory_proposals(
             remaining * world_velocity,
             pose9_to_matrix(world_state),
         )
+    elif world_velocity_mode == "base_pose9_euclidean":
+        world_endpoint_base = pose9_to_matrix(world_state + remaining * world_velocity)
     elif world_velocity_mode == "legacy_spatial_twist":
         world_endpoint_base = se3_left_apply(
             remaining * world_velocity,
@@ -3175,20 +3210,28 @@ class VLAFlowMatching(nn.Module):
                 getattr(self.config, "worldflow_target_type", "legacy_eef")
                 == "world_eef_trajectory"
             )
+            direct_world_pose9_chart = (
+                direct_world_trajectory
+                and self.config.worldflow_world_eef_velocity_mode
+                == "base_pose9_euclidean"
+            )
             self.ego_scene_to_expert = nn.Linear(self.config.pointseg_feature_dim, expert_dim)
             self.world_scene_to_expert = nn.Linear(self.config.worldflow_feature_dim, expert_dim)
             self.world_action_out_proj = (
-                None
-                if direct_world_trajectory
-                else nn.Linear(expert_dim, WorldFlowActionBranch.pose_dim)
+                nn.Linear(expert_dim, WorldFlowActionBranch.pose_dim)
+                if not direct_world_trajectory or direct_world_pose9_chart
+                else None
             )
             self.world_se3_action_out_proj = (
                 nn.Linear(expert_dim, 6)
-                if direct_world_trajectory
-                or self.config.se3_enable
-                and (
-                    self.config.se3_twist_head_mode == "direct_twist"
-                    or self.config.worldflow_se3_head_enable
+                if (
+                    direct_world_trajectory
+                    and not direct_world_pose9_chart
+                    or self.config.se3_enable
+                    and (
+                        self.config.se3_twist_head_mode == "direct_twist"
+                        or self.config.worldflow_se3_head_enable
+                    )
                 )
                 else None
             )
@@ -3302,13 +3345,22 @@ class VLAFlowMatching(nn.Module):
             getattr(self.config, "worldflow_target_type", "legacy_eef")
             == "world_eef_trajectory"
         )
+        direct_world_pose9_chart = (
+            direct_world_trajectory
+            and getattr(
+                self.config,
+                "worldflow_world_eef_velocity_mode",
+                "base_decoupled",
+            )
+            == "base_pose9_euclidean"
+        )
         required = (
             self.ego_scene_to_expert,
             self.world_scene_to_expert,
             self.ego_to_world_cross_attn,
             self.world_to_ego_cross_attn,
         )
-        if not direct_world_trajectory:
+        if not direct_world_trajectory or direct_world_pose9_chart:
             required = (*required, self.world_action_out_proj)
         elif self.world_se3_action_out_proj is None:
             raise RuntimeError(
@@ -3398,9 +3450,13 @@ class VLAFlowMatching(nn.Module):
                 getattr(self.config, "worldflow_freeze_pretrained_ego", False)
             ),
             "world_output_head": (
-                "independently_initialized_direct_se3"
-                if direct_world_trajectory
-                else "copied_legacy_pose9"
+                "copied_independent_base_pose9"
+                if direct_world_pose9_chart
+                else (
+                    "independently_initialized_direct_se3"
+                    if direct_world_trajectory
+                    else "copied_legacy_pose9"
+                )
             ),
             "bidirectional_cross_attention_zero_output_init": True,
             "physical_trajectory_interaction": bool(
@@ -3843,12 +3899,23 @@ class VLAFlowMatching(nn.Module):
         world_x_t: Tensor,
         time: Tensor,
     ) -> Tensor:
-        """Decode World expert features as a spatial twist."""
+        """Decode World expert features in its configured trajectory chart."""
 
         if (
             getattr(self.config, "worldflow_target_type", "legacy_eef")
             == "world_eef_trajectory"
         ):
+            if (
+                getattr(
+                    self.config,
+                    "worldflow_world_eef_velocity_mode",
+                    "base_decoupled",
+                )
+                == "base_pose9_euclidean"
+            ):
+                if self.world_action_out_proj is None:
+                    raise RuntimeError("World-EEF pose9 chart head is not initialized.")
+                return self.world_action_out_proj(expert_out)
             if self.world_se3_action_out_proj is None:
                 raise RuntimeError("World-EEF trajectory SE(3) twist head is not initialized.")
             return self.world_se3_action_out_proj(expert_out)
@@ -5460,6 +5527,19 @@ class VLAFlowMatching(nn.Module):
                 time,
             )
             x_t = matrix_to_pose9(world_h_t)
+        elif (
+            independent_world_trajectory
+            and self.config.worldflow_world_eef_velocity_mode
+            == "base_pose9_euclidean"
+        ):
+            # Both complete trajectories remain in robot-base coordinates,
+            # but use the checkpoint-native pose9 chart.  A fixed left change
+            # of coordinates acts linearly on position and both rotation
+            # columns, so this path is exactly equivariant to Ego's Euclidean
+            # path without sharing parameters or predicting an Ego residual.
+            time_expanded = time[:, None, None]
+            x_t = (1.0 - time_expanded) * noise_pose9 + time_expanded * spatial_gt_pose9
+            u_t = spatial_gt_pose9 - noise_pose9
         elif self.config.se3_enable or independent_world_trajectory:
             world_h_t, u_t = se3_geodesic_flow_state(noise_spatial, spatial_gt, time)
             x_t = matrix_to_pose9(world_h_t)
@@ -5637,7 +5717,13 @@ class VLAFlowMatching(nn.Module):
             independent_world_trajectory
             and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
         )
+        pose9_chart_world_eef = (
+            independent_world_trajectory
+            and self.config.worldflow_world_eef_velocity_mode
+            == "base_pose9_euclidean"
+        )
         rigid_probe_losses: dict[str, Tensor] | None = None
+        rigid_endpoint_losses: dict[str, Tensor] | None = None
         if decoupled_world_eef:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
             flow_state = pose9_to_matrix(x_t)
@@ -5655,6 +5741,16 @@ class VLAFlowMatching(nn.Module):
             )
             pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
             flow_step = rigid_probe_losses["flow"]
+        elif pose9_chart_world_eef:
+            remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
+            pred_spatial_pose9 = x_t + remaining * pred_velocity
+            pred_spatial = pose9_to_matrix(pred_spatial_pose9)
+            flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
+            rigid_endpoint_losses = world_eef_rigid_probe_endpoint_losses(
+                pred_spatial,
+                spatial_gt,
+                probe_radius_m=float(self.config.worldflow_eef_probe_radius_m),
+            )
         elif self.config.se3_enable or independent_world_trajectory:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
             pred_spatial = se3_left_apply(remaining * pred_velocity, pose9_to_matrix(x_t))
@@ -5666,6 +5762,8 @@ class VLAFlowMatching(nn.Module):
             flow_step = F.mse_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
         if rigid_probe_losses is not None:
             geo_step = rigid_probe_losses["endpoint"]
+        elif rigid_endpoint_losses is not None:
+            geo_step = rigid_endpoint_losses["endpoint"]
         else:
             geo_step = se3_geodesic_loss(
                 pred_spatial,
@@ -5802,6 +5900,26 @@ class VLAFlowMatching(nn.Module):
                     ).mean().detach(),
                     "worldflow_endpoint_rotation_probe_err_m": _masked_step_mean(
                         rigid_probe_losses["endpoint_rotation_probe_m"], valid
+                    ).mean().detach(),
+                }
+            )
+        elif rigid_endpoint_losses is not None:
+            flow_error = pred_velocity - u_t
+            self.last_worldflow_metrics.update(
+                {
+                    "worldflow_flow_translation_err_m": _masked_step_mean(
+                        torch.linalg.vector_norm(flow_error[..., :3], dim=-1), valid
+                    ).mean().detach(),
+                    "worldflow_flow_rotation6d_rmse": torch.sqrt(
+                        _masked_step_mean(
+                            flow_error[..., 3:9].square().mean(dim=-1), valid
+                        ).mean()
+                    ).detach(),
+                    "worldflow_endpoint_translation_err_m": _masked_step_mean(
+                        rigid_endpoint_losses["endpoint_translation_m"], valid
+                    ).mean().detach(),
+                    "worldflow_endpoint_rotation_probe_err_m": _masked_step_mean(
+                        rigid_endpoint_losses["endpoint_rotation_probe_m"], valid
                     ).mean().detach(),
                 }
             )
@@ -6595,18 +6713,24 @@ class VLAFlowMatching(nn.Module):
                             getattr(self.config, "worldflow_target_type", "legacy_eef")
                             == "world_eef_trajectory"
                         ):
-                            world_apply = (
-                                decoupled_base_pose_apply
-                                if self.config.worldflow_world_eef_velocity_mode
-                                == "base_decoupled"
-                                else se3_left_apply
-                            )
-                            world_x_t = matrix_to_pose9(
-                                world_apply(
-                                    dt * world_v_t,
-                                    pose9_to_matrix(world_x_t),
+                            if (
+                                self.config.worldflow_world_eef_velocity_mode
+                                == "base_pose9_euclidean"
+                            ):
+                                world_x_t = world_x_t + dt * world_v_t
+                            else:
+                                world_apply = (
+                                    decoupled_base_pose_apply
+                                    if self.config.worldflow_world_eef_velocity_mode
+                                    == "base_decoupled"
+                                    else se3_left_apply
                                 )
-                            )
+                                world_x_t = matrix_to_pose9(
+                                    world_apply(
+                                        dt * world_v_t,
+                                        pose9_to_matrix(world_x_t),
+                                    )
+                                )
                         else:
                             world_x_t = world_x_t + dt * world_v_t
 
@@ -6949,14 +7073,21 @@ class VLAFlowMatching(nn.Module):
             if ego_group_x_t.shape[-1] < self.config.max_action_dim:
                 ego_group_x_t = pad_vector(ego_group_x_t, self.config.max_action_dim)
             if world_twist is not None:
-                world_apply = (
-                    decoupled_base_pose_apply
-                    if self.config.worldflow_target_type == "world_eef_trajectory"
-                    and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
-                    else se3_left_apply
-                )
-                world_h_next = world_apply(dt * world_twist, pose9_to_matrix(world_x_t))
-                world_x_t = matrix_to_pose9(world_h_next)
+                if (
+                    self.config.worldflow_target_type == "world_eef_trajectory"
+                    and self.config.worldflow_world_eef_velocity_mode
+                    == "base_pose9_euclidean"
+                ):
+                    world_x_t = world_x_t + dt * world_twist
+                else:
+                    world_apply = (
+                        decoupled_base_pose_apply
+                        if self.config.worldflow_target_type == "world_eef_trajectory"
+                        and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
+                        else se3_left_apply
+                    )
+                    world_h_next = world_apply(dt * world_twist, pose9_to_matrix(world_x_t))
+                    world_x_t = matrix_to_pose9(world_h_next)
 
         return ego_group_x_t
 

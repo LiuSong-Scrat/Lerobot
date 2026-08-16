@@ -475,3 +475,53 @@ translation and a rotation at an individual probe. Consequently:
 The interaction gate remains unchanged and still uses the unweighted EEF
 translation/rotation errors. Passing the new training objective alone is not
 evidence of success.
+
+The complete rigid-probe run improved World translation but still failed its
+final 100-update gate:
+
+| stream | translation | rotation |
+|---|---:|---:|
+| Ego | 7.19 mm | 0.585 degrees |
+| World | 32.43 mm | 20.51 degrees |
+| World / Ego | 4.51x | 35.07x |
+
+It therefore also stopped without environment evaluation. The four physical
+loss components stayed well-scaled, so the remaining gap is not another
+metre/radian weighting failure. It comes from a deeper representation
+asymmetry: the loaded Ego Expert predicts a pretrained 9D position +
+rotation-6D Euclidean flow, whereas World was given a random 6D
+`[p_dot_base, omega_base]` head and an SO(3) geodesic path. Independent
+parameters had accidentally become an independently redefined and much harder
+prediction problem.
+
+## Symmetric base-pose9 calibration
+
+`base_pose9_euclidean` removes that asymmetry while keeping the complete World
+trajectory in robot-base coordinates. Let `C = T_base_current` be fixed for
+one observation. Left-transforming both Euclidean pose9 endpoints applies the
+same base rotation to position and to each rotation-6D column, plus the same
+base translation to both endpoint positions. Therefore interpolation and
+velocity commute exactly with the coordinate change:
+
+```text
+x_world(t) = left_pose9(C, x_ego(t))
+u_world    = rotate_pose9_velocity(C.R, u_ego)
+```
+
+This is not an Ego residual and no runtime tensor or parameter is shared. The
+World branch still owns its base-frame scene encoder, current-base-pose token,
+Action Expert, action projections and output head. The structural advantages
+are:
+
+- both branches now solve the same 9D flow-matching problem;
+- the independent World output head is copied by value from the trained Ego
+  head instead of being random;
+- position is still added directly on base axes, so rotating orientation never
+  rotates EEF position around the base origin;
+- endpoint projection to SO(3) and the rigid-probe metre loss remain active;
+- there is no `1/(1-t)`, residual, learned rate, gate, or conjugation.
+
+Tests verify the complete raw pose9 path and target velocity are exactly left
+equivariant, and an exact predicted velocity gives zero World flow and endpoint
+loss. Interaction remains disabled until the unchanged physical hard gate
+passes.

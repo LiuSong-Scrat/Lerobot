@@ -1216,12 +1216,13 @@ def test_world_to_ego_causal_ablation_removes_cross_attention_and_residual_corre
     )
 
 
-def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
+def test_world_pose9_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
         worldflow_se3_head_enable=False,
-        worldflow_target_type="legacy_eef",
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
     )
     model.action_in_proj = nn.Linear(12, 4)
     model.action_out_proj = nn.Linear(4, 12)
@@ -1235,7 +1236,7 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     model.pointseg_conditioner = SimpleNamespace(foreground_encoder=nn.Linear(6, 3))
     model.ego_to_world_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
     model.world_to_ego_cross_attn = nn.MultiheadAttention(4, 1, batch_first=True)
-    model.world_twist_residual_out_proj = nn.Linear(4, 6)
+    model.world_twist_residual_out_proj = None
     model.world_ego_scene_type_embedding = nn.Parameter(torch.randn(2, 4))
     model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, 4))
     world = SimpleNamespace(
@@ -1269,10 +1270,10 @@ def test_worldflow_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert torch.equal(model.world_lm_expert.weight, model.vlm_with_expert.lm_expert.weight)
     assert model.world_lm_expert.weight.data_ptr() != model.vlm_with_expert.lm_expert.weight.data_ptr()
     assert report["world_action_expert"] == "independent_bootstrapped_copy"
+    assert report["world_output_head"] == "copied_independent_base_pose9"
     assert torch.count_nonzero(world.language_embedding.weight) == 0
     assert torch.count_nonzero(model.ego_to_world_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
-    assert torch.count_nonzero(model.world_twist_residual_out_proj.weight) == 0
     assert all(parameter.requires_grad for parameter in model.parameters())
 
 
@@ -3658,6 +3659,90 @@ def test_world_eef_trajectory_left_composes_ego_prior_in_robot_base():
     assert model.last_worldflow_metrics["worldflow_flow_rotation_probe_err_m"].item() < 1e-6
     assert model.last_worldflow_metrics["worldflow_endpoint_translation_err_m"].item() < 1e-6
     assert model.last_worldflow_metrics["worldflow_endpoint_rotation_probe_err_m"].item() < 1e-6
+
+
+def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
+    torch.manual_seed(31)
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
+        worldflow_action_fusion="independent_parallel",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_freeze_pretrained_ego=False,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = _make_tiny_worldflow_branch(cfg)
+    model.last_worldflow_metrics = {}
+    model.last_worldflow_payload = {"foreground_pc_ego": torch.randn(2, 8, 6)}
+
+    current = se3_exp(torch.randn(2, 6) * 0.2)
+    ego_noise_h = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.2)
+    ego_target_h = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.2)
+    ego_noise = torch.cat(
+        [matrix_to_pose9(ego_noise_h), torch.zeros(2, cfg.chunk_size, 1)], dim=-1
+    )
+    ego_target = matrix_to_pose9(ego_target_h)
+    world_target_h = current.unsqueeze(1) @ ego_target_h
+    time = torch.tensor([0.25, 0.75])
+    state = model._prepare_worldflow_training_state(
+        {
+            "current_ee_pose": matrix_to_pose9(current),
+            "eef_trajectory": matrix_to_pose9(world_target_h),
+            "step_is_pad": torch.zeros(2, cfg.chunk_size, dtype=torch.bool),
+        },
+        torch.randint(0, 64, (2, 5)),
+        torch.ones(2, 5, dtype=torch.bool),
+        time,
+        actions_is_pad=None,
+        ego_noise=ego_noise,
+    )
+
+    ego_x_t = (1.0 - time[:, None, None]) * ego_noise[..., :9] + time[
+        :, None, None
+    ] * ego_target
+    ego_u_t = ego_target - ego_noise[..., :9]
+    current_rotation = current[:, None, :3, :3]
+    expected_x_t = ego_x_t.clone()
+    expected_x_t[..., :3] = (
+        current_rotation @ ego_x_t[..., :3, None]
+    ).squeeze(-1) + current[:, None, :3, 3]
+    expected_x_t[..., 3:6] = (
+        current_rotation @ ego_x_t[..., 3:6, None]
+    ).squeeze(-1)
+    expected_x_t[..., 6:9] = (
+        current_rotation @ ego_x_t[..., 6:9, None]
+    ).squeeze(-1)
+    expected_u_t = ego_u_t.clone()
+    for component in (slice(0, 3), slice(3, 6), slice(6, 9)):
+        expected_u_t[..., component] = (
+            current_rotation @ ego_u_t[..., component, None]
+        ).squeeze(-1)
+
+    assert torch.allclose(state["x_t"], expected_x_t, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(state["u_t"], expected_u_t, atol=2e-5, rtol=2e-5)
+    output = model._finalize_worldflow_training_loss(
+        state,
+        state["u_t"].clone().requires_grad_(True),
+        ego_target,
+        time,
+    )
+    assert output["per_sample_loss"].abs().max().item() < 2e-5
+    assert model.last_worldflow_metrics["worldflow_flow_rotation6d_rmse"].item() < 1e-7
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():

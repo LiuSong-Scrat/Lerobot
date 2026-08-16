@@ -13,7 +13,7 @@ action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-independent}
 action_fusion=${WORLD_EEF_ACTION_FUSION:-independent_parallel}
 current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-true}
 noise_coupling=${WORLD_EEF_NOISE_COUPLING:-left_compose_ego}
-world_eef_velocity_mode=${WORLD_EEF_VELOCITY_MODE:-base_decoupled}
+world_eef_velocity_mode=${WORLD_EEF_VELOCITY_MODE:-base_pose9_euclidean}
 eval_fusion_override=${WORLD_EEF_EVAL_FUSION_OVERRIDE:-}
 worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-1.0}
 worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-1.0}
@@ -50,8 +50,9 @@ if [[ "$noise_coupling" != independent && "$noise_coupling" != left_compose_ego 
     exit 2
 fi
 if [[ "$world_eef_velocity_mode" != legacy_spatial_twist \
-    && "$world_eef_velocity_mode" != base_decoupled ]]; then
-    echo "WORLD_EEF_VELOCITY_MODE must be legacy_spatial_twist or base_decoupled" >&2
+    && "$world_eef_velocity_mode" != base_decoupled \
+    && "$world_eef_velocity_mode" != base_pose9_euclidean ]]; then
+    echo "WORLD_EEF_VELOCITY_MODE must be legacy_spatial_twist, base_decoupled, or base_pose9_euclidean" >&2
     exit 2
 fi
 if [[ -n "$eval_fusion_override" && "$eval_fusion_override" != cross_attention ]]; then
