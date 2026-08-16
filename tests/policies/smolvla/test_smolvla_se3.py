@@ -14,6 +14,9 @@ def test_action_chunk_start_offset_shifts_dataset_action_indices():
 
     assert cfg.action_delta_indices == [1, 2, 3, 4]
 from lerobot.policies.smolvla.modeling_smolvla import (
+    _inverse_left_compose_world_pose9_chart_to_ego,
+    _left_compose_ego_pose9_chart_to_world,
+    _rotate_ego_pose9_chart_velocity_to_world,
     _worldflow_carrier_matrix,
     SmolVLAPolicy,
     VLAFlowMatching,
@@ -1271,6 +1274,7 @@ def test_world_pose9_bootstrap_copies_ego_modules_without_sharing_or_freezing():
     assert model.world_lm_expert.weight.data_ptr() != model.vlm_with_expert.lm_expert.weight.data_ptr()
     assert report["world_action_expert"] == "independent_bootstrapped_copy"
     assert report["world_output_head"] == "copied_independent_base_pose9"
+    assert report["base_pose9_equivariant_wrapper"] is False
     assert torch.count_nonzero(world.language_embedding.weight) == 0
     assert torch.count_nonzero(model.ego_to_world_cross_attn.out_proj.weight) == 0
     assert torch.count_nonzero(model.world_to_ego_cross_attn.out_proj.weight) == 0
@@ -3691,10 +3695,14 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
     model.last_worldflow_payload = {"foreground_pc_ego": torch.randn(2, 8, 6)}
 
     current = se3_exp(torch.randn(2, 6) * 0.2)
-    ego_noise_h = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.2)
+    # The formal checkpoint uses the standard raw Gaussian action prior, not
+    # a valid SE(3) pose prior.  This regression deliberately keeps both 6D
+    # rotation columns unconstrained: projecting them before the frame change
+    # would make the World path non-affine and fail the assertions below.
+    ego_noise_pose9 = torch.randn(2, cfg.chunk_size, 9) * 0.1
     ego_target_h = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.2)
     ego_noise = torch.cat(
-        [matrix_to_pose9(ego_noise_h), torch.zeros(2, cfg.chunk_size, 1)], dim=-1
+        [ego_noise_pose9, torch.randn(2, cfg.chunk_size, 1) * 0.1], dim=-1
     )
     ego_target = matrix_to_pose9(ego_target_h)
     world_target_h = current.unsqueeze(1) @ ego_target_h
@@ -3733,7 +3741,14 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
             current_rotation @ ego_u_t[..., component, None]
         ).squeeze(-1)
 
+    raw_world_noise = model.left_compose_ego_pose_to_world(ego_noise, matrix_to_pose9(current))
+    projected_world_noise = matrix_to_pose9(
+        current.unsqueeze(1) @ pose9_to_matrix(ego_noise[..., :9])
+    )
+
     assert torch.allclose(state["x_t"], expected_x_t, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(raw_world_noise, expected_x_t - time[:, None, None] * expected_u_t, atol=2e-5, rtol=2e-5)
+    assert not torch.allclose(raw_world_noise, projected_world_noise, atol=1e-4, rtol=1e-4)
     assert torch.allclose(state["u_t"], expected_u_t, atol=2e-5, rtol=2e-5)
     output = model._finalize_worldflow_training_loss(
         state,
@@ -3743,6 +3758,47 @@ def test_world_eef_pose9_path_is_exactly_left_equivariant_to_ego_chart():
     )
     assert output["per_sample_loss"].abs().max().item() < 2e-5
     assert model.last_worldflow_metrics["worldflow_flow_rotation6d_rmse"].item() < 1e-7
+
+
+def test_robot_base_pose9_equivariant_wrapper_round_trips_raw_gaussian_chart():
+    torch.manual_seed(32)
+    current = matrix_to_pose9(se3_exp(torch.randn(4, 6) * 0.3))
+    ego_chart = torch.randn(4, 7, 9) * 0.1
+    ego_velocity = torch.randn(4, 7, 9) * 0.1
+
+    world_chart = _left_compose_ego_pose9_chart_to_world(ego_chart, current)
+    recovered = _inverse_left_compose_world_pose9_chart_to_ego(world_chart, current)
+    world_velocity = _rotate_ego_pose9_chart_velocity_to_world(ego_velocity, current)
+
+    assert torch.allclose(recovered, ego_chart, atol=2e-6, rtol=2e-6)
+    affine_difference = (
+        _left_compose_ego_pose9_chart_to_world(ego_chart + ego_velocity, current)
+        - world_chart
+    )
+    assert torch.allclose(world_velocity, affine_difference, atol=2e-6, rtol=2e-6)
+
+
+def test_robot_base_pose9_world_decoder_rotates_copied_local_head_output():
+    torch.manual_seed(33)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_world_eef_velocity_mode="base_pose9_euclidean",
+    )
+    model.world_action_out_proj = nn.Identity()
+    expert_out = torch.randn(3, 5, 9)
+    current = matrix_to_pose9(se3_exp(torch.randn(3, 6) * 0.2))
+
+    actual = model._predict_world_se3_velocity(
+        expert_out,
+        torch.randn(3, 5, 9),
+        torch.tensor([0.2, 0.5, 0.8]),
+        current,
+    )
+    expected = _rotate_ego_pose9_chart_velocity_to_world(expert_out, current)
+
+    assert torch.equal(actual, expected)
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():

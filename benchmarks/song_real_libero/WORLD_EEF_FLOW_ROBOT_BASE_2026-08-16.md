@@ -563,3 +563,63 @@ the base-frame point cloud as World context), so the independent World function
 is accurate by construction at initialization.  Training another unconstrained
 base-coordinate Transformer, adding a residual/rate head, or tuning loss weights
 does not address the observed failure.
+
+## Raw-chart correction and analytic equivariant World wrapper
+
+The preceding symmetric run still contained a decisive implementation error.
+The formal Ego policy uses an unconstrained Gaussian in all pose9 channels,
+then follows a Euclidean chord.  The original `left_compose_ego_pose_to_world`
+first called `pose9_to_matrix`, which Gram--Schmidt projected those arbitrary
+rotation-6D noise columns onto SO(3).  Consequently its claimed exact
+equivariance held only for already-valid SE(3) samples, not for the actual
+training distribution.
+
+The corrected raw-chart frame map is affine for every Gaussian sample:
+
+```text
+p_base  = R_current p_ego + t_current
+r1_base = R_current r1_ego
+r2_base = R_current r2_ego
+```
+
+It therefore commutes exactly with both Euclidean interpolation and the
+pose9 velocity target without projecting the flow state.  A regression now
+uses deliberately unconstrained Gaussian rotation columns and proves both
+the affine path identity and that the old projected result differs.
+
+The independent World Expert is also wrapped by the inverse/forward analytic
+transport:
+
+- its public point cloud, flow state, target, output and loss remain in the
+  fixed robot-base coordinate system;
+- immediately before the independently parameterized copied action stack,
+  the known current-EEF left transform is removed analytically;
+- the copied local pose9 velocity is rotated back onto robot-base axes after
+  the World output head;
+- the Ego gripper flow state remains an input condition so the copied action
+  projection is function preserving, although World still predicts only the
+  nine pose channels;
+- at bootstrap the World suffix and frozen visual-language prefix have the
+  exact Ego layout, but all World parameters are independent copies;
+- base-frame scene tokens and the current base-frame EEF pose enter the World
+  proposal through a dedicated full-matrix attention residual.  Its output
+  projection is zero initialized, not frozen, and it is neither a scalar gate
+  nor an endpoint/rate residual.
+
+Three otherwise identical four-GPU, one-update smokes show the structural
+effect:
+
+| implementation | Ego translation | World translation | World rotation |
+|---|---:|---:|---:|
+| projected raw noise, unconstrained base Expert | 8.99 mm | 423.8 mm | -- |
+| raw affine noise transport only | 8.85 mm | 212.2 mm | 105.8 degrees |
+| analytic action input/output wrapper | 8.91 mm | 77.9 mm | 5.23 degrees |
+| function-preserving wrapper + base context adapter | 7.98 mm | 7.95 mm | 0.743 degrees |
+
+For the final smoke, the physical World/Ego ratios were `0.9972` for
+translation and `0.9990` for rotation.  This is the first design that satisfies
+the requested same-scale condition at initialization by construction.  The
+VLM alone is frozen; both Action Experts, both point/action paths, both heads
+and the base-context adapter remain trainable.  A complete calibration is
+still required to prove the two paths remain aligned after optimization before
+any interaction or environment evaluation is allowed.

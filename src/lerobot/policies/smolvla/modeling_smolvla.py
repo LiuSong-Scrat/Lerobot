@@ -2400,6 +2400,16 @@ class WorldFlowActionBranch(nn.Module):
         self.action_hidden_dim = int(action_hidden_dim)
         self.min_period = float(config.min_period)
         self.max_period = float(config.max_period)
+        self.base_pose9_equivariant_wrapper = bool(
+            getattr(config, "worldflow_target_type", "legacy_eef")
+            == "world_eef_trajectory"
+            and getattr(
+                config,
+                "worldflow_world_eef_velocity_mode",
+                "legacy_spatial_twist",
+            )
+            == "base_pose9_euclidean"
+        )
         if self.feature_dim % int(config.point_action_fusion_heads) != 0:
             raise ValueError(
                 f"worldflow_feature_dim={self.feature_dim} must be divisible by "
@@ -2422,7 +2432,11 @@ class WorldFlowActionBranch(nn.Module):
         ):
             inactive_module.requires_grad_(False)
 
-        self.action_in_proj = nn.Linear(self.pose_dim, self.action_hidden_dim)
+        # The equivariant World wrapper predicts only the nine pose channels,
+        # but retains the Ego gripper flow state as a conditioning channel so
+        # its copied action stack is exactly function preserving at bootstrap.
+        self.action_input_dim = self.pose_dim + int(self.base_pose9_equivariant_wrapper)
+        self.action_in_proj = nn.Linear(self.action_input_dim, self.action_hidden_dim)
         self.action_time_mlp_in = nn.Linear(self.action_hidden_dim * 2, self.action_hidden_dim)
         self.action_time_mlp_out = nn.Linear(self.action_hidden_dim, self.action_hidden_dim)
         self.scene_context_proj = nn.Linear(self.feature_dim, self.action_hidden_dim)
@@ -2466,6 +2480,15 @@ class WorldFlowActionBranch(nn.Module):
             "scene_mask": scene["scene_mask1"].to(dtype=torch.bool),
             "global_feat": scene["global_feat"],
         }
+        if self.base_pose9_equivariant_wrapper:
+            if current_ee_pose_world is None:
+                raise ValueError(
+                    "The robot-base pose9 equivariant wrapper requires current_ee_pose_world."
+                )
+            result["current_ee_pose_world"] = current_ee_pose_world.to(
+                device=point_cloud_world.device,
+                dtype=torch.float32,
+            )
         if self.current_ee_pose_in_proj is not None:
             if current_ee_pose_world is None:
                 raise ValueError(
@@ -2503,6 +2526,9 @@ class WorldFlowActionBranch(nn.Module):
         time: Tensor,
         *,
         actions_is_pad: Tensor | None = None,
+        ego_gripper_state: Tensor | None = None,
+        ego_point_tokens: Tensor | None = None,
+        ego_point_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if noisy_spatial_pose9.ndim != 3 or noisy_spatial_pose9.shape[-1] != self.pose_dim:
             raise ValueError(
@@ -2516,7 +2542,44 @@ class WorldFlowActionBranch(nn.Module):
         if time.shape != (noisy_spatial_pose9.shape[0],):
             raise ValueError(f"Expected WorldFlow time shape {(noisy_spatial_pose9.shape[0],)}, got {time.shape}.")
 
-        action_tokens = self.action_in_proj(noisy_spatial_pose9.to(dtype=torch.float32))
+        action_chart = noisy_spatial_pose9.to(dtype=torch.float32)
+        if self.base_pose9_equivariant_wrapper:
+            current_ee_pose_world = scene.get("current_ee_pose_world")
+            if not torch.is_tensor(current_ee_pose_world):
+                raise ValueError(
+                    "The robot-base pose9 equivariant wrapper is missing current_ee_pose_world."
+                )
+            # Keep the public World state in robot-base coordinates, but
+            # remove the known current-EEF left frame transform before the
+            # copied Euclidean action stack.  The independent expert can then
+            # learn task dynamics instead of relearning a per-sample basis
+            # change that is already known analytically.
+            action_chart = _inverse_left_compose_world_pose9_chart_to_ego(
+                action_chart,
+                current_ee_pose_world,
+            )
+            expected_gripper_shape = (*action_chart.shape[:2], 1)
+            if ego_gripper_state is None:
+                ego_gripper_state = torch.zeros(
+                    expected_gripper_shape,
+                    device=action_chart.device,
+                    dtype=action_chart.dtype,
+                )
+            if not torch.is_tensor(ego_gripper_state):
+                raise TypeError("Ego gripper state must be a tensor when provided.")
+            if ego_gripper_state.shape != expected_gripper_shape:
+                raise ValueError(
+                    f"Expected Ego gripper state shape {expected_gripper_shape}, "
+                    f"got {ego_gripper_state.shape}."
+                )
+            action_chart = torch.cat(
+                [
+                    action_chart,
+                    ego_gripper_state.to(device=action_chart.device, dtype=action_chart.dtype),
+                ],
+                dim=-1,
+            )
+        action_tokens = self.action_in_proj(action_chart)
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.action_hidden_dim,
@@ -2529,20 +2592,30 @@ class WorldFlowActionBranch(nn.Module):
             F.silu(self.action_time_mlp_in(torch.cat([action_tokens, time_emb], dim=-1)))
         )
 
-        lang_emb = self.language_embedding(lang_tokens.to(device=action_tokens.device, dtype=torch.long))
-        lang_context = _masked_language_mean(
-            lang_emb,
-            lang_masks.to(device=action_tokens.device, dtype=torch.bool),
-        )
-        action_tokens = (
-            action_tokens
-            + self.scene_context_proj(scene["global_feat"]).unsqueeze(1)
-            + self.language_norm(lang_context).unsqueeze(1)
-        )
+        if self.base_pose9_equivariant_wrapper:
+            point_tokens = (
+                ego_point_tokens if torch.is_tensor(ego_point_tokens) else scene["scene_tokens"]
+            )
+            point_mask = ego_point_mask if torch.is_tensor(ego_point_mask) else scene["scene_mask"]
+        else:
+            lang_emb = self.language_embedding(
+                lang_tokens.to(device=action_tokens.device, dtype=torch.long)
+            )
+            lang_context = _masked_language_mean(
+                lang_emb,
+                lang_masks.to(device=action_tokens.device, dtype=torch.bool),
+            )
+            action_tokens = (
+                action_tokens
+                + self.scene_context_proj(scene["global_feat"]).unsqueeze(1)
+                + self.language_norm(lang_context).unsqueeze(1)
+            )
+            point_tokens = scene["scene_tokens"]
+            point_mask = scene["scene_mask"]
         action_tokens = self.point_action_adapter(
             action_tokens,
-            scene["scene_tokens"],
-            point_mask=scene["scene_mask"],
+            point_tokens,
+            point_mask=point_mask,
             actions_is_pad=actions_is_pad,
         )
 
@@ -2572,6 +2645,9 @@ class WorldFlowActionBranch(nn.Module):
         point_is_pad: Tensor | None = None,
         actions_is_pad: Tensor | None = None,
         current_ee_pose_world: Tensor | None = None,
+        ego_gripper_state: Tensor | None = None,
+        ego_point_tokens: Tensor | None = None,
+        ego_point_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         scene = self.encode_scene(
             point_cloud_world,
@@ -2585,6 +2661,9 @@ class WorldFlowActionBranch(nn.Module):
             noisy_spatial_pose9,
             time,
             actions_is_pad=actions_is_pad,
+            ego_gripper_state=ego_gripper_state,
+            ego_point_tokens=ego_point_tokens,
+            ego_point_mask=ego_point_mask,
         )
         return {
             **scene,
@@ -2669,6 +2748,91 @@ def _ego_point_cloud_to_world(
     xyz_world = torch.matmul(point_cloud_ego[..., :3].to(dtype=torch.float32), rot.transpose(-1, -2))
     xyz_world = xyz_world + trans.unsqueeze(1)
     return torch.cat([xyz_world, point_cloud_ego[..., 3:6].to(dtype=torch.float32)], dim=-1)
+
+
+def _left_compose_ego_pose9_chart_to_world(
+    ego_chart: Tensor,
+    current_pose_world: Tensor,
+) -> Tensor:
+    """Apply the current-EEF left frame transform to a raw pose9 chart."""
+
+    if ego_chart.ndim != 3 or ego_chart.shape[-1] != 9:
+        raise ValueError(f"Expected Ego pose9 chart shape (B,T,9), got {ego_chart.shape}.")
+    if current_pose_world.shape != (ego_chart.shape[0], 9):
+        raise ValueError(
+            f"Expected current pose shape {(ego_chart.shape[0], 9)}, got {current_pose_world.shape}."
+        )
+    current = pose9_to_matrix(
+        current_pose_world.to(device=ego_chart.device, dtype=torch.float32)
+    )
+    rotation = current[:, None, :3, :3]
+    translation = current[:, None, :3, 3]
+    world_chart = torch.empty_like(ego_chart, dtype=torch.float32)
+    world_chart[..., :3] = (
+        rotation @ ego_chart[..., :3].to(dtype=torch.float32).unsqueeze(-1)
+    ).squeeze(-1) + translation
+    world_chart[..., 3:6] = (
+        rotation @ ego_chart[..., 3:6].to(dtype=torch.float32).unsqueeze(-1)
+    ).squeeze(-1)
+    world_chart[..., 6:9] = (
+        rotation @ ego_chart[..., 6:9].to(dtype=torch.float32).unsqueeze(-1)
+    ).squeeze(-1)
+    return world_chart
+
+
+def _inverse_left_compose_world_pose9_chart_to_ego(
+    world_chart: Tensor,
+    current_pose_world: Tensor,
+) -> Tensor:
+    """Remove the current-EEF left frame transform from a raw pose9 chart."""
+
+    if world_chart.ndim != 3 or world_chart.shape[-1] != 9:
+        raise ValueError(f"Expected World pose9 chart shape (B,T,9), got {world_chart.shape}.")
+    if current_pose_world.shape != (world_chart.shape[0], 9):
+        raise ValueError(
+            f"Expected current pose shape {(world_chart.shape[0], 9)}, got {current_pose_world.shape}."
+        )
+    current = pose9_to_matrix(
+        current_pose_world.to(device=world_chart.device, dtype=torch.float32)
+    )
+    rotation_inv = current[:, None, :3, :3].transpose(-1, -2)
+    translation = current[:, None, :3, 3]
+    ego_chart = torch.empty_like(world_chart, dtype=torch.float32)
+    ego_chart[..., :3] = (
+        rotation_inv
+        @ (world_chart[..., :3].to(dtype=torch.float32) - translation).unsqueeze(-1)
+    ).squeeze(-1)
+    ego_chart[..., 3:6] = (
+        rotation_inv @ world_chart[..., 3:6].to(dtype=torch.float32).unsqueeze(-1)
+    ).squeeze(-1)
+    ego_chart[..., 6:9] = (
+        rotation_inv @ world_chart[..., 6:9].to(dtype=torch.float32).unsqueeze(-1)
+    ).squeeze(-1)
+    return ego_chart
+
+
+def _rotate_ego_pose9_chart_velocity_to_world(
+    ego_velocity: Tensor,
+    current_pose_world: Tensor,
+) -> Tensor:
+    """Rotate a raw pose9 chart velocity from current-EEF to base axes."""
+
+    if ego_velocity.ndim != 3 or ego_velocity.shape[-1] != 9:
+        raise ValueError(f"Expected Ego pose9 velocity shape (B,T,9), got {ego_velocity.shape}.")
+    if current_pose_world.shape != (ego_velocity.shape[0], 9):
+        raise ValueError(
+            f"Expected current pose shape {(ego_velocity.shape[0], 9)}, got {current_pose_world.shape}."
+        )
+    current = pose9_to_matrix(
+        current_pose_world.to(device=ego_velocity.device, dtype=torch.float32)
+    )
+    rotation = current[:, None, :3, :3]
+    world_velocity = torch.empty_like(ego_velocity, dtype=torch.float32)
+    for component in (slice(0, 3), slice(3, 6), slice(6, 9)):
+        world_velocity[..., component] = (
+            rotation @ ego_velocity[..., component].to(dtype=torch.float32).unsqueeze(-1)
+        ).squeeze(-1)
+    return world_velocity
 
 
 def world_trajectory_to_current_ego_pose9(
@@ -3266,6 +3430,24 @@ class VLAFlowMatching(nn.Module):
                 dropout=0.0,
                 batch_first=True,
             )
+            if direct_world_pose9_chart:
+                # Function-preserving World initialization: the copied World
+                # expert first reproduces the Ego action function exactly.
+                # Robot-base scene/current-pose evidence enters through this
+                # full matrix attention residual, whose zero output projection
+                # preserves that initial function while remaining trainable.
+                self.world_base_context_norm = nn.LayerNorm(expert_dim)
+                self.world_base_context_cross_attn = nn.MultiheadAttention(
+                    expert_dim,
+                    cross_heads,
+                    dropout=0.0,
+                    batch_first=True,
+                )
+                nn.init.zeros_(self.world_base_context_cross_attn.out_proj.weight)
+                nn.init.zeros_(self.world_base_context_cross_attn.out_proj.bias)
+            else:
+                self.world_base_context_norm = None
+                self.world_base_context_cross_attn = None
             physical_trajectory_interaction = getattr(
                 self.config, "worldflow_action_fusion", "cross_attention"
             ) in {
@@ -3300,6 +3482,8 @@ class VLAFlowMatching(nn.Module):
             self.world_to_ego_cross_norm = None
             self.ego_to_world_cross_attn = None
             self.world_to_ego_cross_attn = None
+            self.world_base_context_norm = None
+            self.world_base_context_cross_attn = None
             self.ego_physical_trajectory_in_proj = None
             self.world_physical_trajectory_in_proj = None
             self.register_parameter("world_ego_scene_type_embedding", None)
@@ -3377,14 +3561,22 @@ class VLAFlowMatching(nn.Module):
             self.point_action_fusion.state_dict(),
             strict=True,
         )
-        world.action_in_proj.weight.copy_(self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim])
+        if world.action_in_proj.in_features == self.action_in_proj.in_features:
+            world.action_in_proj.weight.copy_(self.action_in_proj.weight)
+        else:
+            world.action_in_proj.weight.copy_(
+                self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim]
+            )
         world.action_in_proj.bias.copy_(self.action_in_proj.bias)
         world.action_time_mlp_in.load_state_dict(self.action_time_mlp_in.state_dict(), strict=True)
         world.action_time_mlp_out.load_state_dict(self.action_time_mlp_out.state_dict(), strict=True)
         world.scene_context_proj.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         current_pose_proj = getattr(world, "current_ee_pose_in_proj", None)
         if current_pose_proj is not None:
-            current_pose_proj.load_state_dict(world.action_in_proj.state_dict(), strict=True)
+            current_pose_proj.weight.copy_(
+                self.action_in_proj.weight[:, : WorldFlowActionBranch.pose_dim]
+            )
+            current_pose_proj.bias.copy_(self.action_in_proj.bias)
         self.world_scene_to_expert.load_state_dict(self.ego_scene_to_expert.state_dict(), strict=True)
         ego_physical_projection = getattr(self, "ego_physical_trajectory_in_proj", None)
         world_physical_projection = getattr(self, "world_physical_trajectory_in_proj", None)
@@ -3426,6 +3618,15 @@ class VLAFlowMatching(nn.Module):
             attention.out_proj.weight.zero_()
             if attention.out_proj.bias is not None:
                 attention.out_proj.bias.zero_()
+        world_base_context_cross_attn = getattr(
+            self,
+            "world_base_context_cross_attn",
+            None,
+        )
+        if world_base_context_cross_attn is not None:
+            world_base_context_cross_attn.out_proj.weight.zero_()
+            if world_base_context_cross_attn.out_proj.bias is not None:
+                world_base_context_cross_attn.out_proj.bias.zero_()
         if self.world_twist_residual_out_proj is not None:
             self.world_twist_residual_out_proj.weight.zero_()
             self.world_twist_residual_out_proj.bias.zero_()
@@ -3457,6 +3658,9 @@ class VLAFlowMatching(nn.Module):
                     if direct_world_trajectory
                     else "copied_legacy_pose9"
                 )
+            ),
+            "base_pose9_equivariant_wrapper": bool(
+                getattr(world, "base_pose9_equivariant_wrapper", False)
             ),
             "bidirectional_cross_attention_zero_output_init": True,
             "physical_trajectory_interaction": bool(
@@ -3589,12 +3793,27 @@ class VLAFlowMatching(nn.Module):
         return matrix_to_pose9(world_transform)
 
     def left_compose_ego_pose_to_world(self, ego_pose: Tensor, current_pose: Tensor) -> Tensor:
-        """Express an Ego-frame pose sample as an absolute robot-base pose.
+        """Affinely express an Ego pose9 chart sample in robot-base axes.
 
         For the observed current EEF-to-base transform ``C`` and an Ego pose
         ``B`` expressed in that current EEF frame, the same absolute EEF pose
         is ``W = C B``. This is deliberately not the legacy spatial-motion
         conjugation ``C B C^-1``.
+
+        The standard SmolVLA flow starts from unconstrained Gaussian values in
+        the nine Euclidean pose channels.  Those intermediate values are not
+        rotations and must *not* be passed through ``pose9_to_matrix`` here:
+        doing so Gram--Schmidt projects the two rotation columns and destroys
+        the affine relation between the Ego and World flow paths.  Left frame
+        change acts directly on the raw chart as
+
+        ``p_w = R_c p_e + t_c``, ``r1_w = R_c r1_e``,
+        ``r2_w = R_c r2_e``.
+
+        For valid pose9 endpoints this is exactly the chart representation of
+        ``C B``; for arbitrary flow states it remains an invertible affine
+        change of coordinates and therefore commutes with Euclidean flow
+        interpolation.
         """
 
         if ego_pose.ndim != 3 or ego_pose.shape[-1] < 9:
@@ -3603,11 +3822,10 @@ class VLAFlowMatching(nn.Module):
             raise ValueError(
                 f"Expected current pose shape {(ego_pose.shape[0], 9)}, got {current_pose.shape}."
             )
-        ego_transform = pose9_to_matrix(ego_pose[..., :9].to(dtype=torch.float32))
-        current_transform = pose9_to_matrix(
-            current_pose.to(device=ego_pose.device, dtype=torch.float32)
+        return _left_compose_ego_pose9_chart_to_world(
+            ego_pose[..., :9],
+            current_pose,
         )
-        return matrix_to_pose9(current_transform.unsqueeze(1) @ ego_transform)
 
     def project_ego_chart_path_to_world(
         self,
@@ -3898,6 +4116,7 @@ class VLAFlowMatching(nn.Module):
         expert_out: Tensor,
         world_x_t: Tensor,
         time: Tensor,
+        current_ee_pose_world: Tensor | None = None,
     ) -> Tensor:
         """Decode World expert features in its configured trajectory chart."""
 
@@ -3915,7 +4134,15 @@ class VLAFlowMatching(nn.Module):
             ):
                 if self.world_action_out_proj is None:
                     raise RuntimeError("World-EEF pose9 chart head is not initialized.")
-                return self.world_action_out_proj(expert_out)
+                local_velocity = self.world_action_out_proj(expert_out)
+                if current_ee_pose_world is None:
+                    raise RuntimeError(
+                        "Robot-base pose9 decoding requires the current EEF pose."
+                    )
+                return _rotate_ego_pose9_chart_velocity_to_world(
+                    local_velocity,
+                    current_ee_pose_world,
+                )
             if self.world_se3_action_out_proj is None:
                 raise RuntimeError("World-EEF trajectory SE(3) twist head is not initialized.")
             return self.world_se3_action_out_proj(expert_out)
@@ -5011,6 +5238,7 @@ class VLAFlowMatching(nn.Module):
             world_out,
             world_state,
             timestep,
+            current_ee_pose_world,
         )
         ego_proposal_base, world_proposal_current = (
             physically_aligned_world_ego_trajectory_proposals(
@@ -5106,6 +5334,27 @@ class VLAFlowMatching(nn.Module):
                 "Independent World expert requires global/point masks and action tokens/masks."
             )
 
+        if bool(
+            getattr(
+                getattr(self, "worldflow_branch", None),
+                "base_pose9_equivariant_wrapper",
+                False,
+            )
+        ):
+            # Exact Ego-compatible layout for the independently copied Expert.
+            # Absolute base scene/current-pose information is injected only
+            # after this complete local action proposal is formed.
+            world_action_mask = world_action_mask.to(
+                device=world_action_tokens.device,
+                dtype=torch.bool,
+            )
+            suffix_att_masks = torch.tensor(
+                [1] + [0] * (world_action_tokens.shape[1] - 1),
+                dtype=world_action_tokens.dtype,
+                device=world_action_tokens.device,
+            )[None, :].expand(world_action_tokens.shape[0], -1)
+            return world_action_tokens, world_action_mask, suffix_att_masks
+
         world_scene = self.world_scene_to_expert(world_global_feat).unsqueeze(1)
         world_scene_mask = world_point_mask.to(
             device=world_scene.device,
@@ -5166,6 +5415,17 @@ class VLAFlowMatching(nn.Module):
         path before the explicit interaction phase.
         """
 
+        if bool(
+            getattr(
+                getattr(self, "worldflow_branch", None),
+                "base_pose9_equivariant_wrapper",
+                False,
+            )
+        ):
+            # The independent copied Expert starts from the exact Ego prefix.
+            # Its parameters are not shared; base-frame evidence is added by
+            # the dedicated World-only context attention after this pass.
+            return prefix_pad_masks
         point_slices = getattr(self, "last_ego_point_prefix_slices", ())
         if not point_slices:
             return prefix_pad_masks
@@ -5230,6 +5490,50 @@ class VLAFlowMatching(nn.Module):
             suffix_out = outputs_embeds[1]
         return suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
 
+    def _inject_world_base_context(
+        self,
+        world_out: Tensor,
+        world_tokens: dict[str, Tensor],
+    ) -> Tensor:
+        """Inject base-frame scene evidence after a complete World proposal."""
+
+        world_base_context_cross_attn = getattr(
+            self,
+            "world_base_context_cross_attn",
+            None,
+        )
+        world_base_context_norm = getattr(self, "world_base_context_norm", None)
+        if world_base_context_cross_attn is None or world_base_context_norm is None:
+            return world_out
+        if self.world_scene_to_expert is None:
+            raise RuntimeError("World base-context projection is not initialized.")
+        scene_tokens = world_tokens.get("scene_tokens")
+        scene_mask = world_tokens.get("scene_mask")
+        if not torch.is_tensor(scene_tokens) or not torch.is_tensor(scene_mask):
+            raise ValueError("World base-context attention requires scene tokens and mask.")
+        context_tokens = [self.world_scene_to_expert(scene_tokens)]
+        context_masks = [scene_mask.to(device=scene_tokens.device, dtype=torch.bool)]
+        current_pose_token = world_tokens.get("current_ee_pose_token")
+        current_pose_mask = world_tokens.get("current_ee_pose_mask")
+        if torch.is_tensor(current_pose_token) and torch.is_tensor(current_pose_mask):
+            context_tokens.insert(0, current_pose_token)
+            context_masks.insert(
+                0,
+                current_pose_mask.to(device=current_pose_token.device, dtype=torch.bool),
+            )
+        context = torch.cat(context_tokens, dim=1)
+        context_mask = torch.cat(context_masks, dim=1)
+        normalized_world = world_base_context_norm(world_out)
+        normalized_context = world_base_context_norm(context)
+        delta, _ = world_base_context_cross_attn(
+            query=normalized_world,
+            key=normalized_context,
+            value=normalized_context,
+            key_padding_mask=~context_mask,
+            need_weights=False,
+        )
+        return world_out + delta
+
     def _run_world_ego_joint_expert(
         self,
         prefix_embs: Tensor | None,
@@ -5267,6 +5571,7 @@ class VLAFlowMatching(nn.Module):
                 world_tokens,
                 past_key_values=past_key_values,
             )
+            world_out = self._inject_world_base_context(world_out, world_tokens)
             if (
                 getattr(self.config, "worldflow_action_fusion", "cross_attention")
                 == "independent_parallel"
@@ -5560,6 +5865,17 @@ class VLAFlowMatching(nn.Module):
                 rot_weight=float(self.config.worldflow_rot_weight),
             )
 
+        ego_gripper_state = None
+        base_pose9_equivariant_wrapper = bool(
+            getattr(self.worldflow_branch, "base_pose9_equivariant_wrapper", False)
+        )
+        if base_pose9_equivariant_wrapper:
+            ego_gripper_source = ego_x_t if ego_x_t is not None else ego_noise
+            if ego_gripper_source.shape[-1] < 10:
+                raise ValueError(
+                    "Robot-base pose9 World training requires an Ego gripper state."
+                )
+            ego_gripper_state = ego_gripper_source[..., 9:10]
         world_tokens = self.worldflow_branch(
             point_cloud_world,
             lang_tokens,
@@ -5569,6 +5885,9 @@ class VLAFlowMatching(nn.Module):
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
             current_ee_pose_world=current_pose,
+            ego_gripper_state=ego_gripper_state,
+            ego_point_tokens=getattr(self, "last_point_action_tokens", None),
+            ego_point_mask=getattr(self, "last_point_action_mask", None),
         )
         state = {
             "point_cloud_world": point_cloud_world,
@@ -5582,6 +5901,7 @@ class VLAFlowMatching(nn.Module):
             "path_conjugacy_error": path_conjugacy_error,
             "x_t": x_t,
             "u_t": u_t,
+            "ego_gripper_state": ego_gripper_state,
             "valid": valid,
             "world_tokens": world_tokens,
             "independent_world_trajectory": torch.tensor(
@@ -5608,6 +5928,9 @@ class VLAFlowMatching(nn.Module):
         spatial_gt = state["spatial_gt"]
         noise_spatial = state["noise_spatial"]
         current_x_t = state["x_t"]
+        current_u_t = state.get("u_t")
+        current_pose9 = state.get("current_pose9")
+        ego_gripper_state = state.get("ego_gripper_state")
         valid = state["valid"]
         if not all(
             torch.is_tensor(value)
@@ -5622,6 +5945,17 @@ class VLAFlowMatching(nn.Module):
         ):
             raise TypeError("WorldFlow augmentation state contains a non-tensor value.")
 
+        independent_world_trajectory = bool(
+            torch.is_tensor(state.get("independent_world_trajectory"))
+            and bool(state["independent_world_trajectory"].item())
+        )
+        if independent_world_trajectory and not all(
+            torch.is_tensor(value) for value in (current_u_t, current_pose9)
+        ):
+            raise TypeError(
+                "Absolute World-trajectory augmentation requires u_t and current_pose9 tensors."
+            )
+
         transform = _sample_random_se3(
             point_cloud_world.shape[0],
             point_cloud_world.device,
@@ -5631,9 +5965,54 @@ class VLAFlowMatching(nn.Module):
         )
         transform_inv = invert_transform(transform)
         point_cloud_aug = _transform_point_cloud_xyzrgb(point_cloud_world, transform)
-        spatial_gt_aug = transform.unsqueeze(1) @ spatial_gt @ transform_inv.unsqueeze(1)
-        noise_spatial_aug = transform.unsqueeze(1) @ noise_spatial @ transform_inv.unsqueeze(1)
-        if self.config.worldflow_noise_coupling == "projected_ego_path":
+        if independent_world_trajectory:
+            # This is an active rigid transform of an absolute base-frame
+            # trajectory and scene, hence left composition (A H), never the
+            # legacy motion conjugation (A H A^-1).
+            spatial_gt_aug = transform.unsqueeze(1) @ spatial_gt
+            noise_spatial_aug = transform.unsqueeze(1) @ noise_spatial
+            transform_pose9 = matrix_to_pose9(transform)
+            if (
+                self.config.worldflow_world_eef_velocity_mode
+                == "base_pose9_euclidean"
+            ):
+                x_t_aug = _left_compose_ego_pose9_chart_to_world(
+                    current_x_t,
+                    transform_pose9,
+                )
+                u_t_aug = _rotate_ego_pose9_chart_velocity_to_world(
+                    current_u_t,
+                    transform_pose9,
+                )
+            else:
+                x_t_aug = matrix_to_pose9(
+                    transform.unsqueeze(1) @ pose9_to_matrix(current_x_t)
+                )
+                if self.config.worldflow_world_eef_velocity_mode == "base_decoupled":
+                    rotation = transform[:, None, :3, :3]
+                    u_t_aug = torch.cat(
+                        [
+                            (rotation @ current_u_t[..., :3, None]).squeeze(-1),
+                            (rotation @ current_u_t[..., 3:6, None]).squeeze(-1),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    u_t_aug = transform_se3_twist(
+                        current_u_t,
+                        transform.unsqueeze(1),
+                    )
+            current_pose9_aug = matrix_to_pose9(
+                transform @ pose9_to_matrix(current_pose9)
+            )
+        else:
+            spatial_gt_aug = transform.unsqueeze(1) @ spatial_gt @ transform_inv.unsqueeze(1)
+            noise_spatial_aug = transform.unsqueeze(1) @ noise_spatial @ transform_inv.unsqueeze(1)
+            current_pose9_aug = current_pose9
+
+        if independent_world_trajectory:
+            pass
+        elif self.config.worldflow_noise_coupling == "projected_ego_path":
             current_spatial = pose9_to_matrix(current_x_t)
             current_spatial_aug = (
                 transform.unsqueeze(1) @ current_spatial @ transform_inv.unsqueeze(1)
@@ -5663,11 +6042,17 @@ class VLAFlowMatching(nn.Module):
             time,
             point_is_pad=point_is_pad,
             actions_is_pad=~valid,
+            current_ee_pose_world=current_pose9_aug,
+            ego_gripper_state=ego_gripper_state,
+            ego_point_tokens=getattr(self, "last_point_action_tokens", None),
+            ego_point_mask=getattr(self, "last_point_action_mask", None),
         )
         return {
             "spatial_gt": spatial_gt_aug,
             "x_t": x_t_aug,
             "u_t": u_t_aug,
+            "current_pose9": current_pose9_aug,
+            "ego_gripper_state": ego_gripper_state,
             "world_tokens": world_tokens_aug,
         }, transform
 
@@ -6132,7 +6517,12 @@ class VLAFlowMatching(nn.Module):
                     dim=-1,
                 )
             else:
-                world_velocity = self._predict_world_se3_velocity(world_expert_out, world_x_t, time)
+                world_velocity = self._predict_world_se3_velocity(
+                    world_expert_out,
+                    world_x_t,
+                    time,
+                    world_state.get("current_pose9"),
+                )
             if self.config.worldflow_action_fusion == "symmetric_twist":
                 pred = symmetric_world_ego_twist_fusion(
                     pred,
@@ -6208,6 +6598,7 @@ class VLAFlowMatching(nn.Module):
                         world_aug_expert_out,
                         world_x_t_aug,
                         time,
+                        augmented_state.get("current_pose9"),
                     )
         twist_pred = pred[..., :6]
         gripper_vel_pred = pred[..., 6:7]
@@ -6384,6 +6775,7 @@ class VLAFlowMatching(nn.Module):
                     world_expert_out,
                     world_x_t,
                     time,
+                    world_state.get("current_pose9"),
                 )
             else:
                 v_t = self.action_out_proj(ego_expert_out)
@@ -6495,6 +6887,7 @@ class VLAFlowMatching(nn.Module):
                             world_aug_expert_out,
                             augmented_world_x_t,
                             time,
+                            augmented_state.get("current_pose9"),
                         )
                     else:
                         if self.world_action_out_proj is None:
@@ -6619,6 +7012,13 @@ class VLAFlowMatching(nn.Module):
                 point_is_pad=point_is_pad,
                 current_ee_pose_world=current_ee_pose,
             )
+            if self.worldflow_branch.base_pose9_equivariant_wrapper:
+                if self.last_point_action_tokens is None or self.last_point_action_mask is None:
+                    raise ValueError(
+                        "Robot-base pose9 World inference requires cached Ego point-action tokens."
+                    )
+                world_scene["ego_point_tokens"] = self.last_point_action_tokens
+                world_scene["ego_point_mask"] = self.last_point_action_mask
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling == "left_compose_ego":
                     world_x_t = self.left_compose_ego_pose_to_world(
@@ -6780,6 +7180,17 @@ class VLAFlowMatching(nn.Module):
             lang_masks,
             world_x_t,
             timestep,
+            ego_gripper_state=(
+                ego_x_t[..., 9:10]
+                if getattr(
+                    self.worldflow_branch,
+                    "base_pose9_equivariant_wrapper",
+                    False,
+                )
+                else None
+            ),
+            ego_point_tokens=world_scene.get("ego_point_tokens"),
+            ego_point_mask=world_scene.get("ego_point_mask"),
         )
         world_tokens = {
             **world_scene,
@@ -6867,7 +7278,12 @@ class VLAFlowMatching(nn.Module):
                         dim=-1,
                     )
             else:
-                world_velocity = self._predict_world_se3_velocity(world_out, world_x_t, timestep)
+                world_velocity = self._predict_world_se3_velocity(
+                    world_out,
+                    world_x_t,
+                    timestep,
+                    world_scene.get("current_ee_pose_world"),
+                )
             if return_pose9_velocity:
                 return joint_ego_velocity, world_velocity, joint_pose9_velocity
             return joint_ego_velocity, world_velocity
@@ -6876,7 +7292,12 @@ class VLAFlowMatching(nn.Module):
             getattr(self.config, "worldflow_target_type", "legacy_eef")
             == "world_eef_trajectory"
         ):
-            world_velocity = self._predict_world_se3_velocity(world_out, world_x_t, timestep)
+            world_velocity = self._predict_world_se3_velocity(
+                world_out,
+                world_x_t,
+                timestep,
+                world_scene.get("current_ee_pose_world"),
+            )
         else:
             if self.world_action_out_proj is None:
                 raise RuntimeError("Joint World–Ego pose9 output projection is not initialized.")
@@ -6976,6 +7397,13 @@ class VLAFlowMatching(nn.Module):
                 point_is_pad=point_is_pad,
                 current_ee_pose_world=current_ee_pose,
             )
+            if self.worldflow_branch.base_pose9_equivariant_wrapper:
+                if self.last_point_action_tokens is None or self.last_point_action_mask is None:
+                    raise ValueError(
+                        "Robot-base pose9 World inference requires cached Ego point-action tokens."
+                    )
+                world_scene["ego_point_tokens"] = self.last_point_action_tokens
+                world_scene["ego_point_mask"] = self.last_point_action_mask
             if worldflow_noise is None:
                 if self.config.worldflow_noise_coupling == "left_compose_ego":
                     world_x_t = self.left_compose_ego_pose_to_world(
