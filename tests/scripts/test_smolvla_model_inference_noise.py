@@ -82,7 +82,7 @@ def test_zero_noise_is_valid_identity_pose9_for_pose_checkpoints():
 
 @pytest.mark.parametrize(
     "coupling",
-    ["conjugate_ego", "projected_ego_chart", "projected_ego_path"],
+    ["left_compose_ego", "conjugate_ego", "projected_ego_chart", "projected_ego_path"],
 )
 def test_seeded_world_noise_is_deferred_to_model_when_ego_coupling_is_enabled(coupling):
     model = _NoiseModel(

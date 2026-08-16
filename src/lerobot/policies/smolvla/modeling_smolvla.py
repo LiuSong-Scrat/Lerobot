@@ -296,6 +296,59 @@ def se3_left_apply(delta_xi: Tensor, transform: Tensor) -> Tensor:
     return se3_exp(delta_xi) @ transform
 
 
+def decoupled_base_pose_apply(delta_velocity: Tensor, transform: Tensor) -> Tensor:
+    """Apply base-axis translation and rotation without a global-origin lever arm.
+
+    ``delta_velocity`` is ``[delta_position_base, delta_rotation_base]``. The
+    position is translated directly in robot-base coordinates while rotation
+    is left-applied to the orientation only. Unlike an SE(3) spatial twist,
+    rotating the EEF does not spuriously rotate its position around the robot
+    base origin.
+    """
+
+    if delta_velocity.shape[-1] != 6 or transform.shape[-2:] != (4, 4):
+        raise ValueError(
+            "Expected decoupled velocity (...,6) and transform (...,4,4), "
+            f"got {delta_velocity.shape} and {transform.shape}."
+        )
+    delta = delta_velocity.to(device=transform.device, dtype=torch.float32)
+    current = transform.to(dtype=torch.float32)
+    result = current.clone()
+    result[..., :3, 3] = current[..., :3, 3] + delta[..., :3]
+    result[..., :3, :3] = so3_exp(delta[..., 3:6]) @ current[..., :3, :3]
+    return result
+
+
+def decoupled_base_pose_flow_state(
+    noise_transform: Tensor,
+    target_transform: Tensor,
+    time: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Build a robot-base pose flow with independent translation and rotation.
+
+    Position follows a Euclidean line in base coordinates. Orientation follows
+    the SO(3) geodesic using angular velocity expressed on the base axes. This
+    keeps every state an absolute base-frame EEF pose without introducing the
+    ``omega x position`` term of a global-origin spatial twist.
+    """
+
+    if noise_transform.shape != target_transform.shape or noise_transform.shape[-2:] != (4, 4):
+        raise ValueError(
+            "Decoupled pose-flow endpoints must have matching (...,4,4) shapes; "
+            f"got {noise_transform.shape} and {target_transform.shape}."
+        )
+    if time.ndim != 1 or time.shape[0] != noise_transform.shape[0]:
+        raise ValueError(f"Expected time shape ({noise_transform.shape[0]},), got {time.shape}.")
+    noise = noise_transform.to(dtype=torch.float32)
+    target = target_transform.to(dtype=torch.float32)
+    translation_velocity = target[..., :3, 3] - noise[..., :3, 3]
+    angular_velocity = so3_log(target[..., :3, :3] @ noise[..., :3, :3].transpose(-1, -2))
+    velocity = torch.cat([translation_velocity, angular_velocity], dim=-1)
+    time_expanded = time.reshape(time.shape[0], *([1] * (velocity.ndim - 1)))
+    state = decoupled_base_pose_apply(time_expanded * velocity, noise)
+    return state, velocity
+
+
 def transform_se3_twist(twist: Tensor, transform: Tensor) -> Tensor:
     """Apply the SE(3) adjoint for twists ordered as ``[v, omega]``."""
 
@@ -2498,6 +2551,7 @@ def physically_aligned_world_ego_trajectory_proposals(
     world_velocity: Tensor,
     timestep: Tensor,
     current_ee_pose_world: Tensor,
+    world_velocity_mode: str = "legacy_spatial_twist",
 ) -> tuple[Tensor, Tensor]:
     """Build complete, coordinate-aligned trajectory proposals for interaction.
 
@@ -2538,10 +2592,18 @@ def physically_aligned_world_ego_trajectory_proposals(
     ego_endpoint_current = pose9_to_matrix(
         ego_state[..., :9] + remaining * ego_velocity[..., :9]
     )
-    world_endpoint_base = se3_left_apply(
-        remaining * world_velocity,
-        pose9_to_matrix(world_state),
-    )
+    if world_velocity_mode == "base_decoupled":
+        world_endpoint_base = decoupled_base_pose_apply(
+            remaining * world_velocity,
+            pose9_to_matrix(world_state),
+        )
+    elif world_velocity_mode == "legacy_spatial_twist":
+        world_endpoint_base = se3_left_apply(
+            remaining * world_velocity,
+            pose9_to_matrix(world_state),
+        )
+    else:
+        raise ValueError(f"Unknown World EEF velocity mode {world_velocity_mode!r}.")
     current_base = pose9_to_matrix(
         current_ee_pose_world.to(device=ego_state.device, dtype=torch.float32)
     ).unsqueeze(1)
@@ -3342,6 +3404,27 @@ class VLAFlowMatching(nn.Module):
             @ current_inv.unsqueeze(1)
         )
         return matrix_to_pose9(world_transform)
+
+    def left_compose_ego_pose_to_world(self, ego_pose: Tensor, current_pose: Tensor) -> Tensor:
+        """Express an Ego-frame pose sample as an absolute robot-base pose.
+
+        For the observed current EEF-to-base transform ``C`` and an Ego pose
+        ``B`` expressed in that current EEF frame, the same absolute EEF pose
+        is ``W = C B``. This is deliberately not the legacy spatial-motion
+        conjugation ``C B C^-1``.
+        """
+
+        if ego_pose.ndim != 3 or ego_pose.shape[-1] < 9:
+            raise ValueError(f"Expected Ego pose shape (B,T,D>=9), got {ego_pose.shape}.")
+        if current_pose.shape != (ego_pose.shape[0], 9):
+            raise ValueError(
+                f"Expected current pose shape {(ego_pose.shape[0], 9)}, got {current_pose.shape}."
+            )
+        ego_transform = pose9_to_matrix(ego_pose[..., :9].to(dtype=torch.float32))
+        current_transform = pose9_to_matrix(
+            current_pose.to(device=ego_pose.device, dtype=torch.float32)
+        )
+        return matrix_to_pose9(current_transform.unsqueeze(1) @ ego_transform)
 
     def project_ego_chart_path_to_world(
         self,
@@ -4737,6 +4820,7 @@ class VLAFlowMatching(nn.Module):
                 preliminary_world_velocity,
                 timestep,
                 current_ee_pose_world,
+                self.config.worldflow_world_eef_velocity_mode,
             )
         )
         position = self.physical_trajectory_position_embedding.unsqueeze(0).to(
@@ -5124,14 +5208,18 @@ class VLAFlowMatching(nn.Module):
             spatial_gt = current.unsqueeze(1) @ body_gt @ current_inv.unsqueeze(1)
         spatial_gt_pose9 = matrix_to_pose9(spatial_gt)
 
+        absolute_pose_coupled_noise = (
+            independent_world_trajectory
+            and self.config.worldflow_noise_coupling == "left_compose_ego"
+        )
         ego_coupled_noise = not independent_world_trajectory and self.config.worldflow_noise_coupling in {
             "conjugate_ego",
             "projected_ego_chart",
             "projected_ego_path",
         }
         if ego_noise is None:
-            if ego_coupled_noise:
-                raise ValueError("Conjugate WorldFlow noise requires the sampled Ego noise tensor.")
+            if absolute_pose_coupled_noise or ego_coupled_noise:
+                raise ValueError("Coupled WorldFlow noise requires the sampled Ego noise tensor.")
             ego_noise = torch.zeros(
                 *spatial_gt_pose9.shape[:2],
                 10,
@@ -5141,7 +5229,10 @@ class VLAFlowMatching(nn.Module):
             ego_noise[..., 3] = 1.0
             ego_noise[..., 7] = 1.0
 
-        if ego_coupled_noise:
+        if absolute_pose_coupled_noise:
+            noise_pose9 = self.left_compose_ego_pose_to_world(ego_noise, current_pose)
+            noise_spatial = pose9_to_matrix(noise_pose9)
+        elif ego_coupled_noise:
             if coordinate_frame_transform is None:
                 noise_pose9 = self.conjugate_ego_noise_to_world(ego_noise, current_pose)
                 noise_spatial = pose9_to_matrix(noise_pose9)
@@ -5169,7 +5260,11 @@ class VLAFlowMatching(nn.Module):
             noise_spatial = se3_exp(noise_twist)
             noise_pose9 = matrix_to_pose9(noise_spatial)
 
-        if independent_world_trajectory:
+        if absolute_pose_coupled_noise:
+            expected_conjugate_noise = pose9_to_matrix(
+                self.left_compose_ego_pose_to_world(ego_noise, current_pose)
+            )
+        elif independent_world_trajectory:
             expected_conjugate_noise = noise_spatial
         elif coordinate_frame_transform is None:
             expected_conjugate_noise = pose9_to_matrix(
@@ -5203,6 +5298,16 @@ class VLAFlowMatching(nn.Module):
                 x_t = matrix_to_pose9(world_h_t)
                 remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
                 u_t = (spatial_gt_pose9 - x_t) / remaining
+        elif (
+            independent_world_trajectory
+            and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
+        ):
+            world_h_t, u_t = decoupled_base_pose_flow_state(
+                noise_spatial,
+                spatial_gt,
+                time,
+            )
+            x_t = matrix_to_pose9(world_h_t)
         elif self.config.se3_enable or independent_world_trajectory:
             world_h_t, u_t = se3_geodesic_flow_state(noise_spatial, spatial_gt, time)
             x_t = matrix_to_pose9(world_h_t)
@@ -5376,7 +5481,19 @@ class VLAFlowMatching(nn.Module):
             and bool(state["independent_world_trajectory"].item())
         )
         time_expanded = time[:, None, None]
-        if self.config.se3_enable or independent_world_trajectory:
+        decoupled_world_eef = (
+            independent_world_trajectory
+            and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
+        )
+        if decoupled_world_eef:
+            remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
+            pred_spatial = decoupled_base_pose_apply(
+                remaining * pred_velocity,
+                pose9_to_matrix(x_t),
+            )
+            pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
+            flow_step = F.smooth_l1_loss(pred_velocity, u_t, reduction="none").mean(dim=-1)
+        elif self.config.se3_enable or independent_world_trajectory:
             remaining = (1.0 - time).clamp_min(1e-4)[:, None, None]
             pred_spatial = se3_left_apply(remaining * pred_velocity, pose9_to_matrix(x_t))
             pred_spatial_pose9 = matrix_to_pose9(pred_spatial)
@@ -5416,7 +5533,17 @@ class VLAFlowMatching(nn.Module):
             spatial_gt_aug = augmented_state["spatial_gt"]
             if not all(torch.is_tensor(value) for value in (x_t_aug, u_t_aug, spatial_gt_aug)):
                 raise TypeError("Augmented WorldFlow state contains a non-tensor value.")
-            if self.config.se3_enable or independent_world_trajectory:
+            if decoupled_world_eef:
+                pred_aug_spatial = decoupled_base_pose_apply(
+                    remaining * pred_aug_velocity,
+                    pose9_to_matrix(x_t_aug),
+                )
+                flow_step_aug = F.smooth_l1_loss(
+                    pred_aug_velocity,
+                    u_t_aug,
+                    reduction="none",
+                ).mean(dim=-1)
+            elif self.config.se3_enable or independent_world_trajectory:
                 pred_aug_spatial = se3_left_apply(
                     remaining * pred_aug_velocity,
                     pose9_to_matrix(x_t_aug),
@@ -6193,7 +6320,12 @@ class VLAFlowMatching(nn.Module):
                 current_ee_pose_world=current_ee_pose,
             )
             if worldflow_noise is None:
-                if self.config.worldflow_noise_coupling in {
+                if self.config.worldflow_noise_coupling == "left_compose_ego":
+                    world_x_t = self.left_compose_ego_pose_to_world(
+                        noise,
+                        current_ee_pose,
+                    )
+                elif self.config.worldflow_noise_coupling in {
                     "conjugate_ego",
                     "projected_ego_chart",
                     "projected_ego_path",
@@ -6281,8 +6413,14 @@ class VLAFlowMatching(nn.Module):
                             getattr(self.config, "worldflow_target_type", "legacy_eef")
                             == "world_eef_trajectory"
                         ):
+                            world_apply = (
+                                decoupled_base_pose_apply
+                                if self.config.worldflow_world_eef_velocity_mode
+                                == "base_decoupled"
+                                else se3_left_apply
+                            )
                             world_x_t = matrix_to_pose9(
-                                se3_left_apply(
+                                world_apply(
                                     dt * world_v_t,
                                     pose9_to_matrix(world_x_t),
                                 )
@@ -6533,7 +6671,12 @@ class VLAFlowMatching(nn.Module):
                 current_ee_pose_world=current_ee_pose,
             )
             if worldflow_noise is None:
-                if self.config.worldflow_noise_coupling in {
+                if self.config.worldflow_noise_coupling == "left_compose_ego":
+                    world_x_t = self.left_compose_ego_pose_to_world(
+                        ego_group_x_t,
+                        current_ee_pose,
+                    )
+                elif self.config.worldflow_noise_coupling in {
                     "conjugate_ego",
                     "projected_ego_chart",
                     "projected_ego_path",
@@ -6624,7 +6767,13 @@ class VLAFlowMatching(nn.Module):
             if ego_group_x_t.shape[-1] < self.config.max_action_dim:
                 ego_group_x_t = pad_vector(ego_group_x_t, self.config.max_action_dim)
             if world_twist is not None:
-                world_h_next = se3_left_apply(dt * world_twist, pose9_to_matrix(world_x_t))
+                world_apply = (
+                    decoupled_base_pose_apply
+                    if self.config.worldflow_target_type == "world_eef_trajectory"
+                    and self.config.worldflow_world_eef_velocity_mode == "base_decoupled"
+                    else se3_left_apply
+                )
+                world_h_next = world_apply(dt * world_twist, pose9_to_matrix(world_x_t))
                 world_x_t = matrix_to_pose9(world_h_next)
 
         return ego_group_x_t

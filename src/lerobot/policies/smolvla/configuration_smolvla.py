@@ -211,6 +211,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # task-relevant point-flow supervision without explicit object poses or
     # dense scene-flow labels.
     worldflow_target_type: str = "legacy_eef"
+    # Velocity chart for an absolute robot-base EEF trajectory. The legacy
+    # spatial twist rotates/translates about the global origin and therefore
+    # contains a position-dependent omega-cross-p lever arm. ``base_decoupled``
+    # instead predicts [p_dot_base, omega_base]: translation and orientation
+    # are integrated independently while both remain expressed on base axes.
+    # The legacy default preserves old checkpoints that do not serialize this
+    # field; corrected World-EEF training must request ``base_decoupled``.
+    worldflow_world_eef_velocity_mode: str = "legacy_spatial_twist"
     # Canonical fixed frame used by the World branch. Historical checkpoints
     # used the first fixed camera. New World-EEF checkpoints use the robot
     # base so scene geometry is invariant to camera placement and directly
@@ -355,7 +363,12 @@ class SmolVLAConfig(PreTrainedConfig):
     #
     # ``independent`` reproduces the original experimental implementation:
     # Ego body motion and World spatial motion start from unrelated random
-    # transforms. ``conjugate_ego`` samples one physically valid Ego SE(3)
+    # transforms. ``left_compose_ego`` is the physically correct prior for an
+    # absolute robot-base EEF trajectory: if C is the observed current
+    # EEF-to-base pose and B_0 is the Ego prior expressed in the current EEF
+    # frame, the World prior is W_0 = C B_0. Only the stochastic origin is
+    # coupled; the two vector fields are integrated independently afterwards.
+    # ``conjugate_ego`` samples one physically valid Ego SE(3)
     # prior B_0 and derives the World prior exactly as G_0 = C B_0 C^{-1},
     # where C is the current EEF-to-World pose.  The latter is the recommended
     # stochastic double-flow contract. ``projected_ego_chart`` instead keeps a
@@ -757,6 +770,15 @@ class SmolVLAConfig(PreTrainedConfig):
                     "worldflow_target_type must be 'legacy_eef' or "
                     f"'world_eef_trajectory', got {self.worldflow_target_type!r}."
                 )
+            if self.worldflow_world_eef_velocity_mode not in {
+                "legacy_spatial_twist",
+                "base_decoupled",
+            }:
+                raise ValueError(
+                    "worldflow_world_eef_velocity_mode must be "
+                    "'legacy_spatial_twist' or 'base_decoupled', got "
+                    f"{self.worldflow_world_eef_velocity_mode!r}."
+                )
             if self.worldflow_reference_frame not in {
                 "pointcloud_reference_camera",
                 "robot_base",
@@ -773,8 +795,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     world_trajectory_contract_errors.append("worldflow_scene_frame_origin='global'")
                 if self.worldflow_frame_origin != "global":
                     world_trajectory_contract_errors.append("worldflow_frame_origin='global'")
-                if self.worldflow_noise_coupling != "independent":
-                    world_trajectory_contract_errors.append("worldflow_noise_coupling='independent'")
+                if self.worldflow_noise_coupling not in {"independent", "left_compose_ego"}:
+                    world_trajectory_contract_errors.append(
+                        "worldflow_noise_coupling='independent' or 'left_compose_ego'"
+                    )
                 if self.worldflow_action_fusion not in {
                     "cross_attention",
                     "physical_trajectory_cross_attention",
@@ -857,13 +881,14 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_augmentation_rot_scale must be non-negative.")
             if self.worldflow_noise_coupling not in {
                 "independent",
+                "left_compose_ego",
                 "conjugate_ego",
                 "projected_ego_chart",
                 "projected_ego_path",
             }:
                 raise ValueError(
-                    "worldflow_noise_coupling must be 'independent', 'conjugate_ego', "
-                    "'projected_ego_chart', or 'projected_ego_path'; "
+                    "worldflow_noise_coupling must be 'independent', 'left_compose_ego', "
+                    "'conjugate_ego', 'projected_ego_chart', or 'projected_ego_path'; "
                     f"got {self.worldflow_noise_coupling!r}."
                 )
             if self.worldflow_frame_origin not in {"global", "current_ee"}:
@@ -1079,6 +1104,7 @@ class SmolVLAConfig(PreTrainedConfig):
                     "use 'conjugate_ego' with a valid-pose9 or SE(3) prior."
                 )
             if self.worldflow_noise_coupling in {
+                "left_compose_ego",
                 "conjugate_ego",
                 "projected_ego_chart",
                 "projected_ego_path",
@@ -1087,7 +1113,7 @@ class SmolVLAConfig(PreTrainedConfig):
             ):
                 warnings.warn(
                     "worldflow_noise_trans_scale/rot_scale are ignored when "
-                    "the World prior is derived from the Ego prior and current pose by conjugation.",
+                    "the World prior is derived from the Ego prior and current pose.",
                     stacklevel=2,
                 )
             ego_random_prior = (
@@ -1219,6 +1245,7 @@ class SmolVLAConfig(PreTrainedConfig):
             world = (
                 f",worldflow={self.worldflow_noise_coupling},"
                 f"worldflow_targets={target_contract},"
+                f"worldflow_world_eef_velocity={self.worldflow_world_eef_velocity_mode},"
                 f"worldflow_reference={self.worldflow_reference_frame},"
                 f"worldflow_action_expert={self.worldflow_action_expert_mode},"
                 f"worldflow_action_fusion={self.worldflow_action_fusion},"

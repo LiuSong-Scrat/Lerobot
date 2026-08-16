@@ -703,13 +703,14 @@ class SmolVLA_ModelInference:
         if noise_seed is None or not model.config.worldflow_enable:
             return None
         if getattr(model.config, "worldflow_noise_coupling", "independent") in {
+            "left_compose_ego",
             "conjugate_ego",
             "projected_ego_chart",
             "projected_ego_path",
         }:
-            # The model derives G_0 = C B_0 C^{-1} from the already seeded Ego
-            # noise. Supplying an independently sampled World tensor here would
-            # silently break the stochastic double-flow contract.
+            # The model derives the World prior from the already seeded Ego
+            # noise and current pose. Supplying independent World noise here
+            # would silently break the stochastic double-flow contract.
             return None
         state = self.policy.prepare_state(model_batch)
         batch_size = int(state.shape[0])

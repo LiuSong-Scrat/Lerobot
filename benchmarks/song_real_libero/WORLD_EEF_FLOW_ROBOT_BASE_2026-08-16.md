@@ -272,3 +272,62 @@ Performance was not monotonic after step 520, so extending the same run to step
 gradient, residual-rate, gate, or task-specific patch is applied. Under the
 focused-goal stop rule, this experiment is stopped without advancing to
 multi-view or all-suite evaluation.
+
+## Corrected stochastic origin and base-frame velocity contract
+
+The physical-interaction result exposed two remaining principle-level errors
+that are independent of learning rate and training duration.
+
+First, the World flow used an SE(3) prior sampled near the robot-base identity,
+while the Ego flow used a pose prior in the current EEF frame. The two random
+origins therefore did not denote the same physical EEF pose. For an absolute
+robot-base EEF trajectory the correct coordinate map is
+
+```text
+T_base_noise = T_base_current @ T_current_noise
+```
+
+not the rejected motion conjugation
+`T_base_current @ T_current_noise @ inverse(T_base_current)`. The new
+`left_compose_ego` mode couples only this stochastic origin. The independent
+World and Ego experts still predict and integrate their own vector fields
+afterwards.
+
+Second, an absolute World EEF pose was still integrated with a left-trivialized
+SE(3) spatial twist. Its translational channel contains the global-origin
+lever-arm term `omega × position`, so rotating an EEF away from the robot-base
+origin spuriously moves its position around that origin. The corrected
+`base_decoupled` velocity is
+
+```text
+[position_velocity_on_robot_base_axes,
+ angular_velocity_on_robot_base_axes]
+```
+
+Position is added directly. Orientation is left-rotated on robot-base axes,
+but that rotation never changes position. Translation follows a straight line
+and orientation follows the SO(3) geodesic. The target vector field is constant
+and the endpoint is recovered by multiplying by the remaining time; no
+`1/(1-t)` residual rate is learned or executed.
+
+Backward compatibility is explicit: old checkpoints that do not serialize
+`worldflow_world_eef_velocity_mode` retain `legacy_spatial_twist`. The new
+focused recipe explicitly writes both:
+
+```text
+worldflow_noise_coupling=left_compose_ego
+worldflow_world_eef_velocity_mode=base_decoupled
+```
+
+Validation completed on 2026-08-16:
+
+- 108 focused WorldFlow/SmolVLA tests passed.
+- the mathematical tests distinguish left composition from conjugation and
+  verify that pure EEF rotation has no global-origin translation.
+- a real 4-GPU, batch-24-per-rank, six-worker-per-rank update completed and
+  saved/reloaded a checkpoint at
+  `SMOKE_world_eef_physicaltraj_leftcompose_decoupled_1step_20260816`.
+- the reloaded checkpoint completed repeated online LIBERO model calls through
+  the corrected integration path. The long 1-step random-head rollout was
+  intentionally stopped after the execution path was established; it is not a
+  performance measurement.

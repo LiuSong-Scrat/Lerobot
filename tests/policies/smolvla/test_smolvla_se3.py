@@ -19,6 +19,8 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     VLAFlowMatching,
     WorldFlowActionBranch,
     body_twist_to_pose9_velocity,
+    decoupled_base_pose_apply,
+    decoupled_base_pose_flow_state,
     physically_aligned_world_ego_trajectory_proposals,
     make_att_2d_masks,
     matrix_to_pose9,
@@ -55,6 +57,32 @@ def test_se3_relative_update_recovers_target():
     b = se3_exp(torch.randn(8, 6) * 0.2)
     recovered = se3_exp(se3_log(a @ torch.linalg.inv(b))) @ b
     assert torch.allclose(recovered, a, atol=3e-4, rtol=3e-4)
+
+
+def test_decoupled_base_pose_rotation_has_no_global_origin_translation():
+    transform = torch.eye(4)
+    transform[:3, 3] = torch.tensor([0.6, -0.2, 0.4])
+    delta = torch.tensor([0.01, -0.02, 0.03, 0.0, 0.0, torch.pi / 2])
+
+    actual = decoupled_base_pose_apply(delta, transform)
+    legacy = se3_left_apply(delta, transform)
+
+    assert torch.allclose(actual[:3, 3], torch.tensor([0.61, -0.22, 0.43]), atol=1e-6)
+    assert not torch.allclose(actual[:3, 3], legacy[:3, 3], atol=1e-3)
+
+
+def test_decoupled_base_pose_flow_reaches_endpoint_without_rate_amplification():
+    torch.manual_seed(13)
+    noise = se3_exp(torch.randn(2, 4, 6) * 0.2)
+    target = se3_exp(torch.randn(2, 4, 6) * 0.2)
+    time = torch.tensor([0.2, 0.85])
+
+    state, velocity = decoupled_base_pose_flow_state(noise, target, time)
+    remaining = (1.0 - time)[:, None, None]
+    recovered = decoupled_base_pose_apply(remaining * velocity, state)
+
+    assert torch.allclose(recovered, target, atol=4e-5, rtol=4e-5)
+    assert torch.allclose(velocity[..., :3], target[..., :3, 3] - noise[..., :3, 3])
 
 
 def test_twist_adjoint_matches_exact_se3_conjugation():
@@ -1894,6 +1922,23 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     assert "worldflow_targets=world_eef_trajectory" in cfg.flow_contract_summary()
     assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
 
+    physically_coupled_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_decoupled",
+        worldflow_action_fusion="physical_trajectory_cross_attention",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert physically_coupled_cfg.worldflow_noise_coupling == "left_compose_ego"
+    assert physically_coupled_cfg.worldflow_world_eef_velocity_mode == "base_decoupled"
+
     independent_cfg = SmolVLAConfig(
         worldflow_enable=True,
         worldflow_target_type="world_eef_trajectory",
@@ -2659,7 +2704,17 @@ def test_physical_trajectory_proposals_align_complete_predictions_without_residu
         )
     )
     world_state = matrix_to_pose9(world_state_matrix)
-    world_velocity = se3_log(target_base @ torch.linalg.inv(world_state_matrix)) / remaining
+    world_velocity = torch.cat(
+        [
+            (target_base[..., :3, 3] - world_state_matrix[..., :3, 3]) / remaining,
+            so3_log(
+                target_base[..., :3, :3]
+                @ world_state_matrix[..., :3, :3].transpose(-1, -2)
+            )
+            / remaining,
+        ],
+        dim=-1,
+    )
 
     ego_proposal_base, world_proposal_current = (
         physically_aligned_world_ego_trajectory_proposals(
@@ -2669,6 +2724,7 @@ def test_physical_trajectory_proposals_align_complete_predictions_without_residu
             world_velocity,
             timestep,
             matrix_to_pose9(current_base),
+            "base_decoupled",
         )
     )
 
@@ -2684,7 +2740,10 @@ def test_physical_trajectory_proposals_align_complete_predictions_without_residu
 def test_physical_trajectory_cross_attention_zero_output_preserves_both_experts():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(worldflow_target_type="world_eef_trajectory")
+    model.config = SimpleNamespace(
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_world_eef_velocity_mode="base_decoupled",
+    )
     hidden_dim = 8
     model.action_out_proj = nn.Linear(hidden_dim, 10)
     model.world_se3_action_out_proj = nn.Linear(hidden_dim, 6)
@@ -3392,6 +3451,67 @@ def test_world_eef_trajectory_is_not_conjugated_or_residualized():
     )
     assert output["loss_bridge"].item() == 0.0
     assert model.last_worldflow_metrics["loss_worldflow_bridge"].item() == 0.0
+
+
+def test_world_eef_trajectory_left_composes_ego_prior_in_robot_base():
+    torch.manual_seed(29)
+    cfg = SmolVLAConfig(
+        chunk_size=3,
+        n_action_steps=3,
+        pointseg_enable=True,
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="robot_base",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="left_compose_ego",
+        worldflow_world_eef_velocity_mode="base_decoupled",
+        worldflow_action_fusion="physical_trajectory_cross_attention",
+        worldflow_action_expert_mode="independent",
+        worldflow_current_ee_pose_token=True,
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+        worldflow_feature_dim=16,
+        point_action_fusion_heads=4,
+    )
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+    model.worldflow_branch = _make_tiny_worldflow_branch(cfg)
+    model.last_worldflow_metrics = {}
+    model.last_worldflow_payload = {"foreground_pc_ego": torch.randn(2, 8, 6)}
+
+    current = se3_exp(torch.randn(2, 6) * 0.2)
+    ego_noise_h = se3_exp(torch.randn(2, cfg.chunk_size, 6) * 0.1)
+    ego_noise = torch.cat(
+        [matrix_to_pose9(ego_noise_h), torch.zeros(2, cfg.chunk_size, 1)],
+        dim=-1,
+    )
+    target = current.unsqueeze(1) @ se3_exp(
+        torch.randn(2, cfg.chunk_size, 6) * 0.1
+    )
+    state = model._prepare_worldflow_training_state(
+        {
+            "current_ee_pose": matrix_to_pose9(current),
+            "eef_trajectory": matrix_to_pose9(target),
+            "step_is_pad": torch.zeros(2, cfg.chunk_size, dtype=torch.bool),
+        },
+        torch.randint(0, 64, (2, 5)),
+        torch.ones(2, 5, dtype=torch.bool),
+        torch.tensor([0.2, 0.7]),
+        actions_is_pad=None,
+        ego_noise=ego_noise,
+    )
+
+    expected_noise = current.unsqueeze(1) @ ego_noise_h
+    assert torch.allclose(state["noise_spatial"], expected_noise, atol=1e-5)
+    wrong_conjugate = current.unsqueeze(1) @ ego_noise_h @ torch.linalg.inv(current).unsqueeze(1)
+    assert not torch.allclose(state["noise_spatial"], wrong_conjugate, atol=1e-4)
+    assert torch.allclose(
+        state["noise_conjugacy_error"],
+        torch.zeros_like(state["noise_conjugacy_error"]),
+        atol=1e-6,
+    )
 
 
 def test_joint_se3_worldflow_training_path_is_exactly_conjugate():

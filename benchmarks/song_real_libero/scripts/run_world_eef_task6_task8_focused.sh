@@ -12,6 +12,8 @@ freeze_pretrained_ego=${WORLD_EEF_FREEZE_PRETRAINED_EGO:-false}
 action_expert_mode=${WORLD_EEF_ACTION_EXPERT_MODE:-shared}
 action_fusion=${WORLD_EEF_ACTION_FUSION:-cross_attention}
 current_pose_token=${WORLD_EEF_CURRENT_POSE_TOKEN:-false}
+noise_coupling=${WORLD_EEF_NOISE_COUPLING:-left_compose_ego}
+world_eef_velocity_mode=${WORLD_EEF_VELOCITY_MODE:-base_decoupled}
 eval_fusion_override=${WORLD_EEF_EVAL_FUSION_OVERRIDE:-}
 worldflow_loss_weight=${WORLD_EEF_LOSS_WEIGHT:-0.02}
 worldflow_geo_loss_weight=${WORLD_EEF_GEO_LOSS_WEIGHT:-0.002}
@@ -36,6 +38,15 @@ if [[ "$action_fusion" != cross_attention \
 fi
 if [[ "$current_pose_token" != true && "$current_pose_token" != false ]]; then
     echo "WORLD_EEF_CURRENT_POSE_TOKEN must be true or false" >&2
+    exit 2
+fi
+if [[ "$noise_coupling" != independent && "$noise_coupling" != left_compose_ego ]]; then
+    echo "WORLD_EEF_NOISE_COUPLING must be independent or left_compose_ego" >&2
+    exit 2
+fi
+if [[ "$world_eef_velocity_mode" != legacy_spatial_twist \
+    && "$world_eef_velocity_mode" != base_decoupled ]]; then
+    echo "WORLD_EEF_VELOCITY_MODE must be legacy_spatial_twist or base_decoupled" >&2
     exit 2
 fi
 if [[ -n "$eval_fusion_override" && "$eval_fusion_override" != cross_attention ]]; then
@@ -221,10 +232,11 @@ train() {
         --policy.point_action_fusion_enable=true \
         --policy.worldflow_enable=true \
         --policy.worldflow_target_type=world_eef_trajectory \
+        --policy.worldflow_world_eef_velocity_mode="$world_eef_velocity_mode" \
         --policy.worldflow_reference_frame=robot_base \
         --policy.worldflow_frame_origin=global \
         --policy.worldflow_scene_frame_origin=global \
-        --policy.worldflow_noise_coupling=independent \
+        --policy.worldflow_noise_coupling="$noise_coupling" \
         --policy.worldflow_action_fusion="$action_fusion" \
         --policy.worldflow_action_expert_mode="$action_expert_mode" \
         --policy.worldflow_current_ee_pose_token="$current_pose_token" \
