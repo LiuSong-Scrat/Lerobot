@@ -3,8 +3,8 @@ set -euo pipefail
 
 repo=/home/liusong/ProgramFiles/Huggingface/lerobot
 runner="$repo/benchmarks/song_real_libero/scripts/run_world_eef_task6_task8_focused.sh"
-training=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_protectedego_4gpu_b24_1564steps
-experiment=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_protectedego_20260816
+training=${WORLD_EEF_TRAINING_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/world_eef_task6_task8_100ep_protectedego_4gpu_b24_1564steps}
+experiment=${WORLD_EEF_EXPERIMENT_DIR:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/world_eef_task6_task8_100ep_protectedego_20260816}
 
 if (($# == 0)); then
     echo "usage: $0 STEP [STEP ...]" >&2
