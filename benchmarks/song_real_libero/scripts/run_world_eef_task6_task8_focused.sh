@@ -210,6 +210,29 @@ train() {
     test -s "$training/checkpoints/001300/pretrained_model/model.safetensors"
 }
 
+resume_train_1564() {
+    local checkpoint="$training/checkpoints/001300"
+    local config="$checkpoint/pretrained_model/train_config.json"
+    test -s "$checkpoint/pretrained_model/model.safetensors"
+    test -s "$checkpoint/training_state/optimizer_state.safetensors"
+    test -s "$checkpoint/training_state/scheduler_state.json"
+    test -s "$checkpoint/training_state/rng_state.safetensors"
+    test -s "$config"
+    cd "$repo"
+    ulimit -n 65535
+    CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    PYTHONPATH="$repo/src" \
+    SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    "$python" -m accelerate.commands.launch \
+        --multi_gpu --num_processes=4 --num_machines=1 \
+        --mixed_precision=no --dynamo_backend=no --main_process_port=0 \
+        benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+        --config_path="$config" --resume=true \
+        2>&1 | tee -a "$log_dir/train_resume_1300_to_1564.log"
+    test -s "$training/checkpoints/001564/pretrained_model/model.safetensors"
+}
+
 eval_checkpoint() {
     local checkpoint=${1:?usage: $0 eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}
     local tag=${2:-$(basename "$(dirname "$(dirname "$checkpoint")")")}
@@ -381,11 +404,12 @@ case "${1:-}" in
     audit) audit_dataset ;;
     cache) build_cache; audit_cache ;;
     train) train ;;
+    resume-1564) resume_train_1564 ;;
     pipeline) build_cache; audit_cache; train; eval_grid ;;
     eval-grid) eval_grid ;;
     eval) shift; eval_checkpoint "$@" ;;
     *)
-        echo "usage: $0 {audit|cache|train|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
+        echo "usage: $0 {audit|cache|train|resume-1564|pipeline|eval-grid|eval CHECKPOINT [TAG] [EPISODES] [ABLATED] [SAVE_VIDEO]}" >&2
         exit 2
         ;;
 esac
