@@ -7,6 +7,14 @@ Robosuite==1.4.0
 
 ```bash
 cd /home/liusong/ProgramFiles/Huggingface/lerobot
+
+git rev-parse HEAD
+```
+
+本文对应的模型架构提交为：
+
+```text
+d21767a809f760a737ed07c7067f92d635361c38
 ```
 
 ## 1. 准备 Dataset
@@ -18,11 +26,21 @@ cd /home/liusong/ProgramFiles/Huggingface/lerobot
 - 机器人基座坐标系下的 commanded EEF target；
 - agentview RGB 与 XYZRGB 点云。
 
+如果目标 Dataset 已经生成并通过检查，不需要重复执行本节。下面的
+`--overwrite` 会覆盖同名输出。
+
 ```bash
+PYTHONHASHSEED=0 \
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
-MUJOCO_EGL_DEVICE_ID=0 \
-python \
+CUDA_VISIBLE_DEVICES=5 \
+MUJOCO_EGL_DEVICE_ID=5 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+/home/liusong/anaconda3/envs/reap/bin/python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_hdf5_to_dataset.py \
   --config benchmarks/song_real_libero/configs/libero.json \
   --demo-root /opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/libero_demos \
@@ -53,14 +71,25 @@ python \
 
 ## 2. 生成 Cache
 
-4 个进程、每个进程 6 个 DataLoader workers，适配最多 30 个 CPU 线程：
+3 个进程、每个进程 8 个 DataLoader workers，共 24 个 DataLoader workers。
+如果 Cache 已经完整生成并通过检查，不需要重复执行本节。下面的
+`--overwrite` 会覆盖同名输出。
 
 ```bash
+PYTHONHASHSEED=0 \
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+CUDA_VISIBLE_DEVICES=3,4,5 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+SONG_POINTSEG_REQUIRE_POINTOPS=1 \
 SONG_POINTCLOUD_GRIPPER_POINTS=500 \
-torchrun --standalone --nproc_per_node=4 \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  -m torch.distributed.run \
+  --standalone \
+  --nproc_per_node=3 \
   benchmarks/song_real_libero/scripts/song_cache_pointseg_samples.py \
   --dataset.repo_id=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep \
   --camera-views=agentview \
@@ -69,7 +98,7 @@ torchrun --standalone --nproc_per_node=4 \
   --current-points=10000 \
   --future-points=10000 \
   --batch-size=24 \
-  --num-workers=6 \
+  --num-workers=8 \
   --shard-size=2048 \
   --storage-dtype=float16 \
   --nn-chunk-size=1024 \
@@ -83,19 +112,30 @@ torchrun --standalone --nproc_per_node=4 \
 
 - Ego：当前末端坐标系下的完整 EEF trajectory；
 - World：机器人基座坐标系下的完整 EEF trajectory；
-- Ego/World 使用相同类型的 LitePTEncoder 与 PointActionAdapter；
-- 两个流进入同一个 PointActionExpert；
-- 使用成对位置编码、共轭运动编码和 block-causal 可见性；
+- 原训练好的 Ego foreground/background token 原位保留在 VLM prefix；
+- World foreground/background 作为两个新 token 追加到 VLM prefix；
+- World object/background projection 复制训练好的 Ego projection 初始化，随后独立训练；
+- shared PointActionExpert suffix 只包含 32 个 Ego action 与 32 个 World action token；
+- Ego/World 对应动作使用成对位置编码、共轭运动编码和 block-causal 可见性；
+- World 使用完整 pose9+gripper 10D flow，与 Ego 使用同形的逐通道 MSE；
 - 只冻结 VLM，其余有效模块均参与训练。
 
+3 张 GPU、每张卡 batch 32，global batch 为 `3 * 32 = 96`，与原正式
+配置 `4 * 24 = 96` 相同。
+
 ```bash
-CUDA_VISIBLE_DEVICES=3,4,5 \
-PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
-SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+PYTHONHASHSEED=0 \
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 OPENBLAS_NUM_THREADS=1 \
-python -m accelerate.commands.launch \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+CUDA_VISIBLE_DEVICES=3,4,5 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  -m accelerate.commands.launch \
   --multi_gpu \
   --num_processes=3 \
   --num_machines=1 \
@@ -108,18 +148,23 @@ python -m accelerate.commands.launch \
   --dataset.repo_id=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep \
   --pointseg_sample_cache_dir=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep_pointseg_cache \
   --task_balanced_sampling=true \
-  --batch_size=160 \
+  --batch_size=32 \
   --gradient_accumulation_steps=1 \
-  --steps=20000 \
-  --save_freq=2000 \
+  --steps=1300 \
+  --save_freq=1300 \
+  --save_steps='[100,260,520,780,1040,1300]' \
   --log_freq=1 \
-  --eval_freq=2000 \
-  --num_workers=14 \
-  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_world_eef_task6_task8_joint_pae_blockcausal_3gpu_b160_1300steps_20260816 \
-  --job_name=a800_world_eef_task6_task8_joint_pae_blockcausal_3gpu_b160_1300steps_20260816 \
+  --eval_freq=1300 \
+  --num_workers=8 \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_doubleflow_v0base_preservedprefix_pose9gripper_3gpu_b32_1300steps_20260817 \
+  --job_name=a800_doubleflow_v0base_preservedprefix_pose9gripper_3gpu_b32_1300steps_20260817 \
   --policy.device=cuda \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
+  --policy.optimizer_lr=0.0001 \
+  --policy.scheduler_warmup_steps=50 \
+  --policy.scheduler_decay_steps=1300 \
+  --policy.scheduler_decay_lr=0.00001 \
   --policy.camera_views=agentview \
   --policy.rgb_camera_views=agentview \
   --policy.vla_adapter_enable=true \
@@ -155,7 +200,7 @@ python -m accelerate.commands.launch \
   --policy.worldflow_grid_size=0.01 \
   --policy.worldflow_max_points=2048 \
   --policy.worldflow_loss_weight=1.0 \
-  --policy.worldflow_geo_loss_weight=1.0 \
+  --policy.worldflow_geo_loss_weight=0.0 \
   --policy.worldflow_bridge_loss_weight=0.0 \
   --policy.worldflow_equiv_loss_weight=0.0 \
   --policy.worldflow_training_coordinate_frame_augmentation=false \
@@ -179,9 +224,17 @@ tmux new-session -s wepvla_v043_doubleflow
 
 ## 4. 测试
 
-下面以 step 1300 为例，同时测试 LIBERO-10 task 6 和 task 8，各 50 episodes。若物理误差门槛选择了其他 checkpoint，只替换 `--policy.path` 和 `--output-dir`。
+下面以 step 1300 为例，同时测试 LIBERO-10 task 6 和 task 8，各 50
+episodes，共 100 episodes。A800 上使用 `2 * 25 = 50` 个环境 worker，
+推理使用固定 batch 50。若测试其他 checkpoint，只替换 `--policy.path`
+和 `--output-dir`。
+
+当前分支按要求保留 v0.0 原生评测器和原生 LitePT，没有包含后来加入的
+canonical singleton 或确定性 LitePT 修改。因此本节是高并行成功率评测，
+不能宣称不同运行之间的 action 或成功 episode 集合 bitwise 完全一致。
 
 ```bash
+PYTHONHASHSEED=0 \
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 OPENBLAS_NUM_THREADS=1 \
@@ -193,10 +246,11 @@ PYOPENGL_PLATFORM=egl \
 CUDA_VISIBLE_DEVICES=5 \
 MUJOCO_EGL_DEVICE_ID=5 \
 PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
-python \
+/home/liusong/anaconda3/envs/reap/bin/python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_world_eef_task6_task8_joint_pae_blockcausal_3gpu_b160_1300steps_20260816/checkpoints/002000/pretrained_model \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_doubleflow_v0base_preservedprefix_pose9gripper_3gpu_b32_1300steps_20260817/checkpoints/001300/pretrained_model \
+  --device cuda \
   --suite libero_10 \
   --task-id 6 \
   --task-id 8 \
@@ -227,5 +281,5 @@ python \
   --no-visualize-foreground \
   --no-save-video \
   --no-world-to-ego-causal-ablation \
-  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_double_flow_long68
-
+  --output-dir /opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/a800_doubleflow_v0base_preservedprefix_pose9gripper_step001300_100ep
+```
