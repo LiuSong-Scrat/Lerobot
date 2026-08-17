@@ -2587,6 +2587,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             "dataset_from_indices": dataset.meta.episodes["dataset_from_index"],
             "dataset_to_indices": dataset.meta.episodes["dataset_to_index"],
             "episode_indices_to_use": dataset.episodes,
+            # LeRobotDataset materializes an episode-filtered Arrow table with
+            # contiguous, subset-relative row indices.  Metadata boundaries
+            # remain absolute to the complete dataset, so explicitly rebase
+            # selected episodes before those indices reach the DataLoader.
+            "rebase_selected_episodes": dataset.episodes is not None,
             "drop_n_last_frames": int(getattr(cfg.policy, "drop_n_last_frames", 0)),
             "shuffle": True,
         }

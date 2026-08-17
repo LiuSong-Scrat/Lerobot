@@ -28,6 +28,7 @@ class EpisodeAwareSampler:
         drop_n_first_frames: int = 0,
         drop_n_last_frames: int = 0,
         shuffle: bool = False,
+        rebase_selected_episodes: bool = False,
     ):
         """Sampler that optionally incorporates episode boundary information.
 
@@ -41,11 +42,19 @@ class EpisodeAwareSampler:
             shuffle: Whether to shuffle the indices.
         """
         indices = []
+        selected = None if episode_indices_to_use is None else set(episode_indices_to_use)
+        relative_start = 0
         for episode_idx, (start_index, end_index) in enumerate(
             zip(dataset_from_indices, dataset_to_indices, strict=True)
         ):
-            if episode_indices_to_use is None or episode_idx in episode_indices_to_use:
-                indices.extend(range(start_index + drop_n_first_frames, end_index - drop_n_last_frames))
+            if selected is not None and episode_idx not in selected:
+                continue
+            if rebase_selected_episodes:
+                episode_length = int(end_index) - int(start_index)
+                start_index = relative_start
+                end_index = relative_start + episode_length
+                relative_start = end_index
+            indices.extend(range(start_index + drop_n_first_frames, end_index - drop_n_last_frames))
 
         self.indices = indices
         self.shuffle = shuffle
@@ -82,6 +91,7 @@ class TaskBalancedFrameSampler:
         drop_n_last_frames: int = 0,
         shuffle: bool = True,
         num_samples: int | None = None,
+        rebase_selected_episodes: bool = False,
     ):
         if not (
             len(dataset_from_indices) == len(dataset_to_indices) == len(episode_group_ids)
@@ -93,11 +103,17 @@ class TaskBalancedFrameSampler:
             )
         selected = None if episode_indices_to_use is None else set(episode_indices_to_use)
         grouped: dict[Hashable, list[int]] = defaultdict(list)
+        relative_start = 0
         for episode_idx, (start_index, end_index, group_id) in enumerate(
             zip(dataset_from_indices, dataset_to_indices, episode_group_ids, strict=True)
         ):
             if selected is not None and episode_idx not in selected:
                 continue
+            if rebase_selected_episodes:
+                episode_length = int(end_index) - int(start_index)
+                start_index = relative_start
+                end_index = relative_start + episode_length
+                relative_start = end_index
             start = int(start_index) + int(drop_n_first_frames)
             end = int(end_index) - int(drop_n_last_frames)
             if end > start:

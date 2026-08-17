@@ -121,3 +121,29 @@ def test_task_balanced_frame_sampler_respects_episode_subset_and_paired_offset()
     assert len(sampled) == 8
     assert sampled[:4] == [0, 1, 5, 6]
     assert sampled[4:] == [9, 10, 14, 15]
+
+
+def test_episode_aware_sampler_rebases_filtered_dataset_rows():
+    sampler = EpisodeAwareSampler(
+        dataset_from_indices=[0, 2, 5, 9],
+        dataset_to_indices=[2, 5, 9, 11],
+        episode_indices_to_use=[1, 3],
+        rebase_selected_episodes=True,
+    )
+    assert sampler.indices == [0, 1, 2, 3, 4]
+
+
+def test_task_balanced_sampler_rebases_filtered_dataset_rows_and_paired_offset():
+    sampler = TaskBalancedFrameSampler(
+        dataset_from_indices=[0, 2, 5, 9],
+        dataset_to_indices=[2, 5, 9, 11],
+        episode_group_ids=["unused", "task_a", "unused", "task_b"],
+        episode_indices_to_use=[1, 3],
+        rebase_selected_episodes=True,
+        shuffle=False,
+        num_samples=4,
+    )
+    sampler.add_index_offset(5)
+    sampled = list(sampler)
+    assert sampled[:4] == [0, 1, 3, 4]
+    assert sampled[4:] == [5, 6, 8, 9]
