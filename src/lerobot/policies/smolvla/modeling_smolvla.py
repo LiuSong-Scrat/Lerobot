@@ -1771,22 +1771,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         bsize = pc.shape[0]
         device = pc.device
         pc = pc.to(dtype=torch.float32)
-        target_points = int(getattr(self.config, "camera_view_fps_target_points", 10_000))
-        fusion = getattr(self.config, "camera_view_fusion", "legacy_budget")
-        if fusion == "full_union":
-            # Paired primary/full-union batches are padded to the longest item.
-            # The primary copy stays exact because its padded tail is masked by
-            # point_is_pad throughout PointSeg and point encoding.
-            if pc.shape[1] < target_points:
-                raise ValueError(
-                    f"full_union expects at least the {target_points}-point primary cloud, "
-                    f"got {pc.shape[1]}."
-                )
-        elif pc.shape[1] != target_points:
+        if pc.shape[1] <= 0:
             raise ValueError(
-                "SmolVLA expects an input-adapted fixed-size point cloud. "
-                f"Expected {target_points} points, got {pc.shape[1]}. Apply single/multi-view "
-                "fusion and FPS/voxel sampling in the data or inference input layer."
+                "observation.point_cloud must contain at least one point per padded batch row."
+            )
+        if torch.is_tensor(point_is_pad) and point_is_pad.shape != pc.shape[:2]:
+            raise ValueError(
+                "observation.point_cloud_is_pad must match the point axes of "
+                f"observation.point_cloud: expected {pc.shape[:2]}, got {point_is_pad.shape}."
             )
         point_cloud_payload: Tensor | dict[str, Tensor] = pc
         pointseg_keys = (

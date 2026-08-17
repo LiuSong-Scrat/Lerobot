@@ -1681,6 +1681,45 @@ def compose_point_cloud_views(
     return composed
 
 
+def infer_single_view_point_count(
+    fused_point_count: int,
+    *,
+    num_views: int,
+    gripper_points: int,
+) -> int:
+    """Recover the native per-view point count from an equal-view union.
+
+    Reduction-based multi-view fusion concatenates every view's scene points
+    and appends exactly one primary-view gripper tail.  Its input adapter must
+    therefore reduce the union back to the point count of one stored view,
+    whatever that count happens to be (for example 10k in simulation or 50k
+    on a real robot).  This helper deliberately encodes that relationship
+    instead of a dataset-specific numeric constant.
+    """
+
+    fused_point_count = int(fused_point_count)
+    num_views = int(num_views)
+    gripper_points = int(gripper_points)
+    if fused_point_count <= 0:
+        raise ValueError(f"fused_point_count must be positive, got {fused_point_count}.")
+    if num_views <= 0:
+        raise ValueError(f"num_views must be positive, got {num_views}.")
+    if gripper_points < 0 or gripper_points >= fused_point_count:
+        raise ValueError(
+            f"gripper_points must be in [0, {fused_point_count - 1}], got {gripper_points}."
+        )
+    if num_views == 1:
+        return fused_point_count
+    fused_scene_points = fused_point_count - gripper_points
+    if fused_scene_points % num_views != 0:
+        raise ValueError(
+            "The fused cloud does not match the equal-view union layout: "
+            f"({fused_point_count} total - {gripper_points} gripper) scene points "
+            f"are not divisible by {num_views} views."
+        )
+    return fused_scene_points // num_views + gripper_points
+
+
 class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     """Adds a temporal point-cloud window used only to build PointSeg supervision.
 
@@ -1703,8 +1742,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         future_offsets: tuple[int, ...] | list[int] = DEFAULT_FUTURE_OFFSETS,
         bidirectional: bool = True,
         trajectory_samples: int = 32,
-        current_points: int = 8192,
-        future_points: int = 16384,
+        current_points: int | None = 8192,
+        future_points: int | None = 16384,
         seed: int = 1000,
         return_full_point_cloud: bool = False,
         include_base_item: bool = True,
@@ -1745,8 +1784,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.trajectory_samples = int(trajectory_samples)
         if self.trajectory_samples < 0:
             raise ValueError("trajectory_samples must be non-negative.")
-        self.current_points = int(current_points)
-        self.future_points = int(future_points)
+        self.current_points = None if current_points is None else int(current_points)
+        self.future_points = None if future_points is None else int(future_points)
         self.seed = int(seed)
         self.return_full_point_cloud = return_full_point_cloud
         self.include_base_item = bool(include_base_item)
@@ -1942,6 +1981,9 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         }:
             current_sample = current_full
             current_indices = np.arange(current_full.shape[0], dtype=np.int64)
+        elif self.current_points is None:
+            current_sample = current_full
+            current_indices = np.arange(current_full.shape[0], dtype=np.int64)
         else:
             current_sample, current_indices = _sample_rows_with_indices(
                 current_full, self.current_points, rng
@@ -1977,7 +2019,11 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
                     "full_union",
                     "primary_residual",
                 }
-                else _sample_rows(future_cloud, self.future_points, rng)
+                else (
+                    future_cloud
+                    if self.future_points is None
+                    else _sample_rows(future_cloud, self.future_points, rng)
+                )
             )
 
         max_future_points = max(sample.shape[0] for sample in future_samples)

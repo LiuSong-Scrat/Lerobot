@@ -24,6 +24,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
     consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    infer_single_view_point_count,
     multiscale_novelty_union_sample_fused_point_cloud,
     novelty_union_sample_fused_point_cloud,
     transport_novelty_union_sample_fused_point_cloud,
@@ -885,7 +886,7 @@ class SmolVLA_ModelInference:
             raise ValueError(f"Expected point cloud shape (N, 6) or (B, N, 6), got {tuple(pc.shape)}")
         pc = pc.to(self.device)
         fusion = self.camera_view_fusion
-        if fusion in {
+        if len(self.camera_views) > 1 and fusion in {
             "fps",
             "voxel_fps",
             "voxel_cover_fps",
@@ -921,8 +922,12 @@ class SmolVLA_ModelInference:
                 )
             pc, _point_is_pad, _indices = sampler(
                 pc,
-                target_points=int(
-                    getattr(self.policy.config, "camera_view_fps_target_points", 10_000)
+                target_points=infer_single_view_point_count(
+                    pc.shape[1],
+                    num_views=len(self.camera_views),
+                    gripper_points=int(
+                        getattr(self.policy.config, "camera_view_fps_gripper_points", 500)
+                    ),
                 ),
                 gripper_points=int(
                     getattr(self.policy.config, "camera_view_fps_gripper_points", 500)

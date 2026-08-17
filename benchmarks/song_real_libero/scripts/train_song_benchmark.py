@@ -51,6 +51,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
     consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    infer_single_view_point_count,
     multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
@@ -439,7 +440,7 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         point_cloud = self._point_cloud_frame(episode_index, frame_index).copy()
-        if self.camera_view_fusion in {
+        if len(self.camera_views) > 1 and self.camera_view_fusion in {
             "fps",
             "voxel_fps",
             "voxel_cover_fps",
@@ -471,7 +472,11 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
                 sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
             sampled, _point_is_pad, _indices = sampler(
                 torch.from_numpy(point_cloud).unsqueeze(0),
-                target_points=10_000,
+                target_points=infer_single_view_point_count(
+                    point_cloud.shape[0],
+                    num_views=len(self.camera_views),
+                    gripper_points=self.gripper_points,
+                ),
                 gripper_points=self.gripper_points,
                 **sampler_kwargs,
             )
@@ -1052,12 +1057,14 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         policy_cfg: Any,
         mmap_mode: str = "r",
     ):
+        current_points_override = self._env_optional_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS")
+        future_points_override = self._env_optional_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS")
         self.dataset = SongTemporalPointCloudDataset(
             dataset,
             point_cloud_dir=point_cloud_dir,
             future_offsets=self._future_offsets(policy_cfg),
-            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10_000),
-            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
+            current_points=current_points_override,
+            future_points=future_points_override,
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
             camera_views=getattr(policy_cfg, "camera_views", "agentview"),
             camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
@@ -1071,7 +1078,7 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         self.dataset.camera_view_coarse_novelty_scale = float(
             getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
         )
-        self.current_points = int(self.dataset.current_points)
+        self.current_points = self.dataset.current_points
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(os.environ.get("SONG_POINTSEG_ONLINE_DEVICE", default_device))
         self.pseudo_config = PseudoLabelConfig(
@@ -1097,6 +1104,16 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         return int(value)
 
     @staticmethod
+    def _env_optional_int(name: str) -> int | None:
+        value = os.environ.get(name)
+        if value is None or str(value).strip() == "":
+            return None
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"{name} must be positive when set, got {parsed}.")
+        return parsed
+
+    @staticmethod
     def _future_offsets(policy_cfg: Any) -> tuple[int, ...]:
         env_value = os.environ.get("SONG_POINTSEG_ONLINE_FUTURE_OFFSETS")
         if env_value:
@@ -1115,7 +1132,8 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
     def make_collate_fn(self):
         return OnlinePointSegBatchCollator(
             current_points=self.current_points,
-            future_points=int(self.dataset.future_points),
+            future_points=self.dataset.future_points,
+            num_views=len(self.dataset.camera_views),
             camera_view_fusion=self.dataset.camera_view_fusion,
             camera_view_voxel_size=float(
                 getattr(self.dataset, "camera_view_voxel_size", 0.005)
@@ -1137,8 +1155,9 @@ class OnlinePointSegBatchCollator:
     def __init__(
         self,
         *,
-        current_points: int,
-        future_points: int,
+        current_points: int | None,
+        future_points: int | None,
+        num_views: int,
         camera_view_fusion: str,
         camera_view_voxel_size: float,
         camera_view_coarse_novelty_scale: float,
@@ -1146,8 +1165,9 @@ class OnlinePointSegBatchCollator:
         device: torch.device,
         pseudo_config: PseudoLabelConfig,
     ):
-        self.current_points = int(current_points)
-        self.future_points = int(future_points)
+        self.current_points = None if current_points is None else int(current_points)
+        self.future_points = None if future_points is None else int(future_points)
+        self.num_views = int(num_views)
         self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.camera_view_voxel_size = float(camera_view_voxel_size)
         self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
@@ -1178,7 +1198,7 @@ class OnlinePointSegBatchCollator:
                 if bool(future_point_is_pad.any().item())
                 else None
             )
-        if self.camera_view_fusion in {
+        if self.num_views > 1 and self.camera_view_fusion in {
             "fps",
             "voxel_fps",
             "voxel_cover_fps",
@@ -1214,17 +1234,35 @@ class OnlinePointSegBatchCollator:
                 "consensus_multiscale_novelty_union",
             }:
                 sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
+            current_target_points = (
+                self.current_points
+                if self.current_points is not None
+                else infer_single_view_point_count(
+                    current_pc.shape[1],
+                    num_views=self.num_views,
+                    gripper_points=self.gripper_points,
+                )
+            )
             current_pc, current_is_pad, _ = sampler(
                 current_pc,
-                target_points=self.current_points,
+                target_points=current_target_points,
                 gripper_points=self.gripper_points,
                 point_is_pad=current_is_pad,
                 **sampler_kwargs,
             )
             batch_size, time_steps, source_points, channels = future_pc.shape
+            future_target_points = (
+                self.future_points
+                if self.future_points is not None
+                else infer_single_view_point_count(
+                    source_points,
+                    num_views=self.num_views,
+                    gripper_points=self.gripper_points,
+                )
+            )
             future_pc, future_point_is_pad, _ = sampler(
                 future_pc.reshape(batch_size * time_steps, source_points, channels),
-                target_points=self.future_points,
+                target_points=future_target_points,
                 gripper_points=self.gripper_points,
                 point_is_pad=(
                     future_point_is_pad.reshape(batch_size * time_steps, source_points)
@@ -1236,14 +1274,14 @@ class OnlinePointSegBatchCollator:
             future_pc = future_pc.reshape(
                 batch_size,
                 time_steps,
-                self.future_points,
+                future_target_points,
                 channels,
             )
             if torch.is_tensor(future_point_is_pad):
                 future_point_is_pad = future_point_is_pad.reshape(
                     batch_size,
                     time_steps,
-                    self.future_points,
+                    future_target_points,
                 )
             # Avoid running FPS a second time in SmolVLAPolicy and keep online
             # pseudo-label tensors exactly aligned with the model input.
@@ -1406,7 +1444,7 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         if not view_dir.is_dir():
             raise FileNotFoundError(f"Selected point-cloud view {view!r} is missing: {view_dir}")
     logging.info(
-        "Loading point clouds with camera_views=%s and fixed model point count from %s",
+        "Loading point clouds with camera_views=%s and native per-view model point count from %s",
         camera_views,
         root,
     )

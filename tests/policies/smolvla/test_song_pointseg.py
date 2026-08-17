@@ -23,6 +23,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
     consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
+    infer_single_view_point_count,
     multiscale_novelty_union_sample_fused_point_cloud,
     voxel_fps_sample_fused_point_cloud,
     voxel_cover_fps_sample_fused_point_cloud,
@@ -41,6 +42,27 @@ from lerobot.policies.smolvla.song_pointseg import (
     song_pointseg_collate,
     use_primary_view_for_training_index,
 )
+
+
+@pytest.mark.parametrize(
+    ("single_view_points", "num_views", "gripper_points"),
+    [(10_000, 2, 500), (50_000, 2, 500), (50_000, 3, 0), (12_345, 1, 321)],
+)
+def test_infer_single_view_point_count_restores_native_view_length(
+    single_view_points, num_views, gripper_points
+):
+    fused_points = num_views * (single_view_points - gripper_points) + gripper_points
+
+    assert infer_single_view_point_count(
+        fused_points,
+        num_views=num_views,
+        gripper_points=gripper_points,
+    ) == single_view_points
+
+
+def test_infer_single_view_point_count_rejects_malformed_union():
+    with pytest.raises(ValueError, match="not divisible"):
+        infer_single_view_point_count(19_501, num_views=2, gripper_points=500)
 
 
 def test_litept_grid_coord_uses_an_independent_integer_origin_per_sample():

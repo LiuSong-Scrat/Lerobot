@@ -85,7 +85,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # ``primary_residual`` keeps the primary cloud byte-identical and encodes
     # the second view through a zero-initialized matrix residual.
     camera_view_fusion: str = "legacy_budget"
-    camera_view_fps_target_points: int = 10_000
+    # Deprecated compatibility field. Reduction-based multi-view adapters now
+    # derive their output length from the native per-view input length instead
+    # of imposing a dataset-specific fixed point count. Old checkpoints may
+    # still deserialize their recorded numeric value, but it does not constrain
+    # the policy core's accepted input length.
+    camera_view_fps_target_points: int | None = None
     camera_view_fps_gripper_points: int = 500
     camera_view_voxel_size: float = 0.005
     camera_view_coarse_novelty_scale: float = 3.0
@@ -565,12 +570,16 @@ class SmolVLAConfig(PreTrainedConfig):
                 "or 'primary_residual'; "
                 f"got {self.camera_view_fusion!r}."
             )
-        if int(self.camera_view_fps_target_points) <= 0:
-            raise ValueError("camera_view_fps_target_points must be positive.")
-        if not 0 <= int(self.camera_view_fps_gripper_points) < int(self.camera_view_fps_target_points):
-            raise ValueError(
-                "camera_view_fps_gripper_points must be in [0, camera_view_fps_target_points)."
-            )
+        if self.camera_view_fps_target_points is not None:
+            if int(self.camera_view_fps_target_points) <= 0:
+                raise ValueError("camera_view_fps_target_points must be positive when set.")
+            if not 0 <= int(self.camera_view_fps_gripper_points) < int(
+                self.camera_view_fps_target_points
+            ):
+                raise ValueError(
+                    "camera_view_fps_gripper_points must be in "
+                    "[0, camera_view_fps_target_points)."
+                )
         if not math.isfinite(float(self.camera_view_voxel_size)) or float(self.camera_view_voxel_size) <= 0.0:
             raise ValueError("camera_view_voxel_size must be finite and positive.")
         if (

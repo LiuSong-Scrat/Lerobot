@@ -3816,6 +3816,41 @@ def test_full_union_prepare_point_clouds_accepts_padded_variable_length_input():
     assert masks[0].tolist() == [True, True]
 
 
+@pytest.mark.parametrize("num_points", [10_000, 50_000])
+def test_prepare_point_clouds_accepts_dataset_defined_point_count(num_points):
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        camera_view_fusion="legacy_budget",
+        camera_view_fps_target_points=10_000,
+    )
+    policy.model = SimpleNamespace(pointseg_conditioner=None)
+    point_cloud = torch.zeros(2, num_points, 6)
+
+    payloads, masks = policy.prepare_point_clouds(
+        {"observation.point_cloud": point_cloud}
+    )
+
+    assert payloads[0].shape == (2, num_points, 6)
+    assert payloads[0].dtype == torch.float32
+    assert masks[0].tolist() == [True, True]
+
+
+def test_prepare_point_clouds_rejects_misaligned_point_padding_mask():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace()
+    policy.model = SimpleNamespace(pointseg_conditioner=None)
+
+    with pytest.raises(ValueError, match="point_cloud_is_pad must match"):
+        policy.prepare_point_clouds(
+            {
+                "observation.point_cloud": torch.zeros(2, 50_000, 6),
+                "observation.point_cloud_is_pad": torch.zeros(2, 10_000, dtype=torch.bool),
+            }
+        )
+
+
 def test_pointseg_batchnorm_stats_can_be_frozen_without_freezing_parameters():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)

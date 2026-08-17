@@ -45,10 +45,13 @@ class _TinyDataset(torch.utils.data.Dataset):
 
 
 @pytest.mark.parametrize("fusion", ["fps", "voxel_fps"])
-def test_cacheless_multiview_fps_training_keeps_ten_thousand_point_contract(
-    tmp_path, monkeypatch, fusion
+@pytest.mark.parametrize("single_view_points", [10_000, 50_000])
+def test_cacheless_multiview_fps_training_keeps_native_single_view_point_count(
+    tmp_path, monkeypatch, fusion, single_view_points
 ):
-    source = torch.arange(19_500 * 6, dtype=torch.float32).reshape(19_500, 6).numpy()
+    gripper_points = 500
+    fused_points = 2 * (single_view_points - gripper_points) + gripper_points
+    source = torch.arange(fused_points * 6, dtype=torch.float32).reshape(fused_points, 6).numpy()
     observed = {}
 
     def fake_sampler(point_cloud, *, target_points, gripper_points, **kwargs):
@@ -76,16 +79,37 @@ def test_cacheless_multiview_fps_training_keeps_ten_thousand_point_contract(
         camera_views="agentview,robot0_eye_in_hand",
         camera_view_fusion=fusion,
         camera_view_voxel_size=0.007,
-        gripper_points=500,
+        gripper_points=gripper_points,
     )
     monkeypatch.setattr(wrapped, "_point_cloud_frame", lambda *_args: source)
 
     item = wrapped[0]
 
-    assert item["observation.point_cloud"].shape == (1, 10_000, 6)
-    assert observed["target_points"] == 10_000
-    assert observed["gripper_points"] == 500
+    assert item["observation.point_cloud"].shape == (1, single_view_points, 6)
+    assert observed["target_points"] == single_view_points
+    assert observed["gripper_points"] == gripper_points
     assert observed["kwargs"] == ({} if fusion == "fps" else {"voxel_size": 0.007})
+
+
+def test_cacheless_single_view_is_not_resampled(tmp_path, monkeypatch):
+    source = np.arange(50_000 * 6, dtype=np.float32).reshape(50_000, 6)
+    wrapped = PointCloudMemmapDataset(
+        _TinyDataset(),
+        point_cloud_dir=tmp_path / "point_clouds",
+        camera_views="agentview",
+        camera_view_fusion="fps",
+        gripper_points=500,
+    )
+    monkeypatch.setattr(wrapped, "_point_cloud_frame", lambda *_args: source)
+    monkeypatch.setattr(
+        "benchmarks.song_real_libero.scripts.train_song_benchmark.fps_sample_fused_point_cloud",
+        lambda *_args, **_kwargs: pytest.fail("single-view input must not be resampled"),
+    )
+
+    item = wrapped[0]
+
+    assert item["observation.point_cloud"].shape == (1, 50_000, 6)
+    assert np.array_equal(item["observation.point_cloud"].squeeze(0).numpy(), source)
 
 
 def test_policy_materialization_uses_explicit_local_cuda_then_restores_portable_config(monkeypatch):
