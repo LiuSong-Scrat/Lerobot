@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import warnings
 from bisect import bisect_right
@@ -88,6 +89,46 @@ def infer_litept_output_channels(backbone: nn.Module) -> int:
     if not output_linears:
         raise ValueError("Could not infer LitePT output channels from its final stage.")
     return int(output_linears[-1].out_features)
+
+
+def build_litept_grid_coord(coord: Tensor, batch: Tensor, grid_size: float) -> Tensor:
+    """Build LitePT grid coordinates with an independent origin per sample.
+
+    LitePT's fallback derives one origin from the minimum coordinate of the
+    entire packed batch.  That makes a sample's sparse coordinates depend on
+    which other samples happen to share the batch.  Compute the integer voxel
+    coordinates first, then shift each sample by its own lower grid corner so
+    the same point cloud receives the same ``grid_coord`` in every batch.
+    """
+
+    if coord.ndim != 2 or coord.shape[-1] != 3:
+        raise ValueError(f"Expected coord shape (P, 3), got {tuple(coord.shape)}.")
+    if batch.ndim != 1 or batch.shape[0] != coord.shape[0]:
+        raise ValueError(f"Expected batch shape ({coord.shape[0]},), got {tuple(batch.shape)}.")
+    if not math.isfinite(float(grid_size)) or float(grid_size) <= 0:
+        raise ValueError(f"grid_size must be finite and positive, got {grid_size!r}.")
+    if coord.shape[0] == 0:
+        return torch.empty_like(coord, dtype=torch.int32)
+
+    batch = batch.to(device=coord.device, dtype=torch.long)
+    if bool((batch < 0).any().item()):
+        raise ValueError("batch indices must be non-negative.")
+    raw_grid = torch.floor(coord / float(grid_size)).to(dtype=torch.int32)
+    sample_count = int(batch.max().item()) + 1
+    sample_min = torch.full(
+        (sample_count, 3),
+        torch.iinfo(raw_grid.dtype).max,
+        dtype=raw_grid.dtype,
+        device=raw_grid.device,
+    )
+    sample_min.scatter_reduce_(
+        0,
+        batch[:, None].expand_as(raw_grid),
+        raw_grid,
+        reduce="amin",
+        include_self=True,
+    )
+    return raw_grid - sample_min[batch]
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -3525,11 +3566,13 @@ class SongPointSegNet(nn.Module):
         feat = features[valid_batch].reshape(-1, features.shape[-1])[flat_valid].contiguous().to(dtype=torch.float32)
         counts = counts[valid_batch]
         offset = torch.cumsum(counts, dim=0)
+        grid_coord = build_litept_grid_coord(coord, valid_local[:, 0], self.grid_size)
         point = self.backbone(
             {
                 "coord": coord,
                 "feat": feat,
                 "offset": offset,
+                "grid_coord": grid_coord,
                 "grid_size": self.grid_size,
             }
         )

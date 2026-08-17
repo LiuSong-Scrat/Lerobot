@@ -283,3 +283,56 @@ PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
   --no-world-to-ego-causal-ablation \
   --output-dir /opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/a800_doubleflow_v0base_preservedprefix_pose9gripper_step001300_100ep
 ```
+
+
+
+
+
+PYTHONHASHSEED=0 \
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+CUDA_VISIBLE_DEVICES=3 \
+MUJOCO_EGL_DEVICE_ID=3 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_doubleflow_v01_after500_after1000/checkpoints/001500/pretrained_model \
+  --device cuda \
+  --suite libero_10 \
+  --task-id 6 \
+  --task-id 8 \
+  --episodes 50 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --strict-official-init \
+  --gripper-control-mode delta_width_initial_sync \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --waypoint-max-hold-steps 1 \
+  --isolated-policy-workers 1 \
+  --task-workers 2 \
+  --episode-workers-per-task 15 \
+  --task-worker-backend process \
+  --inference-batch-size 30 \
+  --inference-batching-mode fixed_barrier \
+  --no-release-event-exec-enable \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --no-world-to-ego-causal-ablation \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_a800_doubleflow_1500_after500_after1000_2

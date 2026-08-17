@@ -80,6 +80,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegLoss,
     SongPointSegLossConfig,
     SongPointSegNet,
+    build_litept_grid_coord,
     generate_pseudo_labels_from_priors,
     infer_litept_output_channels,
     invert_transform,
@@ -2063,8 +2064,9 @@ class LitePTTokenizer(nn.Module):
         coord = coord[idx]
         feat = feat[idx]
         batch = batch[idx]
+        grid_coord = build_litept_grid_coord(coord, batch, self.grid_size)
 
-        return coord, feat, batch
+        return coord, feat, batch, grid_coord
 
     def forward(self, pc, point_is_pad=None):
         B, N, C = pc.shape
@@ -2111,7 +2113,7 @@ class LitePTTokenizer(nn.Module):
         batch = torch.arange(Bv, device=device).repeat_interleave((~point_is_pad_v).sum(dim=1))
 
         # ========= grid sample =========
-        coord, feat, batch = self._grid_sample_batch(coord, feat, batch)
+        coord, feat, batch, grid_coord = self._grid_sample_batch(coord, feat, batch)
 
         if coord.shape[0] == 0:
             return global_xyz_tok, tok, g, tok_mask
@@ -2124,6 +2126,7 @@ class LitePTTokenizer(nn.Module):
             "coord": coord,
             "feat": feat,
             "offset": offset,
+            "grid_coord": grid_coord,
             "grid_size": self.grid_size,
         }
 

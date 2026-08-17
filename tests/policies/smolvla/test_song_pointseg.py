@@ -19,6 +19,7 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegNet,
     SongTemporalPointCloudDataset,
     _aggregate_motion_hypotheses,
+    build_litept_grid_coord,
     compose_point_cloud_views,
     consensus_multiscale_novelty_union_sample_fused_point_cloud,
     fps_sample_fused_point_cloud,
@@ -40,6 +41,41 @@ from lerobot.policies.smolvla.song_pointseg import (
     song_pointseg_collate,
     use_primary_view_for_training_index,
 )
+
+
+def test_litept_grid_coord_uses_an_independent_integer_origin_per_sample():
+    coord = torch.tensor(
+        [
+            [-0.011, 0.009, 0.000],
+            [0.019, 0.021, -0.001],
+            [100.001, -50.001, 7.999],
+            [100.031, -49.979, 8.009],
+        ],
+        dtype=torch.float32,
+    )
+    batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    grid_coord = build_litept_grid_coord(coord, batch, grid_size=0.01)
+
+    assert grid_coord.dtype == torch.int32
+    assert torch.equal(
+        grid_coord,
+        torch.tensor([[0, 0, 1], [3, 2, 0], [0, 0, 0], [3, 3, 1]], dtype=torch.int32),
+    )
+
+
+def test_litept_grid_coord_is_independent_of_other_samples_in_the_batch():
+    sample = torch.tensor(
+        [[-0.011, 0.009, 0.000], [0.019, 0.021, -0.001]], dtype=torch.float32
+    )
+    other_near = torch.tensor([[1.0, 2.0, 3.0], [1.1, 2.1, 3.1]], dtype=torch.float32)
+    other_far = other_near + torch.tensor([1000.0, -2000.0, 3000.0])
+    batch = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    near_grid = build_litept_grid_coord(torch.cat([sample, other_near]), batch, 0.01)
+    far_grid = build_litept_grid_coord(torch.cat([sample, other_far]), batch, 0.01)
+
+    assert torch.equal(near_grid[:2], far_grid[:2])
 
 
 def test_multiview_point_cloud_composition_keeps_one_gripper_tail():
