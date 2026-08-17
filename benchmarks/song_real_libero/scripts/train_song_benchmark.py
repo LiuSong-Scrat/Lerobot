@@ -440,6 +440,8 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         frame_index = self._to_int(item["frame_index"])
         point_cloud = self._point_cloud_frame(episode_index, frame_index).copy()
         if self.camera_view_fusion in {
+            "fps",
+            "voxel_fps",
             "voxel_cover_fps",
             "novelty_union",
             "multiscale_novelty_union",
@@ -449,13 +451,19 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             # Raw/no-cache training still obeys the same input-adapter contract:
             # the policy model never receives the multi-view union.
             sampler = {
+                "fps": fps_sample_fused_point_cloud,
+                "voxel_fps": voxel_fps_sample_fused_point_cloud,
                 "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
                 "novelty_union": novelty_union_sample_fused_point_cloud,
                 "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
                 "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
                 "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
             }[self.camera_view_fusion]
-            sampler_kwargs = {"voxel_size": self.camera_view_voxel_size}
+            sampler_kwargs = (
+                {"voxel_size": self.camera_view_voxel_size}
+                if self.camera_view_fusion != "fps"
+                else {}
+            )
             if self.camera_view_fusion in {
                 "multiscale_novelty_union",
                 "consensus_multiscale_novelty_union",

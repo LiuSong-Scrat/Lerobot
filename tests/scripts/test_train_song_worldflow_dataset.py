@@ -12,6 +12,7 @@ from benchmarks.song_real_libero.scripts.song_cache_pointseg_samples import (
     _fps_sample_cache_batch,
 )
 from benchmarks.song_real_libero.scripts.train_song_benchmark import (
+    PointCloudMemmapDataset,
     PointSegCacheInjectedDataset,
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
@@ -41,6 +42,50 @@ class _TinyDataset(torch.utils.data.Dataset):
             "frame_index": torch.tensor(self.frame_index),
             "action": torch.zeros(self.chunk_size, 10),
         }
+
+
+@pytest.mark.parametrize("fusion", ["fps", "voxel_fps"])
+def test_cacheless_multiview_fps_training_keeps_ten_thousand_point_contract(
+    tmp_path, monkeypatch, fusion
+):
+    source = torch.arange(19_500 * 6, dtype=torch.float32).reshape(19_500, 6).numpy()
+    observed = {}
+
+    def fake_sampler(point_cloud, *, target_points, gripper_points, **kwargs):
+        observed.update(
+            target_points=target_points,
+            gripper_points=gripper_points,
+            kwargs=kwargs,
+        )
+        indices = torch.arange(target_points).unsqueeze(0)
+        sampled = point_cloud[:, :target_points]
+        return sampled, None, indices
+
+    sampler_name = (
+        "fps_sample_fused_point_cloud"
+        if fusion == "fps"
+        else "voxel_fps_sample_fused_point_cloud"
+    )
+    monkeypatch.setattr(
+        f"benchmarks.song_real_libero.scripts.train_song_benchmark.{sampler_name}",
+        fake_sampler,
+    )
+    wrapped = PointCloudMemmapDataset(
+        _TinyDataset(),
+        point_cloud_dir=tmp_path / "point_clouds",
+        camera_views="agentview,robot0_eye_in_hand",
+        camera_view_fusion=fusion,
+        camera_view_voxel_size=0.007,
+        gripper_points=500,
+    )
+    monkeypatch.setattr(wrapped, "_point_cloud_frame", lambda *_args: source)
+
+    item = wrapped[0]
+
+    assert item["observation.point_cloud"].shape == (1, 10_000, 6)
+    assert observed["target_points"] == 10_000
+    assert observed["gripper_points"] == 500
+    assert observed["kwargs"] == ({} if fusion == "fps" else {"voxel_size": 0.007})
 
 
 def test_policy_materialization_uses_explicit_local_cuda_then_restores_portable_config(monkeypatch):
