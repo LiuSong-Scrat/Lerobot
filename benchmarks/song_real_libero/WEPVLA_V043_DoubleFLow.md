@@ -297,17 +297,20 @@ VECLIB_MAXIMUM_THREADS=1 \
 MALLOC_ARENA_MAX=2 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
-CUDA_VISIBLE_DEVICES=3 \
-MUJOCO_EGL_DEVICE_ID=3 \
+CUDA_VISIBLE_DEVICES=0 \
+MUJOCO_EGL_DEVICE_ID=0 \
 PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
 /home/liusong/anaconda3/envs/reap/bin/python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/a800_doubleflow_v01_after500_after1000/checkpoints/001500/pretrained_model \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/wep_vla_v043_multiview_doubleflow_finetune_4G/checkpoints/030000/pretrained_model \
   --device cuda \
+  --suite-gpu-ids 0,1,2,3 \
   --suite libero_10 \
-  --task-id 6 \
-  --task-id 8 \
+  --suite libero_spatial \
+  --suite libero_object \
+  --suite libero_goal \
+  --all-tasks \
   --episodes 50 \
   --policy-noise-seed 0 \
   --env-seed 7 \
@@ -317,10 +320,10 @@ PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
   --gripper-delta-alignment current_minus_previous \
   --waypoint-max-hold-steps 1 \
   --isolated-policy-workers 1 \
-  --task-workers 2 \
-  --episode-workers-per-task 15 \
+  --task-workers 10 \
+  --episode-workers-per-task 8 \
   --task-worker-backend process \
-  --inference-batch-size 30 \
+  --inference-batch-size 80 \
   --inference-batching-mode fixed_barrier \
   --no-release-event-exec-enable \
   --control-freq 20 \
@@ -335,4 +338,6 @@ PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
   --no-visualize-foreground \
   --save-video \
   --no-world-to-ego-causal-ablation \
-  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_a800_doubleflow_1500_after500_after1000_2
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_wep_vla_v043_multiview_doubleflow_finetune_4G_30k_libero_FULL
+
+  
