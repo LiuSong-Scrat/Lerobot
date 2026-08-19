@@ -40,6 +40,8 @@ export PYTHONPATH="$REPO_ROOT/src"
 export SONG_POINTSEG_REQUIRE_POINTOPS=1
 
 # 24 DataLoader workers plus four train ranks stay below the 30-process CPU budget.
+# BASE_POLICY is already a trained DoubleFlow checkpoint, so keep its World
+# stream instead of overwriting it with a fresh Ego-to-World bootstrap.
 exec "$PYTHON_BIN" -m accelerate.commands.launch \
   --multi_gpu \
   --num_processes=4 \
@@ -100,7 +102,7 @@ exec "$PYTHON_BIN" -m accelerate.commands.launch \
   --policy.worldflow_action_fusion=point_action_expert_conjugate_bridge \
   --policy.worldflow_action_expert_mode=shared \
   --policy.worldflow_current_ee_pose_token=false \
-  --policy.worldflow_bootstrap_from_ego=true \
+  --policy.worldflow_bootstrap_from_ego=false \
   --policy.worldflow_freeze_pretrained_ego=false \
   --policy.worldflow_feature_dim=64 \
   --policy.worldflow_grid_size=0.01 \
