@@ -132,7 +132,13 @@ wallx = [
     "qwen_vl_utils==0.0.11"
 ]
 pi = ["transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi", "scipy>=1.10.1,<1.15"]
-smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "accelerate>=1.7.0,<2.0.0", "safetensors>=0.4.3,<1.0.0"]
+smolvla = [
+    "lerobot[transformers-dep]",
+    "num2words>=0.5.14,<0.6.0",
+    "accelerate>=1.7.0,<2.0.0",
+    "safetensors>=0.4.3,<1.0.0",
+    "colorhash>=1.3.2,<2.0.0",
+]
 groot = [
     "lerobot[transformers-dep]",
     "peft>=0.13.0,<1.0.0",
