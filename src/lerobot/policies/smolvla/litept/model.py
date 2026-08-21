@@ -560,6 +560,10 @@ class Embedding(PointModule):
                 padding=1,
                 bias=False,
                 indice_key="stem",
+                # spconv's implicit GEMM path can raise SIGFPE on Blackwell
+                # (RTX 5090). Native is numerically equivalent and is the path
+                # used by the locally reproduced v0.4.3 runtime.
+                algo=spconv.ConvAlgo.Native,
             )
         )
         if norm_layer is not None:
@@ -633,6 +637,7 @@ class Block(PointModule):
                     kernel_size=3,
                     bias=True,
                     indice_key=cpe_indice_key,
+                    algo=spconv.ConvAlgo.Native,
                 ),
                 nn.Linear(channels, channels),
                 norm_layer(channels),

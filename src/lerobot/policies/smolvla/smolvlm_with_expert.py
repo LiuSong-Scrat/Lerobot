@@ -685,12 +685,8 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
-        expert_model: nn.Module | None = None,
     ):
-        models = [
-            self.get_vlm_model().text_model,
-            self.lm_expert if expert_model is None else expert_model,
-        ]
+        models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient

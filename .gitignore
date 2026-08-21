@@ -173,6 +173,7 @@ outputs/
 
 # Dev folders
 .cache/*
+.venv-smol5090/
 *.stl
 *.urdf
 *.xml

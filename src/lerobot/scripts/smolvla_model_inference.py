@@ -27,6 +27,15 @@ from lerobot.policies.smolvla.inference_diagnostics import (
     save_modality_influence_report,
 )
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.smolvla.molmo2_processing import (
+    OBS_MOLMO_IMAGE_GRIDS,
+    OBS_MOLMO_IMAGE_NUM_CROPS,
+    OBS_MOLMO_IMAGE_TOKEN_POOLING,
+    OBS_MOLMO_PIXEL_VALUES,
+    OBS_MOLMO_TOKEN_TYPE_IDS,
+    prepare_molmo2_multimodal_batch,
+)
+from lerobot.policies.smolvla.processor_smolvla import tokenize_molmo2_text
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -250,6 +259,7 @@ class SmolVLA_ModelInference:
             self.policy_path,
             config=config,
             local_files_only=local_files_only,
+            strict=getattr(config, "vlm_backend", "smolvlm") in {"molmo2_text", "molmo2_full"},
         )
         self.policy.eval()
         self.policy.reset()
@@ -542,16 +552,51 @@ class SmolVLA_ModelInference:
 
         state_tensor = self._prepare_state_tensor(state, state_pose_mode=state_pose_mode)
         state_tensor = self._match_batch_size(state_tensor, batch_size, "observation.state")
-        language = self._tokenize_task(task, batch_size)
-
         batch = {
             "observation.point_cloud": pc.to(self.device),
             OBS_STATE: state_tensor.to(self.device),
-            OBS_LANGUAGE_TOKENS: language["input_ids"].to(self.device),
-            OBS_LANGUAGE_ATTENTION_MASK: language["attention_mask"].to(self.device, dtype=torch.bool),
         }
-        if self.policy.config.vla_adapter_enable:
-            batch.update(self._prepare_rgb_observation_batch(observation, batch_size))
+        rgb_batch: dict[str, torch.Tensor] = {}
+        if self.policy.config.requires_rgb:
+            rgb_batch = self._prepare_rgb_observation_batch(observation, batch_size)
+            batch.update(rgb_batch)
+
+        if self.policy.config.vlm_backend == "molmo2_full":
+            tasks = [task] * batch_size if isinstance(task, str) else list(task)
+            if len(tasks) == 1 and batch_size > 1:
+                tasks *= batch_size
+            if len(tasks) != batch_size:
+                raise ValueError(f"Expected {batch_size} task strings, got {len(tasks)}.")
+            image_key = f"{OBS_IMAGES}.{self.policy.config.selected_rgb_camera_views[0]}"
+            if image_key not in rgb_batch:
+                raise ValueError(
+                    f"Full-Molmo2-ER requires native RGB key {image_key!r}; "
+                    f"prepared keys are {sorted(rgb_batch)}."
+                )
+            native = prepare_molmo2_multimodal_batch(
+                self.policy.model.vlm_with_expert.processor,
+                tasks,
+                rgb_batch[image_key],
+                max_text_length=self.policy.config.tokenizer_max_length,
+            )
+            batch[OBS_LANGUAGE_TOKENS] = native["input_ids"].to(self.device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = native["attention_mask"].to(
+                self.device, dtype=torch.bool
+            )
+            for model_key, native_key in (
+                (OBS_MOLMO_TOKEN_TYPE_IDS, "token_type_ids"),
+                (OBS_MOLMO_PIXEL_VALUES, "pixel_values"),
+                (OBS_MOLMO_IMAGE_TOKEN_POOLING, "image_token_pooling"),
+                (OBS_MOLMO_IMAGE_GRIDS, "image_grids"),
+                (OBS_MOLMO_IMAGE_NUM_CROPS, "image_num_crops"),
+            ):
+                batch[model_key] = native[native_key].to(self.device)
+        else:
+            language = self._tokenize_task(task, batch_size)
+            batch[OBS_LANGUAGE_TOKENS] = language["input_ids"].to(self.device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = language["attention_mask"].to(
+                self.device, dtype=torch.bool
+            )
         return batch
 
     def _prepare_rgb_observation_batch(
@@ -685,6 +730,14 @@ class SmolVLA_ModelInference:
             elif len(tasks) != batch_size:
                 raise ValueError(f"Expected {batch_size} task strings, got {len(tasks)}.")
         tasks = [t if t.endswith("\n") else f"{t}\n" for t in tasks]
+        if getattr(self.policy.config, "vlm_backend", "smolvlm") == "molmo2_text":
+            return tokenize_molmo2_text(
+                self.tokenizer,
+                tasks,
+                max_length=self.policy.config.tokenizer_max_length,
+                padding=self.policy.config.pad_language_to,
+                padding_side="right",
+            )
         return self.tokenizer(
             tasks,
             max_length=self.policy.config.tokenizer_max_length,

@@ -40,7 +40,6 @@ if __package__ and __package__.startswith("benchmarks."):
         pose9_to_homo_np,
         reference_point_cloud_to_current_eff,
         render_camera_names_from_config,
-        robot_base_to_world_matrix,
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -57,7 +56,6 @@ else:
         pose9_to_homo_np,
         reference_point_cloud_to_current_eff,
         render_camera_names_from_config,
-        robot_base_to_world_matrix,
     )
 
 from tqdm import tqdm
@@ -65,8 +63,6 @@ from tqdm import tqdm
 POINT_CLOUD_DIR_NAME = "point_clouds"
 WORLD_EE_POSE_DIR_NAME = "world_ee_poses"
 ACTION_TARGET_EE_POSE_DIR_NAME = "action_target_ee_poses"
-WORLD_BASE_EE_POSE_DIR_NAME = "world_base_ee_poses"
-WORLD_BASE_ACTION_TARGET_EE_POSE_DIR_NAME = "world_base_action_target_ee_poses"
 POINT_CLOUD_CHANNELS = 6
 ACTION_LABEL_SEMANTICS = (
     "causal_same_state_raw_delta_absolute_model_eef_target_"
@@ -246,25 +242,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument(
-        "--worker-scope",
-        choices=("task", "episode"),
-        default=None,
-        help=(
-            "Parallel work unit. 'task' reuses one environment for all selected demos of a task; "
-            "'episode' creates an isolated environment per demo and can use more workers when only "
-            "a few tasks are selected."
-        ),
-    )
-    parser.add_argument(
-        "--resume-temp-artifacts",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Validate and reuse complete episode artifacts already present in --tmp-dir. "
-            "Any existing artifact that fails strict validation aborts the run."
-        ),
-    )
     parser.add_argument("--tmp-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
@@ -448,14 +425,6 @@ def action_target_ee_pose_file(root: Path, episode_index: int) -> Path:
     return root / ACTION_TARGET_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
 
 
-def world_base_ee_pose_file(root: Path, episode_index: int) -> Path:
-    return root / WORLD_BASE_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
-
-
-def world_base_action_target_ee_pose_file(root: Path, episode_index: int) -> Path:
-    return root / WORLD_BASE_ACTION_TARGET_EE_POSE_DIR_NAME / f"episode_{episode_index:06d}.npy"
-
-
 def write_point_cloud_meta(
     root: Path,
     storage: str = "zarr",
@@ -554,51 +523,6 @@ def write_action_target_meta(root: Path) -> None:
     }
     with open(pose_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-
-
-def write_robot_base_worldflow_meta(root: Path) -> None:
-    base_pose_dir = root / WORLD_BASE_EE_POSE_DIR_NAME
-    target_pose_dir = root / WORLD_BASE_ACTION_TARGET_EE_POSE_DIR_NAME
-    base_pose_dir.mkdir(parents=True, exist_ok=True)
-    target_pose_dir.mkdir(parents=True, exist_ok=True)
-    with open(base_pose_dir / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "key": "worldflow.current_ee_pose",
-                "dtype": "float32",
-                "shape": [9],
-                "layout": "episode_npy",
-                "path_format": (
-                    f"{WORLD_BASE_EE_POSE_DIR_NAME}/episode_{{episode_index:06d}}.npy"
-                ),
-                "coordinate_frame": "robot_base",
-                "source": "exact MuJoCo robot root-body transform",
-            },
-            f,
-            indent=2,
-        )
-    with open(target_pose_dir / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "key": "worldflow.eef_trajectory",
-                "dtype": "float32",
-                "shape": [9],
-                "layout": "episode_npy",
-                "path_format": (
-                    f"{WORLD_BASE_ACTION_TARGET_EE_POSE_DIR_NAME}/"
-                    "episode_{episode_index:06d}.npy"
-                ),
-                "coordinate_frame": "robot_base",
-                "target_semantics": "commanded_eef_pose",
-                "source": "raw LIBERO OSC target mapped to model EEF and robot-base frame",
-                "implicit_point_flow": (
-                    "the EEF trajectory is a supervised task-relevant point-flow trace; "
-                    "no simulator object pose or dense scene flow is used"
-                ),
-            },
-            f,
-            indent=2,
-        )
 
 
 def save_episode_point_clouds(
@@ -748,15 +672,6 @@ def save_converted_episode(dataset: LeRobotDataset, episode: dict[str, Any]) -> 
         episode_index,
         episode["action_target_ee_poses"],
     )
-    world_base_path = world_base_ee_pose_file(dataset.root, episode_index)
-    world_base_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(world_base_path, np.ascontiguousarray(episode["world_base_ee_poses"], dtype=np.float32))
-    base_target_path = world_base_action_target_ee_pose_file(dataset.root, episode_index)
-    base_target_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(
-        base_target_path,
-        np.ascontiguousarray(episode["world_base_action_target_ee_poses"], dtype=np.float32),
-    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
@@ -800,14 +715,6 @@ def save_episode_artifact(artifact_dir: Path, episode: dict[str, Any], record: d
         artifact_dir / "action_target_ee_poses.npy",
         np.ascontiguousarray(episode["action_target_ee_poses"], dtype=np.float32),
     )
-    np.save(
-        artifact_dir / "world_base_ee_poses.npy",
-        np.ascontiguousarray(episode["world_base_ee_poses"], dtype=np.float32),
-    )
-    np.save(
-        artifact_dir / "world_base_action_target_ee_poses.npy",
-        np.ascontiguousarray(episode["world_base_action_target_ee_poses"], dtype=np.float32),
-    )
     np.save(artifact_dir / "actions.npy", np.ascontiguousarray(episode["actions"], dtype=np.float32))
     np.save(
         artifact_dir / "observation_states.npy",
@@ -832,8 +739,6 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         "timestamps.npy",
         "world_ee_poses.npy",
         "action_target_ee_poses.npy",
-        "world_base_ee_poses.npy",
-        "world_base_action_target_ee_poses.npy",
     )
     missing = [name for name in required_files if not (artifact_dir / name).is_file()]
     if missing:
@@ -871,12 +776,6 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
     action_target_ee_poses = np.load(
         artifact_dir / "action_target_ee_poses.npy", mmap_mode="r"
     )
-    world_base_ee_poses = np.load(
-        artifact_dir / "world_base_ee_poses.npy", mmap_mode="r"
-    )
-    world_base_action_target_ee_poses = np.load(
-        artifact_dir / "world_base_action_target_ee_poses.npy", mmap_mode="r"
-    )
     frames = int(actions.shape[0])
     shape_errors = []
     if actions.ndim != 2 or actions.shape[1] != 10:
@@ -893,15 +792,6 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         shape_errors.append(
             "action_target_ee_poses shape="
             f"{action_target_ee_poses.shape}, expected ({frames}, 9)"
-        )
-    if world_base_ee_poses.shape != (frames, 9):
-        shape_errors.append(
-            f"world_base_ee_poses shape={world_base_ee_poses.shape}, expected ({frames}, 9)"
-        )
-    if world_base_action_target_ee_poses.shape != (frames, 9):
-        shape_errors.append(
-            "world_base_action_target_ee_poses shape="
-            f"{world_base_action_target_ee_poses.shape}, expected ({frames}, 9)"
         )
     if int(record.get("frames", -1)) != frames:
         shape_errors.append(f"record frames={record.get('frames')}, actions frames={frames}")
@@ -924,8 +814,6 @@ def verify_episode_artifact(artifact_dir: Path, episode_job: dict[str, Any]) -> 
         "observation_states": observation_states,
         "world_ee_poses": world_ee_poses,
         "action_target_ee_poses": action_target_ee_poses,
-        "world_base_ee_poses": world_base_ee_poses,
-        "world_base_action_target_ee_poses": world_base_action_target_ee_poses,
     }
     for name, array in finite_arrays.items():
         if not np.isfinite(np.asarray(array)).all():
@@ -1702,9 +1590,7 @@ def collect_demo_episode(
         for camera in pc_camera_names
     }
     reference_ee_poses = reference_ee_poses_by_camera[reference_camera]
-    base_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     action_target_reference_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
-    action_target_base_ee_poses = np.empty((frame_count, 9), dtype=np.float32)
     observation_grippers = np.empty((frame_count, 1), dtype=np.float32)
     action_grippers = np.empty((frame_count, 1), dtype=np.float32)
     video_frames: dict[str, list[np.ndarray]] = {} if save_video else {}
@@ -1712,6 +1598,7 @@ def collect_demo_episode(
     image_frames_by_camera: dict[str, list[np.ndarray]] = {
         camera: [] for camera in image_feature_cameras(cfg)
     }
+
     def collect_observation_frame(
         frame_idx: int,
         raw_obs: dict[str, Any],
@@ -1748,11 +1635,6 @@ def collect_demo_episode(
                 observation_grippers[frame_idx, 0] = pose9_gripper_reference[-1]
                 primary_world_pose = pose9_gripper_sim_world
         assert primary_world_pose is not None
-        base_to_world = robot_base_to_world_matrix(env)
-        base_ee_poses[frame_idx] = homo_to_pose9(
-            fast_inverse_homogeneous(base_to_world)
-            @ pose9_to_homo_np(np.asarray(primary_world_pose, dtype=np.float32)[:9])
-        )
         return pose9_to_homo_np(
             np.asarray(primary_world_pose, dtype=np.float32)[:9]
         ).astype(np.float64)
@@ -1776,10 +1658,6 @@ def collect_demo_episode(
             env,
             target_model_world,
             reference_camera,
-        )
-        action_target_base_ee_poses[frame_idx] = homo_to_pose9(
-            fast_inverse_homogeneous(robot_base_to_world_matrix(env))
-            @ np.asarray(target_model_world, dtype=np.float64)
         )
 
     # Initialize the delta controller once at the beginning of the source
@@ -1895,6 +1773,7 @@ def collect_demo_episode(
         action_target_reference_ee_poses[:, :3] - reference_ee_poses[:, :3],
         axis=-1,
     )
+
     if cfg["replay_mode"] == "states":
         source_index_expr = f"i + {state_observation_offset}"
         action_source_index_mapping = (
@@ -1933,8 +1812,6 @@ def collect_demo_episode(
         # Legacy key/path retained for the existing WorldFlow dataset wrapper.
         # Values are expressed in the fixed Overview-camera reference frame.
         "world_ee_poses": reference_ee_poses,
-        "world_base_ee_poses": base_ee_poses,
-        "world_base_action_target_ee_poses": action_target_base_ee_poses,
         "action_target_ee_poses": action_target_reference_ee_poses,
         "timestamps": timestamps,
         "video_frames": video_frames,
@@ -2008,8 +1885,6 @@ def make_episode_record(
         "action_pose_coordinate_frame": "episode_origin_eef",
         "observation_state_coordinate_frame": "episode_origin_eef",
         "absolute_action_target_sidecar_coordinate_frame": "overview_camera",
-        "worldflow_reference_frame": "robot_base",
-        "worldflow_target_semantics": "commanded_eef_pose",
         "gripper_action_semantics": "next_state_achieved_physical_width_metres",
         "heuristic_action_target_offset": False,
         "target_residual_translation_m_mean": float(
@@ -2209,14 +2084,6 @@ def save_collected_temp_episode(
         artifact_dir / "action_target_ee_poses.npy",
         final_action_target_ee_pose_path,
     )
-    move_episode_array(
-        artifact_dir / "world_base_ee_poses.npy",
-        world_base_ee_pose_file(dataset.root, episode_index),
-    )
-    move_episode_array(
-        artifact_dir / "world_base_action_target_ee_poses.npy",
-        world_base_action_target_ee_pose_file(dataset.root, episode_index),
-    )
     dataset.save_episode(
         episode_data=make_episode_buffer(
             dataset,
@@ -2300,16 +2167,6 @@ def main() -> None:
         cfg["image_cameras"] = image_feature_cameras(cfg)
     ensure_image_camera_rendered(cfg)
     cfg["num_workers"] = int(cfg_get(cfg, args.num_workers, "num_workers", 1) or 1)
-    cfg["worker_scope"] = str(cfg_get(cfg, args.worker_scope, "worker_scope", "task"))
-    cfg["resume_temp_artifacts"] = bool(
-        cfg_get(cfg, args.resume_temp_artifacts, "resume_temp_artifacts", False)
-    )
-    if cfg["num_workers"] < 1:
-        raise ValueError(f"num_workers must be at least 1, got {cfg['num_workers']}.")
-    if cfg["worker_scope"] not in {"task", "episode"}:
-        raise ValueError(
-            f"worker_scope must be 'task' or 'episode', got {cfg['worker_scope']!r}."
-        )
     max_frames = cfg_get(cfg, args.max_frames_per_demo, "max_frames_per_demo")
     max_frames = int(max_frames) if max_frames is not None else None
     ensure_libero_config(cfg.get("libero_config_path"), args.demo_root or cfg.get("demo_root"))
@@ -2360,7 +2217,6 @@ def main() -> None:
     )
     write_worldflow_meta(dataset.root)
     write_action_target_meta(dataset.root)
-    write_robot_base_worldflow_meta(dataset.root)
 
     summary: dict[str, Any] = {
         "created_unix_s": time.time(),
@@ -2372,12 +2228,6 @@ def main() -> None:
         "reference_frame": "overview_camera",
         "reference_camera": selected_camera_names(cfg)[0],
         "sim_extrinsic_usage": "eef_world_to_overview_camera_only",
-        "robot_base_worldflow": {
-            "coordinate_frame": "robot_base",
-            "target": "commanded model-EEF trajectory",
-            "implicit_point_flow": True,
-            "explicit_object_pose_supervision": False,
-        },
         "render_camera_names": rendered_camera_names(cfg),
         "image_cameras": image_feature_cameras(cfg),
         "image_feature_keys": cfg.get("image_feature_keys", []),
@@ -2392,16 +2242,11 @@ def main() -> None:
             "execution_mode": (
                 "spawn_process_pool" if int(cfg["num_workers"]) > 1 else "in_process_serial"
             ),
-            "worker_scope": (
-                "one isolated environment per episode"
-                if str(cfg["worker_scope"]) == "episode"
-                else "one isolated environment per task"
-            ),
+            "worker_scope": "one isolated environment per task",
             "worker_output": "unique temporary directory per episode job",
             "dataset_commit": "single parent process in deterministic job order",
             "episode_seed": "independent of worker count and completion order",
             "demo_model_runtime_verification": bool(cfg["restore_demo_model"]),
-            "resume_temp_artifacts": bool(cfg["resume_temp_artifacts"]),
         },
         "fps": int(cfg["fps"]),
         "state_observation_alignment": {
@@ -2514,7 +2359,7 @@ def main() -> None:
             )
             task_job_index += 1
 
-    if tmp_dir.exists() and not bool(cfg["resume_temp_artifacts"]):
+    if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2538,78 +2383,20 @@ def main() -> None:
         verify_episode_artifact(actual_path, expected_job)
         results[result_index] = actual_path
 
-    if bool(cfg["resume_temp_artifacts"]):
-        for episode_job in episode_jobs:
-            artifact_path = Path(episode_job["tmp_path"])
-            if not artifact_path.exists():
-                continue
-            register_result(
-                {
-                    "job_index": int(episode_job["job_index"]),
-                    "tmp_path": str(artifact_path),
-                }
-            )
-        if results:
-            print(
-                f"[info] resumed {len(results)}/{len(episode_jobs)} strictly validated "
-                f"temporary episode artifact(s) from {tmp_dir}"
-            )
-
-    pending_indices = set(expected_jobs) - set(results)
-    pending_episode_jobs = [
-        job for job in episode_jobs if int(job["job_index"]) in pending_indices
-    ]
-    pending_task_jobs = []
-    for task_job in task_jobs:
-        pending_for_task = [
-            job
-            for job in task_job["episodes"]
-            if int(job["job_index"]) in pending_indices
-        ]
-        if pending_for_task:
-            pending_task_jobs.append({**task_job, "episodes": pending_for_task})
-
-    if not pending_episode_jobs:
-        print("[info] all requested episodes were restored from validated temporary artifacts")
-    elif int(cfg["num_workers"]) <= 1:
-        for task_job in tqdm(pending_task_jobs, desc="Collecting LIBERO tasks", unit="task"):
+    if int(cfg["num_workers"]) <= 1:
+        for task_job in tqdm(task_jobs, desc="Collecting LIBERO tasks", unit="task"):
             for result in collect_task_worker(task_job):
                 register_result(result)
-    elif str(cfg["worker_scope"]) == "episode":
-        worker_count = min(int(cfg["num_workers"]), len(pending_episode_jobs))
-        print(
-            f"[info] collecting {len(pending_episode_jobs)} remaining LIBERO episode(s) "
-            f"with {worker_count} episode-scoped worker(s)"
-        )
-        with ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=mp.get_context("spawn"),
-        ) as executor:
-            futures = [
-                executor.submit(collect_episode_worker, episode_job)
-                for episode_job in pending_episode_jobs
-            ]
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Collecting LIBERO episodes",
-                unit="episode",
-            ):
-                register_result(future.result())
     else:
         print(
-            f"[info] collecting {len(pending_episode_jobs)} remaining LIBERO episode(s) "
-            f"across {len(pending_task_jobs)} task job(s) "
+            f"[info] collecting {len(episode_jobs)} LIBERO episode(s) across {len(task_jobs)} task job(s) "
             f"with {cfg['num_workers']} worker(s)"
         )
         with ProcessPoolExecutor(
             max_workers=int(cfg["num_workers"]),
             mp_context=mp.get_context("spawn"),
         ) as executor:
-            futures = [
-                executor.submit(collect_task_worker, task_job)
-                for task_job in pending_task_jobs
-            ]
+            futures = [executor.submit(collect_task_worker, task_job) for task_job in task_jobs]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting LIBERO tasks", unit="task"):
                 for result in future.result():
                     register_result(result)

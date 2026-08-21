@@ -17,9 +17,12 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -27,6 +30,7 @@ from typing import Any
 import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
@@ -34,7 +38,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler, TaskBalancedFrameSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -49,23 +53,11 @@ from lerobot.policies.smolvla.song_pointseg import (
     SongPointSegCachedDataset,
     SongTemporalPointCloudDataset,
     compose_point_cloud_views,
-    consensus_multiscale_novelty_union_sample_fused_point_cloud,
-    fps_sample_fused_point_cloud,
-    infer_single_view_point_count,
-    multiscale_novelty_union_sample_fused_point_cloud,
-    voxel_fps_sample_fused_point_cloud,
-    voxel_cover_fps_sample_fused_point_cloud,
-    novelty_union_sample_fused_point_cloud,
-    transport_novelty_union_sample_fused_point_cloud,
     generate_pseudo_labels,
     open_episode_point_clouds,
     parse_camera_views,
-    parse_camera_view_fusion,
-    parse_camera_view_weights,
-    paired_view_augmentation_index,
     point_cloud_dir_for_view,
     song_pointseg_collate,
-    use_primary_view_for_training_index,
     write_role_ply,
 )
 from lerobot.rl.wandb_utils import WandBLogger
@@ -86,6 +78,391 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+CUDA_ALLOCATOR_LEASE_ENABLE_ENV = "MOLMO_FULL_CUDA_LEASE_ENABLE"
+CUDA_ALLOCATOR_LEASE_TARGET_GIB_ENV = "MOLMO_FULL_CUDA_LEASE_TARGET_GIB"
+CUDA_ALLOCATOR_LEASE_CHUNK_MIB_ENV = "MOLMO_FULL_CUDA_LEASE_CHUNK_MIB"
+CUDA_ALLOCATOR_LEASE_HEADROOM_MIB_ENV = "MOLMO_FULL_CUDA_LEASE_HEADROOM_MIB"
+CHECKPOINT_RETENTION_ENV = "MOLMO_CHECKPOINTS_TO_KEEP"
+_MIB = 1024**2
+_GIB = 1024**3
+_MAX_CUDA_ALLOCATOR_LEASE_CHUNKS = 4096
+_CUDA_FREE_AUDIT_TOLERANCE_BYTES = 8 * _MIB
+
+
+def resolve_checkpoint_retention(environ: Mapping[str, str]) -> int | None:
+    """Return an explicitly configured positive rolling-checkpoint limit."""
+
+    raw_value = environ.get(CHECKPOINT_RETENTION_ENV)
+    if raw_value is None or not str(raw_value).strip():
+        return None
+    normalized = str(raw_value).strip()
+    if not normalized.isdigit() or int(normalized) < 1:
+        raise ValueError(f"{CHECKPOINT_RETENTION_ENV} must be a positive integer, got {raw_value!r}.")
+    return int(normalized)
+
+
+def prune_committed_training_checkpoints(
+    *,
+    committed_checkpoint: Path,
+    keep: int | None,
+) -> tuple[Path, ...]:
+    """Delete older numeric checkpoints only after ``last`` commits a new one."""
+
+    if keep is None:
+        return ()
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+        raise ValueError(f"keep must be a positive integer or None, got {keep!r}.")
+
+    committed_checkpoint = Path(committed_checkpoint)
+    checkpoints_dir = committed_checkpoint.parent
+    last_link = checkpoints_dir / "last"
+    if not committed_checkpoint.is_dir() or committed_checkpoint.is_symlink():
+        raise RuntimeError(f"Committed checkpoint is not a real directory: {committed_checkpoint}")
+    if not last_link.is_symlink() or last_link.resolve(strict=True) != committed_checkpoint.resolve(strict=True):
+        raise RuntimeError(f"Checkpoint retention requires last to commit {committed_checkpoint}.")
+
+    numeric_checkpoints = sorted(
+        (
+            path
+            for path in checkpoints_dir.iterdir()
+            if path.name.isdigit() and len(path.name) == 6 and path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: int(path.name),
+        reverse=True,
+    )
+    if committed_checkpoint.resolve(strict=True) not in {
+        path.resolve(strict=True) for path in numeric_checkpoints[:keep]
+    }:
+        raise RuntimeError("The committed checkpoint is not inside the newest retained checkpoint set.")
+
+    deleted: list[Path] = []
+    checkpoints_root = checkpoints_dir.resolve(strict=True)
+    for checkpoint_path in numeric_checkpoints[keep:]:
+        resolved = checkpoint_path.resolve(strict=True)
+        if resolved.parent != checkpoints_root or resolved == committed_checkpoint.resolve(strict=True):
+            raise RuntimeError(f"Refusing unsafe checkpoint retention target: {checkpoint_path}")
+        shutil.rmtree(resolved)
+        deleted.append(checkpoint_path)
+    return tuple(deleted)
+
+
+@dataclasses.dataclass(frozen=True)
+class CudaAllocatorLeaseConfig:
+    """Early rank-local caching-allocator lease for the full Molmo control."""
+
+    target_bytes: int
+    chunk_bytes: int
+    headroom_bytes: int
+
+
+def _parse_cuda_lease_size(
+    environ: Mapping[str, str],
+    name: str,
+    *,
+    default: str,
+    unit_bytes: int,
+    allow_zero: bool = False,
+) -> int:
+    raw_value = str(environ.get(name, default)).strip()
+    try:
+        value = Decimal(raw_value)
+    except InvalidOperation as exc:
+        raise ValueError(f"{name} must be a finite numeric value, got {raw_value!r}.") from exc
+    if not value.is_finite() or value < 0 or (not allow_zero and value == 0):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a finite {qualifier} value, got {raw_value!r}.")
+    byte_value = value * unit_bytes
+    if byte_value != byte_value.to_integral_value():
+        raise ValueError(f"{name}={raw_value!r} does not resolve to a whole number of bytes.")
+    return int(byte_value)
+
+
+def resolve_cuda_allocator_lease_config(
+    *,
+    environ: Mapping[str, str],
+    vlm_backend: str | None,
+    num_processes: int,
+    device_type: str,
+) -> CudaAllocatorLeaseConfig | None:
+    """Resolve the opt-in lease without touching CUDA.
+
+    The backend/process checks intentionally precede environment parsing so a
+    malformed lease variable cannot alter any legacy or single-process run.
+    """
+
+    if vlm_backend != "molmo2_full" or num_processes <= 1:
+        return None
+
+    raw_enabled = environ.get(CUDA_ALLOCATOR_LEASE_ENABLE_ENV)
+    if raw_enabled is None:
+        return None
+    normalized_enabled = str(raw_enabled).strip().lower()
+    if normalized_enabled in {"0", "false", "no", "off"}:
+        return None
+    if normalized_enabled not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            f"{CUDA_ALLOCATOR_LEASE_ENABLE_ENV} must be an explicit boolean, got {raw_enabled!r}."
+        )
+    if device_type != "cuda":
+        raise RuntimeError(
+            "The Full-Molmo2-ER CUDA allocator lease was enabled, but Accelerator selected "
+            f"device_type={device_type!r}."
+        )
+
+    config = CudaAllocatorLeaseConfig(
+        target_bytes=_parse_cuda_lease_size(
+            environ,
+            CUDA_ALLOCATOR_LEASE_TARGET_GIB_ENV,
+            default="30",
+            unit_bytes=_GIB,
+        ),
+        chunk_bytes=_parse_cuda_lease_size(
+            environ,
+            CUDA_ALLOCATOR_LEASE_CHUNK_MIB_ENV,
+            default="1024",
+            unit_bytes=_MIB,
+        ),
+        headroom_bytes=_parse_cuda_lease_size(
+            environ,
+            CUDA_ALLOCATOR_LEASE_HEADROOM_MIB_ENV,
+            default="512",
+            unit_bytes=_MIB,
+            allow_zero=True,
+        ),
+    )
+    maximum_chunks = (config.target_bytes + config.chunk_bytes - 1) // config.chunk_bytes
+    if maximum_chunks > _MAX_CUDA_ALLOCATOR_LEASE_CHUNKS:
+        raise ValueError(
+            "CUDA allocator lease would require too many allocation chunks: "
+            f"target={config.target_bytes} bytes, chunk={config.chunk_bytes} bytes, "
+            f"chunks={maximum_chunks}, limit={_MAX_CUDA_ALLOCATOR_LEASE_CHUNKS}."
+        )
+    return config
+
+
+def plan_cuda_allocator_lease_chunks(
+    *,
+    allocated_bytes: int,
+    reserved_bytes: int,
+    free_bytes: int,
+    target_bytes: int,
+    chunk_bytes: int,
+    headroom_bytes: int,
+) -> tuple[int, ...]:
+    """Return allocation sizes that force reserved memory to ``target_bytes``.
+
+    Existing unused cache must be filled before the allocator asks CUDA for
+    more memory. Therefore the tensors held temporarily must bring *allocated*
+    memory to the target, while the driver-free feasibility check only needs
+    the missing *reserved* bytes plus the configured safety headroom.
+    """
+
+    values = {
+        "allocated_bytes": allocated_bytes,
+        "reserved_bytes": reserved_bytes,
+        "free_bytes": free_bytes,
+        "target_bytes": target_bytes,
+        "chunk_bytes": chunk_bytes,
+        "headroom_bytes": headroom_bytes,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer number of bytes, got {value!r}.")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}.")
+    if target_bytes == 0 or chunk_bytes == 0:
+        raise ValueError("target_bytes and chunk_bytes must both be positive.")
+    if allocated_bytes > reserved_bytes:
+        raise ValueError(
+            f"allocated_bytes ({allocated_bytes}) cannot exceed reserved_bytes ({reserved_bytes})."
+        )
+    if reserved_bytes >= target_bytes:
+        return ()
+
+    missing_driver_bytes = target_bytes - reserved_bytes
+    required_free_bytes = missing_driver_bytes + headroom_bytes
+    if free_bytes < required_free_bytes:
+        raise RuntimeError(
+            "Insufficient rank-local CUDA memory for allocator lease: "
+            f"free={free_bytes} bytes, missing_reserved={missing_driver_bytes} bytes, "
+            f"required_headroom={headroom_bytes} bytes, required_free={required_free_bytes} bytes."
+        )
+
+    temporary_allocation_bytes = target_bytes - allocated_bytes
+    full_chunks, remainder = divmod(temporary_allocation_bytes, chunk_bytes)
+    number_of_chunks = full_chunks + int(remainder > 0)
+    if number_of_chunks > _MAX_CUDA_ALLOCATOR_LEASE_CHUNKS:
+        raise ValueError(
+            f"CUDA allocator lease needs {number_of_chunks} chunks; "
+            f"limit is {_MAX_CUDA_ALLOCATOR_LEASE_CHUNKS}."
+        )
+    chunks = [chunk_bytes] * full_chunks
+    if remainder:
+        chunks.append(remainder)
+    return tuple(chunks)
+
+
+def _cuda_allocator_snapshot(device: torch.device, *, label: str) -> dict[str, int]:
+    torch.cuda.synchronize(device)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    snapshot = {
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+    }
+    if snapshot["allocated_bytes"] > snapshot["reserved_bytes"]:
+        raise RuntimeError(f"CUDA allocator audit {label}: allocated exceeds reserved: {snapshot}.")
+    if snapshot["free_bytes"] > snapshot["total_bytes"]:
+        raise RuntimeError(f"CUDA allocator audit {label}: free exceeds total: {snapshot}.")
+    return snapshot
+
+
+def _format_cuda_allocator_snapshot(snapshot: Mapping[str, int]) -> str:
+    return " ".join(
+        f"{name.removesuffix('_bytes')}={int(value) / _GIB:.3f}GiB"
+        for name, value in snapshot.items()
+    )
+
+
+def reserve_full_molmo2_cuda_allocator_lease(
+    *,
+    accelerator: Accelerator,
+    vlm_backend: str | None,
+    environ: Mapping[str, str],
+) -> dict[str, Any] | None:
+    """Reserve rank-local CUDA cache early, then release all live tensors.
+
+    No random operation is used and peak counters are reset after the lease, so
+    this changes neither training mathematics nor reported model peaks. The
+    cached blocks remain owned by this process until explicitly emptied or the
+    process exits, allowing subsequent model allocations to reuse them.
+    """
+
+    device = torch.device(accelerator.device)
+    config = resolve_cuda_allocator_lease_config(
+        environ=environ,
+        vlm_backend=vlm_backend,
+        num_processes=int(accelerator.num_processes),
+        device_type=device.type,
+    )
+    if config is None:
+        return None
+
+    rank = int(accelerator.process_index)
+    local_rank = int(accelerator.local_process_index)
+    prefix = f"[cuda-allocator-lease rank={rank} local_rank={local_rank} device={device}]"
+
+    def audit_log(message: str, *args: object) -> None:
+        # init_logging intentionally suppresses INFO on non-main ranks. Lease
+        # provenance is rank-local, so preserve one visible line per GPU.
+        if accelerator.is_main_process:
+            logging.info(message, *args)
+        else:
+            print(message % args, flush=True)
+
+    before = _cuda_allocator_snapshot(device, label="before")
+    audit_log(
+        "%s starting target=%.3fGiB chunk=%.3fGiB headroom=%.3fGiB; %s",
+        prefix,
+        config.target_bytes / _GIB,
+        config.chunk_bytes / _GIB,
+        config.headroom_bytes / _GIB,
+        _format_cuda_allocator_snapshot(before),
+    )
+    lease_tensors: list[torch.Tensor] = []
+    try:
+        chunks = plan_cuda_allocator_lease_chunks(
+            allocated_bytes=before["allocated_bytes"],
+            reserved_bytes=before["reserved_bytes"],
+            free_bytes=before["free_bytes"],
+            target_bytes=config.target_bytes,
+            chunk_bytes=config.chunk_bytes,
+            headroom_bytes=config.headroom_bytes,
+        )
+        for allocation_bytes in chunks:
+            lease_tensors.append(torch.empty(allocation_bytes, dtype=torch.uint8, device=device))
+        held = _cuda_allocator_snapshot(device, label="held")
+        expected_held_allocated = before["allocated_bytes"] + sum(chunks)
+        if held["allocated_bytes"] != expected_held_allocated:
+            raise RuntimeError(
+                f"CUDA allocator lease live-allocation audit failed: expected "
+                f"allocated={expected_held_allocated}, actual={held['allocated_bytes']}."
+            )
+        if held["reserved_bytes"] < config.target_bytes:
+            raise RuntimeError(
+                f"CUDA allocator lease missed target: reserved={held['reserved_bytes']} bytes, "
+                f"target={config.target_bytes} bytes."
+            )
+        if held["free_bytes"] < config.headroom_bytes:
+            raise RuntimeError(
+                f"CUDA allocator lease consumed configured headroom: free={held['free_bytes']} bytes, "
+                f"headroom={config.headroom_bytes} bytes."
+            )
+        audit_log("%s tensors-held audit passed; %s", prefix, _format_cuda_allocator_snapshot(held))
+
+        lease_tensors.clear()
+        retained = _cuda_allocator_snapshot(device, label="retained")
+        if retained["allocated_bytes"] != before["allocated_bytes"]:
+            raise RuntimeError(
+                f"CUDA allocator lease leaked live tensors: baseline allocated={before['allocated_bytes']}, "
+                f"retained allocated={retained['allocated_bytes']}."
+            )
+        if retained["reserved_bytes"] != held["reserved_bytes"]:
+            raise RuntimeError(
+                f"CUDA allocator released cache unexpectedly: held reserved={held['reserved_bytes']}, "
+                f"retained reserved={retained['reserved_bytes']}."
+            )
+        if retained["reserved_bytes"] < config.target_bytes:
+            raise RuntimeError(
+                f"CUDA allocator retained only {retained['reserved_bytes']} bytes below "
+                f"target {config.target_bytes}."
+            )
+        if abs(retained["free_bytes"] - held["free_bytes"]) > _CUDA_FREE_AUDIT_TOLERANCE_BYTES:
+            raise RuntimeError(
+                "CUDA driver-free memory changed when lease tensors were returned to cache: "
+                f"held={held['free_bytes']} bytes, retained={retained['free_bytes']} bytes, "
+                f"tolerance={_CUDA_FREE_AUDIT_TOLERANCE_BYTES} bytes."
+            )
+        audit_log("%s cache-retained audit passed; %s", prefix, _format_cuda_allocator_snapshot(retained))
+
+        torch.cuda.reset_peak_memory_stats(device)
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        if peak_allocated != retained["allocated_bytes"] or peak_reserved != retained["reserved_bytes"]:
+            raise RuntimeError(
+                f"CUDA allocator peak reset audit failed: peak_allocated={peak_allocated}, "
+                f"peak_reserved={peak_reserved}, retained={retained}."
+            )
+        audit_log(
+            "%s complete; live tensors deleted, cache retained, peaks reset "
+            "(peak_allocated=%.3fGiB peak_reserved=%.3fGiB).",
+            prefix,
+            peak_allocated / _GIB,
+            peak_reserved / _GIB,
+        )
+        return {
+            "rank": rank,
+            "local_rank": local_rank,
+            "device": str(device),
+            "config": dataclasses.asdict(config),
+            "before": before,
+            "held": held,
+            "retained": retained,
+        }
+    except Exception as exc:
+        # Dropping partial live allocations lets process teardown reclaim them;
+        # never call empty_cache here because a successful partial lease must
+        # remain observable in the failure audit until the fail-fast exit.
+        lease_tensors.clear()
+        try:
+            failed = _cuda_allocator_snapshot(device, label="failure")
+            failure_snapshot = _format_cuda_allocator_snapshot(failed)
+        except Exception as audit_exc:
+            failure_snapshot = f"snapshot-unavailable: {audit_exc!r}"
+        logging.error("%s failed fast: %s; %s", prefix, exc, failure_snapshot)
+        raise RuntimeError(f"{prefix} failed before model creation: {exc}") from exc
 
 
 def validate_policy_camera_cli_overrides(cfg: TrainPipelineConfig) -> dict[str, Any]:
@@ -117,41 +494,6 @@ def validate_policy_camera_cli_overrides(cfg: TrainPipelineConfig) -> dict[str, 
                 f"resolved cfg.policy.{field_name}={resolved_value!r}. "
                 "Refusing to train with an unintended camera modality."
             )
-    raw_weights = parser.parse_arg("policy.camera_view_weights")
-    if raw_weights is not None:
-        num_views = len(parse_camera_views(getattr(cfg.policy, "camera_views", "agentview")))
-        expected_weights = parse_camera_view_weights(raw_weights, num_views=num_views)
-        resolved_raw = getattr(cfg.policy, "camera_view_weights", None)
-        resolved_weights = parse_camera_view_weights(resolved_raw, num_views=num_views)
-        provenance["camera_view_weights"] = {
-            "cli_raw": raw_weights,
-            "cli_parsed": list(expected_weights or ()),
-            "resolved_raw": resolved_raw,
-            "resolved_parsed": list(resolved_weights or ()),
-        }
-        if resolved_weights != expected_weights:
-            raise RuntimeError(
-                f"Explicit --policy.camera_view_weights={raw_weights!r} was not applied: "
-                f"resolved value={resolved_raw!r}. Refusing to train with an unintended "
-                "multi-view point budget."
-            )
-    raw_fusion = parser.parse_arg("policy.camera_view_fusion")
-    if raw_fusion is not None:
-        expected_fusion = parse_camera_view_fusion(raw_fusion)
-        resolved_raw = getattr(cfg.policy, "camera_view_fusion", "legacy_budget")
-        resolved_fusion = parse_camera_view_fusion(resolved_raw)
-        provenance["camera_view_fusion"] = {
-            "cli_raw": raw_fusion,
-            "cli_parsed": expected_fusion,
-            "resolved_raw": resolved_raw,
-            "resolved_parsed": resolved_fusion,
-        }
-        if resolved_fusion != expected_fusion:
-            raise RuntimeError(
-                f"Explicit --policy.camera_view_fusion={raw_fusion!r} was not applied: "
-                f"resolved value={resolved_raw!r}."
-            )
-
     return provenance
 
 
@@ -173,63 +515,25 @@ def validate_policy_camera_config_matches_training_config(
                 f"policy.config.{field_name}={model_value!r}. "
                 "Refusing to create a checkpoint with contradictory metadata."
             )
-    num_views = len(parse_camera_views(getattr(cfg.policy, "camera_views", "agentview")))
-    train_weights = parse_camera_view_weights(
-        getattr(cfg.policy, "camera_view_weights", None),
-        num_views=num_views,
-    )
-    model_weights = parse_camera_view_weights(
-        getattr(policy.config, "camera_view_weights", None),
-        num_views=num_views,
-    )
-    if train_weights != model_weights:
-        raise RuntimeError(
-            "Camera view weights diverged while loading the policy: "
-            f"training={train_weights}, model={model_weights}."
-        )
 
 
-    train_fusion = parse_camera_view_fusion(getattr(cfg.policy, "camera_view_fusion", None))
-    model_fusion = parse_camera_view_fusion(getattr(policy.config, "camera_view_fusion", None))
-    if train_fusion != model_fusion:
-        raise RuntimeError(
-            "Camera view fusion diverged while loading the policy: "
-            f"training={train_fusion!r}, model={model_fusion!r}."
-        )
+def canonical_rgb_camera_name(name: str) -> str:
+    """Map dataset/checkpoint RGB aliases to one semantic camera name.
 
-
-def make_policy_on_accelerator_device(
-    *,
-    policy_cfg: Any,
-    ds_meta: Any,
-    rename_map: dict[str, str] | None,
-    accelerator_device: torch.device,
-) -> PreTrainedPolicy:
-    """Materialize a distributed policy directly on its process-local GPU.
-
-    Policy configs intentionally save the portable device value ``"cuda"``.
-    Passing that unindexed value through safetensors while every DDP process can
-    see every GPU may, however, transiently materialize nonzero ranks on GPU 0.
-    The released tensors leave a CUDA context behind and consume enough memory
-    to make a legitimate batch-48 update intermittently OOM on a 24 GiB GPU.
-
-    Temporarily make the load device explicit (for example ``cuda:3``), then
-    restore the portable config value.  This changes neither model parameters
-    nor the device recorded in checkpoints and does not touch LitePT.
+    This is used only for compatibility validation. It intentionally does not
+    rename dataset features or copy image tensors: the policy continues to read
+    the exact serialized feature key, such as ``observation.images.overhead``.
     """
 
-    saved_device = policy_cfg.device
-    if accelerator_device.type == "cuda":
-        policy_cfg.device = str(accelerator_device)
-    try:
-        policy = make_policy(
-            cfg=policy_cfg,
-            ds_meta=ds_meta,
-            rename_map=rename_map,
-        )
-    finally:
-        policy_cfg.device = saved_device
-    return policy
+    name = str(name).removeprefix("observation.images.")
+    aliases = {
+        "overhead": "agentview",
+        "overview": "agentview",
+        "external": "agentview",
+        "wrist": "robot0_eye_in_hand",
+        "hand": "robot0_eye_in_hand",
+    }
+    return aliases.get(name, name)
 
 
 def write_training_camera_provenance(
@@ -245,10 +549,8 @@ def write_training_camera_provenance(
     # The active memmap wrapper reads point clouds from dataset.root. Retain a
     # compatibility fallback for older launch configs that exposed a separate
     # point_cloud_memmap_dir field.
-    cache_dir = (
-        getattr(cfg, "pointseg_sample_cache_dir", None)
-        or getattr(cfg, "point_cloud_memmap_dir", None)
-        or getattr(cfg.dataset, "root", None)
+    cache_dir = getattr(cfg, "point_cloud_memmap_dir", None) or getattr(
+        cfg.dataset, "root", None
     )
     manifest_path = Path(cache_dir) / "manifest.json" if cache_dir else None
     if manifest_path is not None and manifest_path.is_file():
@@ -258,32 +560,9 @@ def write_training_camera_provenance(
             key: manifest.get(key)
             for key in (
                 "camera_views",
-                "camera_view_weights",
                 "gripper_points",
-                "camera_view_fusion",
-                "camera_view_voxel_size",
-                "camera_view_coarse_novelty_scale",
                 "current_points",
                 "future_points",
-                "trajectory_offset_filtering",
-            )
-        }
-    primary_manifest_summary: dict[str, Any] | None = None
-    primary_cache_dir = getattr(cfg, "pointseg_primary_sample_cache_dir", None)
-    primary_manifest_path = Path(primary_cache_dir) / "manifest.json" if primary_cache_dir else None
-    if primary_manifest_path is not None and primary_manifest_path.is_file():
-        with open(primary_manifest_path, encoding="utf-8") as manifest_file:
-            primary_manifest = json.load(manifest_file)
-        primary_manifest_summary = {
-            key: primary_manifest.get(key)
-            for key in (
-                "camera_views",
-                "camera_view_weights",
-                "gripper_points",
-                "camera_view_fusion",
-                "current_points",
-                "future_points",
-                "trajectory_offset_filtering",
             )
         }
 
@@ -297,50 +576,20 @@ def write_training_camera_provenance(
         "resolved_train_config": {
             "camera_views": getattr(cfg.policy, "camera_views", None),
             "rgb_camera_views": getattr(cfg.policy, "rgb_camera_views", None),
-            "camera_view_weights": getattr(cfg.policy, "camera_view_weights", None),
-            "camera_view_fusion": getattr(cfg.policy, "camera_view_fusion", None),
-            "camera_view_voxel_size": getattr(cfg.policy, "camera_view_voxel_size", None),
-            "camera_view_coarse_novelty_scale": getattr(
-                cfg.policy, "camera_view_coarse_novelty_scale", None
-            ),
-            "multiview_input_view_dropout_enable": getattr(
-                cfg.policy, "multiview_input_view_dropout_enable", False
-            ),
-            "multiview_input_view_dropout_seed": getattr(
-                cfg.policy, "multiview_input_view_dropout_seed", None
-            ),
-            "multiview_input_view_dropout_paired_coverage": getattr(
-                cfg.policy, "multiview_input_view_dropout_paired_coverage", False
-            ),
         },
         "resolved_policy_config": {
             "camera_views": getattr(policy.config, "camera_views", None),
             "rgb_camera_views": getattr(policy.config, "rgb_camera_views", None),
-            "camera_view_weights": getattr(policy.config, "camera_view_weights", None),
+            "effective_rgb_camera_views": list(
+                getattr(policy.config, "selected_rgb_camera_views", ())
+            ),
+            "vlm_backend": getattr(policy.config, "vlm_backend", None),
             "image_features": sorted(getattr(policy.config, "image_features", {})),
-            "camera_view_fusion": getattr(policy.config, "camera_view_fusion", None),
-            "camera_view_voxel_size": getattr(policy.config, "camera_view_voxel_size", None),
-            "camera_view_coarse_novelty_scale": getattr(
-                policy.config, "camera_view_coarse_novelty_scale", None
-            ),
-            "multiview_input_view_dropout_enable": getattr(
-                policy.config, "multiview_input_view_dropout_enable", False
-            ),
-            "multiview_input_view_dropout_seed": getattr(
-                policy.config, "multiview_input_view_dropout_seed", None
-            ),
-            "multiview_input_view_dropout_paired_coverage": getattr(
-                policy.config, "multiview_input_view_dropout_paired_coverage", False
-            ),
         },
         "point_cloud_cache_manifest_path": (
             None if manifest_path is None else str(manifest_path)
         ),
         "point_cloud_cache_manifest": manifest_summary,
-        "primary_point_cloud_cache_manifest_path": (
-            None if primary_manifest_path is None else str(primary_manifest_path)
-        ),
-        "primary_point_cloud_cache_manifest": primary_manifest_summary,
     }
     path = output_dir / "camera_training_provenance.json"
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -360,23 +609,12 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
-        camera_view_weights: Any = None,
-        camera_view_fusion: Any = "legacy_budget",
-        camera_view_voxel_size: float = 0.005,
-        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
     ):
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
         self.dataset_root = self.point_cloud_dir.parent
         self.camera_views = parse_camera_views(camera_views)
-        self.camera_view_weights = parse_camera_view_weights(
-            camera_view_weights,
-            num_views=len(self.camera_views),
-        )
-        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
-        self.camera_view_voxel_size = float(camera_view_voxel_size)
-        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -431,8 +669,6 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
-            view_weights=self.camera_view_weights,
-            fusion=self.camera_view_fusion,
         )
 
     def __getitem__(self, idx):
@@ -440,58 +676,20 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         point_cloud = self._point_cloud_frame(episode_index, frame_index).copy()
-        if len(self.camera_views) > 1 and self.camera_view_fusion in {
-            "fps",
-            "voxel_fps",
-            "voxel_cover_fps",
-            "novelty_union",
-            "multiscale_novelty_union",
-            "consensus_multiscale_novelty_union",
-            "transport_novelty_union",
-        }:
-            # Raw/no-cache training still obeys the same input-adapter contract:
-            # the policy model never receives the multi-view union.
-            sampler = {
-                "fps": fps_sample_fused_point_cloud,
-                "voxel_fps": voxel_fps_sample_fused_point_cloud,
-                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
-                "novelty_union": novelty_union_sample_fused_point_cloud,
-                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
-                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
-                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
-            }[self.camera_view_fusion]
-            sampler_kwargs = (
-                {"voxel_size": self.camera_view_voxel_size}
-                if self.camera_view_fusion != "fps"
-                else {}
-            )
-            if self.camera_view_fusion in {
-                "multiscale_novelty_union",
-                "consensus_multiscale_novelty_union",
-            }:
-                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
-            sampled, _point_is_pad, _indices = sampler(
-                torch.from_numpy(point_cloud).unsqueeze(0),
-                target_points=infer_single_view_point_count(
-                    point_cloud.shape[0],
-                    num_views=len(self.camera_views),
-                    gripper_points=self.gripper_points,
-                ),
-                gripper_points=self.gripper_points,
-                **sampler_kwargs,
-            )
-            point_cloud = sampled.squeeze(0).numpy().copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
 
 
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
-    """Inject strict fixed-reference supervision for the selected World target.
+    """Inject fixed-reference EEF pose chunks for WorldFlow supervision.
 
     ``worldflow.current_ee_pose`` is the achieved pose at the observation
-    frame. In ``world_eef_trajectory`` mode both it and the commanded future
-    EEF targets are expressed directly in the complete robot-base frame.
-    Legacy camera-frame datasets retain their historical behavior.
+    frame. Future targets come from ``action_target_ee_poses`` when that
+    command-target sidecar is available. This is essential because the Ego
+    action chunk is supervised with those same controller targets; using
+    achieved future poses here makes the World--Ego bridge align two different
+    labels. Legacy datasets without the command-target sidecar fall back to
+    achieved poses.
     """
 
     def __init__(
@@ -500,39 +698,21 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
-        target_type: str = "legacy_eef",
         action_start_offset: int = 0,
         require_action_target_sidecar: bool = False,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
         self.root = Path(root)
-        self.target_type = str(target_type)
-        if self.target_type not in {"legacy_eef", "world_eef_trajectory"}:
-            raise ValueError(f"Unsupported WorldFlow target_type={self.target_type!r}.")
-        self.pose_dir = self.root / (
-            "world_base_ee_poses"
-            if self.target_type == "world_eef_trajectory"
-            else "world_ee_poses"
-        )
-        command_target_dir = self.root / (
-            "world_base_action_target_ee_poses"
-            if self.target_type == "world_eef_trajectory"
-            else "action_target_ee_poses"
-        )
-        if (
-            self.target_type == "legacy_eef"
-            and require_action_target_sidecar
-            and not command_target_dir.is_dir()
-        ):
+        self.pose_dir = self.root / "world_ee_poses"
+        command_target_dir = self.root / "action_target_ee_poses"
+        if require_action_target_sidecar and not command_target_dir.is_dir():
             raise FileNotFoundError(
                 "WorldFlow requires commanded action targets but the sidecar directory is missing: "
                 f"{command_target_dir}. Regenerate the dataset with action_target_ee_poses or set "
                 "worldflow_require_action_target_sidecar=False only for an explicitly achieved-trajectory dataset."
             )
-        self.target_pose_dir = (
-            command_target_dir if command_target_dir.is_dir() else self.pose_dir
-        )
+        self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
         self.chunk_size = int(chunk_size)
         self.action_start_offset = int(action_start_offset)
         if self.action_start_offset < 0:
@@ -545,33 +725,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(
                 f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
             )
-        if self.target_type == "world_eef_trajectory" and not command_target_dir.is_dir():
-            raise FileNotFoundError(
-                "Robot-base WorldFlow requires the commanded EEF trajectory sidecar: "
-                f"{command_target_dir}. Camera-frame or achieved-pose fallbacks are forbidden."
-            )
-        if self.target_type == "world_eef_trajectory":
-            base_meta_path = self.pose_dir / "meta.json"
-            target_meta_path = command_target_dir / "meta.json"
-            if not base_meta_path.is_file() or not target_meta_path.is_file():
-                raise FileNotFoundError(
-                    "Robot-base WorldFlow requires explicit coordinate metadata at "
-                    f"{base_meta_path} and {target_meta_path}."
-                )
-            with open(base_meta_path, encoding="utf-8") as f:
-                base_meta = json.load(f)
-            with open(target_meta_path, encoding="utf-8") as f:
-                target_meta = json.load(f)
-            if (
-                base_meta.get("coordinate_frame") != "robot_base"
-                or target_meta.get("coordinate_frame") != "robot_base"
-                or target_meta.get("target_semantics") != "commanded_eef_pose"
-            ):
-                raise ValueError(
-                    "Robot-base WorldFlow metadata must declare robot_base coordinates and "
-                    "target_semantics='commanded_eef_pose'."
-                )
-        if self.target_type == "legacy_eef" and self.target_pose_dir == self.pose_dir:
+        if self.target_pose_dir == self.pose_dir:
             logging.warning(
                 "WorldFlow command-target sidecar is absent at %s; falling back to achieved future poses. "
                 "The World--Ego bridge is exactly label-consistent only when action_target_ee_poses is present.",
@@ -638,10 +792,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         poses = self._episode_poses(episode_index)
+        target_poses = self._episode_target_poses(episode_index)
         episode_len = int(len(poses))
         if episode_len <= 0:
             raise ValueError(f"Worldflow episode {episode_index} is empty.")
-        target_poses = self._episode_target_poses(episode_index)
         if len(target_poses) != episode_len:
             raise ValueError(
                 f"WorldFlow episode {episode_index} achieved/target lengths differ: "
@@ -665,88 +819,11 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             + np.arange(chunk_size, dtype=np.int64)
         )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
-        target_key = (
-            "worldflow.eef_trajectory"
-            if self.target_type == "world_eef_trajectory"
-            else "worldflow.ee_poses"
-        )
-        item[target_key] = torch.from_numpy(
+        item["worldflow.ee_poses"] = torch.from_numpy(
             np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
         )
-        target_frame_indices = frame_indices
-        item["worldflow.step_is_pad"] = torch.from_numpy(
-            target_frame_indices >= episode_len
-        )
+        item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
         return item
-
-
-def _paired_pointseg_cache_contract_mismatches(
-    all_view_manifest: dict[str, Any],
-    primary_manifest: dict[str, Any],
-    *,
-    camera_view_fusion: str,
-    num_views: int,
-    gripper_points: int,
-) -> dict[str, tuple[Any, Any]]:
-    """Compare semantic cache contracts for exact primary/all-view pairing.
-
-    ``full_union`` deliberately has a variable input length: every view keeps
-    all of its scene points while only the primary gripper tail is retained.
-    The primary replay therefore remains the checkpoint-native 10k cloud and
-    is padded by ``song_pointseg_collate`` next to the 19.5k two-view cloud.
-
-    ``nn_chunk_size`` only tiles exact nearest-neighbour computation.  It does
-    not change the pseudo-label definition and may differ between caches made
-    for different point counts.
-    """
-
-    # Cache schema versions describe the on-disk reader contract, not the
-    # pseudo-label semantics that must match between paired views.  Each
-    # SongPointSegCachedDataset has already rejected unsupported versions;
-    # allow a compatible immutable primary cache (v11) to pair with a v12
-    # multiscale cache that only adds the coarse-novelty input metadata.
-    matching_fields = (
-        "num_samples",
-        "future_offsets",
-        "temporal_offsets",
-        "trajectory_mode",
-        "trajectory_offset_filtering",
-        "gripper_points",
-        "pseudo_label_policy",
-    )
-    mismatches = {
-        key: (all_view_manifest.get(key), primary_manifest.get(key))
-        for key in matching_fields
-        if all_view_manifest.get(key) != primary_manifest.get(key)
-    }
-
-    def semantic_pseudo_config(manifest: dict[str, Any]) -> Any:
-        config = manifest.get("pseudo_label_config")
-        if not isinstance(config, dict):
-            return config
-        return {key: value for key, value in config.items() if key != "nn_chunk_size"}
-
-    all_pseudo_config = semantic_pseudo_config(all_view_manifest)
-    primary_pseudo_config = semantic_pseudo_config(primary_manifest)
-    if all_pseudo_config != primary_pseudo_config:
-        mismatches["pseudo_label_config"] = (all_pseudo_config, primary_pseudo_config)
-
-    for field in ("current_points", "future_points"):
-        all_points = all_view_manifest.get(field)
-        primary_points = primary_manifest.get(field)
-        if camera_view_fusion == "full_union":
-            try:
-                expected_all_points = (
-                    int(num_views) * (int(primary_points) - int(gripper_points))
-                    + int(gripper_points)
-                )
-            except (TypeError, ValueError):
-                expected_all_points = None
-            if int(num_views) < 1 or expected_all_points != all_points:
-                mismatches[field] = (all_points, primary_points)
-        elif all_points != primary_points:
-            mismatches[field] = (all_points, primary_points)
-    return mismatches
 
 
 class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
@@ -771,36 +848,16 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         strict: bool = True,
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
-        camera_view_weights: Any = None,
-        camera_view_fusion: Any = "legacy_budget",
-        camera_view_voxel_size: float = 0.005,
-        camera_view_coarse_novelty_scale: float = 3.0,
         gripper_points: int = 500,
-        primary_cache_dir: str | Path | None = None,
-        view_dropout_enable: bool = False,
-        view_dropout_seed: int = 20260812,
-        view_dropout_paired_coverage: bool = False,
     ):
         self.dataset = dataset
         self.cache = SongPointSegCachedDataset(cache_dir)
-        self.primary_cache = (
-            SongPointSegCachedDataset(primary_cache_dir)
-            if primary_cache_dir is not None and str(primary_cache_dir).strip()
-            else None
-        )
         root_value = getattr(dataset, "root", None)
         if root_value is None:
             root_value = dataset.meta.root
         root = Path(root_value)
         self.point_cloud_dir = Path(point_cloud_dir) if point_cloud_dir is not None else root / "point_clouds"
         self.camera_views = parse_camera_views(camera_views)
-        self.camera_view_weights = parse_camera_view_weights(
-            camera_view_weights,
-            num_views=len(self.camera_views),
-        )
-        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
-        self.camera_view_voxel_size = float(camera_view_voxel_size)
-        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -810,92 +867,10 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             for view in self.camera_views
         }
         self.gripper_points = int(gripper_points)
-        self.view_dropout_enable = bool(view_dropout_enable)
-        self.view_dropout_seed = int(view_dropout_seed)
-        self.view_dropout_paired_coverage = bool(view_dropout_paired_coverage)
-        if self.view_dropout_paired_coverage and not self.view_dropout_enable:
-            raise ValueError("Paired view coverage requires input-level view dropout.")
         cached_views = self.cache.manifest.get("camera_views")
         if cached_views is not None and tuple(cached_views) != self.camera_views:
             raise ValueError(
                 f"PointSeg cache views {tuple(cached_views)} do not match training views {self.camera_views}."
-            )
-        cached_fusion = parse_camera_view_fusion(self.cache.manifest.get("camera_view_fusion"))
-        if cached_fusion != self.camera_view_fusion:
-            raise ValueError(
-                f"PointSeg cache fusion {cached_fusion!r} does not match training fusion {self.camera_view_fusion!r}."
-            )
-        if self.camera_view_fusion in {
-            "voxel_fps",
-            "voxel_cover_fps",
-            "novelty_union",
-            "multiscale_novelty_union",
-            "consensus_multiscale_novelty_union",
-            "transport_novelty_union",
-        }:
-            cached_voxel_size = float(self.cache.manifest.get("camera_view_voxel_size", -1.0))
-            if cached_voxel_size != self.camera_view_voxel_size:
-                raise ValueError(
-                    f"PointSeg cache voxel size {cached_voxel_size} does not match training "
-                    f"voxel size {self.camera_view_voxel_size}."
-                )
-        if self.camera_view_fusion in {
-            "multiscale_novelty_union",
-            "consensus_multiscale_novelty_union",
-        }:
-            cached_coarse_scale = float(
-                self.cache.manifest.get("camera_view_coarse_novelty_scale", 3.0)
-            )
-            if cached_coarse_scale != self.camera_view_coarse_novelty_scale:
-                raise ValueError(
-                    f"PointSeg cache coarse novelty scale {cached_coarse_scale} does not match "
-                    f"training scale {self.camera_view_coarse_novelty_scale}. Rebuild the cache "
-                    "with the same multiscale input contract."
-                )
-        cached_weights = parse_camera_view_weights(
-            self.cache.manifest.get("camera_view_weights"),
-            num_views=len(self.camera_views),
-        )
-        if cached_weights != self.camera_view_weights:
-            raise ValueError(
-                "PointSeg cache camera_view_weights "
-                f"{cached_weights} do not match training weights {self.camera_view_weights}. "
-                "Rebuild the cache with the same per-view point budget."
-            )
-        if self.view_dropout_enable:
-            if self.primary_cache is None:
-                raise ValueError(
-                    "Input-level view dropout requires pointseg_primary_sample_cache_dir so "
-                    "primary-only inputs always use matching PointSeg labels."
-                )
-            primary_manifest = self.primary_cache.manifest
-            primary_views = tuple(primary_manifest.get("camera_views") or ("agentview",))
-            if primary_views != (self.camera_views[0],):
-                raise ValueError(
-                    f"Primary replay cache views {primary_views} must contain only "
-                    f"the first configured view {(self.camera_views[0],)}."
-                )
-            primary_fusion = parse_camera_view_fusion(primary_manifest.get("camera_view_fusion"))
-            if primary_fusion != "legacy_budget":
-                raise ValueError(
-                    f"Primary replay cache must use legacy_budget single-view identity, got {primary_fusion!r}."
-                )
-            mismatches = _paired_pointseg_cache_contract_mismatches(
-                self.cache.manifest,
-                primary_manifest,
-                camera_view_fusion=self.camera_view_fusion,
-                num_views=len(self.camera_views),
-                gripper_points=self.gripper_points,
-            )
-            if mismatches:
-                raise ValueError(
-                    "Primary and all-view PointSeg cache contracts differ: "
-                    f"{mismatches}. Rebuild them with identical temporal and pseudo-label settings."
-                )
-        elif self.primary_cache is not None:
-            raise ValueError(
-                "pointseg_primary_sample_cache_dir was provided but "
-                "multiview_input_view_dropout_enable is false."
             )
         self.strict = strict
         self.mmap_mode = mmap_mode
@@ -904,11 +879,6 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Song pointseg cache has {len(self.cache)} samples but action dataset has {len(self.dataset)}. "
                 "Rebuild the cache without --max-samples, or set SONG_POINTSEG_CACHE_STRICT=0 for debugging."
-            )
-        if self.strict and self.primary_cache is not None and len(self.primary_cache) < len(self.dataset):
-            raise ValueError(
-                f"Primary PointSeg cache has {len(self.primary_cache)} samples but action dataset has "
-                f"{len(self.dataset)}. Rebuild the paired primary cache for the same episodes."
             )
 
     def __getattr__(self, name):
@@ -920,14 +890,7 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
         return state
 
     def __len__(self):
-        multiplier = 2 if self.view_dropout_paired_coverage else 1
-        return multiplier * len(self.dataset)
-
-    @property
-    def num_frames(self) -> int:
-        """Report augmented frame count so epoch metrics match paired coverage."""
-
-        return len(self)
+        return len(self.dataset)
 
     @staticmethod
     def _to_int(value) -> int:
@@ -959,8 +922,6 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
-            view_weights=self.camera_view_weights,
-            fusion=self.camera_view_fusion,
         )
 
     def _check_alignment(self, item: dict[str, Any], cache_item: dict[str, torch.Tensor], idx: int) -> None:
@@ -982,43 +943,20 @@ class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
                 )
 
     def __getitem__(self, idx):
-        if self.view_dropout_paired_coverage:
-            base_idx, use_primary = paired_view_augmentation_index(
-                idx,
-                len(self.dataset),
-                self.view_dropout_seed,
-            )
-        else:
-            base_idx = int(idx)
-            use_primary = bool(
-                self.view_dropout_enable
-                and self.primary_cache is not None
-                and use_primary_view_for_training_index(base_idx, self.view_dropout_seed)
-            )
-        item = self.dataset[base_idx]
-        if base_idx >= len(self.cache):
+        item = self.dataset[idx]
+        if idx >= len(self.cache):
             if self.strict:
-                raise IndexError(f"Song pointseg cache is missing dataset index {base_idx}.")
+                raise IndexError(f"Song pointseg cache is missing dataset index {idx}.")
             return item
 
-        active_cache = self.primary_cache if use_primary else self.cache
-        assert active_cache is not None
-        cache_item = active_cache[base_idx]
-        self._check_alignment(item, cache_item, base_idx)
+        cache_item = self.cache[idx]
+        self._check_alignment(item, cache_item, idx)
         if "observation.point_cloud" not in cache_item and "observation.point_cloud_indices" in cache_item:
             episode_index = self._to_int(cache_item["episode_index"])
             frame_index = self._to_int(cache_item["frame_index"])
             indices = cache_item["observation.point_cloud_indices"].detach().cpu().numpy().astype(np.int64)
-            full_point_cloud = (
-                np.asarray(
-                    self._episode_point_clouds(self.camera_views[0], episode_index)[frame_index],
-                    dtype=np.float32,
-                )
-                if use_primary
-                else self._point_cloud_frame(episode_index, frame_index)
-            )
             point_cloud = np.asarray(
-                full_point_cloud if self.camera_view_fusion == "primary_residual" and not use_primary else full_point_cloud[indices],
+                self._point_cloud_frame(episode_index, frame_index)[indices],
                 dtype=np.float32,
             ).copy()
             cache_item["observation.point_cloud"] = torch.from_numpy(point_cloud)
@@ -1057,28 +995,18 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         policy_cfg: Any,
         mmap_mode: str = "r",
     ):
-        current_points_override = self._env_optional_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS")
-        future_points_override = self._env_optional_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS")
         self.dataset = SongTemporalPointCloudDataset(
             dataset,
             point_cloud_dir=point_cloud_dir,
             future_offsets=self._future_offsets(policy_cfg),
-            current_points=current_points_override,
-            future_points=future_points_override,
+            current_points=self._env_int("SONG_POINTSEG_ONLINE_CURRENT_POINTS", 10_000),
+            future_points=self._env_int("SONG_POINTSEG_ONLINE_FUTURE_POINTS", 10_000),
             seed=self._env_int("SONG_POINTSEG_ONLINE_SEED", 1000),
             camera_views=getattr(policy_cfg, "camera_views", "agentview"),
-            camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
-            camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
             gripper_points=self._env_int("SONG_POINTCLOUD_GRIPPER_POINTS", 500),
             mmap_mode=mmap_mode,
         )
-        self.dataset.camera_view_voxel_size = float(
-            getattr(policy_cfg, "camera_view_voxel_size", 0.005)
-        )
-        self.dataset.camera_view_coarse_novelty_scale = float(
-            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
-        )
-        self.current_points = self.dataset.current_points
+        self.current_points = int(self.dataset.current_points)
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(os.environ.get("SONG_POINTSEG_ONLINE_DEVICE", default_device))
         self.pseudo_config = PseudoLabelConfig(
@@ -1104,16 +1032,6 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
         return int(value)
 
     @staticmethod
-    def _env_optional_int(name: str) -> int | None:
-        value = os.environ.get(name)
-        if value is None or str(value).strip() == "":
-            return None
-        parsed = int(value)
-        if parsed <= 0:
-            raise ValueError(f"{name} must be positive when set, got {parsed}.")
-        return parsed
-
-    @staticmethod
     def _future_offsets(policy_cfg: Any) -> tuple[int, ...]:
         env_value = os.environ.get("SONG_POINTSEG_ONLINE_FUTURE_OFFSETS")
         if env_value:
@@ -1132,16 +1050,6 @@ class OnlinePointSegPseudoDataset(torch.utils.data.Dataset):
     def make_collate_fn(self):
         return OnlinePointSegBatchCollator(
             current_points=self.current_points,
-            future_points=self.dataset.future_points,
-            num_views=len(self.dataset.camera_views),
-            camera_view_fusion=self.dataset.camera_view_fusion,
-            camera_view_voxel_size=float(
-                getattr(self.dataset, "camera_view_voxel_size", 0.005)
-            ),
-            camera_view_coarse_novelty_scale=float(
-                getattr(self.dataset, "camera_view_coarse_novelty_scale", 3.0)
-            ),
-            gripper_points=int(self.dataset.gripper_points),
             device=self.device,
             pseudo_config=self.pseudo_config,
         )
@@ -1152,26 +1060,8 @@ class OnlinePointSegBatchCollator:
 
     transient_keys = OnlinePointSegPseudoDataset.transient_keys
 
-    def __init__(
-        self,
-        *,
-        current_points: int | None,
-        future_points: int | None,
-        num_views: int,
-        camera_view_fusion: str,
-        camera_view_voxel_size: float,
-        camera_view_coarse_novelty_scale: float,
-        gripper_points: int,
-        device: torch.device,
-        pseudo_config: PseudoLabelConfig,
-    ):
-        self.current_points = None if current_points is None else int(current_points)
-        self.future_points = None if future_points is None else int(future_points)
-        self.num_views = int(num_views)
-        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
-        self.camera_view_voxel_size = float(camera_view_voxel_size)
-        self.camera_view_coarse_novelty_scale = float(camera_view_coarse_novelty_scale)
-        self.gripper_points = int(gripper_points)
+    def __init__(self, *, current_points: int, device: torch.device, pseudo_config: PseudoLabelConfig):
+        self.current_points = int(current_points)
         self.device = torch.device(device)
         self.pseudo_config = pseudo_config
         self.profile_freq = int(os.environ.get("SONG_POINTSEG_PROFILE_FREQ", "0") or 0)
@@ -1198,96 +1088,6 @@ class OnlinePointSegBatchCollator:
                 if bool(future_point_is_pad.any().item())
                 else None
             )
-        if self.num_views > 1 and self.camera_view_fusion in {
-            "fps",
-            "voxel_fps",
-            "voxel_cover_fps",
-            "novelty_union",
-            "multiscale_novelty_union",
-            "consensus_multiscale_novelty_union",
-            "transport_novelty_union",
-        }:
-            sampler = {
-                "fps": fps_sample_fused_point_cloud,
-                "voxel_fps": voxel_fps_sample_fused_point_cloud,
-                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
-                "novelty_union": novelty_union_sample_fused_point_cloud,
-                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
-                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
-                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
-            }[self.camera_view_fusion]
-            sampler_kwargs = (
-                {"voxel_size": self.camera_view_voxel_size}
-                if self.camera_view_fusion
-                in {
-                    "voxel_fps",
-                    "voxel_cover_fps",
-                    "novelty_union",
-                    "multiscale_novelty_union",
-                    "consensus_multiscale_novelty_union",
-                    "transport_novelty_union",
-                }
-                else {}
-            )
-            if self.camera_view_fusion in {
-                "multiscale_novelty_union",
-                "consensus_multiscale_novelty_union",
-            }:
-                sampler_kwargs["coarse_novelty_scale"] = self.camera_view_coarse_novelty_scale
-            current_target_points = (
-                self.current_points
-                if self.current_points is not None
-                else infer_single_view_point_count(
-                    current_pc.shape[1],
-                    num_views=self.num_views,
-                    gripper_points=self.gripper_points,
-                )
-            )
-            current_pc, current_is_pad, _ = sampler(
-                current_pc,
-                target_points=current_target_points,
-                gripper_points=self.gripper_points,
-                point_is_pad=current_is_pad,
-                **sampler_kwargs,
-            )
-            batch_size, time_steps, source_points, channels = future_pc.shape
-            future_target_points = (
-                self.future_points
-                if self.future_points is not None
-                else infer_single_view_point_count(
-                    source_points,
-                    num_views=self.num_views,
-                    gripper_points=self.gripper_points,
-                )
-            )
-            future_pc, future_point_is_pad, _ = sampler(
-                future_pc.reshape(batch_size * time_steps, source_points, channels),
-                target_points=future_target_points,
-                gripper_points=self.gripper_points,
-                point_is_pad=(
-                    future_point_is_pad.reshape(batch_size * time_steps, source_points)
-                    if torch.is_tensor(future_point_is_pad)
-                    else None
-                ),
-                **sampler_kwargs,
-            )
-            future_pc = future_pc.reshape(
-                batch_size,
-                time_steps,
-                future_target_points,
-                channels,
-            )
-            if torch.is_tensor(future_point_is_pad):
-                future_point_is_pad = future_point_is_pad.reshape(
-                    batch_size,
-                    time_steps,
-                    future_target_points,
-                )
-            # Avoid running FPS a second time in SmolVLAPolicy and keep online
-            # pseudo-label tensors exactly aligned with the model input.
-            batch["observation.point_cloud"] = current_pc.detach().cpu()
-            if torch.is_tensor(current_is_pad):
-                batch["observation.point_cloud_is_pad"] = current_is_pad.detach().cpu()
         t2 = time.perf_counter()
         with torch.inference_mode():
             pseudo = generate_pseudo_labels(
@@ -1299,9 +1099,6 @@ class OnlinePointSegBatchCollator:
                 future_point_is_pad=future_point_is_pad,
                 trajectory_poses=batch["pointseg_trajectory_ee_poses"].to(
                     device=self.device, dtype=torch.float32
-                ),
-                trajectory_offsets=batch["pointseg_trajectory_offsets"].to(
-                    device=self.device, dtype=torch.long
                 ),
                 config=self.pseudo_config,
             )
@@ -1333,17 +1130,8 @@ class OnlinePointSegBatchCollator:
         return batch
 
 
-def maybe_wrap_pointseg_cache_dataset(
-    dataset,
-    cache_dir_value: str | Path | None = None,
-    policy_cfg=None,
-    primary_cache_dir_value: str | Path | None = None,
-):
+def maybe_wrap_pointseg_cache_dataset(dataset, cache_dir_value: str | Path | None = None, policy_cfg=None):
     def maybe_online_fallback(reason: str):
-        if bool(getattr(policy_cfg, "multiview_input_view_dropout_enable", False)):
-            raise ValueError(
-                f"{reason}; input-level view dropout requires paired offline single/all-view caches."
-            )
         if not bool(getattr(policy_cfg, "pointseg_enable", False)):
             logging.info(f"{reason}; pointseg is disabled, so no online pseudo labels are needed.")
             return dataset
@@ -1383,29 +1171,6 @@ def maybe_wrap_pointseg_cache_dataset(
     point_cloud_dir = root / "point_clouds"
     mmap_mode = os.environ.get("SONG_POINTCLOUD_MMAP_MODE", "r")
     logging.info(f"Injecting Song pointseg temporal cache from {cache_dir}")
-    view_dropout_enable = bool(
-        getattr(policy_cfg, "multiview_input_view_dropout_enable", False)
-    )
-    primary_cache_dir = (
-        Path(str(primary_cache_dir_value).strip())
-        if primary_cache_dir_value is not None and str(primary_cache_dir_value).strip()
-        else None
-    )
-    if view_dropout_enable:
-        if primary_cache_dir is None or not (primary_cache_dir / "manifest.json").is_file():
-            raise FileNotFoundError(
-                "multiview_input_view_dropout_enable requires a valid "
-                f"pointseg_primary_sample_cache_dir, got {primary_cache_dir_value!r}."
-            )
-        logging.info(
-            "Input-level auxiliary-view dropout is enabled with matching primary cache %s",
-            primary_cache_dir,
-        )
-    elif primary_cache_dir is not None:
-        raise ValueError(
-            "pointseg_primary_sample_cache_dir requires "
-            "policy.multiview_input_view_dropout_enable=true."
-        )
     return PointSegCacheInjectedDataset(
         dataset,
         cache_dir=cache_dir,
@@ -1413,21 +1178,7 @@ def maybe_wrap_pointseg_cache_dataset(
         strict=strict,
         mmap_mode=mmap_mode,
         camera_views=getattr(policy_cfg, "camera_views", "agentview"),
-        camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
-        camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
-        camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
-        camera_view_coarse_novelty_scale=float(
-            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
-        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
-        primary_cache_dir=primary_cache_dir,
-        view_dropout_enable=view_dropout_enable,
-        view_dropout_seed=int(
-            getattr(policy_cfg, "multiview_input_view_dropout_seed", 20260812)
-        ),
-        view_dropout_paired_coverage=bool(
-            getattr(policy_cfg, "multiview_input_view_dropout_paired_coverage", False)
-        ),
     )
 
 
@@ -1444,7 +1195,7 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         if not view_dir.is_dir():
             raise FileNotFoundError(f"Selected point-cloud view {view!r} is missing: {view_dir}")
     logging.info(
-        "Loading point clouds with camera_views=%s and native per-view model point count from %s",
+        "Loading point clouds with camera_views=%s and fixed model point count from %s",
         camera_views,
         root,
     )
@@ -1454,12 +1205,6 @@ def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
         point_cloud_dir=point_cloud_dir,
         mmap_mode=mmap_mode,
         camera_views=camera_views,
-        camera_view_weights=getattr(policy_cfg, "camera_view_weights", None),
-        camera_view_fusion=getattr(policy_cfg, "camera_view_fusion", "legacy_budget"),
-        camera_view_voxel_size=float(getattr(policy_cfg, "camera_view_voxel_size", 0.005)),
-        camera_view_coarse_novelty_scale=float(
-            getattr(policy_cfg, "camera_view_coarse_novelty_scale", 3.0)
-        ),
         gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
     )
 
@@ -1493,7 +1238,6 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
-        target_type=str(getattr(policy_cfg, "worldflow_target_type", "legacy_eef")),
         action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         require_action_target_sidecar=bool(
             getattr(policy_cfg, "worldflow_require_action_target_sidecar", False)
@@ -1927,6 +1671,121 @@ def count_parameters(module: torch.nn.Module, only_trainable: bool = False) -> i
     return total
 
 
+def audit_molmo2er_pointonly_policy(policy: torch.nn.Module) -> dict[str, int]:
+    """Fail before optimizer/DDP if the registered 3B control has drifted."""
+
+    config = getattr(policy, "config", None)
+    if getattr(config, "vlm_backend", None) != "molmo2_text":
+        return {}
+
+    expected_total = 3_137_049_278
+    expected_trainable = 930_980_030
+    total = count_parameters(policy)
+    trainable = count_parameters(policy, only_trainable=True)
+    if (total, trainable) != (expected_total, expected_trainable):
+        raise RuntimeError(
+            "Molmo2-ER point-only parameter contract drifted before training: "
+            f"expected total/trainable={expected_total}/{expected_trainable}, "
+            f"actual={total}/{trainable}."
+        )
+
+    trainable_prefixes = (
+        "model.vlm_with_expert.lm_expert.",
+        "model.pointseg_conditioner.",
+        "model.pointseg_object_proj.",
+        "model.pointseg_background_proj.",
+        "model.point_action_fusion.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+        "model.action_time_mlp_in.",
+        "model.action_time_mlp_out.",
+    )
+    unexpected_trainable = [
+        name
+        for name, parameter in policy.named_parameters()
+        if parameter.requires_grad and not name.startswith(trainable_prefixes)
+    ]
+    if unexpected_trainable:
+        raise RuntimeError(
+            "Molmo2-ER point-only found trainable parameters outside the v0.4.3 allowlist: "
+            f"{unexpected_trainable[:12]}"
+        )
+
+    backend = policy.model.vlm_with_expert
+    if any(parameter.requires_grad for parameter in backend.vlm.parameters()):
+        raise RuntimeError("The retained Molmo text backbone is not completely frozen.")
+    if any(not parameter.requires_grad for parameter in backend.lm_expert.parameters()):
+        raise RuntimeError("The Molmo Action Expert contains unexpectedly frozen parameters.")
+    if getattr(backend, "scale_input_embeddings", None) is not False:
+        raise RuntimeError("Native Molmo embeddings must not be multiplied by sqrt(hidden_size).")
+    if any(
+        marker in name
+        for name, _ in backend.named_parameters()
+        for marker in ("vision_backbone", "vision_model", "lm_head")
+    ):
+        raise RuntimeError("The point-only Molmo backend instantiated a forbidden vision/LM-head parameter.")
+
+    return {"total_parameters": total, "trainable_parameters": trainable}
+
+
+def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
+    """Fail before optimizer/DDP if the frozen Full-Molmo2-ER contract drifts."""
+
+    config = getattr(policy, "config", None)
+    if getattr(config, "vlm_backend", None) != "molmo2_full":
+        return {}
+
+    expected_total = 6_261_215_886
+    expected_trainable = 1_799_274_686
+    total = count_parameters(policy)
+    trainable = count_parameters(policy, only_trainable=True)
+    if (total, trainable) != (expected_total, expected_trainable):
+        raise RuntimeError(
+            "Full-Molmo2-ER parameter contract drifted before training: "
+            f"expected total/trainable={expected_total}/{expected_trainable}, "
+            f"actual={total}/{trainable}."
+        )
+
+    trainable_prefixes = (
+        "model.vlm_with_expert.lm_expert.",
+        "model.pointseg_conditioner.",
+        "model.pointseg_object_proj.",
+        "model.pointseg_background_proj.",
+        "model.point_action_fusion.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+        "model.action_time_mlp_in.",
+        "model.action_time_mlp_out.",
+    )
+    unexpected_trainable = [
+        name
+        for name, parameter in policy.named_parameters()
+        if parameter.requires_grad and not name.startswith(trainable_prefixes)
+    ]
+    if unexpected_trainable:
+        raise RuntimeError(
+            "Full-Molmo2-ER found trainable parameters outside the WEP-VLA allowlist: "
+            f"{unexpected_trainable[:12]}"
+        )
+
+    backend = policy.model.vlm_with_expert
+    if len(backend.vlm.blocks) != 36 or len(backend.lm_expert.layers) != 36:
+        raise RuntimeError("Full-Molmo2-ER requires exactly 36 VLM and 36 Expert layers.")
+    if not hasattr(backend, "vision_backbone"):
+        raise RuntimeError("Full-Molmo2-ER did not instantiate its native vision backbone.")
+    frozen_modules = (backend.vlm, backend.vision_backbone)
+    if any(parameter.requires_grad for module in frozen_modules for parameter in module.parameters()):
+        raise RuntimeError("Molmo ViT/connector/text parameters must all be frozen.")
+    if any(not parameter.requires_grad for parameter in backend.lm_expert.parameters()):
+        raise RuntimeError("The Full-Molmo2-ER Action Expert contains unexpectedly frozen parameters.")
+    if hasattr(backend, "lm_head") or any("lm_head" in name for name, _ in backend.named_parameters()):
+        raise RuntimeError("The unused Molmo lm_head must be physically absent.")
+    if getattr(backend, "scale_input_embeddings", None) is not False:
+        raise RuntimeError("Native Molmo embeddings must not be multiplied by sqrt(hidden_size).")
+
+    return {"total_parameters": total, "trainable_parameters": trainable}
+
+
 def ensure_ddp_parameters_initialized(module: torch.nn.Module, accelerator: Accelerator) -> None:
     """Fail before Accelerator/DDP wrapping and report the exact lazy parameters."""
 
@@ -1950,66 +1809,19 @@ def ensure_ddp_parameters_initialized(module: torch.nn.Module, accelerator: Acce
     logging.warning(message)
 
 
-def worldflow_ego_priority_projection_statistics(
-    ego_gradients: list[torch.Tensor | None],
-    world_gradients: list[torch.Tensor | None],
-) -> dict[str, torch.Tensor | int]:
-    """Measure the asymmetric PCGrad correction for two action-loss paths.
+def make_song_training_ddp_kwargs(vlm_backend: str | None) -> DistributedDataParallelKwargs:
+    """Build DDP kwargs while keeping legacy-policy behavior unchanged.
 
-    ``ego_gradients`` comes from stochastic-depth samples that execute the
-    ordinary Ego policy. ``world_gradients`` comes from samples that retain the
-    physical World-to-Ego correction.  A negative global dot product means the
-    World update would locally increase the protected Ego objective.  In that
-    case the returned coefficient defines
-
-    ``g_world_projected = g_world - coefficient * g_ego``.
-
-    The function does not mutate gradients and intentionally has no model- or
-    task-specific parameter list: every parameter reached by both paths enters
-    the same global inner product, while disjoint World-only gradients are
-    untouched by the caller.
+    Full-Molmo2-ER has about 3.47 GiB of trainable gradients per rank.  Making
+    those gradients views into the existing all-reduce buckets avoids a second
+    allocation of the same size after DDP's first iteration.  Other backends
+    retain Accelerate's previous/default ``gradient_as_bucket_view=False``.
     """
 
-    if len(ego_gradients) != len(world_gradients):
-        raise ValueError(
-            "Ego and World gradient lists must have equal length, got "
-            f"{len(ego_gradients)} and {len(world_gradients)}."
-        )
-    overlap = [
-        (ego, world)
-        for ego, world in zip(ego_gradients, world_gradients, strict=True)
-        if ego is not None and world is not None
-    ]
-    if not overlap:
-        raise RuntimeError("WorldFlow gradient projection found no shared trainable parameters.")
-
-    device = overlap[0][0].device
-    dot = torch.zeros((), device=device, dtype=torch.float32)
-    ego_norm_sq = torch.zeros_like(dot)
-    world_norm_sq = torch.zeros_like(dot)
-    for ego, world in overlap:
-        ego_float = ego.detach().to(dtype=torch.float32)
-        world_float = world.detach().to(dtype=torch.float32)
-        dot = dot + torch.sum(ego_float * world_float)
-        ego_norm_sq = ego_norm_sq + torch.sum(ego_float.square())
-        world_norm_sq = world_norm_sq + torch.sum(world_float.square())
-
-    epsilon = torch.finfo(torch.float32).tiny
-    cosine = dot / torch.sqrt((ego_norm_sq * world_norm_sq).clamp_min(epsilon))
-    coefficient = torch.where(
-        (dot < 0) & (ego_norm_sq > epsilon),
-        dot / ego_norm_sq.clamp_min(epsilon),
-        torch.zeros_like(dot),
+    return DistributedDataParallelKwargs(
+        find_unused_parameters=True,
+        gradient_as_bucket_view=vlm_backend == "molmo2_full",
     )
-    return {
-        "dot": dot,
-        "ego_norm": torch.sqrt(ego_norm_sq),
-        "world_norm": torch.sqrt(world_norm_sq),
-        "cosine": cosine,
-        "coefficient": coefficient,
-        "conflict": (dot < 0).to(dtype=torch.float32),
-        "overlap_parameter_count": len(overlap),
-    }
 
 
 def update_policy(
@@ -2049,23 +1861,6 @@ def update_policy(
     """
     start_time = time.perf_counter()
     policy.train()
-    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    ego_priority_projection = bool(
-        getattr(
-            getattr(unwrapped_policy, "config", None),
-            "worldflow_training_ego_priority_gradient_projection",
-            False,
-        )
-    )
-    ego_tangent_projection = bool(
-        getattr(
-            getattr(unwrapped_policy, "config", None),
-            "worldflow_training_shared_gradient_ego_tangent_projection",
-            False,
-        )
-    )
-    gradient_projection_enabled = ego_priority_projection or ego_tangent_projection
-    per_sample_loss = None
 
     # Get RA-BC weights if enabled
     rabc_batch_weights = None
@@ -2077,11 +1872,6 @@ def update_policy(
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
         if rabc_batch_weights is not None:
-            if gradient_projection_enabled:
-                raise ValueError(
-                    "WorldFlow Ego-priority gradient projection is not combined with RA-BC "
-                    "sample weighting; both alter per-sample gradient geometry."
-                )
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
@@ -2093,186 +1883,25 @@ def update_policy(
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-        elif gradient_projection_enabled:
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
-            loss = per_sample_loss.mean()
         else:
             loss, output_dict = policy.forward(batch)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    if not torch.isfinite(loss):
+    finite_loss = torch.isfinite(loss.detach()).to(device=loss.device, dtype=torch.int32)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        # Every rank must make the same backward/no-backward decision.  A
+        # rank-local early return would leave its peers blocked forever in a
+        # DDP gradient collective.
+        torch.distributed.all_reduce(finite_loss, op=torch.distributed.ReduceOp.MIN)
+    if not bool(finite_loss.item()):
         optimizer.zero_grad(set_to_none=True)
-        output_dict["skipped_nonfinite_loss"] = 1
-        train_metrics.loss = loss.item()
-        train_metrics.grad_norm = float("nan")
-        train_metrics.lr = optimizer.param_groups[0]["lr"]
-        train_metrics.update_s = time.perf_counter() - start_time
-        return train_metrics, output_dict
+        raise FloatingPointError("Non-finite loss detected on at least one distributed rank.")
 
-    if gradient_projection_enabled:
-        if not perform_optimizer_step or float(loss_scale) != 1.0:
-            raise ValueError(
-                "WorldFlow Ego-priority gradient projection currently requires one physical "
-                "batch per optimizer step (gradient_accumulation_steps=1)."
-            )
-        if per_sample_loss is None or per_sample_loss.ndim != 1:
-            raise RuntimeError("Expected one per-sample loss vector for WorldFlow gradient projection.")
-        keep_mask = getattr(
-            getattr(unwrapped_policy, "model", None),
-            "last_worldflow_world_to_ego_keep_mask",
-            None,
-        )
-        if not torch.is_tensor(keep_mask) or keep_mask.shape != per_sample_loss.shape:
-            raise RuntimeError(
-                "WorldFlow gradient projection requires the forward pass's per-sample "
-                f"World-to-Ego keep mask, got {None if keep_mask is None else tuple(keep_mask.shape)} "
-                f"for losses {tuple(per_sample_loss.shape)}."
-            )
-        keep_mask = keep_mask.to(device=per_sample_loss.device, dtype=torch.bool)
-        local_batch_size = per_sample_loss.numel()
-        # Dividing each partition by the complete local batch means their sum
-        # is exactly the original mean action objective. DDP's averaged
-        # gradients therefore reconstruct the global-batch mean even when the
-        # stochastic keep counts differ across ranks.
-        ego_component = per_sample_loss[~keep_mask].sum() / local_batch_size
-        world_component = per_sample_loss[keep_mask].sum() / local_batch_size
-        trainable_parameters = [parameter for parameter in policy.parameters() if parameter.requires_grad]
-
-        accelerator.backward(ego_component, retain_graph=True)
-        ego_gradients = [
-            parameter.grad.detach().clone() if parameter.grad is not None else None
-            for parameter in trainable_parameters
-        ]
-        optimizer.zero_grad(set_to_none=True)
-        accelerator.backward(world_component)
-        world_gradients = [parameter.grad for parameter in trainable_parameters]
-        if ego_priority_projection:
-            projection = worldflow_ego_priority_projection_statistics(
-                ego_gradients,
-                world_gradients,
-            )
-            coefficient = projection["coefficient"]
-            assert torch.is_tensor(coefficient)
-            ego_scale = 1.0 - coefficient
-            for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
-                if ego_gradient is None:
-                    continue
-                if parameter.grad is None:
-                    parameter.grad = ego_gradient
-                else:
-                    parameter.grad.add_(ego_gradient * ego_scale.to(dtype=ego_gradient.dtype))
-
-            output_dict["worldflow_ego_priority_gradient_ego_loss"] = ego_component.detach().item()
-            output_dict["worldflow_ego_priority_gradient_world_loss"] = world_component.detach().item()
-            for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "coefficient", "conflict"):
-                metric = projection[metric_name]
-                assert torch.is_tensor(metric)
-                output_dict[f"worldflow_ego_priority_gradient_{metric_name}"] = metric.detach().item()
-            output_dict["worldflow_ego_priority_gradient_overlap_parameter_count"] = int(
-                projection["overlap_parameter_count"]
-            )
-        else:
-            world_group_names = {"new_world_bidirectional", "world_physical_residual_head"}
-            protected_parameter_ids = {
-                id(parameter)
-                for group in optimizer.param_groups
-                if group.get("group_name") not in world_group_names
-                for parameter in group["params"]
-            }
-            world_only_role_resolver = getattr(
-                unwrapped_policy,
-                "get_worldflow_ego_tangent_world_only_parameter_ids",
-                None,
-            )
-            world_only_point_parameter_ids = (
-                set(world_only_role_resolver())
-                if callable(world_only_role_resolver)
-                else set()
-            )
-            optimizer_parameter_ids = {
-                id(parameter)
-                for group in optimizer.param_groups
-                for parameter in group["params"]
-            }
-            if not world_only_point_parameter_ids <= optimizer_parameter_ids:
-                raise RuntimeError(
-                    "World-only point-path role resolution returned parameters outside the optimizer."
-                )
-            # Physical roles and learning-rate groups are intentionally
-            # independent.  V49 places World point consumers in the high-LR
-            # point-input group, but they must still retain the gradients from
-            # samples where World-to-Ego is active.
-            protected_parameter_ids.difference_update(world_only_point_parameter_ids)
-            if not protected_parameter_ids:
-                raise RuntimeError(
-                    "Ego-tangent projection requires a non-empty pretrained/common optimizer group."
-                )
-            protected_ego_gradients = []
-            protected_world_gradients = []
-            for parameter, ego_gradient, world_gradient in zip(
-                trainable_parameters,
-                ego_gradients,
-                world_gradients,
-                strict=True,
-            ):
-                if id(parameter) in protected_parameter_ids:
-                    protected_ego_gradients.append(ego_gradient)
-                    protected_world_gradients.append(world_gradient)
-            projection = worldflow_ego_priority_projection_statistics(
-                protected_ego_gradients,
-                protected_world_gradients,
-            )
-            dot = projection["dot"]
-            ego_norm = projection["ego_norm"]
-            world_norm = projection["world_norm"]
-            assert torch.is_tensor(dot) and torch.is_tensor(ego_norm) and torch.is_tensor(world_norm)
-            epsilon = torch.finfo(torch.float32).tiny
-            aligned_coefficient = torch.clamp_min(
-                dot / ego_norm.square().clamp_min(epsilon),
-                0.0,
-            )
-            retained_world_norm = aligned_coefficient * ego_norm
-            for parameter, ego_gradient in zip(trainable_parameters, ego_gradients, strict=True):
-                if id(parameter) in protected_parameter_ids:
-                    if ego_gradient is None:
-                        parameter.grad = None
-                    else:
-                        parameter.grad = ego_gradient * (
-                            1.0 + aligned_coefficient.to(dtype=ego_gradient.dtype)
-                        )
-                elif ego_gradient is not None:
-                    if parameter.grad is None:
-                        parameter.grad = ego_gradient
-                    else:
-                        parameter.grad.add_(ego_gradient)
-
-            output_dict["worldflow_ego_tangent_gradient_ego_loss"] = ego_component.detach().item()
-            output_dict["worldflow_ego_tangent_gradient_world_loss"] = world_component.detach().item()
-            for metric_name in ("dot", "ego_norm", "world_norm", "cosine", "conflict"):
-                metric = projection[metric_name]
-                assert torch.is_tensor(metric)
-                output_dict[f"worldflow_ego_tangent_gradient_{metric_name}"] = metric.detach().item()
-            output_dict["worldflow_ego_tangent_gradient_aligned_coefficient"] = (
-                aligned_coefficient.detach().item()
-            )
-            output_dict["worldflow_ego_tangent_gradient_retained_world_norm"] = (
-                retained_world_norm.detach().item()
-            )
-            output_dict["worldflow_ego_tangent_gradient_retained_world_fraction"] = (
-                retained_world_norm / world_norm.clamp_min(epsilon)
-            ).detach().item()
-            output_dict["worldflow_ego_tangent_gradient_protected_parameter_count"] = len(
-                protected_ego_gradients
-            )
-            output_dict["worldflow_ego_tangent_gradient_world_only_point_parameter_count"] = len(
-                world_only_point_parameter_ids
-            )
-    else:
-        # Use accelerator's backward method. Scale each micro-batch
-        # contribution so accumulated gradients equal the mean over the
-        # effective batch. The unscaled loss is retained for logs.
-        accelerator.backward(loss * float(loss_scale))
+    # Use accelerator's backward method
+    # Scale each micro-batch contribution so accumulated gradients equal the
+    # mean over the effective batch.  The unscaled loss is retained for logs.
+    accelerator.backward(loss * float(loss_scale))
 
     if not perform_optimizer_step:
         train_metrics.loss = loss.item()
@@ -2288,14 +1917,12 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
-    if not torch.isfinite(torch.as_tensor(grad_norm)):
+    finite_grad = torch.isfinite(torch.as_tensor(grad_norm, device=loss.device)).to(torch.int32)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(finite_grad, op=torch.distributed.ReduceOp.MIN)
+    if not bool(finite_grad.item()):
         optimizer.zero_grad(set_to_none=True)
-        output_dict["skipped_nonfinite_grad"] = 1
-        train_metrics.loss = loss.item()
-        train_metrics.grad_norm = grad_norm.item()
-        train_metrics.lr = optimizer.param_groups[0]["lr"]
-        train_metrics.update_s = time.perf_counter() - start_time
-        return train_metrics, output_dict
+        raise FloatingPointError("Non-finite gradient norm detected on at least one distributed rank.")
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
@@ -2345,9 +1972,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
-
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = make_song_training_ddp_kwargs(getattr(cfg.policy, "vlm_backend", None))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
@@ -2357,11 +1982,38 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cpu=force_cpu,
         )
 
+    if getattr(cfg.policy, "vlm_backend", None) in {"molmo2_text", "molmo2_full"}:
+        # safetensors treats the ambiguous string "cuda" as cuda:0 even when
+        # Accelerate has selected another local rank.  A full policy warm-start
+        # would therefore make all ranks stage the 3B checkpoint on GPU 0.
+        # Pin checkpoint construction/loading to the rank-local device before
+        # make_policy calls from_pretrained(strict=True).
+        cfg.policy.device = str(accelerator.device)
+
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
+
+    if getattr(cfg.policy, "vlm_backend", None) in {"molmo2_text", "molmo2_full"}:
+        if accelerator.mixed_precision != "no":
+            raise ValueError(
+                "The locked Molmo2-ER control requires Accelerate mixed_precision='no'; "
+                f"got {accelerator.mixed_precision!r}."
+            )
+        if cfg.peft is not None:
+            raise ValueError("The locked Molmo2-ER control does not permit a PEFT wrapper.")
+
+    # Claim each rank-local GPU before dataset/model construction. This is an
+    # explicit full-Molmo multi-GPU opt-in and is a no-op for every legacy
+    # backend. Temporary tensors are deleted inside the helper; only reusable
+    # caching-allocator reservations remain.
+    reserve_full_molmo2_cuda_allocator_lease(
+        accelerator=accelerator,
+        vlm_backend=getattr(cfg.policy, "vlm_backend", None),
+        environ=os.environ,
+    )
 
     # Only log on main process
     if is_main_process:
@@ -2387,12 +2039,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(
-            dataset,
-            cfg.pointseg_sample_cache_dir,
-            cfg.policy,
-            cfg.pointseg_primary_sample_cache_dir,
-        )
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -2401,12 +2048,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
-        dataset = maybe_wrap_pointseg_cache_dataset(
-            dataset,
-            cfg.pointseg_sample_cache_dir,
-            cfg.policy,
-            cfg.pointseg_primary_sample_cache_dir,
-        )
+        dataset = maybe_wrap_pointseg_cache_dataset(dataset, cfg.pointseg_sample_cache_dir, cfg.policy)
         dataset = maybe_wrap_point_cloud_memmap_dataset(dataset, cfg.policy)
         dataset = maybe_wrap_worldflow_dataset(dataset, cfg.policy)
 
@@ -2420,41 +2062,55 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
-    policy = make_policy_on_accelerator_device(
-        policy_cfg=cfg.policy,
+    policy = make_policy(
+        cfg=cfg.policy,
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
-        accelerator_device=device,
     )
-    worldflow_bootstrap_requested = bool(getattr(cfg.policy, "worldflow_bootstrap_from_ego", False))
-    if worldflow_bootstrap_requested and not cfg.resume:
-        bootstrap = getattr(getattr(policy, "model", None), "bootstrap_worldflow_from_ego", None)
-        if not callable(bootstrap):
-            raise RuntimeError(
-                "worldflow_bootstrap_from_ego=True requires a policy model with "
-                "bootstrap_worldflow_from_ego()."
-            )
-        bootstrap_report = bootstrap()
-        if is_main_process:
-            logging.info("WorldFlow Ego bootstrap report: %s", bootstrap_report)
-    elif worldflow_bootstrap_requested and cfg.resume and is_main_process:
-        logging.info(
-            "Skipping WorldFlow Ego bootstrap during exact resume; preserving the checkpoint's "
-            "independently trained World and Ego parameters."
-        )
     validate_policy_camera_config_matches_training_config(cfg, policy)
+    molmo_audit = audit_molmo2er_pointonly_policy(policy)
+    if molmo_audit and is_main_process:
+        logging.info(
+            "Molmo2-ER point-only pre-DDP audit passed: total=%s, trainable=%s",
+            molmo_audit["total_parameters"],
+            molmo_audit["trainable_parameters"],
+        )
+    full_molmo_audit = audit_full_molmo2er_policy(policy)
+    if full_molmo_audit and is_main_process:
+        logging.info(
+            "Full-Molmo2-ER pre-DDP audit passed: total=%s, trainable=%s",
+            full_molmo_audit["total_parameters"],
+            full_molmo_audit["trainable_parameters"],
+        )
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
 
     selected_views = parse_camera_views(getattr(cfg.policy, "camera_views", "agentview"))
-    rgb_value = getattr(cfg.policy, "rgb_camera_views", None)
-    selected_rgb_views = parse_camera_views(selected_views if rgb_value is None else rgb_value)
-    expected_image_keys = {f"observation.images.{view}" for view in selected_rgb_views}
+    selected_rgb_views = tuple(
+        getattr(
+            policy.config,
+            "selected_rgb_camera_views",
+            parse_camera_views(
+                selected_views
+                if getattr(cfg.policy, "rgb_camera_views", None) is None
+                else getattr(cfg.policy, "rgb_camera_views")
+            ),
+        )
+    )
     actual_image_keys = set(getattr(policy.config, "image_features", {}))
-    missing_image_keys = sorted(expected_image_keys - actual_image_keys)
-    if missing_image_keys and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
+    expected_rgb_cameras = {
+        canonical_rgb_camera_name(view)
+        for view in selected_rgb_views
+    }
+    actual_rgb_cameras = {
+        canonical_rgb_camera_name(key)
+        for key in actual_image_keys
+    }
+    missing_rgb_cameras = sorted(expected_rgb_cameras - actual_rgb_cameras)
+    if missing_rgb_cameras and bool(getattr(cfg.policy, "requires_rgb", False)):
         raise ValueError(
-            f"Selected RGB camera views {selected_rgb_views} require image features {missing_image_keys}, "
+            f"Selected RGB camera views {selected_rgb_views} require semantic cameras "
+            f"{missing_rgb_cameras}, "
             f"but policy image features are {sorted(actual_image_keys)}."
         )
     if is_main_process:
@@ -2525,6 +2181,37 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if getattr(policy.config, "vlm_backend", None) == "molmo2_full":
+        # CUDA's automatic foreach AdamW path materializes a temporary tensor
+        # list roughly as large as all 1.8B trainable parameters during the
+        # first step.  The scalar-tensor path has identical AdamW
+        # hyperparameters/state semantics but updates one tensor at a time,
+        # avoiding that multi-GiB transient on 32-GiB RTX 5090s.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["foreach"] = False
+        if is_main_process:
+            logging.info(
+                "Full-Molmo2-ER AdamW uses foreach=False to bound optimizer-step peak memory; "
+                "lr/betas/eps/weight_decay are unchanged."
+            )
+        optimizer_parameter_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        backend = policy.model.vlm_with_expert
+        frozen_parameter_ids = {
+            id(parameter)
+            for module in (backend.vlm, backend.vision_backbone)
+            for parameter in module.parameters()
+        }
+        overlap = optimizer_parameter_ids & frozen_parameter_ids
+        if overlap:
+            raise RuntimeError(
+                f"Full-Molmo2-ER optimizer contains {len(overlap)} frozen Molmo parameter tensors."
+            )
+        if any(group.get("foreach") is not False for group in optimizer.param_groups):
+            raise RuntimeError("Full-Molmo2-ER requires low-peak AdamW foreach=False on every group.")
 
     # Load precomputed SARM progress for RA-BC if enabled
     # Generate progress using: src/lerobot/policies/sarm/compute_rabc_weights.py
@@ -2581,81 +2268,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames") or cfg.task_balanced_sampling:
+    if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
-        sampler_kwargs = {
-            "dataset_from_indices": dataset.meta.episodes["dataset_from_index"],
-            "dataset_to_indices": dataset.meta.episodes["dataset_to_index"],
-            "episode_indices_to_use": dataset.episodes,
-            # LeRobotDataset materializes an episode-filtered Arrow table with
-            # contiguous, subset-relative row indices.  Metadata boundaries
-            # remain absolute to the complete dataset, so explicitly rebase
-            # selected episodes before those indices reach the DataLoader.
-            "rebase_selected_episodes": dataset.episodes is not None,
-            "drop_n_last_frames": int(getattr(cfg.policy, "drop_n_last_frames", 0)),
-            "shuffle": True,
-        }
-        if cfg.task_balanced_sampling:
-            episode_tasks = dataset.meta.episodes["tasks"]
-            invalid = [index for index, tasks in enumerate(episode_tasks) if len(tasks) != 1]
-            if invalid:
-                raise ValueError(
-                    "task_balanced_sampling requires exactly one task per episode; "
-                    f"invalid episode indices include {invalid[:10]}."
-                )
-            sampler = TaskBalancedFrameSampler(
-                episode_group_ids=[str(tasks[0]) for tasks in episode_tasks],
-                **sampler_kwargs,
-            )
-            if is_main_process:
-                source_counts = {
-                    str(group_id): len(indices)
-                    for group_id, indices in sampler.grouped_indices.items()
-                }
-                logging.info(
-                    "Task-balanced frame sampling enabled: %d tasks, %d samples/epoch, "
-                    "source frame counts=%s",
-                    len(source_counts),
-                    len(sampler),
-                    source_counts,
-                )
-        else:
-            sampler = EpisodeAwareSampler(**sampler_kwargs)
+        sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=dataset.episodes,
+            drop_n_last_frames=cfg.policy.drop_n_last_frames,
+            shuffle=True,
+        )
     else:
         shuffle = True
         sampler = None
-
-    if (
-        isinstance(dataset, PointSegCacheInjectedDataset)
-        and dataset.view_dropout_paired_coverage
-        and is_main_process
-    ):
-        logging.info(
-            "Exact paired view coverage dataset: %d source frames x 2 complementary modes = %d samples.",
-            len(dataset.dataset),
-            len(dataset),
-        )
-
-    if (
-        isinstance(dataset, PointSegCacheInjectedDataset)
-        and dataset.view_dropout_paired_coverage
-        and sampler is not None
-    ):
-        base_num_samples = len(dataset.dataset)
-        if isinstance(sampler, TaskBalancedFrameSampler):
-            base_count = len(sampler)
-            sampler.add_index_offset(base_num_samples)
-        else:
-            base_indices = list(sampler.indices)
-            base_count = len(base_indices)
-            sampler.indices = base_indices + [index + base_num_samples for index in base_indices]
-        if is_main_process:
-            logging.info(
-                "Expanded EpisodeAwareSampler for exact paired view coverage: "
-                "%d eligible frames x 2 complementary modes = %d samples.",
-                base_count,
-                len(sampler),
-            )
 
     collate_fn = make_song_train_collate_fn(dataset)
     dataloader_num_workers = int(cfg.num_workers)
@@ -2687,6 +2311,31 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    if getattr(cfg.policy, "vlm_backend", None) == "molmo2_full":
+        if accelerator.num_processes > 1:
+            if not isinstance(policy, torch.nn.parallel.DistributedDataParallel):
+                raise RuntimeError(
+                    "Full-Molmo2-ER expected Accelerate to return DistributedDataParallel "
+                    f"for {accelerator.num_processes} processes, got {type(policy).__name__}."
+                )
+            if policy.gradient_as_bucket_view is not True:
+                raise RuntimeError(
+                    "Full-Molmo2-ER requires DDP gradient_as_bucket_view=True to avoid a "
+                    "second 3.47-GiB gradient allocation per rank."
+                )
+            if is_main_process:
+                logging.info(
+                    "Full-Molmo2-ER DDP memory audit passed: "
+                    "gradient_as_bucket_view=%s (effective after the first iteration), "
+                    "find_unused_parameters=%s",
+                    policy.gradient_as_bucket_view,
+                    policy.find_unused_parameters,
+                )
+        elif is_main_process:
+            logging.info(
+                "Full-Molmo2-ER DDP memory audit skipped for single-process execution; "
+                "gradient_as_bucket_view is only applicable to multi-process DDP."
+            )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -2751,16 +2400,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
+        if device.type == "cuda":
+            gib = float(1024**3)
+            output_dict["cuda_allocated_gib"] = torch.cuda.memory_allocated(device) / gib
+            output_dict["cuda_reserved_gib"] = torch.cuda.memory_reserved(device) / gib
+            output_dict["cuda_peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / gib
         if is_main_process:
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
-        sparse_save_steps = {int(value) for value in cfg.save_steps}
-        is_saving_step = (
-            step % cfg.save_freq == 0
-            or step in sparse_save_steps
-            or step == cfg.steps
-        )
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
@@ -2787,13 +2436,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "loss_worldflow_equiv",
                     "worldflow_trans_err",
                     "worldflow_rot_err_deg",
-                    "worldflow_flow_translation_err_m",
-                    "worldflow_flow_rotation_probe_err_m",
-                    "worldflow_flow_rotation6d_rmse",
-                    "worldflow_endpoint_translation_err_m",
-                    "worldflow_endpoint_rotation_probe_err_m",
-                    "worldflow_to_ego_trans_err_ratio",
-                    "worldflow_to_ego_rot_err_ratio",
                     "worldflow_valid_ratio",
                     "worldflow_foreground_points",
                     "worldflow_noise_conjugacy_error",
@@ -2801,6 +2443,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "pointseg_foreground_ratio",
                     "pointseg_operation_prob_mean",
                     "pointseg_selection_score_mean",
+                    "point_prefix_rms",
+                    "language_prefix_rms",
+                    "point_language_rms_ratio",
+                    "cuda_allocated_gib",
+                    "cuda_reserved_gib",
+                    "cuda_peak_allocated_gib",
+                    "skipped_nonfinite_loss",
+                    "skipped_nonfinite_grad",
                     "pred_operation_prob",
                     "loss_soft_bce",
                     "loss_smoothness",
@@ -2843,10 +2493,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     tag="train",
                     max_items=2,
                 )
-                # try:
-                #     ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
-                # except Exception:
-                #     logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
+                try:
+                    ood_case_inference(policy, preprocessor, postprocessor, batch, step, output_dir=cfg.output_dir,ood_num_points=50000)
+                except Exception:
+                    logging.exception("OOD case inference failed at step %s; continuing training/checkpoint save.", step)
 
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
@@ -2862,6 +2512,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                deleted_checkpoints = prune_committed_training_checkpoints(
+                    committed_checkpoint=checkpoint_dir,
+                    keep=resolve_checkpoint_retention(os.environ),
+                )
+                if deleted_checkpoints:
+                    logging.info(
+                        "Checkpoint retention kept the newest committed checkpoint and deleted: %s",
+                        ", ".join(str(path) for path in deleted_checkpoints),
+                    )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 

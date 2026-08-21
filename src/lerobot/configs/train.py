@@ -69,30 +69,18 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
-    # Match an equal-weight task benchmark by drawing the same number of valid
-    # frames from each task per dataloader epoch. Disabled by default to retain
-    # the historical global-uniform-over-frames training distribution.
-    task_balanced_sampling: bool = False
     # Number of micro-batches accumulated before one optimizer update.  ``steps``
     # continues to count optimizer updates, so enabling accumulation does not
     # silently change checkpoint or scheduler semantics.
     gradient_accumulation_steps: int = 1
     steps: int = 100_000
     pointseg_sample_cache_dir: str = ""
-    # Optional single-view PointSeg cache paired with an all-view fused cache for
-    # training-time auxiliary-camera dropout.  The policy architecture is
-    # unchanged; each sample uses one cache whose labels match its exact input.
-    pointseg_primary_sample_cache_dir: str = ""
     eval_freq: int = 20_000
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
-    # Additional sparse optimizer-step milestones. This keeps early checkpoints
-    # such as 25/75/100 without forcing a large model save at every small
-    # interval for the remainder of a full-epoch run.
-    save_steps: list[int] = field(default_factory=list)
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -116,18 +104,6 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "gradient_accumulation_steps must be at least 1, "
                 f"got {self.gradient_accumulation_steps}."
-            )
-        invalid_save_steps = sorted(
-            {
-                int(step)
-                for step in self.save_steps
-                if int(step) <= 0 or int(step) > int(self.steps)
-            }
-        )
-        if invalid_save_steps:
-            raise ValueError(
-                "save_steps entries must be in [1, steps], "
-                f"got invalid entries {invalid_save_steps} for steps={self.steps}."
             )
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")

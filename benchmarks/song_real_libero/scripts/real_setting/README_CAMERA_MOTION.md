@@ -2,7 +2,7 @@
 PIPE=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/real_setting/song_rgbd_pipeline.sh
 
 #动态相机---L515
-  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking3
+  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking5
   #数据采集
   bash "$PIPE" record \
     --camera L515 \
@@ -14,7 +14,7 @@ PIPE=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/
     --output "$DYNAMIC_OUTPUT_DIR" \
     --fast \
     --progress-every 10 \
-    --segment-workers 3
+    --segment-workers 20
   #单独处理并查看某个动态 segment
   bash "$PIPE" process-segment \
   --mode dynamic \
@@ -55,7 +55,7 @@ bash "$PIPE" view \
 # Ego数据处理
   ## 构造真机 HDF5 HDF5FromRawData  Raw--->HDF5
   cd ~/ProgramFiles/Huggingface/lerobot
-  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking3
+  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking5
   HDF5_OUTPUT_DIR=benchmarks/song_real_libero/data/real_setting/hdf5_raw
 
   ###############################
@@ -72,6 +72,10 @@ bash "$PIPE" view \
     --camera-reference-mode episode_first \
     --pose-frame camera \
     --align-to-episode-first \
+    --ego-trajectory-filter se3_lowpass \
+    --ego-trajectory-filter-cutoff-hz 4.0 \
+    --ego-trajectory-filter-order 3 \
+    --ego-trajectory-max-angular-speed-deg-s 900 \
     --reproject-rgb-to-episode-first \
     --rgb-reproject-workers 4 \
     --run-inference \
@@ -80,6 +84,9 @@ bash "$PIPE" view \
     --fast \
     --force-handedness right \
     --fusion-mode model-depth \
+    --hand-depth-knn-backend cuda \
+    --hand-depth-rigid-refinement \
+    --hand-rigid-temporal-filter \
     --camera-names overhead,hand
     
   #直接用推理后的结果交互切片
@@ -93,9 +100,16 @@ bash "$PIPE" view \
     --camera-reference-mode episode_first \
     --pose-frame camera \
     --align-to-episode-first \
+    --ego-trajectory-filter se3_lowpass \
+    --ego-trajectory-filter-cutoff-hz 4.0 \
+    --ego-trajectory-filter-order 3 \
+    --ego-trajectory-max-angular-speed-deg-s 900 \
     --reproject-rgb-to-episode-first \
     --force-handedness right \
     --fusion-mode model-depth \
+    --hand-depth-knn-backend auto \
+    --hand-depth-rigid-refinement \
+    --hand-rigid-temporal-filter \
     --camera-names overhead,hand
 
   #离线推理后切分点切片
@@ -110,9 +124,16 @@ bash "$PIPE" view \
     --camera-reference-mode episode_first \
     --pose-frame camera \
     --align-to-episode-first \
+    --ego-trajectory-filter se3_lowpass \
+    --ego-trajectory-filter-cutoff-hz 4.0 \
+    --ego-trajectory-filter-order 3 \
+    --ego-trajectory-max-angular-speed-deg-s 900 \
     --reproject-rgb-to-episode-first \
     --force-handedness right \
     --fusion-mode model-depth \
+    --hand-depth-knn-backend auto \
+    --hand-depth-rigid-refinement \
+    --hand-rigid-temporal-filter \
     --camera-names overhead,hand \
     --segments "$(cat "$DYNAMIC_OUTPUT_DIR/segments.txt")" \
     --max-points 50000 \
@@ -127,11 +148,31 @@ python /home/liusong/ProgramFiles/HandPoseExtraction/scripts/run_rgbd_sequence_w
   --reuse-jsonl \
   --show3d
 
-当前 HDF5 构建要求 JSONL 版本为 `wilor_mano_mesh_rgbd_chamfer_v5`。如果上面的查看命令
-提示版本不兼容，必须去掉 `--reuse-jsonl` 重新推理。该版本保持完整 MANO 手的关节和 mesh
-几何，只允许 RGB-D 对整只手施加同一个全局平移修正；不会再把各顶点独立吸附到可见深度面。
+当前 HDF5 构建默认要求 JSONL 版本为
+`wilor_mano_mesh_rgbd_rigid_icp_temporal_v7`。如果上面的查看命令提示版本不兼容，必须去掉
+`--reuse-jsonl` 重新推理。该版本保持完整 MANO 手的关节和 mesh 几何：RGB-D 先做全局深度
+平移，再以可见表面 trimmed projective ICP 校正同一个刚体 SE(3)，最后仅对这一刚体
+correction 做短缺口插值和 Savitzky–Golay 平滑；不会把各关节或顶点独立吸附到可见深度面，
+原有虚拟二指夹爪拟合逻辑也没有改变。
 若需要在 Open3D 中同时查看对齐后的完整 MANO mesh，应在重新推理时添加 `--include-mesh`；
 没有该字段时看到的手表面是原始 RGB-D 点云，不是 MANO mesh。
+
+### Ego 末端轨迹的离线 SE(3) 滤波
+
+`--ego-trajectory-filter se3_lowpass` 在相机运动补偿完成后、写入每个 episode 的 HDF5
+之前处理末端位姿。平移和符号连续的四元数使用离线零相位 Butterworth 低通，因此不会像
+因果滑动平均那样引入动作时延；滤波后重新归一化四元数，并默认精确保留 episode 的首尾
+位姿。夹爪开合、原始 `handpose_wilor.jsonl`、RGB-D 点云和 3D 手部关键点均不修改。
+
+WiLoR 偶尔会为同一个平行夹爪选择相差 180 度的手部坐标基。默认开启的
+`--ego-trajectory-parallel-jaw-symmetry` 会先在平行夹爪的等价姿态中选择时间连续的表示；
+超过 `--ego-trajectory-max-angular-speed-deg-s` 的非物理旋转则视为坐标基重置，并把一个
+恒定 SO(3) 修正延续到后续帧。它们处理的是姿态表示跳变，不是把正常快速运动逐帧截断。
+
+对于约 30 Hz 的轨迹，建议从 4 Hz、三阶开始。3 Hz 可进一步压制噪声但可能削弱短促动作，
+5 Hz 保留更多细节但也保留更多高频抖动。若要完全恢复旧行为，使用
+`--ego-trajectory-filter none`；每段的滤波残差、轨迹长度、时间戳修复数和姿态基修复数都会
+写入 HDF5 根属性 `ego_trajectory_filter_metrics_json`。
 
 
   ## 预处理---Continuous---HalfReduce---AddGripper---MixedStageGen

@@ -13,6 +13,7 @@ from benchmarks.song_real_libero.scripts.real_setting.build_humanhand_hdf5_datas
     attach_external_camera_poses,
     canonicalize_gripper_pose_sequence,
     distort_normalized_points,
+    filter_gripper_pose_sequence,
     normalized_pixel_rays,
 )
 from benchmarks.song_real_libero.scripts.real_setting.camera_motion_utils import (
@@ -107,6 +108,137 @@ def test_hdf5_builder_canonicalizes_rotation_representation_without_changing_pos
         R.from_euler("zyx", physical_euler).as_matrix(),
         atol=1e-10,
     )
+
+
+def test_hdf5_builder_zero_phase_se3_filter_reduces_high_frequency_pose_noise() -> None:
+    frame_count = 121
+    sampling_hz = 30.0
+    time_s = np.arange(frame_count, dtype=np.float64) / sampling_hz
+    slow_position = np.column_stack(
+        [
+            0.12 * time_s / time_s[-1],
+            0.03 * np.sin(2.0 * np.pi * 0.35 * time_s),
+            0.55 + 0.02 * np.cos(2.0 * np.pi * 0.25 * time_s),
+        ]
+    )
+    alternating = np.where(np.arange(frame_count) % 2 == 0, 1.0, -1.0)
+    noisy_position = slow_position.copy()
+    noisy_position[:, 0] += 0.004 * alternating
+    noisy_position[:, 2] += 0.003 * alternating
+
+    slow_angle = 0.45 * time_s / time_s[-1]
+    noisy_angle = slow_angle + np.deg2rad(3.0) * alternating
+    rotations = R.from_euler("z", noisy_angle)
+    poses = np.column_stack([noisy_position, rotations.as_euler("zyx")])
+
+    filtered_pose, filtered_quat, metrics = filter_gripper_pose_sequence(
+        poses,
+        rotations.as_quat(),
+        time_s * 1000.0,
+        cutoff_hz=4.0,
+        order=3,
+        parallel_jaw_symmetry=False,
+        preserve_endpoints=True,
+    )
+
+    noisy_step = np.linalg.norm(np.diff(noisy_position, axis=0), axis=1)
+    filtered_step = np.linalg.norm(np.diff(filtered_pose[:, :3], axis=0), axis=1)
+    assert np.percentile(filtered_step, 95) < 0.6 * np.percentile(noisy_step, 95)
+    assert metrics["translation_path_after_m"] < metrics["translation_path_before_m"]
+    assert metrics["rotation_path_after_deg"] < metrics["rotation_path_before_deg"]
+    np.testing.assert_allclose(filtered_pose[[0, -1], :3], noisy_position[[0, -1]], atol=1e-10)
+    np.testing.assert_allclose(
+        R.from_quat(filtered_quat[[0, -1]]).as_matrix(),
+        rotations[[0, -1]].as_matrix(),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(np.linalg.norm(filtered_quat, axis=1), 1.0, atol=1e-10)
+
+
+def test_hdf5_builder_filter_removes_parallel_jaw_basis_flip_and_repairs_timestamp() -> None:
+    frame_count = 90
+    time_s = np.arange(frame_count, dtype=np.float64) / 30.0
+    rotations = R.from_euler(
+        "zyx",
+        np.column_stack(
+            [
+                np.linspace(0.0, 0.5, frame_count),
+                0.08 * np.sin(time_s),
+                0.04 * np.cos(time_s),
+            ]
+        ),
+    )
+    raw_matrices = rotations.as_matrix()
+    raw_matrices[25:65] = raw_matrices[25:65] @ np.diag([-1.0, -1.0, 1.0])
+    raw_rotations = R.from_matrix(raw_matrices)
+    positions = np.column_stack(
+        [0.03 * time_s, np.zeros(frame_count), np.full(frame_count, 0.5)]
+    )
+    poses = np.column_stack([positions, raw_rotations.as_euler("zyx")])
+    timestamps_ms = time_s * 1000.0
+    timestamps_ms[50] = timestamps_ms[49]
+
+    filtered_pose, filtered_quat, metrics = filter_gripper_pose_sequence(
+        poses,
+        raw_rotations.as_quat(),
+        timestamps_ms,
+        cutoff_hz=4.0,
+        order=3,
+        parallel_jaw_symmetry=True,
+        preserve_endpoints=True,
+    )
+
+    filtered_rotations = R.from_quat(filtered_quat)
+    filtered_steps_deg = np.rad2deg(
+        (filtered_rotations[:-1].inv() * filtered_rotations[1:]).magnitude()
+    )
+    assert filtered_steps_deg.max() < 2.0
+    assert metrics["parallel_jaw_corrected_frame_count"] == 40
+    assert metrics["parallel_jaw_state_switch_count"] == 2
+    assert metrics["timestamp_repair_count"] == 1
+    assert np.isfinite(filtered_pose).all()
+
+
+def test_hdf5_builder_filter_stabilizes_persistent_orientation_frame_reset() -> None:
+    frame_count = 100
+    time_s = np.arange(frame_count, dtype=np.float64) / 30.0
+    physical_rotations = R.from_euler(
+        "zyx",
+        np.column_stack(
+            [
+                0.35 * time_s / time_s[-1],
+                0.06 * np.sin(time_s),
+                0.03 * np.cos(time_s),
+            ]
+        ),
+    )
+    reset = R.from_euler("xyz", [70.0, -35.0, 20.0], degrees=True).as_matrix()
+    observed_matrices = physical_rotations.as_matrix()
+    observed_matrices[45:] = reset @ observed_matrices[45:]
+    observed_rotations = R.from_matrix(observed_matrices)
+    positions = np.column_stack(
+        [0.04 * time_s, np.zeros(frame_count), np.full(frame_count, 0.5)]
+    )
+    poses = np.column_stack([positions, observed_rotations.as_euler("zyx")])
+
+    _filtered_pose, filtered_quat, metrics = filter_gripper_pose_sequence(
+        poses,
+        observed_rotations.as_quat(),
+        time_s * 1000.0,
+        cutoff_hz=4.0,
+        order=3,
+        max_angular_speed_deg_s=900.0,
+        parallel_jaw_symmetry=False,
+        preserve_endpoints=True,
+    )
+
+    filtered_rotations = R.from_quat(filtered_quat)
+    filtered_steps_deg = np.rad2deg(
+        (filtered_rotations[:-1].inv() * filtered_rotations[1:]).magnitude()
+    )
+    assert metrics["orientation_frame_reset_count"] == 1
+    assert metrics["largest_rejected_angular_speed_deg_s"] > 900.0
+    assert filtered_steps_deg.max() < 1.0
 
 
 def test_overview_and_hand_camera_requests_support_l515_and_d435i() -> None:
@@ -648,3 +780,93 @@ def test_fixed_camera_episode_keeps_legacy_real_conversion_semantics(tmp_path) -
     assert record["reference_frame"] == "world"
     assert record["world_definition"] == "fixed_overview_camera"
     assert record["uses_camera_tracking_pose"] is False
+
+
+def test_episode_first_camera_world_is_accepted_without_second_alignment(tmp_path) -> None:
+    """Aligned human-hand/StageGen files need no rewrite or camera reapplication."""
+
+    hdf5_path = tmp_path / "episode_first_camera_world.hdf5"
+    raw_pose9 = matrix_to_pose9(
+        np.stack(
+            [
+                _translation(0.0, 0.0, 0.5),
+                _translation(0.05, 0.0, 0.5),
+            ]
+        )
+    )
+    cloud = np.asarray(
+        [
+            [0.0, 0.0, 0.8, 120.0, 80.0, 40.0],
+            [0.1, 0.0, 0.9, 120.0, 80.0, 40.0],
+        ],
+        dtype=np.float32,
+    )
+    with h5py.File(hdf5_path, "w") as root:
+        root.attrs["pose_frame"] = "world"
+        root.attrs["source_pose_frame"] = "camera"
+        root.attrs["reference_frame"] = "episode_first_camera"
+        root.attrs["world_frame_definition"] = "camera frame at first source_record_index"
+        root.attrs["episode_first_alignment_applied"] = True
+        root.attrs["uses_camera_extrinsic"] = False
+        root.attrs["camera_reference_mode"] = "episode_first"
+        root.attrs["task"] = "already aligned camera world"
+        cloud_dataset = root.create_dataset(
+            "observations/cloud_rgb/overhead",
+            data=np.stack([cloud, cloud]),
+        )
+        cloud_dataset.attrs["coordinate_frame"] = "episode_first_camera"
+        cloud_dataset.attrs["alignment_applied"] = True
+        pose_dataset = root.create_dataset("observations/pose_eular", data=raw_pose9)
+        pose_dataset.attrs["coordinate_frame"] = "episode_first_camera"
+        root.create_dataset("observations/eff_angular", data=np.asarray([0.08, 0.04]))
+        root.create_dataset("timestamp_ms", data=np.asarray([0.0, 33.0]))
+
+        # This is retained audit metadata, not a transform to apply again. Its
+        # direction is intentionally outside load_camera_motion's raw-input
+        # contract so the test fails if the converter attempts a second pass.
+        camera_pose = root.create_dataset(
+            "observations/camera_tracking_pose/overhead",
+            data=np.stack([np.eye(4), _translation(0.4)]),
+        )
+        camera_pose.attrs["transform_direction"] = "camera_to_episode_first_camera"
+        camera_pose.attrs["translation_unit"] = "meter"
+        camera_pose.attrs["pose_format"] = "matrix"
+
+    cfg = {
+        **_camera_cfg(camera_motion_compensation="required"),
+        "point_cloud_key": None,
+        "image_key": "none",
+        "image_feature_key": None,
+        "pose_key": "observations/pose_eular",
+        "pose_format": "pose9",
+        "gripper_key": "observations/eff_angular",
+        "timestamp_key": "timestamp_ms",
+        "timestamp_mode": "source",
+        "cloud_frame": "auto",
+        "task": None,
+        "fps": 30,
+        "max_frames": None,
+        "num_points": len(cloud),
+        "add_gripper_cloud": False,
+        "input_has_gripper_cloud": False,
+        "gripper_points": 0,
+        "gripper_len": 0.06,
+        "gripper_template": "reap",
+        "gripper_drop_strategy": "random",
+        "gripper_shuffle_points": False,
+        "gripper_widths_are_normalized": False,
+        "gripper_max_width": 0.08,
+        "seed": 7,
+        "camera_motion_debug": False,
+        "camera_motion_debug_frames": 2,
+        "camera_motion_debug_max_points": len(cloud),
+    }
+    episode, record = convert_hdf5_episode(hdf5_path, cfg)
+
+    np.testing.assert_allclose(episode["world_ee_poses"], raw_pose9, atol=1e-7)
+    assert "camera_to_world" not in episode
+    assert record["source_cloud_frame"] == "camera"
+    assert record["world_definition"] == "episode_first_overview_camera"
+    assert record["source_already_camera_reference_aligned"] is True
+    assert record["uses_camera_tracking_pose"] is False
+    assert record["camera_motion"]["reason"] == "source_already_camera_reference_aligned"

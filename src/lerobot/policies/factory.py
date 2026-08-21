@@ -489,6 +489,12 @@ def make_policy(
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
+        if getattr(cfg, "vlm_backend", "smolvlm") in {"molmo2_text", "molmo2_full"}:
+            # A partial load could leave missing 3B tensors at their random
+            # initialization while preserving the same parameter count.  The
+            # registered control therefore requires exact checkpoint topology
+            # for resume as well as evaluation.
+            kwargs["strict"] = True
         policy = policy_cls.from_pretrained(**kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo

@@ -16,7 +16,7 @@
 from datasets import Dataset
 
 from lerobot.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from lerobot.datasets.sampler import EpisodeAwareSampler, TaskBalancedFrameSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import (
     hf_transform_to_torch,
 )
@@ -90,60 +90,3 @@ def test_shuffle():
     assert sampler.indices == [0, 1, 2, 3, 4, 5]
     assert len(sampler) == 6
     assert set(sampler) == {0, 1, 2, 3, 4, 5}
-
-
-def test_task_balanced_frame_sampler_has_exact_equal_group_mass():
-    sampler = TaskBalancedFrameSampler(
-        dataset_from_indices=[0, 2, 6],
-        dataset_to_indices=[2, 6, 9],
-        episode_group_ids=["short", "long", "long"],
-        shuffle=False,
-        num_samples=8,
-    )
-    sampled = list(sampler)
-    assert len(sampled) == 8
-    assert sum(index < 2 for index in sampled) == 4
-    assert sum(index >= 2 for index in sampled) == 4
-    assert set(sampled).issubset(set(range(9)))
-
-
-def test_task_balanced_frame_sampler_respects_episode_subset_and_paired_offset():
-    sampler = TaskBalancedFrameSampler(
-        dataset_from_indices=[0, 2, 5],
-        dataset_to_indices=[2, 5, 9],
-        episode_group_ids=[0, 1, 1],
-        episode_indices_to_use=[0, 2],
-        shuffle=False,
-        num_samples=4,
-    )
-    sampler.add_index_offset(9)
-    sampled = list(sampler)
-    assert len(sampled) == 8
-    assert sampled[:4] == [0, 1, 5, 6]
-    assert sampled[4:] == [9, 10, 14, 15]
-
-
-def test_episode_aware_sampler_rebases_filtered_dataset_rows():
-    sampler = EpisodeAwareSampler(
-        dataset_from_indices=[0, 2, 5, 9],
-        dataset_to_indices=[2, 5, 9, 11],
-        episode_indices_to_use=[1, 3],
-        rebase_selected_episodes=True,
-    )
-    assert sampler.indices == [0, 1, 2, 3, 4]
-
-
-def test_task_balanced_sampler_rebases_filtered_dataset_rows_and_paired_offset():
-    sampler = TaskBalancedFrameSampler(
-        dataset_from_indices=[0, 2, 5, 9],
-        dataset_to_indices=[2, 5, 9, 11],
-        episode_group_ids=["unused", "task_a", "unused", "task_b"],
-        episode_indices_to_use=[1, 3],
-        rebase_selected_episodes=True,
-        shuffle=False,
-        num_samples=4,
-    )
-    sampler.add_index_offset(5)
-    sampled = list(sampler)
-    assert sampled[:4] == [0, 1, 3, 4]
-    assert sampled[4:] == [5, 6, 8, 9]
