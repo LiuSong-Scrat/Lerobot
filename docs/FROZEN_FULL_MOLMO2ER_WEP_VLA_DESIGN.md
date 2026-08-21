@@ -1,18 +1,18 @@
 # Frozen Full-Molmo2-ER WEP-VLA 设计合同
 
-- 状态：架构设计冻结；Full-Molmo2 主干已实现，双视角 + World–Ego DoubleFlow 尚待按本文完成代码适配与门禁
+- 状态：架构设计冻结；Full-Molmo2 主干已实现，单视角 World–Ego DoubleFlow 尚待按本文完成启动配置与门禁
 - 目标基线：已复现的 500M WEP-VLA / v0.4.3 方法
-- 目标模型：完整冻结 Molmo2-ER + 从头训练的 Full SmolVLA-style Action Expert + 输入级双视角点云 + World–Ego DoubleFlow
+- 目标模型：完整冻结 Molmo2-ER + 从头训练的 Full SmolVLA-style Action Expert + 单视角点云 + World–Ego DoubleFlow
 
-> 2026-08-21 修订：主方案由“单视角、WorldFlow 关闭”改为“单 RGB、双视角点云、WorldFlow 开启”。当前 `train_full_molmo2er_wep_vla_8gpu.sh` 和 `vlm_backend='molmo2_full'` 配置校验仍保留旧合同；在完成第 17 节的实现与回归门禁前，不得把本文视为已经可直接启动的训练命令。
+> 2026-08-21 修订：主方案保持单路 `agentview` RGB 与单路 `agentview` 点云，只把 WorldFlow 从关闭改为开启。当前 `train_full_molmo2er_wep_vla_8gpu.sh` 仍显式关闭 WorldFlow；在完成第 17 节的启动配置与回归门禁前，不得把本文视为已经可直接启动的训练命令。
 
-参考口径分两部分：`origin/wep_vla_v0.4.3_multiview_doubleflow` 中的 `WEPVLA_V043_DoubleFLow.md` 提供共享 Expert 的完整 World pose9 DoubleFlow 合同；同分支较晚的 `GOAL_RESUME_MULTIVIEW_WORLDFLOW_2026-08-15.md`/handoff continuation 提供 V52 输入级 multiview 合同。较晚的 V52 `consensus_multiscale_novelty_union` 与失败审计优先于早期 README 中的简单 `fps` 示例。
+参考口径使用 `origin/wep_vla_v0.4.3_multiview_doubleflow` 中的 `WEPVLA_V043_DoubleFLow.md`：它定义共享 Expert 的完整 World pose9 DoubleFlow。`origin/wep_vla_v0.4.3` 原始分支不包含 1 cm/4 cm consensus fusion；该能力来自后来提交的 V52 `9447a43`，不属于本模型合同。因此不移植 `consensus_multiscale_novelty_union`，也不读取 `robot0_eye_in_hand` 点云。
 
 ## 1. 最终决策
 
 新模型采用：
 
-> 完整冻结的 Molmo2-ER VLM，加上与其 36 层一一对应、宽度为 VLM 0.75 倍的 36 层 SmolVLA-style Action Expert；点云在输入阶段融合 `agentview` 与 `robot0_eye_in_hand`，Ego 与 World 两条物理共轭的 action flow 共享同一个 Action Expert，并保留 PointSeg、FG/BG 全局点 token、局部 PointActionFusion 和 flow matching 主目标。
+> 完整冻结的 Molmo2-ER VLM，加上与其 36 层一一对应、宽度为 VLM 0.75 倍的 36 层 SmolVLA-style Action Expert；输入保持单路 `agentview` RGB 与单路 `agentview` XYZRGB 点云，Ego 与 World 两条物理共轭的 action flow 共享同一个 Action Expert，并保留 PointSeg、FG/BG 全局点 token、局部 PointActionFusion 和 flow matching 主目标。
 
 核心决定：
 
@@ -22,8 +22,7 @@
 - Action Expert、PointSeg、点投影、action/time 投影和 PointActionFusion 从头训练。
 - Action Expert 继续使用 500M 的交替拓扑：偶数层 joint self-attention，奇数层 pure cross-attention。
 - IMAGE 与 FG/BG SCENE token 构成双向感知块；文本保持 Molmo 原生 causal 语义。
-- VLM 仍只使用真实二维 `agentview` RGB；点云使用 `agentview + robot0_eye_in_hand` 双视角。
-- 双视角只在点云输入阶段做 exact-index coreset 融合，模型收到的仍是严格 10,000 点，不增加多视角专用网络、固定视角 quota 或 learned gate。
+- VLM 使用真实二维 `agentview` RGB，点云也只使用 `agentview`；不读取 `robot0_eye_in_hand`。
 - 开启 WorldFlow：Ego 与 World 描述同一条物理轨迹，共享一个 36 层 Action Expert；World 信息必须通过联合 action block 实际影响最终 Ego action。
 - 保留 Molmo 原生视觉 processor、特殊 token 和 392 个视觉特征，不额外压缩成 64 个 token。
 - 运行模型物理删除不参与 VLA forward 的 `lm_head`。
@@ -42,13 +41,12 @@
 
 该实验检验：
 
-> 在完整冻结 Molmo2-ER、扩大 Action Expert 并保留 WEP 点云接口的条件下，输入级双视角几何覆盖与物理共轭的 World–Ego DoubleFlow 能否共同改善机器人策略能力，而不是只移动失败 episode 的边界。
+> 在完整冻结 Molmo2-ER、扩大 Action Expert 并保持单视角 WEP 输入不变的条件下，物理共轭的 World–Ego DoubleFlow 能否改善机器人策略能力。
 
 必须保持不变：
 
 - 相同任务、episode、动作目标和评测种子；
-- 单路 `agentview` RGB；
-- 双视角融合后严格 10,000 点的模型输入合同；
+- 单路 `agentview` RGB 和单路 `agentview` 10,000 点 XYZRGB；
 - 一个 FG 和一个 BG 全局点 token；
 - foreground local point 到 action 的直接融合；
 - chunk、action 维度、时间采样与逐通道 flow-matching 目标定义；
@@ -58,8 +56,6 @@
 
 本次有意改变、必须单独报告：
 
-- 点云由单 `agentview` 改为 `agentview + robot0_eye_in_hand`；
-- PointSeg cache 必须按双视角融合合同重建，不能复用单视角 sample-index cache；
 - `worldflow_enable` 由 `false` 改为 `true`；
 - 单 Ego action chunk 改为 Ego/World 两个 32-step action chunk 的联合推理；
 - 训练 batch 需要 commanded World EEF target sidecar。
@@ -88,8 +84,7 @@
 | Expert hidden / FFN | 720 / 2048 | 1920 / 5120 |
 | Expert 结构 | 偶数 joint-SA、奇数 pure-CA | 完全相同，仅加深加宽 |
 | RGB 输入 | agentview 256² | agentview 256² |
-| 点云输入 | agentview 10,000 点 | agentview + eye-in-hand 输入级融合后仍为 10,000 点 |
-| 多视角模块 | 无 | 无；仅 exact-index coreset |
+| 点云输入 | agentview 10,000 点 | agentview 10,000 点 |
 | WorldFlow | 参考分支可选 | 开启；World/Ego 共享 Action Expert |
 | 视觉预处理 | 手工放大 512² | Molmo 原生 378² processor |
 | 视觉输出 | 64 个 connector tokens | 392 个视觉特征、410 个 IMAGE 位置 |
@@ -117,11 +112,11 @@ range: [0, 1]
 配置必须显式保证：
 
 ```text
-camera_views=agentview,robot0_eye_in_hand
+camera_views=agentview
 rgb_camera_views=agentview
 ```
 
-`camera_views` 控制点云，`rgb_camera_views` 控制 Molmo 图像；两者不得重新耦合。eye-in-hand 只补充几何覆盖，不再向 Molmo prefix 增加第二组 IMAGE token，因此 Molmo 的 392 个视觉特征/410 个 IMAGE 位置合同保持不变。
+`camera_views` 和 `rgb_camera_views` 都必须只包含 `agentview`。Molmo prefix 只接收这一组图像，因此 392 个视觉特征/410 个 IMAGE 位置合同保持不变。
 
 ### 4.2 点云
 
@@ -130,31 +125,10 @@ rgb_camera_views=agentview
 ```text
 shape: 10000×6
 channels: X, Y, Z, R, G, B
-views: agentview, robot0_eye_in_hand
+view: agentview
 ```
 
-两个视角先转换到同一个当前 EEF/Ego 坐标合同，再在模型外执行输入级融合。冻结方案采用 v0.4.3 multiview 分支的 V52 几何合同：
-
-```text
-camera_view_fusion = consensus_multiscale_novelty_union
-camera_view_voxel_size = 0.01
-camera_view_coarse_novelty_scale = 4.0
-camera_view_fps_gripper_points = 500
-output = 9500 scene + 500 primary gripper = 10000 points
-```
-
-具体约束：
-
-1. `agentview` 是 primary；其每个 1 cm fine voxel 都保留一个真实输入代表点。
-2. 两个视角在同一 fine voxel 重叠时，从真实 union 中选择最接近 union centroid 的 medoid；不合成新点。
-3. eye-in-hand 独有覆盖只有在 4 cm coarse voxel 上相对 primary 仍然新颖时才进入，每个 coarse cell 最多一个真实 medoid。
-4. 最终点数始终为 10,000；primary 的 500 个 gripper tail 精确保留且只追加一次。
-5. 不使用 50:50、99:1 或其他固定视角配额，不使用 learned gate、语义规则、局部最近点交换、遮挡启发式或 task-specific 目标点。
-6. 单视角输入已经为 10,000 点时必须 byte-identical 返回，保证旧单视角 checkpoint/消融入口可比较。
-
-双视角融合发生在 PointSeg 之前，因此 PointSeg、FG/BG 聚合与 PointActionFusion 看到的是同一份 fused 10K cloud。必须重新生成与此融合模式一致的 exact-index cache，并逐 shard 验证 online/cache 索引逐元素一致、索引唯一、1 cm primary coverage、4 cm secondary novelty 和 gripper tail。旧单视角 cache 不兼容。
-
-PointSeg cache 中的未来轨迹信息仍只用于离线生成软监督；在线模型输入只有当前双视角点云、当前 `agentview` RGB、当前 EEF pose 和任务文本。
+继续使用当前单视角 PointSeg cache、坐标合同和 UMI 处理。PointSeg cache 中的未来轨迹信息仍只用于离线生成软监督；在线模型输入只有当前 `agentview` 点云、当前 `agentview` RGB、当前 EEF pose 和任务文本。不得读取或融合 `robot0_eye_in_hand` 点云。
 
 ### 4.3 State 与 Action
 
@@ -395,14 +369,13 @@ foreground local scene_tok1, mask
 
 全局 FG/BG prefix 路和局部 foreground-action 路都必须保留，并在评估阶段分别做遮蔽消融。
 
-双视角不会新增 PointSeg 或 PointAction 模块。融合后的同一份 10K cloud 先产生 Ego foreground/background；WorldFlow 再把选中的真实 foreground XYZRGB 用当前 EEF pose 解析地映射到 robot-base/World 坐标系。World 拥有独立的 LitePT、scene projection 和 point-action adapter，Ego/World 两条直接点路径都必须可训练，但两者共享同一个 36 层 Action Expert。
+WorldFlow 使用同一份单视角 `agentview` 10K cloud。Ego 路先产生 foreground/background；WorldFlow 再把选中的真实 foreground XYZRGB 用当前 EEF pose 解析地映射到 robot-base/World 坐标系。World 拥有独立的 LitePT、scene projection 和 point-action adapter，Ego/World 两条直接点路径都必须可训练，但两者共享同一个 36 层 Action Expert。
 
 严禁：
 
-- 为 eye-in-hand 增加独立 learned encoder/gate；
 - 冻结 Ego 而只训练 World；
 - 让 World 使用不同物理轨迹或独立随机语义；
-- 把双视角输入融合与 World/Ego 坐标流混为同一件事。
+- 为 World→Ego 信息流增加 learned scalar gate。
 
 ## 10. 完整冻结的 Molmo2-ER
 
@@ -692,9 +665,7 @@ trainable = 151,032,494
 
 如果未来 warm-start 自己的 PointSeg，应作为单独消融，不能混入主实验。
 
-双视角训练数据采用 paired coverage：每个原始 frame 同时提供 primary-only 和 all-view fused 两个互补入口，最终推理使用 all-view fused。这样单/双视角看到相同任务与动作监督，不通过随机 view dropout 或固定 camera quota 改变物理语义。paired 数据会改变每 epoch 的 sample 数，训练记录必须同时报告 optimizer steps、seen samples 和等效原始 frames。
-
-参考分支 V49/V52 的“Ego/World 对称 point-path 高 LR”是针对成熟 V32 checkpoint 的输入域适配，不直接照搬到本模型：本模型所有非 VLM 模块均从头训练，使用统一 base LR。仍必须审计 Ego 与 World 两条直接 point path 都有 finite、非零梯度，且所有 Molmo 参数保持冻结。
+本模型不引入单/多视角配对覆盖，也不增加多视角专用 optimizer group。本模型所有非 VLM 模块均从头训练并使用统一 base LR；仍必须审计 Ego 与 World 两条直接 point path 都有 finite、非零梯度，且所有 Molmo 参数保持冻结。
 
 训练配置：
 
@@ -737,7 +708,7 @@ Adam moments:   6.94 GiB
 steady state:  22.18 GiB
 ```
 
-该估计尚未计入 World LitePT、双 action stream、双视角融合与相关 activation。DoubleFlow 实现完成后必须在 Adam 状态创建后重新记录每卡 allocated/reserved/peak；若改成 FP32 moments，普通 replicated DDP 很可能放不下。
+该估计尚未计入 World LitePT、双 action stream 与相关 activation。DoubleFlow 实现完成后必须在 Adam 状态创建后重新记录每卡 allocated/reserved/peak；若改成 FP32 moments，普通 replicated DDP 很可能放不下。
 
 建议起点：
 
@@ -785,9 +756,9 @@ DoubleFlow 会增加 World LitePT 与 32 个 World action token 的 36 层联合
 
 每次新观测：
 
-1. 把 `agentview` 与 `robot0_eye_in_hand` 点云转换到同一 Ego frame，并融合成严格 10K exact-index coreset；
+1. 读取单路 `agentview` 10K XYZRGB 点云；
 2. 单独处理 `agentview` RGB；
-3. 对 fused cloud 运行 PointSeg 并生成 Ego FG/BG；
+3. 对该点云运行 PointSeg 并生成 Ego FG/BG；
 4. 一次性构造完整 `BOS+IMAGE+FG+BG+TEXT`；
 5. 用 IMAGE+SCENE hybrid mask 跑完整 36 层并缓存各层 prefix K/V 与 validity mask；
 6. 把预测 Ego foreground 解析地转换到 World frame，编码 Ego/World scene；
@@ -805,12 +776,11 @@ DoubleFlow 会增加 World LitePT 与 32 个 World action token 的 36 层联合
 
 截至本次文档修订，不能只把启动参数从 `false` 改成 `true`。正式训练前必须完成并提交：
 
-1. 从 `origin/wep_vla_v0.4.3_multiview_doubleflow` 移植 `consensus_multiscale_novelty_union`、对应配置字段、禁止 learned gate 的 `worldflow_ego_residual_gate_init=None` 校验和 exact-index cache/online 一致性测试。
-2. 将 `vlm_backend='molmo2_full'` 的旧校验从“point/RGB 都只能 agentview”改为“point 必须是 agentview+eye-in-hand，RGB 必须只是 agentview”，同时保留单视角消融入口。
-3. 修改 `train_full_molmo2er_wep_vla_8gpu.sh` 的旧单视角/WorldFlow-off 合同、resume guard 和 launch record；脚本应改名或提供清晰的 7-GPU DoubleFlow 入口。
-4. 训练启动参数必须显式包含本文第 4、12、15 节的 fusion、WorldFlow 和 GPU 约束；禁止依赖默认值。
-5. 用包含 commanded World EEF target sidecar 的数据重建双视角 cache；旧 single-view cache 与旧 launch record 不得复用为正式 run。
-6. 更新参数量、显存、吞吐和 checkpoint schema manifest 后，才允许把状态从“待适配”改为“已实现”。
+1. 修改 `train_full_molmo2er_wep_vla_8gpu.sh` 的 WorldFlow-off 合同、resume guard 和 launch record；脚本应改名或提供清晰的 7-GPU DoubleFlow 入口，并保持 `camera_views=agentview`、`rgb_camera_views=agentview`。
+2. 训练启动参数必须显式包含本文第 12、15 节的全部 WorldFlow 和 GPU 约束，包括 `worldflow_ego_residual_gate_init=None`；禁止依赖默认值，缺失的配置字段或解析器必须先补齐。
+3. 确保数据包含同步的 commanded World EEF target sidecar。现有单视角 point cache 只有在 dataset/cache semantic hash 和索引对齐检查通过后才可复用；本方案不要求重建多视角 cache，旧 launch record 不得复用为正式 run。
+4. 增加 WorldFlow on/off、joint suffix mask、sidecar、Molmo 冻结以及 7-GPU 启动合同的回归测试。`vlm_backend='molmo2_full'` 继续使用当前仅允许 `agentview` 的校验，不需要放宽。
+5. 更新参数量、显存、吞吐和 checkpoint schema manifest 后，才允许把状态从“待适配”改为“已实现”。
 
 ### 17.1 权重和结构
 
@@ -828,9 +798,7 @@ DoubleFlow 会增加 World LitePT 与 32 个 World action token 的 36 层联合
 ### 17.2 Processor 与 token
 
 - 每个样本恰好一个 agentview RGB；
-- 每个 dual 样本同时存在 agentview 与 robot0_eye_in_hand 点云；
-- fusion 输出严格 10K、索引唯一、9500 scene + 500 primary gripper；
-- primary 1 cm fine coverage、secondary 4 cm persistent novelty 与 exact-index online/cache 审计通过；
+- 每个样本恰好一份 `agentview` 10K 点云，不存在 `robot0_eye_in_hand` 输入特征；
 - 256²输入恰好两个 crop；
 - 恰好 392 个 `<im_patch>` 特征位置；
 - 恰好 410 个 IMAGE 位置；
@@ -902,10 +870,9 @@ SCENE 关闭时，mask 和 Molmo native IMAGE/TEXT 路径必须退化并与官�
 - FG/BG 置零/交换；
 - language 遮蔽；
 - local PointActionFusion 关闭；
-- secondary point view 遮蔽；
 - World scene/action K/V 遮蔽。
 
-所有预注册操作都应造成可测 action delta，避免某一路输入被模型实际忽略。secondary-view 与 World ablation 必须分开，不能把“更多点”与“World→Ego 信息流”合成一个不可解释开关。
+所有预注册操作都应造成可测 action delta，避免某一路输入被模型实际忽略。World ablation 必须与 RGB、global scene、local point 和 language 消融分别报告。
 
 ### 17.7 Cache 和 checkpoint
 
@@ -931,22 +898,13 @@ SCENE 关闭时，mask 和 Molmo native IMAGE/TEXT 路径必须退化并与官�
 
 - 相同 40 个任务；
 - 相同每任务 episode/seeds；
-- 相同 agentview RGB、双视角原始点云与 1 cm/4 cm fusion 合同；
+- 相同单路 `agentview` RGB 与单路 `agentview` 10K 点云合同；
 - 相同执行 16 步和观测刷新逻辑；
 - 按 suite、task 和总体报告成功率；
 - 同时报告吞吐、显存、单步/闭环延迟；
-- 固定 checkpoint 做 RGB、global scene、local point、language、secondary view 和 World 信息流消融。
+- 固定 checkpoint 做 RGB、global scene、local point、language 和 World 信息流消融。
 
-每个候选 checkpoint 必须在同 episode、同 fixed action/noise cache 和相同 suffix layout 下完成 2×2：
-
-| 输入点云 | World→Ego 开启 | World→Ego 遮蔽 |
-|---|---:|---:|
-| 双视角 fused | 主模型 | World 因果消融 |
-| primary-only | multiview 因果消融 | 双重消融 |
-
-必须分别报告：双视角简单效应、WorldFlow 简单效应和二者交互项。只有“双视角 + WorldFlow”严格高于同 checkpoint 的“单视角 + WorldFlow”与“双视角 + World 遮蔽”，才能声称两项改动共同有效。
-
-参考分支的历史结果是风险证据，不是本模型收益证据：V52 step520 的本地 Full500 dual+World 在 `461/487`、26 failures、理论最高 `474/500` 时早停；A800 batch80 交叉复核为 `462/500`。因此本文只冻结要实现和验证的方案，不能预先写“multiview + WorldFlow 已提升成功率”。
+每个候选 checkpoint 必须在同 episode、同 fixed action/noise cache 和相同 suffix layout 下比较 World→Ego 开启与仅遮蔽 World scene/action K/V；遮蔽时不得改变 token 数、位置或 Ego noise。训练层面的收益还要与相同单视角输入、相同训练预算的 WorldFlow-off baseline 比较。只有主模型优于同 checkpoint 的 World 因果消融且不劣于单视角 Ego baseline，才能声称 WorldFlow 有效。
 
 推荐阶段：
 
@@ -962,12 +920,12 @@ SCENE 关闭时，mask 和 Molmo native IMAGE/TEXT 路径必须退化并与官�
 建议名称：
 
 ```text
-Frozen Full-Molmo2-ER Dual-View World–Ego WEP-VLA
+Frozen Full-Molmo2-ER World–Ego WEP-VLA
 ```
 
 建议方法描述：
 
-> We retain the alternating self/cross-attention action-expert family and replace the frozen backbone with the full 36-layer Molmo2-ER. Agent-view RGB follows the native Molmo image path, while agent-view and eye-in-hand point clouds are fused into a fixed-size exact-index coreset before PointSeg. Ego and World trajectory flows share one 36-layer action expert and are coupled by the current end-effector carrier transform. All Molmo parameters remain frozen and are verified unchanged throughout training.
+> We retain the alternating self/cross-attention action-expert family and replace the frozen backbone with the full 36-layer Molmo2-ER. A single agent-view RGB stream follows the native Molmo image path, and a single agent-view point cloud supplies PointSeg. Ego and World trajectory flows share one 36-layer action expert and are coupled by the current end-effector carrier transform. All Molmo parameters remain frozen and are verified unchanged throughout training.
 
 不能表述为：
 
@@ -977,6 +935,4 @@ Frozen Full-Molmo2-ER Dual-View World–Ego WEP-VLA
 - “所有 prefix 都是双向”；
 - “VLM 在 `no_grad` 中运行”；
 - “模型仍是 3B”；
-- “V52 已证明双视角 + WorldFlow 有正收益”；
-- “双视角通过独立 learned view module 融合”；
 - “WorldFlow 只是一个与最终 Ego action 断开的辅助 loss”。
