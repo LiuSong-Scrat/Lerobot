@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -21,6 +22,7 @@ from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
+from lerobot.policies.smolvla.constants import FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
@@ -58,7 +60,64 @@ class SmolVLAConfig(PreTrainedConfig):
     # legacy checkpoints by coupling RGB selection to point-cloud selection.
     camera_views: str = "agentview"
     rgb_camera_views: str | None = None
-
+    # Optional scene-point budget ratios in camera_views order. None preserves
+    # the legacy equal split, so existing multi-view checkpoints keep the exact
+    # composition they were trained with. Example: "9,1" retains 90% of the
+    # agentview scene budget while adding 10% eye-in-hand coverage.
+    camera_view_weights: str | None = None
+    # Multi-view composition policy. ``legacy_budget`` preserves every old
+    # checkpoint exactly. ``fps`` forms an equal union of every view's scene
+    # points, keeps one gripper tail, and downsamples on-device with FPS.
+    # ``voxel_fps`` first removes repeated occupied voxels from the shared
+    # spatial union, then applies the same FPS contract.
+    # ``voxel_cover_fps`` retains one representative of every occupied voxel
+    # when possible, then fills remaining detail slots in union-FPS order.
+    # ``multiscale_novelty_union`` protects every primary fine voxel and adds
+    # one secondary representative only for coverage that remains novel at a
+    # configurable coarser scale; the geometry determines the camera share.
+    # ``consensus_multiscale_novelty_union`` additionally lets overlapping
+    # views choose a real union-medoid representative inside each protected
+    # primary fine voxel, while retaining coarse-only secondary novelty.
+    # ``transport_novelty_union`` preserves every primary occupied voxel and
+    # inserts secondary novel voxels through local one-to-one replacements.
+    # ``full_union`` preserves every scene point from every selected view and
+    # appends the primary gripper tail once. It changes only the input length;
+    # no model module or checkpoint parameter is added.
+    # ``primary_residual`` keeps the primary cloud byte-identical and encodes
+    # the second view through a zero-initialized matrix residual.
+    camera_view_fusion: str = "legacy_budget"
+    # Deprecated compatibility field. Reduction-based multi-view adapters now
+    # derive their output length from the native per-view input length instead
+    # of imposing a dataset-specific fixed point count. Old checkpoints may
+    # still deserialize their recorded numeric value, but it does not constrain
+    # the policy core's accepted input length.
+    camera_view_fps_target_points: int | None = None
+    camera_view_fps_gripper_points: int = 500
+    camera_view_voxel_size: float = 0.005
+    camera_view_coarse_novelty_scale: float = 3.0
+    multiview_pretrained_lr_multiplier: float = 1.0
+    multiview_residual_lr_multiplier: float = 1.0
+    # Discriminative fine-tuning for input-layer multi-view fusion. All
+    # parameters remain trainable; the point-input path can adapt faster than
+    # the pretrained action path to reduce catastrophic forgetting.
+    multiview_input_pretrained_lr_multiplier: float = 1.0
+    multiview_input_point_lr_multiplier: float = 1.0
+    # When jointly adapting an Ego/World double-flow checkpoint to a new
+    # point-cloud input distribution, place both coordinate streams' direct
+    # point consumers in the point-input optimizer group.  This changes only
+    # training-time optimizer membership; the forward graph and old-checkpoint
+    # path are unchanged.  It is opt-in so historical runs remain exact.
+    multiview_input_symmetric_point_path_adaptation: bool = False
+    # Training-only input augmentation: deterministically expose roughly half
+    # the frames as the original primary view and half as the all-view fused
+    # cloud. Inference still uses every configured view. No model module or
+    # learned gate is introduced.
+    multiview_input_view_dropout_enable: bool = False
+    multiview_input_view_dropout_seed: int = 20260812
+    # Expand training to two complementary entries per frame: primary-only
+    # and all-view input. This gives both input domains full data coverage
+    # without changing model layers or inference behavior.
+    multiview_input_view_dropout_paired_coverage: bool = False
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
@@ -119,6 +178,9 @@ class SmolVLAConfig(PreTrainedConfig):
     pointseg_aux_loss_weight: float = 0.20
     pointseg_use_temporal_priors_as_input: bool = False
     pointseg_use_pseudo_selection: bool = True
+    # Preserve pretrained LitePT/PointSeg population statistics during
+    # small-data fine-tuning. BatchNorm affine parameters remain trainable.
+    pointseg_freeze_batchnorm_stats: bool = False
     point_action_fusion_enable: bool = True
     point_action_fusion_heads: int = 4
     point_action_fusion_dropout: float = 0.0
@@ -142,20 +204,163 @@ class SmolVLAConfig(PreTrainedConfig):
     # Joint World–Ego trajectory branch. PointSeg selects foreground XYZRGB in
     # the Ego/body frame, then the current EEF pose analytically maps those
     # exact points into World. World owns an independent LitePT + PointAction
-    # front-end, but both streams share the official Action Expert. One
-    # attention-pooled global scene token per stream forms the causal-prefix
-    # scene block; all World/Ego action tokens form one bidirectional block.
-    # The branch is active in training and inference.
+    # front-end. Historical modes share the official Action Expert; the
+    # calibrated design instead gives World an independently parameterized
+    # copy. Explicit fusion modes may exchange complete trajectory tokens only
+    # after both streams have formed their own proposals. The branch is active
+    # in training and inference.
     worldflow_enable: bool = False
+    # Supervision semantics for the independent World branch. ``legacy_eef``
+    # retains historical checkpoints whose World target is derived through
+    # the old carrier/conjugacy path. ``world_eef_trajectory`` predicts the
+    # commanded EEF trajectory directly in the fixed robot-base frame. With
+    # the foreground cloud in that same frame, the trajectory acts as sparse,
+    # task-relevant point-flow supervision without explicit object poses or
+    # dense scene-flow labels.
+    worldflow_target_type: str = "legacy_eef"
+    # Velocity chart for an absolute robot-base EEF trajectory. The legacy
+    # spatial twist rotates/translates about the global origin and therefore
+    # contains a position-dependent omega-cross-p lever arm. ``base_decoupled``
+    # instead predicts [p_dot_base, omega_base]: translation and orientation
+    # are integrated independently while both remain expressed on base axes.
+    # The legacy default preserves old checkpoints that do not serialize this
+    # field. ``base_pose9_euclidean`` keeps the complete pose in robot-base
+    # coordinates but uses the same 9D position + rotation-6D Euclidean flow
+    # as the pretrained Ego branch. Under the known current-EEF left transform
+    # that path is exactly linearly equivariant to Ego, so an independent World
+    # Expert does not have to relearn an unrelated 6D SO(3) flow and random
+    # output head before the two streams can reach comparable accuracy.
+    worldflow_world_eef_velocity_mode: str = "legacy_spatial_twist"
+    # Canonical fixed frame used by the World branch. Historical checkpoints
+    # used the first fixed camera. New World-EEF checkpoints use the robot
+    # base so scene geometry is invariant to camera placement and directly
+    # comparable across calibrated fixed cameras. This frame is never the UMI
+    # episode origin and never the current EEF frame.
+    worldflow_reference_frame: str = "pointcloud_reference_camera"
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
+    # Keep the pretrained World LitePT population statistics fixed during
+    # fine-tuning while leaving its BatchNorm affine parameters and every
+    # World/Ego path trainable. This removes a learning-rate-independent
+    # train/inference drift in the residual feature distribution.
+    worldflow_freeze_batchnorm_stats: bool = False
     worldflow_loss_weight: float = 0.05
     worldflow_geo_loss_weight: float = 0.05
     worldflow_bridge_loss_weight: float = 0.05
     worldflow_trans_weight: float = 1.0
     worldflow_rot_weight: float = 1.0
+    # Physical radius of the symmetric rigid probes used to supervise an
+    # absolute robot-base EEF trajectory.  Translation and angular errors have
+    # incompatible units (metres versus radians); evaluating the velocity and
+    # endpoint displacement of points attached to the EEF converts both to
+    # metres without a tunable scalar loss balance.  Ten centimetres is a
+    # robot/tool geometry constant, not an optimization multiplier.
+    worldflow_eef_probe_radius_m: float = 0.10
     worldflow_se3_head_enable: bool = False
     worldflow_equiv_loss_weight: float = 0.02
+    # Discriminative fine-tuning keeps every path plastic while permitting an
+    # existing World representation and its zero-initialized physical residual
+    # output head to adapt on different time scales. ``None`` preserves the
+    # historical two-group behavior by using ``worldflow_new_lr_multiplier``
+    # for the residual head as well. Every explicit multiplier must be positive:
+    # zero would silently freeze a path.
+    worldflow_pretrained_lr_multiplier: float = 1.0
+    worldflow_new_lr_multiplier: float = 1.0
+    worldflow_residual_lr_multiplier: float | None = None
+    # Preserve an already strong Ego policy while learning the independent
+    # World branch and the explicit bidirectional interaction modules.  This
+    # prevents a small focused dataset (for example 100 demonstrations) from
+    # rewriting the pretrained Action Expert, Ego point path, or action head.
+    # World remains fully trainable and can still affect Ego through the
+    # zero-initialized World-to-Ego cross-attention path.
+    worldflow_freeze_pretrained_ego: bool = False
+    # Training-only stochastic depth for the physical World-to-Ego correction.
+    # A dropped sample is optimized through the unchanged Ego action path;
+    # retained samples use the complete bidirectional World/Ego path. This adds
+    # no parameter or inference-time branch and uses the same action objective
+    # for both cases. A value of 1 is forbidden because it would prevent the
+    # World correction from receiving action gradients.
+    worldflow_training_world_to_ego_dropout_probability: float = 0.0
+    # Optional residual-boosting gradient routing. On samples whose physical
+    # World-to-Ego correction is retained, treat the current Ego prediction as
+    # a fixed boosting anchor and update the World/residual path through the
+    # unchanged action loss. Dropped samples continue to update the ordinary
+    # Ego action path. This is training-only, adds no parameter or loss, and
+    # leaves the complete inference forward exactly unchanged.
+    worldflow_training_residual_anchor_stop_gradient: bool = False
+    # Training-only asymmetric PCGrad for the two stochastic-depth paths.
+    # The ordinary Ego-only samples define the protected shared gradient.  If
+    # the World-corrected samples produce an opposing gradient, only that
+    # opposing component is projected out; aligned World gradients and all
+    # World-only parameter gradients are retained.  Both paths still optimize
+    # the same action loss from one forward, every parameter remains trainable,
+    # and inference is unchanged.
+    worldflow_training_ego_priority_gradient_projection: bool = False
+    # Stronger shared-backbone variant: on pretrained/common parameters the
+    # World-corrected gradient is projected onto the non-negative one-
+    # dimensional span of the ordinary Ego gradient. Orthogonal or opposing
+    # World components cannot rewrite the baseline representation, while the
+    # dedicated World/bidirectional/residual parameter groups retain their
+    # complete gradients. Ego/common parameters still train from the original
+    # Ego action loss, so no branch is frozen.
+    worldflow_training_shared_gradient_ego_tangent_projection: bool = False
+    # Continuous-time parameterization for endpoint residual boosting. The
+    # World head predicts a bounded residual *rate* and the physical SE(3)
+    # endpoint correction is multiplied by the remaining flow time (1-t).
+    # Consequently the correction vanishes at the terminal boundary and the
+    # velocity reconstruction cannot amplify a time-independent residual by
+    # 1/(1-t). This is a fixed analytical boundary condition, not a learned
+    # gate; it adds no parameter or auxiliary objective. Disabled by default
+    # so historical checkpoints preserve their exact inference function.
+    worldflow_endpoint_residual_rate_parameterization: bool = False
+    # Express the endpoint residual twist in the Ego carrier frame instead of
+    # the arbitrary World coordinate frame. A rigid reparameterization of the
+    # World frame then leaves the target six-vector unchanged, rather than
+    # requiring the point network to learn the SE(3) adjoint transformation of
+    # a spatial World twist. The correction is still composed physically on
+    # SE(3), uses the same residual head and action loss, and adds no parameter,
+    # gate, auxiliary objective, or inference-time branch. Disabled by default
+    # for exact historical-checkpoint compatibility.
+    worldflow_endpoint_residual_ego_frame_parameterization: bool = False
+    # Express the endpoint correction as a body twist at the predicted Ego
+    # endpoint: B_corrected = B_ego Exp(xi_body).  The corresponding target
+    # Log(B_ego^-1 B_target) is right-invariant and follows the endpoint's own
+    # axes, while remaining independent of an arbitrary World-coordinate
+    # reparameterization.  This reuses the existing six-dimensional head and
+    # action loss; it adds no parameter, gate, auxiliary objective, or second
+    # forward.  Disabled by default for exact historical-checkpoint
+    # compatibility and mutually exclusive with the carrier-frame left twist
+    # above.
+    worldflow_endpoint_residual_body_frame_parameterization: bool = False
+    # Interpret the same six-dimensional World head as a right-trivialized
+    # body-twist *velocity* at the current Ego Flow state rather than as a
+    # finite correction at the predicted endpoint.  The induced tangent
+    # dB/dt = B hat(xi_body) is lifted back into the pretrained pose9/rotation6d
+    # gauge before it is added to the Ego Euclidean vector field.  Its axes are
+    # therefore defined by the known current state, not by a still-changing
+    # endpoint prediction.  This is coordinate invariant, reuses the existing
+    # residual head and action loss, and adds no parameter, gate, auxiliary
+    # objective, or second forward.  Disabled by default for exact historical
+    # checkpoint compatibility and mutually exclusive with every finite
+    # endpoint-residual parameterization above.
+    worldflow_body_velocity_residual_parameterization: bool = False
+    # Training-only reparameterization of the complete World coordinate frame.
+    # One random rigid transform A is applied consistently to World points,
+    # the Ego-to-World carrier C, and every World trajectory state, so the
+    # physical Ego action represented by C^-1 G C is unchanged. This replaces
+    # the canonical World representation for the ordinary single action-loss
+    # forward; it adds no second view, auxiliary objective, parameter, gate, or
+    # inference-time operation.
+    worldflow_training_coordinate_frame_augmentation: bool = False
+    # Optional one-shot initialization used when adapting an Ego checkpoint:
+    # copy shape-compatible Ego action/point modules into the World stream,
+    # while keeping both streams trainable. This is not applied when loading a
+    # trained WorldFlow checkpoint unless explicitly requested by the caller.
+    worldflow_bootstrap_from_ego: bool = False
+    # Deprecated checkpoint-compatibility field. World/Ego scalar gates are
+    # forbidden; only None is accepted. Keeping the parser field lets older
+    # gate-free checkpoints that serialized null continue to load.
+    worldflow_ego_residual_gate_init: float | None = None
     # 0 keeps the complete predicted foreground. A positive value is an
     # optional memory cap applied after PointSeg foreground selection.
     worldflow_max_points: int = 0
@@ -177,18 +382,86 @@ class SmolVLAConfig(PreTrainedConfig):
     #
     # ``independent`` reproduces the original experimental implementation:
     # Ego body motion and World spatial motion start from unrelated random
-    # transforms. ``conjugate_ego`` samples one physically valid Ego SE(3)
+    # transforms. ``left_compose_ego`` is the physically correct prior for an
+    # absolute robot-base EEF trajectory: if C is the observed current
+    # EEF-to-base pose and B_0 is the Ego prior expressed in the current EEF
+    # frame, the World prior is W_0 = C B_0. Only the stochastic origin is
+    # coupled; the two vector fields are integrated independently afterwards.
+    # ``conjugate_ego`` samples one physically valid Ego SE(3)
     # prior B_0 and derives the World prior exactly as G_0 = C B_0 C^{-1},
     # where C is the current EEF-to-World pose.  The latter is the recommended
-    # stochastic double-flow contract.  It requires either the valid-pose9
-    # prior or the complete manifold SE(3) flow because legacy Euclidean
-    # Gaussian rotation-6D vectors are not elements of SE(3) and therefore
-    # cannot be conjugated safely.
+    # stochastic double-flow contract. ``projected_ego_chart`` instead keeps a
+    # legacy checkpoint's exact Euclidean Ego noise distribution, projects its
+    # rotation-6D chart to SO(3), and conjugates only the World prior. This is
+    # the checkpoint-compatible coupling contract: it leaves the Ego input
+    # byte-for-byte unchanged while removing an unrelated World random origin.
+    # ``projected_ego_path`` strengthens that contract at every denoising time:
+    # World state is always the analytic conjugate of the current projected Ego
+    # chart, rather than following a second, incompatible Euclidean chord.
     worldflow_noise_coupling: str = "independent"
-    # Checkpoint-adaptation compatibility switch used by later WorldFlow
-    # branches.  It is deliberately false for this point-only continuation;
-    # with worldflow_enable=False no WorldFlow branch is instantiated.
-    worldflow_bootstrap_from_ego: bool = False
+    # ``global`` is the historical spatial-transform frame G=CBC^-1. Its
+    # translation contains a world-origin lever-arm term. ``current_ee`` keeps
+    # world-aligned axes but places the origin at the current EEF, yielding an
+    # exactly invertible, better-conditioned conjugacy without that term.
+    worldflow_frame_origin: str = "global"
+    # Coordinate frame used only to encode the World scene points. ``carrier``
+    # preserves the historical contract and reuses ``worldflow_frame_origin``.
+    # ``global`` keeps the scene in the fixed dataset/world frame even when the
+    # action-flow carrier uses ``current_ee`` to remove its conjugation
+    # lever-arm. This separates sensory information from action
+    # parameterization: it restores absolute scene position without changing
+    # the well-conditioned local World action state or adding model parameters.
+    worldflow_scene_frame_origin: str = "carrier"
+    # ``cross_attention`` preserves historical checkpoints: World affects the
+    # Ego head only through token exchange. ``symmetric_twist`` additionally
+    # maps the World spatial twist back to Ego coordinates with the exact SE(3)
+    # adjoint and averages the two physical predictions with fixed 1:1 weight.
+    # ``conjugate_residual`` derives an exact World baseline from Ego and lets
+    # a zero-initialized World head predict a residual correction. The
+    # checkpoint-compatible ``conjugate_residual_consensus`` splits that
+    # correction equally between the two coordinate descriptions, then derives
+    # World exactly from the corrected Ego twist. ``conjugate_residual_boosting``
+    # has the same forward contract but stops the direct Ego-score gradient in
+    # the World auxiliary objective. This makes the World residual learn the
+    # remaining Ego error instead of allowing the two predictors to cancel.
+    # ``endpoint_geodesic_consensus`` retains the checkpoint's legacy pose9
+    # Ego flow.  Ego and World independently predict the same physical
+    # endpoint, the World endpoint is conjugated back to Ego coordinates, and
+    # their fixed 1:1 SE(3) geodesic midpoint is converted back to an Ego
+    # pose9 velocity.  This gives World a coordinate-defined path to Ego
+    # without a latent residual or learned gate.
+    # ``endpoint_residual_boosting`` instead keeps the pretrained Ego endpoint
+    # as the exact zero-residual function and uses the existing zero-initialized
+    # World twist head to predict only the remaining SE(3) endpoint error.  The
+    # corrected World endpoint is conjugated back to Ego and represented in the
+    # original pose9 chart.  It has no fixed mixing coefficient: World learns a
+    # physical correction, not a second absolute policy to average with Ego.
+    # These are deterministic geometry/fixed fusion contracts, not learned gates.
+    # ``point_action_expert_conjugate_bridge`` keeps two coordinate-semantic
+    # front-ends (each LitePT + PointAction adapter), converts their current
+    # flow states to the same robot-base motion operator by exact conjugation,
+    # exchanges them through bidirectional full-matrix token adapters, and runs
+    # both action streams through one shared Action Expert parameter instance.
+    # Neither branch's input state or supervision target is rewritten.
+    # ``independent_parallel`` is the calibration phase for a true dual-flow
+    # model: both complete trajectories are directly supervised and every
+    # non-VLM module remains trainable, but neither flow can alter the other.
+    # Physical interaction is enabled only after their unweighted endpoint
+    # errors are comparable. This is a curriculum, not a learned gate.
+    worldflow_action_fusion: str = "cross_attention"
+    # ``shared`` is the historical implementation: World owns its geometric
+    # front-end but its action tokens are processed by the Ego Action Expert.
+    # ``independent`` gives World a separately parameterized Action Expert,
+    # bootstrapped once from Ego and then trained only by the World/interaction
+    # objectives.  Ego and World exchange information only through the explicit
+    # bidirectional cross-attention path after their respective experts.
+    worldflow_action_expert_mode: str = "shared"
+    # A robot-base trajectory is not Markov without the achieved current EEF
+    # pose: after the foreground cloud is mapped out of the current-EEF frame,
+    # that pose can no longer be recovered from foreground geometry alone.
+    # New World-trajectory models expose it as an explicit World Expert token.
+    # Disabled by default so historical WorldFlow checkpoints remain loadable.
+    worldflow_current_ee_pose_token: bool = False
     worldflow_augmentation_trans_scale: float = 0.20
     worldflow_augmentation_rot_scale: float = 0.75
     # Legacy Dense-ObjectFlow options retained only so old command lines and
@@ -204,9 +477,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # analytically projects their instantaneous rigid-body derivative onto a
     # spatial SE(3) twist. ``pose9_endpoint`` instead preserves the old flow
     # head's endpoint semantics: x_t + (1-t) v_pose9 is projected to SE(3), then
-    # converted to the exact left-trivialized geodesic velocity from x_t. All
-    # modes use the same manifold-valued prior, geodesic training path and
-    # group integration; only the output parameterization differs.
+    # converted to the exact left-trivialized geodesic velocity from x_t.
+    # ``pose9_chart_endpoint`` additionally keeps the original v0.4.2
+    # Euclidean pose9 chart as the Action Expert input while carrying a
+    # separate physical state on SE(3). This preserves checkpoint input and
+    # endpoint semantics without giving up group integration or World/Ego
+    # conjugacy. All modes use a manifold-valued physical state.
     se3_twist_head_mode: str = "direct_twist"
     se3_noise_trans_scale: float = 0.15
     se3_noise_rot_scale: float = 0.75
@@ -230,11 +506,30 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
-    # Keep the existing SmolVLA implementation as the default. ``molmo2_text``
-    # is the historical point-cloud-only 3B control (18/36 text layers, no
-    # vision). ``molmo2_full`` is the Frozen Full-Molmo2-ER WEP-VLA contract:
-    # native RGB vision plus all 36 text layers, paired with a 36-layer expert.
+    # The v0.4.3 multiview DoubleFlow policy remains the architecture baseline.
+    # Molmo backends replace only the frozen VLM implementation.
     vlm_backend: str = "smolvlm"
+    # Persist the token/attention topology in every policy checkpoint.  This
+    # prevents a detached-scene-suffix checkpoint from being mistaken for the
+    # shape- and semantics-incompatible WEP-prefix model.
+    full_molmo_topology: str = FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
+    # Historical Scheme B kept Full-Molmo2-ER outside the training graph and
+    # exposed detached IMAGE/TEXT K/V only.  The WEP-compatible Full-Molmo
+    # topology instead places trainable FG/BG in the VLM prefix, so decoder
+    # input gradients must be enabled even though every Molmo parameter stays
+    # frozen.  Keep this field for checkpoint/CLI compatibility, but the full
+    # backend contract requires it to be false.
+    molmo_inference_only: bool = False
+    # Recompute coupled frozen-Molmo/Action-Expert segments during backward.
+    # This preserves the exact WEP attention graph while avoiding retention of
+    # all 36 layers' decoder activations.
+    molmo_gradient_checkpointing: bool = True
+    # Two layers per segment halves retained boundary tensors relative to
+    # one-layer segments while keeping the recomputation peak bounded.
+    molmo_gradient_checkpointing_layers_per_segment: int = 2
+    # Batch-vectorized fixed 256px/two-crop native image transform. Contract
+    # mismatches always fall back to Molmo's trusted slow processor.
+    molmo_image_fast_path: bool = True
     # Optional raw SmolVLM directory/repository or SmolVLA policy checkpoint
     # used only as the source of the VLM weights. `vlm_model_name` remains the
     # source of the architecture and processor when a policy checkpoint is used.
@@ -278,10 +573,147 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.camera_view_fusion not in {
+            "legacy_budget",
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+            "primary_residual",
+        }:
+            raise ValueError(
+                "camera_view_fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
+                "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+                "'consensus_multiscale_novelty_union', "
+                "'transport_novelty_union', "
+                "'uniform_union', 'full_union', "
+                "or 'primary_residual'; "
+                f"got {self.camera_view_fusion!r}."
+            )
+        if self.camera_view_fps_target_points is not None:
+            if int(self.camera_view_fps_target_points) <= 0:
+                raise ValueError("camera_view_fps_target_points must be positive when set.")
+            if not 0 <= int(self.camera_view_fps_gripper_points) < int(
+                self.camera_view_fps_target_points
+            ):
+                raise ValueError(
+                    "camera_view_fps_gripper_points must be in "
+                    "[0, camera_view_fps_target_points)."
+                )
+        if not math.isfinite(float(self.camera_view_voxel_size)) or float(self.camera_view_voxel_size) <= 0.0:
+            raise ValueError("camera_view_voxel_size must be finite and positive.")
+        if (
+            not math.isfinite(float(self.camera_view_coarse_novelty_scale))
+            or float(self.camera_view_coarse_novelty_scale) <= 1.0
+        ):
+            raise ValueError("camera_view_coarse_novelty_scale must be finite and greater than one.")
+        if self.camera_view_fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+            "primary_residual",
+        } and self.camera_view_weights not in {None, ""}:
+            raise ValueError(
+                f"camera_view_weights cannot be combined with camera_view_fusion={self.camera_view_fusion!r}; "
+                "equal-union fusion does not use a hand-chosen view ratio."
+            )
+        if float(self.multiview_input_pretrained_lr_multiplier) <= 0:
+            raise ValueError("multiview_input_pretrained_lr_multiplier must be positive; zero would freeze parameters.")
+        if float(self.multiview_input_point_lr_multiplier) <= 0:
+            raise ValueError("multiview_input_point_lr_multiplier must be positive; zero would freeze parameters.")
+        if self.multiview_input_symmetric_point_path_adaptation and not self.worldflow_enable:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires worldflow_enable=True."
+            )
+        if self.multiview_input_symmetric_point_path_adaptation and self.camera_view_fusion not in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+        }:
+            raise ValueError(
+                "multiview_input_symmetric_point_path_adaptation requires a supported "
+                "input-layer multi-view fusion."
+            )
+        if self.multiview_input_view_dropout_enable:
+            if self.camera_view_fusion not in {
+                "fps",
+                "novelty_union",
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+                "transport_novelty_union",
+                "uniform_union",
+                "full_union",
+            }:
+                raise ValueError(
+                    "multiview_input_view_dropout_enable currently requires "
+                    "camera_view_fusion='fps', 'novelty_union', 'multiscale_novelty_union', "
+                    "'consensus_multiscale_novelty_union', "
+                    "'transport_novelty_union', 'uniform_union', or 'full_union'."
+                )
+            views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())
+            if len(views) < 2:
+                raise ValueError("multiview_input_view_dropout_enable requires at least two camera_views.")
+        elif self.multiview_input_view_dropout_paired_coverage:
+            raise ValueError(
+                "multiview_input_view_dropout_paired_coverage requires "
+                "multiview_input_view_dropout_enable=true."
+            )
+        if self.camera_view_fusion == "primary_residual":
+            views = tuple(part.strip() for part in str(self.camera_views).split(",") if part.strip())
+            if len(views) != 2:
+                raise ValueError(
+                    "camera_view_fusion='primary_residual' requires exactly two camera_views; "
+                    f"got {views}."
+                )
+            if float(self.multiview_pretrained_lr_multiplier) <= 0:
+                raise ValueError("multiview_pretrained_lr_multiplier must be positive.")
+            if float(self.multiview_residual_lr_multiplier) <= 0:
+                raise ValueError("multiview_residual_lr_multiplier must be positive.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
+            )
+        if int(self.action_chunk_start_offset) < 0:
+            raise ValueError("action_chunk_start_offset must be non-negative.")
+        if int(self.action_chunk_start_offset) > 0:
+            warnings.warn(
+                "ACTION TEMPORAL CONTRACT: action_chunk_start_offset="
+                f"{int(self.action_chunk_start_offset)} means predicted token 0 is trained from "
+                f"dataset action[i+{int(self.action_chunk_start_offset)}]. Online inference must "
+                "execute predicted token 0 (action_index=0); do not apply the offset a second time.",
+                stacklevel=2,
+            )
+        if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
+            raise ValueError(
+                "flow_time_sampling must be one of beta, uniform, integration_grid; "
+                f"got {self.flow_time_sampling!r}."
+            )
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive.")
+        if not 0.0 <= float(self.flow_time_zero_probability) < 1.0:
+            raise ValueError("flow_time_zero_probability must be in [0, 1).")
+        if self.flow_time_zero_probability > 0 and self.flow_time_sampling != "integration_grid":
+            raise ValueError(
+                "flow_time_zero_probability is only supported with "
+                "flow_time_sampling='integration_grid'."
             )
         if self.vlm_backend not in {"smolvlm", "molmo2_text", "molmo2_full"}:
             raise ValueError(
@@ -426,6 +858,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"depth and width may differ ({details})."
                 )
         elif self.vlm_backend == "molmo2_full":
+            if not 1 <= self.molmo_gradient_checkpointing_layers_per_segment <= 36:
+                raise ValueError(
+                    "molmo_gradient_checkpointing_layers_per_segment must be in [1,36]."
+                )
             if self.selected_camera_views != ("agentview",):
                 raise ValueError(
                     "vlm_backend='molmo2_full' requires exactly camera_views='agentview'."
@@ -465,16 +901,12 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("Full-Molmo2-ER requires alternating even-SA/odd-CA Expert layers.")
             if abs(float(self.expert_width_multiplier) - 0.75) > 1e-12:
                 raise ValueError("Full-Molmo2-ER requires expert_width_multiplier=0.75.")
-            if not any(
-                abs(float(self.scheduler_decay_lr) - value) <= 1e-12
-                for value in (2.5e-6, 3e-5)
-            ):
-                raise ValueError(
-                    "Full-Molmo2-ER scheduler_decay_lr must be 2.5e-6 for the fresh 36k stage "
-                    "or 3e-5 for a 30k warm-start fine-tuning stage."
-                )
-
+            # The optimizer schedule is a run-time training choice rather than
+            # part of the Full-Molmo2-ER architecture contract.  Keep
+            # scheduler_warmup_steps, scheduler_decay_steps and
+            # scheduler_decay_lr configurable through the normal CLI fields.
             full_contract = {
+                "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
                 "n_obs_steps": 1,
                 "chunk_size": 32,
                 "n_action_steps": 16,
@@ -489,6 +921,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 "flow_time_sampling": "beta",
                 "flow_time_zero_probability": 0.0,
                 "use_cache": True,
+                "molmo_inference_only": False,
+                "molmo_image_fast_path": True,
                 "freeze_vision_encoder": True,
                 "train_state_proj": True,
                 "encode_robot_state": False,
@@ -511,19 +945,51 @@ class SmolVLAConfig(PreTrainedConfig):
                 "action_loss_translation_weight": 1.0,
                 "action_loss_rotation_weight": 1.0,
                 "action_loss_gripper_weight": 1.0,
-                "pose9_action_noise_enable": False,
-                "worldflow_enable": False,
+                "pose9_action_noise_trans_scale": 0.15,
+                "pose9_action_noise_rot_scale": 0.35,
+                "pose9_action_noise_gripper_scale": 0.05,
+                "worldflow_enable": True,
+                "worldflow_target_type": "world_eef_trajectory",
+                "worldflow_world_eef_velocity_mode": "base_pose9_euclidean",
+                "worldflow_reference_frame": "robot_base",
+                "worldflow_frame_origin": "global",
+                "worldflow_scene_frame_origin": "global",
+                "worldflow_action_fusion": "point_action_expert_conjugate_bridge",
+                "worldflow_action_expert_mode": "shared",
+                "worldflow_current_ee_pose_token": False,
+                "worldflow_freeze_pretrained_ego": False,
+                "worldflow_training_coordinate_frame_augmentation": False,
+                "worldflow_pretrained_lr_multiplier": 1.0,
+                "worldflow_new_lr_multiplier": 1.0,
+                "worldflow_feature_dim": 64,
+                "worldflow_grid_size": 0.01,
+                "worldflow_loss_weight": 1.0,
+                "worldflow_geo_loss_weight": 0.0,
+                "worldflow_bridge_loss_weight": 0.0,
+                "worldflow_equiv_loss_weight": 0.0,
+                "worldflow_trans_weight": 1.0,
+                "worldflow_rot_weight": 1.0,
+                "worldflow_noise_trans_scale": 0.15,
+                "worldflow_noise_rot_scale": 0.20,
+                "worldflow_augmentation_trans_scale": 0.20,
+                "worldflow_augmentation_rot_scale": 0.75,
+                "worldflow_min_transport_points": 3,
+                "worldflow_transport_score_threshold": 0.05,
+                "worldflow_eef_probe_radius_m": 0.10,
+                "worldflow_max_points": 2048,
+                "worldflow_require_action_target_sidecar": True,
+                "worldflow_noise_coupling": "left_compose_ego",
                 "worldflow_se3_head_enable": False,
                 "worldflow_bootstrap_from_ego": False,
+                "worldflow_ego_residual_gate_init": None,
                 "se3_enable": False,
                 "se3_final_correction_enable": False,
+                "rtc_config": None,
                 "optimizer_lr": 1e-4,
                 "optimizer_betas": (0.9, 0.95),
                 "optimizer_eps": 1e-8,
                 "optimizer_weight_decay": 1e-10,
                 "optimizer_grad_clip_norm": 10,
-                "scheduler_warmup_steps": 100,
-                "scheduler_decay_steps": 30_000,
                 "load_action_expert_weights": False,
                 "load_action_expert_projection_weights": False,
                 "attention_mode": "cross_attn",
@@ -548,30 +1014,6 @@ class SmolVLAConfig(PreTrainedConfig):
                     for name, (expected, actual) in drift.items()
                 )
                 raise ValueError(f"Full-Molmo2-ER WEP-VLA contract drifted ({details}).")
-        if int(self.action_chunk_start_offset) < 0:
-            raise ValueError("action_chunk_start_offset must be non-negative.")
-        if int(self.action_chunk_start_offset) > 0:
-            warnings.warn(
-                "ACTION TEMPORAL CONTRACT: action_chunk_start_offset="
-                f"{int(self.action_chunk_start_offset)} means predicted token 0 is trained from "
-                f"dataset action[i+{int(self.action_chunk_start_offset)}]. Online inference must "
-                "execute predicted token 0 (action_index=0); do not apply the offset a second time.",
-                stacklevel=2,
-            )
-        if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
-            raise ValueError(
-                "flow_time_sampling must be one of beta, uniform, integration_grid; "
-                f"got {self.flow_time_sampling!r}."
-            )
-        if self.num_steps <= 0:
-            raise ValueError("num_steps must be positive.")
-        if not 0.0 <= float(self.flow_time_zero_probability) < 1.0:
-            raise ValueError("flow_time_zero_probability must be in [0, 1).")
-        if self.flow_time_zero_probability > 0 and self.flow_time_sampling != "integration_grid":
-            raise ValueError(
-                "flow_time_zero_probability is only supported with "
-                "flow_time_sampling='integration_grid'."
-            )
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
@@ -588,10 +1030,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 "direct_twist",
                 "projected_pose9",
                 "pose9_endpoint",
+                "pose9_chart_endpoint",
             }:
                 raise ValueError(
                     "se3_twist_head_mode must be 'direct_twist', 'projected_pose9', "
-                    "or 'pose9_endpoint'; "
+                    "'pose9_endpoint', or 'pose9_chart_endpoint'; "
                     f"got {self.se3_twist_head_mode!r}."
                 )
             for name in (
@@ -629,13 +1072,162 @@ class SmolVLAConfig(PreTrainedConfig):
                 if float(getattr(self, name)) < 0:
                     raise ValueError(f"{name} must be non-negative.")
         if self.worldflow_se3_head_enable:
-            warnings.warn(
-                "worldflow_se3_head_enable is kept only for CLI compatibility and is ignored. "
-                "WorldFlow directly flow-matches an SE(3) spatial transform through its "
-                "LitePT/PointAction front-end and the shared World–Ego Action Expert.",
-                stacklevel=2,
+            if not self.worldflow_enable:
+                raise ValueError("worldflow_se3_head_enable=True requires worldflow_enable=True.")
+            if not self.se3_enable:
+                raise ValueError("worldflow_se3_head_enable=True requires se3_enable=True.")
+        if self.worldflow_training_coordinate_frame_augmentation and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_coordinate_frame_augmentation=True requires worldflow_enable=True."
+            )
+        if self.worldflow_training_ego_priority_gradient_projection and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_ego_priority_gradient_projection=True requires worldflow_enable=True."
+            )
+        if self.worldflow_training_shared_gradient_ego_tangent_projection and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_training_shared_gradient_ego_tangent_projection=True requires "
+                "worldflow_enable=True."
+            )
+        if self.worldflow_endpoint_residual_rate_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_rate_parameterization=True requires "
+                "worldflow_enable=True."
+            )
+        if self.worldflow_endpoint_residual_ego_frame_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
+                "worldflow_enable=True."
+            )
+        if self.worldflow_endpoint_residual_body_frame_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_endpoint_residual_body_frame_parameterization=True requires "
+                "worldflow_enable=True."
+            )
+        if self.worldflow_body_velocity_residual_parameterization and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_body_velocity_residual_parameterization=True requires "
+                "worldflow_enable=True."
+            )
+        if self.worldflow_freeze_pretrained_ego and not self.worldflow_enable:
+            raise ValueError(
+                "worldflow_freeze_pretrained_ego=True requires worldflow_enable=True."
             )
         if self.worldflow_enable:
+            if self.worldflow_action_expert_mode not in {"shared", "independent"}:
+                raise ValueError(
+                    "worldflow_action_expert_mode must be 'shared' or 'independent', "
+                    f"got {self.worldflow_action_expert_mode!r}."
+                )
+            if self.worldflow_target_type not in {
+                "legacy_eef",
+                "world_eef_trajectory",
+            }:
+                raise ValueError(
+                    "worldflow_target_type must be 'legacy_eef' or "
+                    f"'world_eef_trajectory', got {self.worldflow_target_type!r}."
+                )
+            if self.worldflow_world_eef_velocity_mode not in {
+                "legacy_spatial_twist",
+                "base_decoupled",
+                "base_pose9_euclidean",
+            }:
+                raise ValueError(
+                    "worldflow_world_eef_velocity_mode must be "
+                    "'legacy_spatial_twist', 'base_decoupled', or "
+                    "'base_pose9_euclidean', got "
+                    f"{self.worldflow_world_eef_velocity_mode!r}."
+                )
+            if self.worldflow_reference_frame not in {
+                "pointcloud_reference_camera",
+                "robot_base",
+            }:
+                raise ValueError(
+                    "worldflow_reference_frame must be 'pointcloud_reference_camera' or "
+                    f"'robot_base', got {self.worldflow_reference_frame!r}."
+                )
+            if self.worldflow_target_type == "world_eef_trajectory":
+                world_trajectory_contract_errors = []
+                if self.worldflow_reference_frame != "robot_base":
+                    world_trajectory_contract_errors.append("worldflow_reference_frame='robot_base'")
+                if self.worldflow_scene_frame_origin != "global":
+                    world_trajectory_contract_errors.append("worldflow_scene_frame_origin='global'")
+                if self.worldflow_frame_origin != "global":
+                    world_trajectory_contract_errors.append("worldflow_frame_origin='global'")
+                if self.worldflow_noise_coupling not in {"independent", "left_compose_ego"}:
+                    world_trajectory_contract_errors.append(
+                        "worldflow_noise_coupling='independent' or 'left_compose_ego'"
+                    )
+                if self.worldflow_action_fusion not in {
+                    "independent_parallel",
+                    "cross_attention",
+                    "point_action_expert_conjugate_bridge",
+                    "physical_trajectory_cross_attention",
+                    "world_trajectory_arm_ego_gripper",
+                }:
+                    world_trajectory_contract_errors.append(
+                        "worldflow_action_fusion='independent_parallel', 'cross_attention', "
+                        "'point_action_expert_conjugate_bridge', "
+                        "'physical_trajectory_cross_attention', or "
+                        "'world_trajectory_arm_ego_gripper'"
+                    )
+                if self.worldflow_bridge_loss_weight != 0:
+                    world_trajectory_contract_errors.append("worldflow_bridge_loss_weight=0")
+                if self.worldflow_equiv_loss_weight != 0:
+                    world_trajectory_contract_errors.append("worldflow_equiv_loss_weight=0")
+                if self.worldflow_training_coordinate_frame_augmentation:
+                    world_trajectory_contract_errors.append(
+                        "worldflow_training_coordinate_frame_augmentation=False"
+                    )
+                if self.worldflow_residual_lr_multiplier is not None:
+                    world_trajectory_contract_errors.append("worldflow_residual_lr_multiplier=None")
+                if self.worldflow_world_eef_velocity_mode in {
+                    "base_decoupled",
+                    "base_pose9_euclidean",
+                } and (
+                    not math.isclose(self.worldflow_trans_weight, 1.0)
+                    or not math.isclose(self.worldflow_rot_weight, 1.0)
+                ):
+                    world_trajectory_contract_errors.append(
+                        "worldflow_trans_weight=worldflow_rot_weight=1 for the fixed physical-probe metric"
+                    )
+                if world_trajectory_contract_errors:
+                    raise ValueError(
+                        "world_eef_trajectory WorldFlow requires the strict independent-branch "
+                        "contract: " + ", ".join(world_trajectory_contract_errors) + "."
+                    )
+            if self.worldflow_ego_residual_gate_init is not None:
+                raise ValueError(
+                    "World/Ego residual gates are unsupported; "
+                    "worldflow_ego_residual_gate_init must be None."
+                )
+            if self.worldflow_freeze_pretrained_ego and not math.isclose(
+                self.worldflow_pretrained_lr_multiplier,
+                1.0,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            ):
+                raise ValueError(
+                    "worldflow_freeze_pretrained_ego=True requires "
+                    "worldflow_pretrained_lr_multiplier=1.0 because frozen parameters "
+                    "are excluded from the optimizer rather than assigned a nominal learning rate."
+                )
+            if self.worldflow_pretrained_lr_multiplier <= 0:
+                raise ValueError("worldflow_pretrained_lr_multiplier must be positive; zero would freeze Ego.")
+            if self.worldflow_new_lr_multiplier <= 0:
+                raise ValueError("worldflow_new_lr_multiplier must be positive; zero would freeze World.")
+            if (
+                self.worldflow_residual_lr_multiplier is not None
+                and self.worldflow_residual_lr_multiplier <= 0
+            ):
+                raise ValueError(
+                    "worldflow_residual_lr_multiplier must be positive; zero would freeze the residual head."
+                )
+            if not 0.0 <= self.worldflow_training_world_to_ego_dropout_probability < 1.0:
+                raise ValueError(
+                    "worldflow_training_world_to_ego_dropout_probability must be in [0,1); "
+                    "1 would remove all World-to-Ego action gradients."
+                )
             action_norm = self.normalization_mapping.get("ACTION")
             if action_norm is not NormalizationMode.IDENTITY:
                 raise ValueError(
@@ -655,10 +1247,263 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("worldflow_noise_trans_scale must be non-negative.")
             if self.worldflow_noise_rot_scale < 0:
                 raise ValueError("worldflow_noise_rot_scale must be non-negative.")
-            if self.worldflow_noise_coupling not in {"independent", "conjugate_ego"}:
+            if self.worldflow_eef_probe_radius_m <= 0:
+                raise ValueError("worldflow_eef_probe_radius_m must be positive.")
+            if self.worldflow_augmentation_trans_scale < 0:
+                raise ValueError("worldflow_augmentation_trans_scale must be non-negative.")
+            if self.worldflow_augmentation_rot_scale < 0:
+                raise ValueError("worldflow_augmentation_rot_scale must be non-negative.")
+            if self.worldflow_noise_coupling not in {
+                "independent",
+                "left_compose_ego",
+                "conjugate_ego",
+                "projected_ego_chart",
+                "projected_ego_path",
+            }:
                 raise ValueError(
-                    "worldflow_noise_coupling must be 'independent' or 'conjugate_ego'; "
+                    "worldflow_noise_coupling must be 'independent', 'left_compose_ego', "
+                    "'conjugate_ego', 'projected_ego_chart', or 'projected_ego_path'; "
                     f"got {self.worldflow_noise_coupling!r}."
+                )
+            if self.worldflow_frame_origin not in {"global", "current_ee"}:
+                raise ValueError(
+                    "worldflow_frame_origin must be 'global' or 'current_ee'; "
+                    f"got {self.worldflow_frame_origin!r}."
+                )
+            if self.worldflow_scene_frame_origin not in {"carrier", "global"}:
+                raise ValueError(
+                    "worldflow_scene_frame_origin must be 'carrier' or 'global'; "
+                    f"got {self.worldflow_scene_frame_origin!r}."
+                )
+            if (
+                self.worldflow_scene_frame_origin == "global"
+                and self.worldflow_training_coordinate_frame_augmentation
+            ):
+                raise ValueError(
+                    "worldflow_scene_frame_origin='global' is incompatible with random "
+                    "World-coordinate reparameterization: the fixed global scene frame is "
+                    "the intended information source."
+                )
+            if self.worldflow_action_fusion not in {
+                "independent_parallel",
+                "cross_attention",
+                "point_action_expert_conjugate_bridge",
+                "symmetric_twist",
+                "conjugate_residual",
+                "conjugate_residual_consensus",
+                "conjugate_residual_boosting",
+                "endpoint_geodesic_consensus",
+                "endpoint_residual_boosting",
+                "physical_trajectory_cross_attention",
+                "world_trajectory_arm_ego_gripper",
+            }:
+                raise ValueError(
+                    "worldflow_action_fusion must be 'independent_parallel', 'cross_attention', "
+                    "'point_action_expert_conjugate_bridge', "
+                    "'symmetric_twist', "
+                    "'conjugate_residual', 'conjugate_residual_consensus', or "
+                    "'conjugate_residual_boosting', 'endpoint_geodesic_consensus', or "
+                    "'endpoint_residual_boosting', or "
+                    "'physical_trajectory_cross_attention', or "
+                    "'world_trajectory_arm_ego_gripper'; "
+                    f"got {self.worldflow_action_fusion!r}."
+                )
+            if self.worldflow_action_fusion == "point_action_expert_conjugate_bridge":
+                shared_expert_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    shared_expert_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "shared":
+                    shared_expert_contract_errors.append("worldflow_action_expert_mode='shared'")
+                if self.worldflow_noise_coupling != "left_compose_ego":
+                    shared_expert_contract_errors.append("worldflow_noise_coupling='left_compose_ego'")
+                if self.worldflow_world_eef_velocity_mode != "base_pose9_euclidean":
+                    shared_expert_contract_errors.append(
+                        "worldflow_world_eef_velocity_mode='base_pose9_euclidean'"
+                    )
+                if self.worldflow_current_ee_pose_token:
+                    shared_expert_contract_errors.append("worldflow_current_ee_pose_token=False")
+                if self.se3_enable:
+                    shared_expert_contract_errors.append("se3_enable=False")
+                if shared_expert_contract_errors:
+                    raise ValueError(
+                        "point_action_expert_conjugate_bridge requires symmetric World/Ego "
+                        "front-ends meeting in one shared Action Expert: "
+                        + ", ".join(shared_expert_contract_errors)
+                        + "."
+                    )
+            if self.worldflow_action_fusion == "independent_parallel":
+                calibration_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    calibration_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    calibration_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    calibration_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.worldflow_freeze_pretrained_ego:
+                    calibration_contract_errors.append("worldflow_freeze_pretrained_ego=False")
+                if self.se3_enable:
+                    calibration_contract_errors.append("se3_enable=False")
+                if calibration_contract_errors:
+                    raise ValueError(
+                        "independent_parallel requires two independently supervised, fully trainable "
+                        "action flows before interaction: "
+                        + ", ".join(calibration_contract_errors)
+                        + "."
+                    )
+            if self.worldflow_current_ee_pose_token and (
+                self.worldflow_target_type != "world_eef_trajectory"
+                or self.worldflow_action_expert_mode != "independent"
+            ):
+                raise ValueError(
+                    "worldflow_current_ee_pose_token=True requires "
+                    "worldflow_target_type='world_eef_trajectory' and "
+                    "worldflow_action_expert_mode='independent'."
+                )
+            if self.worldflow_action_fusion == "world_trajectory_arm_ego_gripper":
+                execution_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    execution_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    execution_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    execution_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.se3_enable:
+                    execution_contract_errors.append("se3_enable=False")
+                if execution_contract_errors:
+                    raise ValueError(
+                        "world_trajectory_arm_ego_gripper requires the physical execution contract: "
+                        + ", ".join(execution_contract_errors)
+                        + "."
+                    )
+            if self.worldflow_action_fusion == "physical_trajectory_cross_attention":
+                interaction_contract_errors = []
+                if self.worldflow_target_type != "world_eef_trajectory":
+                    interaction_contract_errors.append("worldflow_target_type='world_eef_trajectory'")
+                if self.worldflow_action_expert_mode != "independent":
+                    interaction_contract_errors.append("worldflow_action_expert_mode='independent'")
+                if not self.worldflow_current_ee_pose_token:
+                    interaction_contract_errors.append("worldflow_current_ee_pose_token=True")
+                if self.se3_enable:
+                    interaction_contract_errors.append("se3_enable=False")
+                if interaction_contract_errors:
+                    raise ValueError(
+                        "physical_trajectory_cross_attention requires independent complete "
+                        "World/Ego trajectories in aligned physical frames: "
+                        + ", ".join(interaction_contract_errors)
+                        + "."
+                    )
+            if (
+                self.worldflow_endpoint_residual_rate_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_rate_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_ego_frame_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_ego_frame_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_body_frame_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_endpoint_residual_body_frame_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_body_velocity_residual_parameterization
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_body_velocity_residual_parameterization=True requires "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if (
+                self.worldflow_endpoint_residual_ego_frame_parameterization
+                and self.worldflow_endpoint_residual_body_frame_parameterization
+            ):
+                raise ValueError(
+                    "Select only one endpoint residual frame parameterization: "
+                    "carrier-frame left twist or endpoint body-frame right twist."
+                )
+            if self.worldflow_body_velocity_residual_parameterization and any(
+                (
+                    self.worldflow_endpoint_residual_rate_parameterization,
+                    self.worldflow_endpoint_residual_ego_frame_parameterization,
+                    self.worldflow_endpoint_residual_body_frame_parameterization,
+                )
+            ):
+                raise ValueError(
+                    "Body-velocity residuals are mutually exclusive with finite endpoint-residual "
+                    "rate and frame parameterizations."
+                )
+            if self.worldflow_action_fusion in {
+                "symmetric_twist",
+                "conjugate_residual",
+                "conjugate_residual_consensus",
+                "conjugate_residual_boosting",
+            } and not self.se3_enable:
+                raise ValueError(f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires se3_enable=True.")
+            if self.worldflow_action_fusion in {
+                "endpoint_geodesic_consensus",
+                "endpoint_residual_boosting",
+            } and (
+                self.se3_enable or self.worldflow_noise_coupling != "projected_ego_path"
+            ):
+                raise ValueError(
+                    f"worldflow_action_fusion={self.worldflow_action_fusion!r} requires the "
+                    "checkpoint-compatible legacy Ego chart (se3_enable=False) and "
+                    "worldflow_noise_coupling='projected_ego_path'."
+                )
+            if (
+                self.worldflow_training_world_to_ego_dropout_probability > 0
+                and self.worldflow_action_fusion != "endpoint_residual_boosting"
+            ):
+                raise ValueError(
+                    "worldflow_training_world_to_ego_dropout_probability is supported only for "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if self.worldflow_training_residual_anchor_stop_gradient and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+            ):
+                raise ValueError(
+                    "worldflow_training_residual_anchor_stop_gradient requires training-time "
+                    "World-to-Ego dropout and "
+                    "worldflow_action_fusion='endpoint_residual_boosting'."
+                )
+            if self.worldflow_training_ego_priority_gradient_projection and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+                or not self.worldflow_training_residual_anchor_stop_gradient
+            ):
+                raise ValueError(
+                    "worldflow_training_ego_priority_gradient_projection requires "
+                    "endpoint_residual_boosting with positive training-time World-to-Ego "
+                    "dropout and residual-anchor stop-gradient."
+                )
+            if self.worldflow_training_shared_gradient_ego_tangent_projection and (
+                self.worldflow_action_fusion != "endpoint_residual_boosting"
+                or self.worldflow_training_world_to_ego_dropout_probability <= 0
+                or not self.worldflow_training_residual_anchor_stop_gradient
+            ):
+                raise ValueError(
+                    "worldflow_training_shared_gradient_ego_tangent_projection requires "
+                    "endpoint_residual_boosting with positive training-time World-to-Ego "
+                    "dropout and residual-anchor stop-gradient."
+                )
+            if (
+                self.worldflow_training_ego_priority_gradient_projection
+                and self.worldflow_training_shared_gradient_ego_tangent_projection
+            ):
+                raise ValueError(
+                    "Select only one WorldFlow shared-gradient projection strategy."
                 )
             if self.worldflow_noise_coupling == "conjugate_ego" and not (
                 self.pose9_action_noise_enable or self.se3_enable
@@ -668,13 +1513,27 @@ class SmolVLAConfig(PreTrainedConfig):
                     "pose9_action_noise_enable=True or se3_enable=True so the Ego prior is a valid "
                     "SE(3) transform."
                 )
-            if self.worldflow_noise_coupling == "conjugate_ego" and (
+            if self.worldflow_noise_coupling in {
+                "projected_ego_chart",
+                "projected_ego_path",
+            } and (
+                self.pose9_action_noise_enable or self.se3_enable
+            ):
+                raise ValueError(
+                    "projected Ego chart coupling is only for the legacy Euclidean Ego chart; "
+                    "use 'conjugate_ego' with a valid-pose9 or SE(3) prior."
+                )
+            if self.worldflow_noise_coupling in {
+                "left_compose_ego",
+                "conjugate_ego",
+                "projected_ego_chart",
+                "projected_ego_path",
+            } and (
                 self.worldflow_noise_trans_scale != 0.15 or self.worldflow_noise_rot_scale != 0.20
             ):
                 warnings.warn(
                     "worldflow_noise_trans_scale/rot_scale are ignored when "
-                    "worldflow_noise_coupling='conjugate_ego'; the World prior is derived from "
-                    "the Ego prior and current pose by exact conjugation.",
+                    "the World prior is derived from the Ego prior and current pose.",
                     stacklevel=2,
                 )
             ego_random_prior = (
@@ -697,7 +1556,10 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
                 )
             )
-            if self.worldflow_noise_coupling == "independent":
+            if (
+                self.worldflow_noise_coupling == "independent"
+                and self.worldflow_target_type == "legacy_eef"
+            ):
                 detail = (
                     " Both priors are valid poses, but their random origins still describe different "
                     "physical trajectories."
@@ -766,8 +1628,19 @@ class SmolVLAConfig(PreTrainedConfig):
                 float(self.se3_noise_rot_scale),
                 float(self.se3_noise_gripper_scale),
             )
-            origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
-            origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
+            if self.se3_twist_head_mode == "pose9_chart_endpoint":
+                origin = (
+                    "pose9_chart_zero_projected_to_se3"
+                    if scales == (0.0, 0.0, 0.0)
+                    else "v0.4.2_pose9_chart_gaussian_projected_to_se3"
+                )
+                origin = (
+                    f"{origin}(trans={scales[0]},rot6d={scales[1]},"
+                    f"gripper={scales[2]})"
+                )
+            else:
+                origin = "se3_identity_deterministic" if scales == (0.0, 0.0, 0.0) else "se3_manifold_random"
+                origin = f"{origin}(trans_m={scales[0]},rot_rad={scales[1]},gripper_m={scales[2]})"
             flow = f"se3_geodesic_left_trivialized(head={self.se3_twist_head_mode})"
         elif self.pose9_action_noise_enable:
             scales = (
@@ -782,14 +1655,22 @@ class SmolVLAConfig(PreTrainedConfig):
             origin = "v0.4.2_raw_channel_gaussian(std=0.1)"
             flow = "channel_euclidean"
         if self.worldflow_enable:
-            target_contract = (
-                "commanded_required"
-                if self.worldflow_require_action_target_sidecar
-                else "legacy_fallback_allowed"
-            )
+            target_contract = self.worldflow_target_type
+            if target_contract == "legacy_eef":
+                target_contract = (
+                    "legacy_eef_commanded_required"
+                    if self.worldflow_require_action_target_sidecar
+                    else "legacy_eef_fallback_allowed"
+                )
             world = (
                 f",worldflow={self.worldflow_noise_coupling},"
-                f"worldflow_targets={target_contract}"
+                f"worldflow_targets={target_contract},"
+                f"worldflow_world_eef_velocity={self.worldflow_world_eef_velocity_mode},"
+                f"worldflow_reference={self.worldflow_reference_frame},"
+                f"worldflow_action_expert={self.worldflow_action_expert_mode},"
+                f"worldflow_action_fusion={self.worldflow_action_fusion},"
+                f"worldflow_current_pose_token={self.worldflow_current_ee_pose_token},"
+                f"worldflow_eef_probe_radius_m={self.worldflow_eef_probe_radius_m}"
             )
         else:
             world = ",worldflow=disabled"

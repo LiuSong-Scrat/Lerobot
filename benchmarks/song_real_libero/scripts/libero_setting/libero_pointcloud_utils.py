@@ -28,6 +28,8 @@ def ensure_libero_config(config_path: str | Path | None = None, dataset_root: st
     os.environ["LIBERO_CONFIG_PATH"] = str(config_dir)
     config_file = config_dir / "config.yaml"
     requested_dataset_root = Path(dataset_root).expanduser().resolve() if dataset_root else None
+    if config_file.exists() and requested_dataset_root is None:
+        return config_file
 
     spec = importlib.util.find_spec("libero")
     if spec is None or not spec.submodule_search_locations:
@@ -37,53 +39,25 @@ def ensure_libero_config(config_path: str | Path | None = None, dataset_root: st
     if not benchmark_root.is_dir():
         raise FileNotFoundError(f"Could not locate LIBERO benchmark root under {package_root}")
 
-    configured_paths: dict[str, Path] = {}
+    datasets = requested_dataset_root if requested_dataset_root is not None else benchmark_root.parent / "datasets"
     if config_file.exists():
-        for line in config_file.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition(":")
-            if separator and value.strip():
-                configured_paths[key.strip()] = Path(value.strip().strip("\"'")).expanduser().resolve()
-
-    configured_datasets = configured_paths.get("datasets")
-    if requested_dataset_root is not None:
-        datasets = requested_dataset_root
-    elif configured_datasets is not None and configured_datasets.is_dir():
-        datasets = configured_datasets
-    else:
-        datasets = benchmark_root.parent / "datasets"
-    configured_assets = configured_paths.get("assets")
-    assets_candidates = [
-        Path(os.environ["LIBERO_ASSETS_PATH"]).expanduser().resolve()
-        if os.environ.get("LIBERO_ASSETS_PATH")
-        else None,
-        configured_assets,
-        benchmark_root / "assets",
-        Path.home() / ".cache" / "libero" / "assets",
-    ]
-    assets = next(
-        (path for path in assets_candidates if path is not None and path.is_dir()),
-        benchmark_root / "assets",
-    )
-
+        existing = config_file.read_text(encoding="utf-8")
+        if f"datasets: {datasets}" in existing:
+            return config_file
     config_dir.mkdir(parents=True, exist_ok=True)
-    config_text = "\n".join(
-        [
-            f"benchmark_root: {benchmark_root}",
-            f"bddl_files: {benchmark_root / 'bddl_files'}",
-            f"init_states: {benchmark_root / 'init_files'}",
-            f"datasets: {datasets}",
-            f"assets: {assets}",
-            "",
-        ]
+    config_file.write_text(
+        "\n".join(
+            [
+                f"benchmark_root: {benchmark_root}",
+                f"bddl_files: {benchmark_root / 'bddl_files'}",
+                f"init_states: {benchmark_root / 'init_files'}",
+                f"datasets: {datasets}",
+                f"assets: {benchmark_root / 'assets'}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-    if not config_file.exists() or config_file.read_text(encoding="utf-8") != config_text:
-        config_file.write_text(config_text, encoding="utf-8")
-
-    if assets.is_dir():
-        # hf-libero's get_assets_path() does not consult config.yaml. Seed its
-        # process-local cache so evaluation uses the configured offline assets.
-        libero_module = importlib.import_module("libero.libero")
-        libero_module._assets_path_cache = str(assets)
     return config_file
 
 
@@ -773,6 +747,85 @@ def matrix_to_pose9_np(matrix: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def eef_pose9_world_to_reference_np(
+    eef_pose_world: np.ndarray,
+    reference_to_world: np.ndarray,
+) -> np.ndarray:
+    """Express a simulator-world EEF pose in a fixed reference frame.
+
+    ``reference_to_world`` is the camera extrinsic used when the dataset point
+    clouds were generated.  Any values after the pose9 prefix (for example the
+    physical gripper width) are copied unchanged.
+    """
+
+    eef_pose_world = np.asarray(eef_pose_world, dtype=np.float32)
+    reference_to_world = np.asarray(reference_to_world, dtype=np.float32)
+    if eef_pose_world.ndim < 1 or eef_pose_world.shape[-1] < 9:
+        raise ValueError(
+            "eef_pose_world must end with at least 9 pose values, "
+            f"got shape {eef_pose_world.shape}."
+        )
+    if reference_to_world.shape != (4, 4):
+        raise ValueError(
+            "reference_to_world must have shape (4, 4), "
+            f"got {reference_to_world.shape}."
+        )
+
+    eef_to_world = pose9_to_homo_np(eef_pose_world[..., :9])
+    world_to_reference = fast_inverse_homogeneous(reference_to_world)
+    eef_to_reference = world_to_reference @ eef_to_world
+    return np.concatenate(
+        [matrix_to_pose9_np(eef_to_reference), eef_pose_world[..., 9:]],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def eef_pose9_world_to_reference_camera(
+    env: Any,
+    eef_pose_world: np.ndarray,
+    reference_camera: str,
+) -> np.ndarray:
+    """Express a simulator-world EEF pose in a fixed LIBERO camera frame."""
+
+    try:
+        from robosuite.utils.camera_utils import get_camera_extrinsic_matrix
+    except Exception as exc:  # pragma: no cover - optional LIBERO dependency path
+        raise RuntimeError("robosuite camera utilities are required for LIBERO pose conversion.") from exc
+
+    reference_camera = normalize_camera_name(reference_camera)
+    reference_to_world = get_camera_extrinsic_matrix(env.sim, reference_camera).astype(np.float32)
+    return eef_pose9_world_to_reference_np(eef_pose_world, reference_to_world)
+
+
+def robot_base_to_world_matrix(env: Any) -> np.ndarray:
+    """Return the calibrated robot-base pose in the simulator world frame."""
+
+    robots = list(getattr(env, "robots", []))
+    if len(robots) != 1:
+        raise ValueError(
+            "Robot-base WorldFlow currently requires exactly one robot, "
+            f"got {len(robots)}."
+        )
+    root_body = getattr(getattr(robots[0], "robot_model", None), "root_body", None)
+    if not root_body:
+        raise ValueError("Could not resolve the robot model's root body.")
+    position = np.asarray(env.sim.data.get_body_xpos(root_body), dtype=np.float32).reshape(3)
+    rotation = np.asarray(env.sim.data.get_body_xmat(root_body), dtype=np.float32).reshape(3, 3)
+    base_to_world = np.eye(4, dtype=np.float32)
+    base_to_world[:3, :3] = rotation
+    base_to_world[:3, 3] = position
+    return base_to_world
+
+
+def eef_pose9_world_to_robot_base(env: Any, eef_pose_world: np.ndarray) -> np.ndarray:
+    """Express a simulator-world EEF pose in the calibrated robot-base frame."""
+
+    return eef_pose9_world_to_reference_np(
+        eef_pose_world,
+        robot_base_to_world_matrix(env),
+    )
+
+
 def observation_to_camera_point_cloud(
     env: Any,
     raw_obs: dict[str, Any],
@@ -871,15 +924,18 @@ def observation_to_model_point_cloud(
     gripper_drop_strategy: str = "tail",
     gripper_shuffle_points: bool = False,
     seed: int = 0,
+    camera_view_weights: Any = None,
+    camera_view_fusion: Any = "legacy_budget",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build the exact fixed-size point cloud expected by single/multi-view training.
+    """Build the point cloud expected by the selected training fusion policy.
 
     Each selected camera first produces its own ``num_points`` cloud.  When the
     gripper cloud is enabled, every per-camera cloud keeps the training layout:
     scene points first and one addressable gripper tail.  The shared training
-    composition helper then returns either the unchanged single-view cloud or a
-    fixed-size multi-view cloud with an equal non-gripper budget per camera and
-    the first camera's gripper tail appended exactly once.
+    composition helper then returns either the unchanged single-view cloud, a
+    fixed-size legacy-budget cloud, or the full multi-view scene union consumed
+    by the shared FPS sampler or primary-residual splitter. The first camera's
+    gripper tail is appended once.
 
     Returns:
       model_point_cloud: xyzrgb in the current end-effector frame.
@@ -890,6 +946,7 @@ def observation_to_model_point_cloud(
     # tools that do not initialize the policy package.
     from lerobot.policies.smolvla.song_pointseg import (
         compose_point_cloud_views,
+        parse_camera_view_fusion,
         parse_camera_views,
     )
 
@@ -937,8 +994,25 @@ def observation_to_model_point_cloud(
         stored_view_clouds,
         gripper_points=gripper_points if bool(add_gripper_cloud) else 0,
         seed=int(seed),
+        view_weights=camera_view_weights,
+        fusion=camera_view_fusion,
     )
-    expected_shape = (total_points, 6)
+    expected_points = total_points
+    fusion_mode = parse_camera_view_fusion(camera_view_fusion)
+    if fusion_mode in {
+        "fps",
+        "voxel_fps",
+        "voxel_cover_fps",
+        "novelty_union",
+        "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union",
+        "transport_novelty_union",
+        "full_union",
+        "primary_residual",
+    } and len(views) > 1:
+        scene_points = total_points - (gripper_points if bool(add_gripper_cloud) else 0)
+        expected_points = len(views) * scene_points + (gripper_points if bool(add_gripper_cloud) else 0)
+    expected_shape = (expected_points, 6)
     if model_point_cloud.shape != expected_shape:
         raise RuntimeError(
             f"Expected composed model point cloud shape {expected_shape}, got {model_point_cloud.shape}."

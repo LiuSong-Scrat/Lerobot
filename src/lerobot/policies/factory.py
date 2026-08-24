@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+from pathlib import Path
 from typing import Any, TypedDict
 
 import torch
@@ -38,7 +40,10 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.configuration_smolvla import (
+    FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+    SmolVLAConfig,
+)
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -403,6 +408,30 @@ def make_pre_post_processors(
     return processors
 
 
+def _validate_full_molmo_checkpoint_topology(pretrained_path: str | Path) -> None:
+    """Reject policy checkpoints from the retired detached-scene topology."""
+
+    checkpoint_config_path = Path(pretrained_path).expanduser() / "config.json"
+    if not checkpoint_config_path.is_file():
+        return
+    with checkpoint_config_path.open(encoding="utf-8") as checkpoint_config_file:
+        checkpoint_config = json.load(checkpoint_config_file)
+    if checkpoint_config.get("vlm_backend") != "molmo2_full":
+        return
+    checkpoint_topology = checkpoint_config.get("full_molmo_topology")
+    if (
+        checkpoint_config.get("molmo_inference_only") is True
+        or checkpoint_topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
+    ):
+        raise ValueError(
+            "This checkpoint uses the retired detached-scene-suffix Full-Molmo topology "
+            "or has no registered WEP-prefix topology marker. The WEP-prefix model "
+            "changes FG/BG projections from 1920 to 2560 and cannot resume or evaluate "
+            "that checkpoint. Start a fresh run, or first create an explicit converted "
+            "warm-start checkpoint; do not use --resume."
+        )
+
+
 def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
@@ -495,6 +524,8 @@ def make_policy(
             # registered control therefore requires exact checkpoint topology
             # for resume as well as evaluation.
             kwargs["strict"] = True
+        if getattr(cfg, "vlm_backend", "smolvlm") == "molmo2_full":
+            _validate_full_molmo_checkpoint_topology(cfg.pretrained_path)
         policy = policy_cls.from_pretrained(**kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo

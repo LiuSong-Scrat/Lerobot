@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torchvision
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -59,6 +60,12 @@ MOLMO2_EXPECTED_PATCH_POSITIONS = 392
 MOLMO2_EXPECTED_IMAGE_POSITIONS = 410
 MOLMO2_EXPECTED_IMAGE_SIZE = 256
 MOLMO2_DEFAULT_MAX_TEXT_TOKENS = 48
+MOLMO2_NATIVE_CROP_SIZE = 378
+MOLMO2_NATIVE_PATCH_SIZE = 14
+MOLMO2_NATIVE_PATCHES_PER_SIDE = MOLMO2_NATIVE_CROP_SIZE // MOLMO2_NATIVE_PATCH_SIZE
+MOLMO2_NATIVE_PATCHES_PER_CROP = MOLMO2_NATIVE_PATCHES_PER_SIDE**2
+MOLMO2_NATIVE_PATCH_VECTOR_SIZE = MOLMO2_NATIVE_PATCH_SIZE**2 * 3
+MOLMO2_NATIVE_POOLED_SIDE = 14
 
 
 def load_local_molmo2_processor(processor_name: str | Path) -> Any:
@@ -211,6 +218,138 @@ def _as_tensor(value: Any, *, key: str) -> torch.Tensor:
         raise TypeError(f"Molmo processor output {key!r} is not tensor-like.") from exc
 
 
+
+def _matches_fixed_molmo2_image_contract(processor: Any) -> bool:
+    """Return whether the native processor matches the locked 256px/two-crop contract.
+
+    The optimized path is intentionally narrow. Any future Molmo checkpoint
+    with different resizing, normalization, tiling, patching, or pooling
+    settings automatically falls back to the trusted native processor.
+    """
+
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return False
+    size = getattr(image_processor, "size", None)
+    try:
+        resample = int(getattr(image_processor, "resample"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(size, dict)
+        and size.get("height") == MOLMO2_NATIVE_CROP_SIZE
+        and size.get("width") == MOLMO2_NATIVE_CROP_SIZE
+        and int(getattr(image_processor, "max_crops", -1)) == 8
+        and tuple(getattr(image_processor, "overlap_margins", ())) == (4, 4)
+        and int(getattr(image_processor, "patch_size", -1)) == MOLMO2_NATIVE_PATCH_SIZE
+        and tuple(getattr(image_processor, "pooling_size", ())) == (2, 2)
+        and tuple(float(value) for value in getattr(image_processor, "image_mean", ()))
+        == (0.5, 0.5, 0.5)
+        and tuple(float(value) for value in getattr(image_processor, "image_std", ()))
+        == (0.5, 0.5, 0.5)
+        and resample == 2
+        and callable(getattr(processor, "get_image_tokens", None))
+        and isinstance(getattr(processor, "image_placeholder_token", None), str)
+    )
+
+
+def _fixed_pooling_indices() -> torch.Tensor:
+    """Build Molmo's constant global/local 27x27 -> 14x14 pooling table."""
+
+    side = MOLMO2_NATIVE_PATCHES_PER_SIDE
+    patch_indices = torch.arange(side * side, dtype=torch.long).reshape(side, side)
+    # Native arange_for_pooling pads an odd 27x27 grid on its bottom/right.
+    padded = torch.full((side + 1, side + 1), -1, dtype=torch.long)
+    padded[:side, :side] = patch_indices
+    pooled = padded.reshape(MOLMO2_NATIVE_POOLED_SIDE, 2, MOLMO2_NATIVE_POOLED_SIDE, 2)
+    pooled = pooled.permute(0, 2, 1, 3).reshape(-1, 4)
+    local = torch.where(
+        pooled >= 0,
+        pooled + MOLMO2_NATIVE_PATCHES_PER_CROP,
+        pooled,
+    )
+    return torch.cat([pooled, local], dim=0)
+
+
+_MOLMO2_FIXED_POOLING_INDICES = _fixed_pooling_indices()
+_MOLMO2_FIXED_IMAGE_GRID = torch.full((4,), MOLMO2_NATIVE_POOLED_SIDE, dtype=torch.long)
+
+
+def _prepare_fixed_molmo2_images_fast(
+    processor: Any,
+    images: torch.Tensor,
+) -> dict[str, torch.Tensor] | None:
+    """Batch the fixed Molmo2-ER image transform without changing its outputs.
+
+    For a square 256x256 input the native tiler selects one 378x378 local
+    crop. The global 378x378 crop is therefore pixel-identical. The native
+    implementation nevertheless resizes both crops independently inside a
+    Python loop. This path performs one batched resize, duplicates the result
+    in native [global, local] order, and vectorizes patchification.
+    """
+
+    if not _matches_fixed_molmo2_image_contract(processor):
+        return None
+    if images.device.type != "cpu" or images.dtype != torch.float32:
+        return None
+
+    image_processor = processor.image_processor
+    resize = torchvision.transforms.Resize(
+        [MOLMO2_NATIVE_CROP_SIZE, MOLMO2_NATIVE_CROP_SIZE],
+        image_processor.resample,
+        antialias=False,
+    )
+    resized = resize(images)
+    resized = torch.clip(resized, 0.0, 1.0).to(dtype=torch.float32)
+
+    # Match native normalize_image's float32 HWC arithmetic and channel order.
+    resized_hwc = resized.permute(0, 2, 3, 1).contiguous()
+    mean = resized_hwc.new_tensor(image_processor.image_mean).reshape(1, 1, 1, 3)
+    std = resized_hwc.new_tensor(image_processor.image_std).reshape(1, 1, 1, 3)
+    resized_hwc.sub_(mean).div_(std)
+
+    batch_size = int(resized_hwc.shape[0])
+    side = MOLMO2_NATIVE_PATCHES_PER_SIDE
+    patch = MOLMO2_NATIVE_PATCH_SIZE
+    patches = resized_hwc.reshape(batch_size, side, patch, side, patch, 3)
+    patches = patches.permute(0, 1, 3, 2, 4, 5).contiguous()
+    patches = patches.reshape(
+        batch_size,
+        MOLMO2_NATIVE_PATCHES_PER_CROP,
+        MOLMO2_NATIVE_PATCH_VECTOR_SIZE,
+    )
+    # Native image_to_patches_and_grids concatenates global before local for
+    # every image, then the batch processor concatenates images.
+    pixel_values = patches[:, None].expand(-1, MOLMO2_EXPECTED_IMAGE_CROPS, -1, -1)
+    pixel_values = pixel_values.reshape(
+        batch_size * MOLMO2_EXPECTED_IMAGE_CROPS,
+        MOLMO2_NATIVE_PATCHES_PER_CROP,
+        MOLMO2_NATIVE_PATCH_VECTOR_SIZE,
+    )
+    return {
+        "pixel_values": pixel_values,
+        "image_token_pooling": _MOLMO2_FIXED_POOLING_INDICES.repeat(batch_size, 1),
+        "image_grids": _MOLMO2_FIXED_IMAGE_GRID.repeat(batch_size, 1),
+        "image_num_crops": torch.full(
+            (batch_size,), MOLMO2_EXPECTED_IMAGE_CROPS, dtype=torch.long
+        ),
+    }
+
+
+def _insert_fixed_image_tokens(processor: Any, prompts: list[str]) -> list[str]:
+    image_grid = _MOLMO2_FIXED_IMAGE_GRID.numpy()
+    image_string = "".join(processor.get_image_tokens(image_grid))
+    placeholder = processor.image_placeholder_token
+    expanded: list[str] = []
+    for prompt in prompts:
+        if prompt.count(placeholder) != 1:
+            raise RuntimeError(
+                "The fixed Full-Molmo2-ER fast path requires exactly one image placeholder "
+                f"per prompt, got {prompt.count(placeholder)}."
+            )
+        expanded.append(prompt.replace(placeholder, image_string, 1))
+    return expanded
+
 def _repad_text_fields_to_the_right(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -238,6 +377,7 @@ def prepare_molmo2_multimodal_batch(
     images: torch.Tensor | Sequence[Any],
     *,
     max_text_length: int,
+    use_fast_image_path: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Create a full, untruncated native Molmo2 batch from LeRobot RGB and tasks.
 
@@ -282,21 +422,38 @@ def prepare_molmo2_multimodal_batch(
 
     # Molmo's image processor accepts HWC float arrays in [0, 1].  Keeping a
     # list here preserves the one-image-per-example association for a batch.
-    images_hwc = images_tensor.detach().to(device="cpu", dtype=torch.float32).permute(0, 2, 3, 1).contiguous()
+    images_cpu = images_tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    fast_images = (
+        _prepare_fixed_molmo2_images_fast(processor, images_cpu)
+        if use_fast_image_path
+        else None
+    )
     # Molmo2-ER's remote ``insert_bos`` implementation expects left-padded
     # tokenizer output. Calling it on right-padded rows turns trailing PADs
     # into valid tokens. Use its native side internally, then immediately
     # canonicalize all three sequence fields to right padding below.
     processor.tokenizer.padding_side = "left"
     try:
-        native = processor(
-            text=prompts,
-            images=[image.numpy() for image in images_hwc],
-            padding="longest",
-            truncation=False,
-            return_tensors="pt",
-            return_mm_token_type_ids=True,
-        )
+        if fast_images is None:
+            images_hwc = images_cpu.permute(0, 2, 3, 1).contiguous()
+            native = processor(
+                text=prompts,
+                images=[image.numpy() for image in images_hwc],
+                padding="longest",
+                truncation=False,
+                return_tensors="pt",
+                return_mm_token_type_ids=True,
+            )
+        else:
+            native = processor(
+                text=_insert_fixed_image_tokens(processor, prompts),
+                images=None,
+                padding="longest",
+                truncation=False,
+                return_tensors="pt",
+                return_mm_token_type_ids=True,
+            )
+            native.update(fast_images)
     finally:
         processor.tokenizer.padding_side = "right"
 

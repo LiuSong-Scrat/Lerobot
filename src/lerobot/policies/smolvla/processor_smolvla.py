@@ -133,6 +133,7 @@ class Molmo2FullMultimodalProcessorStep(ObservationProcessorStep):
     image_key: str = "observation.images.agentview"
     task_key: str = "task"
     max_text_length: int = 48
+    use_fast_image_path: bool = True
 
     input_processor: Any = field(default=None, init=False, repr=False)
 
@@ -172,6 +173,7 @@ class Molmo2FullMultimodalProcessorStep(ObservationProcessorStep):
             complementary_data[self.task_key],
             observation[self.image_key],
             max_text_length=self.max_text_length,
+            use_fast_image_path=self.use_fast_image_path,
         )
         new_observation = dict(observation)
         new_observation[OBS_LANGUAGE_TOKENS] = native["input_ids"]
@@ -188,6 +190,7 @@ class Molmo2FullMultimodalProcessorStep(ObservationProcessorStep):
             "image_key": self.image_key,
             "task_key": self.task_key,
             "max_text_length": self.max_text_length,
+            "use_fast_image_path": self.use_fast_image_path,
         }
         if self.processor_name is not None and self.processor is None:
             config["processor_name"] = self.processor_name
@@ -264,6 +267,7 @@ def make_smolvla_pre_post_processors(
                     processor_name=config.vlm_model_name,
                     image_key=image_key,
                     max_text_length=config.tokenizer_max_length,
+                    use_fast_image_path=getattr(config, "molmo_image_fast_path", True),
                 ),
             ]
         )

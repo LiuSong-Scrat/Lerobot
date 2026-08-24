@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,13 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla.configuration_smolvla import (
+    FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+)
+from lerobot.policies.smolvla.modeling_smolvla import (
+    expected_full_molmo2er_parameter_budget,
+    full_molmo2er_trainable_parameter_prefixes,
+)
 from lerobot.policies.smolvla.processor_smolvla import validate_smolvla_worldflow_preprocessor
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
@@ -88,6 +96,604 @@ _MIB = 1024**2
 _GIB = 1024**3
 _MAX_CUDA_ALLOCATOR_LEASE_CHUNKS = 4096
 _CUDA_FREE_AUDIT_TOLERANCE_BYTES = 8 * _MIB
+EXACT_GLOBAL_BATCH_MANIFEST_NAME = "exact_global_batch_manifest.json"
+FULL_MOLMO2ER_FIRST_STEP_GRADIENT_AUDIT_NAME = (
+    "full_molmo2er_first_optimizer_step_gradient_audit.json"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExactGlobalBatchPlan:
+    """A fixed-rank schedule whose DDP gradient is an exact global sample mean."""
+
+    global_batch_size: int
+    world_size: int
+    micro_batch_size_per_rank: int
+    gradient_accumulation_steps: int
+    full_micro_steps: int
+    partial_active_ranks: int
+    physical_forward_samples_per_optimizer_step: int
+    discarded_samples_per_optimizer_step: int
+    valid_loss_scale: float
+
+    @property
+    def partial_micro_step_index(self) -> int | None:
+        if self.partial_active_ranks == 0:
+            return None
+        return self.full_micro_steps
+
+
+def _require_positive_int(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    return value
+
+
+def resolve_exact_global_batch_plan(
+    *,
+    global_batch_size: int | None,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+) -> ExactGlobalBatchPlan | None:
+    """Resolve an exact DDP batch schedule, or preserve legacy accumulation.
+
+    A partial micro-step is representable only as whole rank-local batches.
+    Every rank still executes forward/backward on that micro-step; ranks outside
+    the deterministic active set receive a zero loss scale.
+    """
+
+    if global_batch_size is None:
+        return None
+
+    global_batch_size = _require_positive_int("global_batch_size", global_batch_size)
+    batch_size = _require_positive_int("batch_size", batch_size)
+    gradient_accumulation_steps = _require_positive_int(
+        "gradient_accumulation_steps", gradient_accumulation_steps
+    )
+    world_size = _require_positive_int("world_size", world_size)
+
+    samples_per_full_micro_step = world_size * batch_size
+    full_micro_steps, partial_samples = divmod(global_batch_size, samples_per_full_micro_step)
+    required_accumulation_steps = full_micro_steps + int(partial_samples > 0)
+    if gradient_accumulation_steps != required_accumulation_steps:
+        raise ValueError(
+            "Exact global_batch_size requires gradient_accumulation_steps="
+            f"{required_accumulation_steps}, got {gradient_accumulation_steps}: "
+            f"global_batch_size={global_batch_size}, world_size={world_size}, "
+            f"batch_size={batch_size}."
+        )
+    if partial_samples % batch_size != 0:
+        raise ValueError(
+            "Exact global_batch_size cannot split a rank-local micro-batch: "
+            f"partial_samples={partial_samples}, batch_size={batch_size}."
+        )
+
+    partial_active_ranks = partial_samples // batch_size
+    physical_forward_samples = samples_per_full_micro_step * gradient_accumulation_steps
+    return ExactGlobalBatchPlan(
+        global_batch_size=global_batch_size,
+        world_size=world_size,
+        micro_batch_size_per_rank=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        full_micro_steps=full_micro_steps,
+        partial_active_ranks=partial_active_ranks,
+        physical_forward_samples_per_optimizer_step=physical_forward_samples,
+        discarded_samples_per_optimizer_step=physical_forward_samples - global_batch_size,
+        # DDP averages gradients over ranks, while each local loss is already
+        # averaged over its B samples: (W * B / G) * (1/W) * sum(local means)
+        # is exactly the mean over the G active samples.
+        valid_loss_scale=world_size * batch_size / global_batch_size,
+    )
+
+
+def exact_global_batch_active_ranks(
+    plan: ExactGlobalBatchPlan,
+    *,
+    optimizer_step: int,
+    micro_step: int,
+) -> tuple[int, ...]:
+    """Return gradient-contributing ranks for one deterministic micro-step."""
+
+    if isinstance(optimizer_step, bool) or not isinstance(optimizer_step, int) or optimizer_step < 0:
+        raise ValueError(f"optimizer_step must be a non-negative integer, got {optimizer_step!r}.")
+    if isinstance(micro_step, bool) or not isinstance(micro_step, int):
+        raise ValueError(f"micro_step must be an integer, got {micro_step!r}.")
+    if not 0 <= micro_step < plan.gradient_accumulation_steps:
+        raise ValueError(f"micro_step must be in [0, {plan.gradient_accumulation_steps}), got {micro_step}.")
+    if micro_step < plan.full_micro_steps or plan.partial_active_ranks == 0:
+        return tuple(range(plan.world_size))
+
+    start_rank = optimizer_step % plan.world_size
+    return tuple((start_rank + offset) % plan.world_size for offset in range(plan.partial_active_ranks))
+
+
+def exact_global_batch_rank_loss_scale(
+    plan: ExactGlobalBatchPlan,
+    *,
+    optimizer_step: int,
+    micro_step: int,
+    rank: int,
+) -> float:
+    """Return W*B/G for an active rank and zero for a discarded sample."""
+
+    if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < plan.world_size:
+        raise ValueError(f"rank must be in [0, {plan.world_size}), got {rank!r}.")
+    active_ranks = exact_global_batch_active_ranks(
+        plan,
+        optimizer_step=optimizer_step,
+        micro_step=micro_step,
+    )
+    return plan.valid_loss_scale if rank in active_ranks else 0.0
+
+
+def exact_global_batch_manifest(plan: ExactGlobalBatchPlan) -> dict[str, Any]:
+    """Serialize the exact-gradient contract without host- or time-dependent data."""
+
+    return {
+        "version": 1,
+        "mode": "exact_global_batch",
+        "global_batch_size": plan.global_batch_size,
+        "world_size": plan.world_size,
+        "micro_batch_size_per_rank": plan.micro_batch_size_per_rank,
+        "gradient_accumulation_steps": plan.gradient_accumulation_steps,
+        "full_micro_steps": plan.full_micro_steps,
+        "partial_micro_step_index": plan.partial_micro_step_index,
+        "partial_active_ranks": plan.partial_active_ranks,
+        "physical_forward_samples_per_optimizer_step": (plan.physical_forward_samples_per_optimizer_step),
+        "discarded_for_gradient_samples_per_optimizer_step": (plan.discarded_samples_per_optimizer_step),
+        "valid_loss_scale": plan.valid_loss_scale,
+        "valid_loss_scale_fraction": (
+            f"{plan.world_size * plan.micro_batch_size_per_rank}/{plan.global_batch_size}"
+        ),
+        "ddp_gradient_reduction": "mean",
+        "partial_rank_rotation": "consecutive ranks from optimizer_step % world_size",
+        "partial_rank_rotation_period_optimizer_steps": plan.world_size,
+        "all_ranks_forward_backward_every_micro_step": True,
+        "sample_counter_increment_per_optimizer_step": plan.global_batch_size,
+        "scheduler_steps_per_optimizer_step": 1,
+        "logged_loss_reduction": "global mean over gradient-contributing samples, once per optimizer step",
+    }
+
+
+def write_exact_global_batch_manifest(
+    output_dir: str | Path,
+    plan: ExactGlobalBatchPlan,
+) -> Path:
+    """Atomically persist the contract and reject an incompatible resume."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / EXACT_GLOBAL_BATCH_MANIFEST_NAME
+    payload = exact_global_batch_manifest(plan)
+    if path.is_file():
+        with open(path, encoding="utf-8") as manifest_file:
+            existing_payload = json.load(manifest_file)
+        if existing_payload != payload:
+            raise RuntimeError(f"Existing exact global-batch manifest is incompatible: {path}")
+        return path
+
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(payload, manifest_file, indent=2, ensure_ascii=False)
+        manifest_file.write("\n")
+    temporary_path.replace(path)
+    return path
+
+
+def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary_path, "w", encoding="utf-8") as output_file:
+        json.dump(dict(payload), output_file, indent=2, ensure_ascii=False)
+        output_file.write("\n")
+    temporary_path.replace(path)
+    return path
+
+
+def resolve_logical_physical_cuda_mapping(
+    *,
+    logical_cuda_index: int,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """Resolve a process-visible CUDA index back to its launcher-visible device."""
+
+    if (
+        isinstance(logical_cuda_index, bool)
+        or not isinstance(logical_cuda_index, int)
+        or logical_cuda_index < 0
+    ):
+        raise ValueError(f"logical_cuda_index must be a non-negative integer, got {logical_cuda_index!r}.")
+    raw_visible_devices = environ.get("CUDA_VISIBLE_DEVICES")
+    if raw_visible_devices is None or not raw_visible_devices.strip():
+        visible_devices = None
+        physical_cuda_device = str(logical_cuda_index)
+    else:
+        parsed_devices = tuple(part.strip() for part in raw_visible_devices.split(","))
+        if any(not part for part in parsed_devices):
+            raise ValueError(f"Malformed CUDA_VISIBLE_DEVICES={raw_visible_devices!r}.")
+        if logical_cuda_index >= len(parsed_devices):
+            raise ValueError(
+                "Logical CUDA index is outside CUDA_VISIBLE_DEVICES: "
+                f"logical={logical_cuda_index}, visible={parsed_devices}."
+            )
+        visible_devices = list(parsed_devices)
+        physical_cuda_device = parsed_devices[logical_cuda_index]
+
+    return {
+        "logical_cuda_index": logical_cuda_index,
+        "physical_cuda_device": physical_cuda_device,
+        "cuda_visible_devices": visible_devices,
+    }
+
+
+def build_exact_global_batch_cuda_memory_rank_record(
+    *,
+    plan: ExactGlobalBatchPlan,
+    completed_optimizer_step: int,
+    global_rank: int,
+    local_rank: int,
+    logical_cuda_index: int,
+    accelerator_device: str,
+    memory_snapshot: Mapping[str, int],
+    optimizer_state_tensor_count: int,
+    optimizer_state_total_numel: int,
+    environ: Mapping[str, str],
+    hostname: str,
+) -> dict[str, Any]:
+    """Build one rank's post-first-Adam-step CUDA allocation record."""
+
+    for name, value in (
+        ("completed_optimizer_step", completed_optimizer_step),
+        ("global_rank", global_rank),
+        ("local_rank", local_rank),
+        ("optimizer_state_tensor_count", optimizer_state_tensor_count),
+        ("optimizer_state_total_numel", optimizer_state_total_numel),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
+    if completed_optimizer_step < 1:
+        raise ValueError("completed_optimizer_step must be at least one.")
+    if not 0 <= global_rank < plan.world_size:
+        raise ValueError(f"global_rank must be in [0, {plan.world_size}), got {global_rank}.")
+    if optimizer_state_tensor_count < 1 or optimizer_state_total_numel < 1:
+        raise RuntimeError("Optimizer state tensors were not materialized by the completed first step.")
+
+    required_memory_fields = (
+        "allocated_bytes",
+        "reserved_bytes",
+        "peak_allocated_bytes",
+        "peak_reserved_bytes",
+    )
+    normalized_memory: dict[str, int] = {}
+    for field in required_memory_fields:
+        value = memory_snapshot.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"memory_snapshot[{field!r}] must be a non-negative integer, got {value!r}.")
+        normalized_memory[field] = value
+    if normalized_memory["allocated_bytes"] > normalized_memory["reserved_bytes"]:
+        raise ValueError("CUDA allocated_bytes cannot exceed reserved_bytes.")
+    if normalized_memory["peak_allocated_bytes"] < normalized_memory["allocated_bytes"]:
+        raise ValueError("CUDA peak_allocated_bytes cannot be below allocated_bytes.")
+    if normalized_memory["peak_reserved_bytes"] < normalized_memory["reserved_bytes"]:
+        raise ValueError("CUDA peak_reserved_bytes cannot be below reserved_bytes.")
+
+    mapping = resolve_logical_physical_cuda_mapping(
+        logical_cuda_index=logical_cuda_index,
+        environ=environ,
+    )
+    gib = float(_GIB)
+    return {
+        "version": 1,
+        "mode": "exact_global_batch_post_first_optimizer_step_cuda_memory",
+        "completed_optimizer_step": completed_optimizer_step,
+        "global_rank": global_rank,
+        "local_rank": local_rank,
+        "world_size": plan.world_size,
+        "hostname": str(hostname),
+        "accelerator_device": str(accelerator_device),
+        **mapping,
+        "global_batch_size": plan.global_batch_size,
+        "physical_forward_samples_per_optimizer_step": (plan.physical_forward_samples_per_optimizer_step),
+        "discarded_for_gradient_samples_per_optimizer_step": (plan.discarded_samples_per_optimizer_step),
+        **normalized_memory,
+        "allocated_gib": normalized_memory["allocated_bytes"] / gib,
+        "reserved_gib": normalized_memory["reserved_bytes"] / gib,
+        "peak_allocated_gib": normalized_memory["peak_allocated_bytes"] / gib,
+        "peak_reserved_gib": normalized_memory["peak_reserved_bytes"] / gib,
+        "optimizer_state_tensor_count": optimizer_state_tensor_count,
+        "optimizer_state_total_numel": optimizer_state_total_numel,
+    }
+
+
+def exact_global_batch_cuda_memory_rank_dir(output_dir: str | Path) -> Path:
+    return Path(output_dir) / "exact_global_batch_post_adam_cuda_memory_ranks"
+
+
+def exact_global_batch_cuda_memory_audit_path(output_dir: str | Path) -> Path:
+    return Path(output_dir) / "exact_global_batch_post_adam_cuda_memory_audit.json"
+
+
+def write_exact_global_batch_cuda_memory_rank_record(
+    output_dir: str | Path,
+    record: Mapping[str, Any],
+) -> Path:
+    global_rank = record.get("global_rank")
+    if isinstance(global_rank, bool) or not isinstance(global_rank, int) or global_rank < 0:
+        raise ValueError(f"Rank memory record has invalid global_rank={global_rank!r}.")
+    path = exact_global_batch_cuda_memory_rank_dir(output_dir) / f"rank_{global_rank:03d}.json"
+    return _write_json_atomically(path, record)
+
+
+def aggregate_exact_global_batch_cuda_memory_records(
+    output_dir: str | Path,
+    *,
+    plan: ExactGlobalBatchPlan,
+    expected_completed_optimizer_step: int,
+) -> Path:
+    """Validate all independent rank records and atomically write rank-0's audit."""
+
+    rank_dir = exact_global_batch_cuda_memory_rank_dir(output_dir)
+    expected_paths = tuple(rank_dir / f"rank_{rank:03d}.json" for rank in range(plan.world_size))
+    missing_paths = [str(path) for path in expected_paths if not path.is_file()]
+    if missing_paths:
+        raise RuntimeError(f"Missing post-Adam CUDA memory rank records: {missing_paths}")
+
+    records: list[dict[str, Any]] = []
+    for expected_rank, path in enumerate(expected_paths):
+        with open(path, encoding="utf-8") as rank_file:
+            record = json.load(rank_file)
+        expected_fields = {
+            "global_rank": expected_rank,
+            "world_size": plan.world_size,
+            "completed_optimizer_step": expected_completed_optimizer_step,
+            "global_batch_size": plan.global_batch_size,
+            "physical_forward_samples_per_optimizer_step": (plan.physical_forward_samples_per_optimizer_step),
+            "discarded_for_gradient_samples_per_optimizer_step": (plan.discarded_samples_per_optimizer_step),
+        }
+        mismatches = {
+            field: {"expected": expected, "actual": record.get(field)}
+            for field, expected in expected_fields.items()
+            if record.get(field) != expected
+        }
+        if mismatches:
+            raise RuntimeError(f"Invalid post-Adam CUDA memory record {path}: {mismatches}")
+        records.append(record)
+
+    payload = {
+        "version": 1,
+        "mode": "exact_global_batch_post_first_optimizer_step_cuda_memory",
+        "completed_optimizer_step": expected_completed_optimizer_step,
+        "world_size": plan.world_size,
+        "global_batch_size": plan.global_batch_size,
+        "rank_count": len(records),
+        "max_allocated_bytes": max(record["allocated_bytes"] for record in records),
+        "max_reserved_bytes": max(record["reserved_bytes"] for record in records),
+        "max_peak_allocated_bytes": max(record["peak_allocated_bytes"] for record in records),
+        "max_peak_reserved_bytes": max(record["peak_reserved_bytes"] for record in records),
+        "logical_to_physical_cuda_mapping": [
+            {
+                "global_rank": record["global_rank"],
+                "local_rank": record["local_rank"],
+                "logical_cuda_index": record["logical_cuda_index"],
+                "physical_cuda_device": record["physical_cuda_device"],
+            }
+            for record in records
+        ],
+        "ranks": records,
+    }
+    return _write_json_atomically(exact_global_batch_cuda_memory_audit_path(output_dir), payload)
+
+
+def optimizer_state_tensor_summary(optimizer: Optimizer) -> tuple[int, int]:
+    tensor_count = 0
+    total_numel = 0
+    for state in optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                tensor_count += 1
+                total_numel += value.numel()
+    return tensor_count, total_numel
+
+
+def audit_first_optimizer_step_trainable_gradients(
+    module: torch.nn.Module,
+    output_dir: str | Path,
+) -> Path:
+    """Collectively prove that every registered trainable tensor received a gradient.
+
+    DDP with ``find_unused_parameters=False`` otherwise reports a missing
+    hook only when the next forward starts. Run this gate after the first
+    synchronized backward and before Adam mutates or clears gradients. Every
+    rank gathers the same compact missing-gradient mask, writes one
+    deterministic named audit, and makes the same pass/fail decision.
+
+    A materialized all-zero gradient is valid (for example, a zero-scaled rank
+    in the exact-192 tail); only ``grad is None`` means the tensor was absent
+    from that rank's accumulated autograd graph.
+    """
+
+    named_trainable = tuple(
+        (name, parameter) for name, parameter in module.named_parameters() if parameter.requires_grad
+    )
+    if not named_trainable:
+        raise RuntimeError("First-step gradient audit found no trainable parameters.")
+
+    names = tuple(name for name, _ in named_trainable)
+    numels = tuple(int(parameter.numel()) for _, parameter in named_trainable)
+    device = named_trainable[0][1].device
+    local_missing = torch.tensor(
+        [int(parameter.grad is None) for _, parameter in named_trainable],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if distributed:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        gathered_missing = [torch.empty_like(local_missing) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_missing, local_missing)
+    else:
+        world_size = 1
+        rank = 0
+        gathered_missing = [local_missing]
+
+    rank_records: list[dict[str, Any]] = []
+    missing_name_sets: list[tuple[str, ...]] = []
+    for global_rank, missing_mask in enumerate(gathered_missing):
+        missing_indices = torch.nonzero(missing_mask, as_tuple=False).flatten().cpu().tolist()
+        missing_names = tuple(names[index] for index in missing_indices)
+        missing_name_sets.append(missing_names)
+        rank_records.append(
+            {
+                "global_rank": global_rank,
+                "missing_tensor_count": len(missing_indices),
+                "missing_parameter_numel": sum(numels[index] for index in missing_indices),
+                "missing_parameter_names": list(missing_names),
+            }
+        )
+
+    union_missing_names = sorted({name for missing_names in missing_name_sets for name in missing_names})
+    comparison_pass = not union_missing_names
+    payload = {
+        "version": 1,
+        "mode": "full_molmo2er_first_optimizer_step_gradient_coverage",
+        "comparison_pass": comparison_pass,
+        "world_size": world_size,
+        "trainable_parameter_tensor_count": len(named_trainable),
+        "trainable_parameter_numel": sum(numels),
+        "all_ranks_same_missing_set": all(
+            missing_names == missing_name_sets[0] for missing_names in missing_name_sets[1:]
+        ),
+        "union_missing_tensor_count": len(union_missing_names),
+        "union_missing_parameter_names": union_missing_names,
+        "ranks": rank_records,
+    }
+    path = Path(output_dir) / FULL_MOLMO2ER_FIRST_STEP_GRADIENT_AUDIT_NAME
+    if rank == 0:
+        _write_json_atomically(path, payload)
+    if distributed:
+        torch.distributed.barrier()
+
+    if not comparison_pass:
+        preview = ", ".join(union_missing_names[:24])
+        if len(union_missing_names) > 24:
+            preview += f", ... (+{len(union_missing_names) - 24} more)"
+        raise RuntimeError(
+            "Full-Molmo2-ER first-step gradient coverage failed before optimizer.step: "
+            f"{len(union_missing_names)} trainable tensors were absent on at least one rank "
+            f"({preview}). Complete rank-specific names: {path}"
+        )
+    return path
+
+
+def _update_sha256_with_length_prefixed_bytes(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
+    digest.update(value)
+
+
+def hash_full_molmo2er_frozen_parameters(
+    policy: torch.nn.Module,
+    *,
+    chunk_bytes: int = 16 * _MIB,
+) -> dict[str, Any]:
+    """Hash frozen live parameters with bounded CPU memory and no full-tensor copy."""
+
+    chunk_bytes = _require_positive_int("chunk_bytes", chunk_bytes)
+    backend = policy.model.vlm_with_expert
+    named_parameters = [
+        (f"backend.vlm.{name}", parameter) for name, parameter in backend.vlm.named_parameters()
+    ]
+    named_parameters.extend(
+        (f"backend.vision_backbone.{name}", parameter)
+        for name, parameter in backend.vision_backbone.named_parameters()
+    )
+    named_parameters.sort(key=lambda item: item[0])
+    if not named_parameters:
+        raise RuntimeError("Full-Molmo2-ER frozen hash found no VLM/vision parameters.")
+
+    digest = hashlib.sha256()
+    total_numel = 0
+    total_bytes = 0
+    seen_names: set[str] = set()
+    with torch.no_grad():
+        for name, parameter in named_parameters:
+            if name in seen_names:
+                raise RuntimeError(f"Duplicate frozen parameter name in hash contract: {name}")
+            seen_names.add(name)
+            if parameter.requires_grad:
+                raise RuntimeError(f"Trainable parameter entered frozen hash contract: {name}")
+            if not parameter.is_contiguous():
+                raise RuntimeError(
+                    f"Frozen hash requires contiguous parameter storage to avoid a full copy: {name}"
+                )
+
+            element_size = parameter.element_size()
+            parameter_numel = parameter.numel()
+            parameter_bytes = parameter_numel * element_size
+            metadata = json.dumps(
+                {
+                    "name": name,
+                    "shape": list(parameter.shape),
+                    "dtype": str(parameter.dtype),
+                    "numel": parameter_numel,
+                    "nbytes": parameter_bytes,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _update_sha256_with_length_prefixed_bytes(digest, metadata)
+
+            elements_per_chunk = max(1, chunk_bytes // element_size)
+            flattened = parameter.detach().view(-1)
+            for start in range(0, parameter_numel, elements_per_chunk):
+                chunk = flattened[start : start + elements_per_chunk]
+                cpu_byte_chunk = chunk.view(torch.uint8).to(
+                    device="cpu",
+                    non_blocking=False,
+                    copy=True,
+                )
+                digest.update(memoryview(cpu_byte_chunk.numpy()))
+                del cpu_byte_chunk
+
+            total_numel += parameter_numel
+            total_bytes += parameter_bytes
+
+    return {
+        "algorithm": "sha256",
+        "hash_scheme": "length-prefixed name/shape/dtype/numel/nbytes metadata then raw tensor bytes",
+        "parameter_order": "lexicographic fully-qualified name",
+        "chunk_bytes": chunk_bytes,
+        "parameter_count": len(named_parameters),
+        "total_numel": total_numel,
+        "total_bytes": total_bytes,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def write_full_molmo2er_frozen_parameter_hash_audit(
+    output_dir: str | Path,
+    *,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> Path:
+    comparison_pass = dict(before) == dict(after)
+    payload = {
+        "version": 1,
+        "mode": "full_molmo2er_frozen_live_parameter_before_after_hash",
+        "comparison_pass": comparison_pass,
+        "before": dict(before),
+        "after": dict(after),
+    }
+    path = _write_json_atomically(
+        Path(output_dir) / "full_molmo2er_frozen_parameter_hash_audit.json",
+        payload,
+    )
+    if not comparison_pass:
+        raise RuntimeError(f"Full-Molmo2-ER frozen live parameters changed during training; see {path}.")
+    return path
 
 
 def resolve_checkpoint_retention(environ: Mapping[str, str]) -> int | None:
@@ -681,15 +1287,12 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 
 
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
-    """Inject fixed-reference EEF pose chunks for WorldFlow supervision.
+    """Inject strict fixed-reference supervision for the selected World target.
 
     ``worldflow.current_ee_pose`` is the achieved pose at the observation
-    frame. Future targets come from ``action_target_ee_poses`` when that
-    command-target sidecar is available. This is essential because the Ego
-    action chunk is supervised with those same controller targets; using
-    achieved future poses here makes the World--Ego bridge align two different
-    labels. Legacy datasets without the command-target sidecar fall back to
-    achieved poses.
+    frame. In ``world_eef_trajectory`` mode both it and the commanded future
+    EEF targets are expressed directly in the complete robot-base frame.
+    Legacy camera-frame datasets retain their historical behavior.
     """
 
     def __init__(
@@ -698,21 +1301,39 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
+        target_type: str = "legacy_eef",
         action_start_offset: int = 0,
         require_action_target_sidecar: bool = False,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
         self.root = Path(root)
-        self.pose_dir = self.root / "world_ee_poses"
-        command_target_dir = self.root / "action_target_ee_poses"
-        if require_action_target_sidecar and not command_target_dir.is_dir():
+        self.target_type = str(target_type)
+        if self.target_type not in {"legacy_eef", "world_eef_trajectory"}:
+            raise ValueError(f"Unsupported WorldFlow target_type={self.target_type!r}.")
+        self.pose_dir = self.root / (
+            "world_base_ee_poses"
+            if self.target_type == "world_eef_trajectory"
+            else "world_ee_poses"
+        )
+        command_target_dir = self.root / (
+            "world_base_action_target_ee_poses"
+            if self.target_type == "world_eef_trajectory"
+            else "action_target_ee_poses"
+        )
+        if (
+            self.target_type == "legacy_eef"
+            and require_action_target_sidecar
+            and not command_target_dir.is_dir()
+        ):
             raise FileNotFoundError(
                 "WorldFlow requires commanded action targets but the sidecar directory is missing: "
                 f"{command_target_dir}. Regenerate the dataset with action_target_ee_poses or set "
                 "worldflow_require_action_target_sidecar=False only for an explicitly achieved-trajectory dataset."
             )
-        self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
+        self.target_pose_dir = (
+            command_target_dir if command_target_dir.is_dir() else self.pose_dir
+        )
         self.chunk_size = int(chunk_size)
         self.action_start_offset = int(action_start_offset)
         if self.action_start_offset < 0:
@@ -725,7 +1346,33 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(
                 f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
             )
-        if self.target_pose_dir == self.pose_dir:
+        if self.target_type == "world_eef_trajectory" and not command_target_dir.is_dir():
+            raise FileNotFoundError(
+                "Robot-base WorldFlow requires the commanded EEF trajectory sidecar: "
+                f"{command_target_dir}. Camera-frame or achieved-pose fallbacks are forbidden."
+            )
+        if self.target_type == "world_eef_trajectory":
+            base_meta_path = self.pose_dir / "meta.json"
+            target_meta_path = command_target_dir / "meta.json"
+            if not base_meta_path.is_file() or not target_meta_path.is_file():
+                raise FileNotFoundError(
+                    "Robot-base WorldFlow requires explicit coordinate metadata at "
+                    f"{base_meta_path} and {target_meta_path}."
+                )
+            with open(base_meta_path, encoding="utf-8") as f:
+                base_meta = json.load(f)
+            with open(target_meta_path, encoding="utf-8") as f:
+                target_meta = json.load(f)
+            if (
+                base_meta.get("coordinate_frame") != "robot_base"
+                or target_meta.get("coordinate_frame") != "robot_base"
+                or target_meta.get("target_semantics") != "commanded_eef_pose"
+            ):
+                raise ValueError(
+                    "Robot-base WorldFlow metadata must declare robot_base coordinates and "
+                    "target_semantics='commanded_eef_pose'."
+                )
+        if self.target_type == "legacy_eef" and self.target_pose_dir == self.pose_dir:
             logging.warning(
                 "WorldFlow command-target sidecar is absent at %s; falling back to achieved future poses. "
                 "The World--Ego bridge is exactly label-consistent only when action_target_ee_poses is present.",
@@ -792,10 +1439,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         poses = self._episode_poses(episode_index)
-        target_poses = self._episode_target_poses(episode_index)
         episode_len = int(len(poses))
         if episode_len <= 0:
             raise ValueError(f"Worldflow episode {episode_index} is empty.")
+        target_poses = self._episode_target_poses(episode_index)
         if len(target_poses) != episode_len:
             raise ValueError(
                 f"WorldFlow episode {episode_index} achieved/target lengths differ: "
@@ -819,11 +1466,88 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             + np.arange(chunk_size, dtype=np.int64)
         )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
-        item["worldflow.ee_poses"] = torch.from_numpy(
+        target_key = (
+            "worldflow.eef_trajectory"
+            if self.target_type == "world_eef_trajectory"
+            else "worldflow.ee_poses"
+        )
+        item[target_key] = torch.from_numpy(
             np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
         )
-        item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
+        target_frame_indices = frame_indices
+        item["worldflow.step_is_pad"] = torch.from_numpy(
+            target_frame_indices >= episode_len
+        )
         return item
+
+
+def _paired_pointseg_cache_contract_mismatches(
+    all_view_manifest: dict[str, Any],
+    primary_manifest: dict[str, Any],
+    *,
+    camera_view_fusion: str,
+    num_views: int,
+    gripper_points: int,
+) -> dict[str, tuple[Any, Any]]:
+    """Compare semantic cache contracts for exact primary/all-view pairing.
+
+    ``full_union`` deliberately has a variable input length: every view keeps
+    all of its scene points while only the primary gripper tail is retained.
+    The primary replay therefore remains the checkpoint-native 10k cloud and
+    is padded by ``song_pointseg_collate`` next to the 19.5k two-view cloud.
+
+    ``nn_chunk_size`` only tiles exact nearest-neighbour computation.  It does
+    not change the pseudo-label definition and may differ between caches made
+    for different point counts.
+    """
+
+    # Cache schema versions describe the on-disk reader contract, not the
+    # pseudo-label semantics that must match between paired views.  Each
+    # SongPointSegCachedDataset has already rejected unsupported versions;
+    # allow a compatible immutable primary cache (v11) to pair with a v12
+    # multiscale cache that only adds the coarse-novelty input metadata.
+    matching_fields = (
+        "num_samples",
+        "future_offsets",
+        "temporal_offsets",
+        "trajectory_mode",
+        "trajectory_offset_filtering",
+        "gripper_points",
+        "pseudo_label_policy",
+    )
+    mismatches = {
+        key: (all_view_manifest.get(key), primary_manifest.get(key))
+        for key in matching_fields
+        if all_view_manifest.get(key) != primary_manifest.get(key)
+    }
+
+    def semantic_pseudo_config(manifest: dict[str, Any]) -> Any:
+        config = manifest.get("pseudo_label_config")
+        if not isinstance(config, dict):
+            return config
+        return {key: value for key, value in config.items() if key != "nn_chunk_size"}
+
+    all_pseudo_config = semantic_pseudo_config(all_view_manifest)
+    primary_pseudo_config = semantic_pseudo_config(primary_manifest)
+    if all_pseudo_config != primary_pseudo_config:
+        mismatches["pseudo_label_config"] = (all_pseudo_config, primary_pseudo_config)
+
+    for field in ("current_points", "future_points"):
+        all_points = all_view_manifest.get(field)
+        primary_points = primary_manifest.get(field)
+        if camera_view_fusion == "full_union":
+            try:
+                expected_all_points = (
+                    int(num_views) * (int(primary_points) - int(gripper_points))
+                    + int(gripper_points)
+                )
+            except (TypeError, ValueError):
+                expected_all_points = None
+            if int(num_views) < 1 or expected_all_points != all_points:
+                mismatches[field] = (all_points, primary_points)
+        elif all_points != primary_points:
+            mismatches[field] = (all_points, primary_points)
+    return mismatches
 
 
 class PointSegCacheInjectedDataset(torch.utils.data.Dataset):
@@ -1238,6 +1962,7 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        target_type=str(getattr(policy_cfg, "worldflow_target_type", "legacy_eef")),
         action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         require_action_target_sidecar=bool(
             getattr(policy_cfg, "worldflow_require_action_target_sidecar", False)
@@ -1735,8 +2460,18 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
     if getattr(config, "vlm_backend", None) != "molmo2_full":
         return {}
 
-    expected_total = 6_261_215_886
-    expected_trainable = 1_799_274_686
+    if getattr(config, "molmo_inference_only", None) is not False:
+        raise RuntimeError(
+            "WEP-prefix Full-Molmo2-ER requires molmo_inference_only=false so FG/BG "
+            "input gradients can traverse the frozen decoder."
+        )
+
+    worldflow_enabled = bool(getattr(config, "worldflow_enable", False))
+    expected_budget = expected_full_molmo2er_parameter_budget(
+        worldflow_enable=worldflow_enabled
+    )
+    expected_total = expected_budget["total"]
+    expected_trainable = expected_budget["trainable"]
     total = count_parameters(policy)
     trainable = count_parameters(policy, only_trainable=True)
     if (total, trainable) != (expected_total, expected_trainable):
@@ -1746,16 +2481,8 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
             f"actual={total}/{trainable}."
         )
 
-    trainable_prefixes = (
-        "model.vlm_with_expert.lm_expert.",
-        "model.pointseg_conditioner.",
-        "model.pointseg_object_proj.",
-        "model.pointseg_background_proj.",
-        "model.point_action_fusion.",
-        "model.action_in_proj.",
-        "model.action_out_proj.",
-        "model.action_time_mlp_in.",
-        "model.action_time_mlp_out.",
+    trainable_prefixes = full_molmo2er_trainable_parameter_prefixes(
+        worldflow_enable=worldflow_enabled
     )
     unexpected_trainable = [
         name
@@ -1769,6 +2496,28 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         )
 
     backend = policy.model.vlm_with_expert
+    architecture = backend.architecture_contract
+    wep_prefix_contract = {
+        "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+        "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
+        "per_layer_memory": "evolving_image_text_fg_bg_prefix",
+        "fg_bg_location": "trainable_vlm_prefix",
+        "action_location": "expert_suffix_only",
+        "text_prefix_autograd_preserved": True,
+        "gradient_checkpointing": bool(
+            getattr(config, "molmo_gradient_checkpointing", True)
+        ),
+        "gradient_checkpointing_layers_per_segment": int(
+            getattr(config, "molmo_gradient_checkpointing_layers_per_segment", 1)
+        ),
+    }
+    drift = {
+        key: {"expected": expected, "actual": architecture.get(key)}
+        for key, expected in wep_prefix_contract.items()
+        if architecture.get(key) != expected
+    }
+    if drift or getattr(backend, "inference_only_vlm", None) is not False:
+        raise RuntimeError(f"Full-Molmo2-ER WEP-prefix execution contract drifted: {drift}.")
     if len(backend.vlm.blocks) != 36 or len(backend.lm_expert.layers) != 36:
         raise RuntimeError("Full-Molmo2-ER requires exactly 36 VLM and 36 Expert layers.")
     if not hasattr(backend, "vision_backbone"):
@@ -1784,6 +2533,66 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         raise RuntimeError("Native Molmo embeddings must not be multiplied by sqrt(hidden_size).")
 
     return {"total_parameters": total, "trainable_parameters": trainable}
+
+
+def write_full_molmo2er_parameter_audit(
+    output_dir: str | Path,
+    policy: torch.nn.Module,
+    audit: Mapping[str, int],
+) -> Path:
+    """Atomically persist the actual pre-optimizer/pre-DDP parameter audit."""
+
+    backend = policy.model.vlm_with_expert
+    total = int(audit["total_parameters"])
+    trainable = int(audit["trainable_parameters"])
+    vision_backbone_present = hasattr(backend, "vision_backbone")
+    molmo_frozen = vision_backbone_present and not any(
+        parameter.requires_grad
+        for module in (backend.vlm, backend.vision_backbone)
+        for parameter in module.parameters()
+    )
+    payload = {
+        "version": 3,
+        "backend": "molmo2_full",
+        "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "frozen_parameters": total - trainable,
+        "worldflow_enabled": bool(getattr(policy.config, "worldflow_enable", False)),
+        "vlm_layers": len(backend.vlm.blocks),
+        "molmo_inference_only": bool(getattr(policy.config, "molmo_inference_only", False)),
+        "vlm_execution": backend.architecture_contract.get("vlm_execution"),
+        "per_layer_memory": backend.architecture_contract.get("per_layer_memory"),
+        "fg_bg_location": backend.architecture_contract.get("fg_bg_location"),
+        "gradient_checkpointing": backend.architecture_contract.get(
+            "gradient_checkpointing"
+        ),
+        "gradient_checkpointing_layers_per_segment": backend.architecture_contract.get(
+            "gradient_checkpointing_layers_per_segment"
+        ),
+        "distributed_strategy": "DDP",
+        "expert_layers": len(backend.lm_expert.layers),
+        "vision_backbone_present": vision_backbone_present,
+        "molmo_frozen": molmo_frozen,
+        "trainable_allowlist_pass": True,
+    }
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "full_molmo2er_parameter_audit.json"
+    if path.is_file():
+        with open(path, encoding="utf-8") as audit_file:
+            existing_payload = json.load(audit_file)
+        if existing_payload != payload:
+            raise RuntimeError(f"Existing Full-Molmo2-ER parameter audit is incompatible: {path}")
+        return path
+
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary_path, "w", encoding="utf-8") as audit_file:
+        json.dump(payload, audit_file, indent=2, ensure_ascii=False)
+        audit_file.write("\n")
+    temporary_path.replace(path)
+    return path
 
 
 def ensure_ddp_parameters_initialized(module: torch.nn.Module, accelerator: Accelerator) -> None:
@@ -1814,13 +2623,19 @@ def make_song_training_ddp_kwargs(vlm_backend: str | None) -> DistributedDataPar
 
     Full-Molmo2-ER has about 3.47 GiB of trainable gradients per rank.  Making
     those gradients views into the existing all-reduce buckets avoids a second
-    allocation of the same size after DDP's first iteration.  Other backends
-    retain Accelerate's previous/default ``gradient_as_bucket_view=False``.
+    allocation of the same size after DDP's first iteration. The Full graph is
+    fixed, so disabling unused-parameter discovery avoids traversing roughly
+    2.1B trainable parameters every micro-step. ``static_graph=True`` is not
+    used because PyTorch 2.8's reducer is incompatible with the ``no_sync``
+    gradient-accumulation pattern used here. Other backends retain the previous
+    dynamic-graph behavior.
     """
 
+    full_molmo2er = vlm_backend == "molmo2_full"
     return DistributedDataParallelKwargs(
-        find_unused_parameters=True,
-        gradient_as_bucket_view=vlm_backend == "molmo2_full",
+        find_unused_parameters=not full_molmo2er,
+        gradient_as_bucket_view=full_molmo2er,
+        static_graph=False,
     )
 
 
@@ -1836,6 +2651,10 @@ def update_policy(
     rabc_weights_provider=None,
     loss_scale: float = 1.0,
     perform_optimizer_step: bool = True,
+    record_loss: bool = True,
+    require_per_sample_mean: bool = False,
+    audit_first_step_gradients: bool = False,
+    gradient_audit_output_dir: str | Path | None = None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -1883,10 +2702,23 @@ def update_policy(
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+        elif require_per_sample_mean:
+            # Exact global-batch scaling is defined over equal-weight samples,
+            # even when episode-tail action padding differs within B>1.
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            if per_sample_loss.ndim != 1:
+                raise ValueError(
+                    f"Expected per-sample loss shape [B], got {per_sample_loss.shape}."
+                )
+            loss = per_sample_loss.mean()
         else:
             loss, output_dict = policy.forward(batch)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+    # Normalize the logging contract across policies (including RA-BC): this
+    # is the exact scalar whose scaled gradient is accumulated below.
+    output_dict["loss"] = loss.detach().item()
 
     finite_loss = torch.isfinite(loss.detach()).to(device=loss.device, dtype=torch.int32)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1904,7 +2736,8 @@ def update_policy(
     accelerator.backward(loss * float(loss_scale))
 
     if not perform_optimizer_step:
-        train_metrics.loss = loss.item()
+        if record_loss:
+            train_metrics.loss = loss.item()
         train_metrics.lr = optimizer.param_groups[0]["lr"]
         train_metrics.update_s = time.perf_counter() - start_time
         return train_metrics, output_dict
@@ -1924,6 +2757,19 @@ def update_policy(
         optimizer.zero_grad(set_to_none=True)
         raise FloatingPointError("Non-finite gradient norm detected on at least one distributed rank.")
 
+    if audit_first_step_gradients:
+        if gradient_audit_output_dir is None:
+            raise ValueError("gradient_audit_output_dir is required for the first-step gradient audit.")
+        gradient_audit_path = audit_first_optimizer_step_trainable_gradients(
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True),
+            gradient_audit_output_dir,
+        )
+        if accelerator.is_main_process:
+            logging.info(
+                "Full-Molmo2-ER first-step trainable gradient audit passed: %s",
+                gradient_audit_path,
+            )
+
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
@@ -1938,7 +2784,8 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    if record_loss:
+        train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -1995,6 +2842,30 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
+    # Prevent rank 0 from creating output artifacts while peers are still in cfg.validate().
+    accelerator.wait_for_everyone()
+
+    exact_global_batch_plan = resolve_exact_global_batch_plan(
+        global_batch_size=cfg.global_batch_size,
+        batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        world_size=accelerator.num_processes,
+    )
+    if exact_global_batch_plan is not None and is_main_process:
+        exact_batch_manifest_path = write_exact_global_batch_manifest(
+            cfg.output_dir,
+            exact_global_batch_plan,
+        )
+        logging.info(
+            "Exact global-batch contract: gradients=%s, physical_forwards=%s, "
+            "discarded_for_gradient=%s, loss_scale=%s, manifest=%s",
+            exact_global_batch_plan.global_batch_size,
+            exact_global_batch_plan.physical_forward_samples_per_optimizer_step,
+            exact_global_batch_plan.discarded_samples_per_optimizer_step,
+            exact_global_batch_plan.valid_loss_scale,
+            exact_batch_manifest_path,
+        )
+    accelerator.wait_for_everyone()
 
     if getattr(cfg.policy, "vlm_backend", None) in {"molmo2_text", "molmo2_full"}:
         if accelerator.mixed_precision != "no":
@@ -2077,10 +2948,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
     full_molmo_audit = audit_full_molmo2er_policy(policy)
     if full_molmo_audit and is_main_process:
+        full_molmo_audit_path = write_full_molmo2er_parameter_audit(
+            cfg.output_dir,
+            policy,
+            full_molmo_audit,
+        )
         logging.info(
-            "Full-Molmo2-ER pre-DDP audit passed: total=%s, trainable=%s",
+            "Full-Molmo2-ER pre-DDP audit passed: total=%s, trainable=%s, frozen=%s, manifest=%s",
             full_molmo_audit["total_parameters"],
             full_molmo_audit["trainable_parameters"],
+            full_molmo_audit["total_parameters"] - full_molmo_audit["trainable_parameters"],
+            full_molmo_audit_path,
         )
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
@@ -2135,7 +3013,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     ensure_ddp_parameters_initialized(policy, accelerator)
 
-    # Wait for all processes to finish policy creation before continuing
+    # All ranks hold the same initialized policy before rank 0 streams the
+    # frozen VLM/vision bytes through a bounded-memory hash.
+    accelerator.wait_for_everyone()
+    frozen_molmo_hash_before = None
+    if full_molmo_audit and exact_global_batch_plan is not None and is_main_process:
+        logging.info("Hashing frozen Full-Molmo2-ER VLM/vision parameters before training")
+        frozen_molmo_hash_before = hash_full_molmo2er_frozen_parameters(policy)
+        _write_json_atomically(
+            Path(cfg.output_dir) / "full_molmo2er_frozen_parameter_hash_before.json",
+            {"version": 1, "before": frozen_molmo_hash_before},
+        )
+        logging.info(
+            "Frozen Full-Molmo2-ER pre-training hash: sha256=%s bytes=%s",
+            frozen_molmo_hash_before["sha256"],
+            frozen_molmo_hash_before["total_bytes"],
+        )
     accelerator.wait_for_everyone()
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
@@ -2240,6 +3133,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+    if exact_global_batch_plan is not None and is_main_process:
+        logging.info(
+            "Exact global-batch partial-rank rotation at optimizer step %s: active ranks=%s",
+            step,
+            exact_global_batch_active_ranks(
+                exact_global_batch_plan,
+                optimizer_step=step,
+                micro_step=exact_global_batch_plan.gradient_accumulation_steps - 1,
+            ),
+        )
 
     num_learnable_params = count_parameters(policy, only_trainable=True)
     num_total_params = count_parameters(policy, only_trainable=False)
@@ -2258,12 +3161,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
         accumulation_steps = int(cfg.gradient_accumulation_steps)
-        effective_bs = cfg.batch_size * accumulation_steps * num_processes
-        logging.info(
-            "Effective batch size: "
-            f"{cfg.batch_size} x {accumulation_steps} accumulation x "
-            f"{num_processes} process(es) = {effective_bs}"
-        )
+        if exact_global_batch_plan is None:
+            effective_bs = cfg.batch_size * accumulation_steps * num_processes
+            logging.info(
+                "Effective batch size: "
+                f"{cfg.batch_size} x {accumulation_steps} accumulation x "
+                f"{num_processes} process(es) = {effective_bs}"
+            )
+        else:
+            effective_bs = exact_global_batch_plan.global_batch_size
+            logging.info(
+                "Exact effective batch size: %s active samples from %s physical forwards "
+                "(%s discarded only for gradient; every rank still runs forward/backward)",
+                effective_bs,
+                exact_global_batch_plan.physical_forward_samples_per_optimizer_step,
+                exact_global_batch_plan.discarded_samples_per_optimizer_step,
+            )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -2300,7 +3213,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
         pin_memory=device.type == "cuda",
-        drop_last=False,
+        drop_last=exact_global_batch_plan is not None,
         prefetch_factor=2 if dataloader_num_workers > 0 else None,
         persistent_workers=dataloader_num_workers > 0,
         collate_fn=collate_fn,
@@ -2323,13 +3236,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     "Full-Molmo2-ER requires DDP gradient_as_bucket_view=True to avoid a "
                     "second 3.47-GiB gradient allocation per rank."
                 )
+            if policy.find_unused_parameters is not False:
+                raise RuntimeError("Full-Molmo2-ER requires DDP find_unused_parameters=False.")
+            if policy.static_graph is not False:
+                raise RuntimeError(
+                    "Full-Molmo2-ER requires DDP static_graph=False because its no_sync "
+                    "accumulation is incompatible with PyTorch 2.8 static-graph DDP."
+                )
             if is_main_process:
                 logging.info(
                     "Full-Molmo2-ER DDP memory audit passed: "
                     "gradient_as_bucket_view=%s (effective after the first iteration), "
-                    "find_unused_parameters=%s",
+                    "find_unused_parameters=%s, static_graph=%s",
                     policy.gradient_as_bucket_view,
                     policy.find_unused_parameters,
+                    policy.static_graph,
                 )
         elif is_main_process:
             logging.info(
@@ -2339,6 +3260,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     dl_iter = cycle(dataloader)
 
     policy.train()
+    post_adam_cuda_memory_audit_done = True
+    if exact_global_batch_plan is not None and device.type == "cuda":
+        aggregate_memory_audit_path = exact_global_batch_cuda_memory_audit_path(cfg.output_dir)
+        audit_exists_flag = torch.tensor(
+            int(is_main_process and aggregate_memory_audit_path.is_file()),
+            device=device,
+            dtype=torch.int32,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(audit_exists_flag, src=0)
+        elif accelerator.num_processes != 1:
+            raise RuntimeError(
+                "Exact post-Adam memory audit requires an initialized distributed process group."
+            )
+        post_adam_cuda_memory_audit_done = bool(audit_exists_flag.item())
+        if post_adam_cuda_memory_audit_done and is_main_process:
+            logging.info("Reusing completed post-Adam CUDA memory audit: %s", aggregate_memory_audit_path)
 
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
@@ -2348,16 +3286,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
 
-    # Keep global batch size for logging; MetricsTracker handles world size internally.
     accumulation_steps = int(cfg.gradient_accumulation_steps)
-    effective_batch_size = cfg.batch_size * accumulation_steps * accelerator.num_processes
+    if exact_global_batch_plan is None:
+        effective_batch_size = cfg.batch_size * accumulation_steps * accelerator.num_processes
+        tracker_batch_size = cfg.batch_size * accumulation_steps
+        tracker_accelerator = accelerator
+    else:
+        effective_batch_size = exact_global_batch_plan.global_batch_size
+        # Count only gradient-contributing samples. Supplying the already-global
+        # value without an accelerator prevents MetricsTracker multiplying by W.
+        tracker_batch_size = exact_global_batch_plan.global_batch_size
+        tracker_accelerator = None
     train_tracker = MetricsTracker(
-        cfg.batch_size * accumulation_steps,
+        tracker_batch_size,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
         initial_step=step,
-        accelerator=accelerator,
+        accelerator=tracker_accelerator,
     )
 
     if is_main_process:
@@ -2376,7 +3322,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         output_dict = {}
+        exact_local_loss_sum = 0.0
         for micro_step in range(accumulation_steps):
+            if exact_global_batch_plan is None:
+                rank_loss_scale = 1.0 / accumulation_steps
+                rank_contributes_gradient = True
+            else:
+                rank_loss_scale = exact_global_batch_rank_loss_scale(
+                    exact_global_batch_plan,
+                    optimizer_step=step,
+                    micro_step=micro_step,
+                    rank=accelerator.process_index,
+                )
+                rank_contributes_gradient = rank_loss_scale > 0.0
             start_time = time.perf_counter()
             batch = next(dl_iter)
             batch = preprocessor(batch)
@@ -2384,7 +3342,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             is_last_micro_step = micro_step + 1 == accumulation_steps
             sync_context = nullcontext() if is_last_micro_step else accelerator.no_sync(policy)
             with sync_context:
-                train_tracker, output_dict = update_policy(
+                train_tracker, micro_output_dict = update_policy(
                     train_tracker,
                     policy,
                     batch,
@@ -2393,9 +3351,34 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     accelerator=accelerator,
                     lr_scheduler=lr_scheduler,
                     rabc_weights_provider=rabc_weights,
-                    loss_scale=1.0 / accumulation_steps,
+                    loss_scale=rank_loss_scale,
                     perform_optimizer_step=is_last_micro_step,
+                    require_per_sample_mean=exact_global_batch_plan is not None,
+                    audit_first_step_gradients=bool(
+                        full_molmo_audit and step == 0 and is_last_micro_step
+                    ),
+                    gradient_audit_output_dir=cfg.output_dir,
+                    # Exact mode records one globally reduced mean below,
+                    # rather than treating every micro-step as a full batch.
+                    record_loss=exact_global_batch_plan is None,
                 )
+            if rank_contributes_gradient:
+                output_dict = micro_output_dict
+                if exact_global_batch_plan is not None:
+                    exact_local_loss_sum += (
+                        float(micro_output_dict["loss"])
+                        * exact_global_batch_plan.micro_batch_size_per_rank
+                    )
+
+        if exact_global_batch_plan is not None:
+            exact_loss_sum = torch.tensor(exact_local_loss_sum, device=device, dtype=torch.float64)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(exact_loss_sum, op=torch.distributed.ReduceOp.SUM)
+            elif accelerator.num_processes != 1:
+                raise RuntimeError("Exact loss logging requires an initialized process group.")
+            exact_global_loss = float(exact_loss_sum.item()) / exact_global_batch_plan.global_batch_size
+            train_tracker.loss = exact_global_loss
+            output_dict["loss"] = exact_global_loss
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -2405,6 +3388,52 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             output_dict["cuda_allocated_gib"] = torch.cuda.memory_allocated(device) / gib
             output_dict["cuda_reserved_gib"] = torch.cuda.memory_reserved(device) / gib
             output_dict["cuda_peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / gib
+        if not post_adam_cuda_memory_audit_done:
+            # update_policy has completed optimizer.step(), so Adam's lazy state
+            # tensors exist before this synchronized memory snapshot.
+            torch.cuda.synchronize(device)
+            optimizer_state_count, optimizer_state_numel = optimizer_state_tensor_summary(optimizer)
+            memory_record = build_exact_global_batch_cuda_memory_rank_record(
+                plan=exact_global_batch_plan,
+                completed_optimizer_step=step,
+                global_rank=accelerator.process_index,
+                local_rank=accelerator.local_process_index,
+                logical_cuda_index=torch.cuda.current_device(),
+                accelerator_device=str(device),
+                memory_snapshot={
+                    "allocated_bytes": torch.cuda.memory_allocated(device),
+                    "reserved_bytes": torch.cuda.memory_reserved(device),
+                    "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                    "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                },
+                optimizer_state_tensor_count=optimizer_state_count,
+                optimizer_state_total_numel=optimizer_state_numel,
+                environ=os.environ,
+                hostname=os.uname().nodename,
+            )
+            rank_memory_path = write_exact_global_batch_cuda_memory_rank_record(
+                cfg.output_dir,
+                memory_record,
+            )
+            logging.info(
+                "Rank %s saved post-Adam CUDA memory audit to %s",
+                accelerator.process_index,
+                rank_memory_path,
+            )
+            accelerator.wait_for_everyone()
+            if is_main_process:
+                aggregate_memory_audit_path = aggregate_exact_global_batch_cuda_memory_records(
+                    cfg.output_dir,
+                    plan=exact_global_batch_plan,
+                    expected_completed_optimizer_step=step,
+                )
+                logging.info(
+                    "Aggregated %s-rank post-Adam CUDA memory audit: %s",
+                    accelerator.num_processes,
+                    aggregate_memory_audit_path,
+                )
+            accelerator.wait_for_everyone()
+            post_adam_cuda_memory_audit_done = True
         if is_main_process:
             progbar.update(1)
         train_tracker.step()
@@ -2574,6 +3603,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+
+    accelerator.wait_for_everyone()
+    if frozen_molmo_hash_before is not None:
+        logging.info("Hashing frozen Full-Molmo2-ER VLM/vision parameters after training")
+        frozen_molmo_hash_after = hash_full_molmo2er_frozen_parameters(
+            accelerator.unwrap_model(policy)
+        )
+        frozen_hash_audit_path = write_full_molmo2er_frozen_parameter_hash_audit(
+            cfg.output_dir,
+            before=frozen_molmo_hash_before,
+            after=frozen_molmo_hash_after,
+        )
+        logging.info(
+            "Frozen Full-Molmo2-ER before/after hash audit passed: sha256=%s artifact=%s",
+            frozen_molmo_hash_after["sha256"],
+            frozen_hash_audit_path,
+        )
+    accelerator.wait_for_everyone()
 
     if is_main_process:
         progbar.close()

@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+import torchvision
 
 from lerobot.policies.smolvla import processor_smolvla
 from lerobot.policies.smolvla.molmo2_processing import (
@@ -28,6 +29,7 @@ from lerobot.policies.smolvla.molmo2_processing import (
     OBS_MOLMO_IMAGE_TOKEN_POOLING,
     OBS_MOLMO_PIXEL_VALUES,
     OBS_MOLMO_TOKEN_TYPE_IDS,
+    _prepare_fixed_molmo2_images_fast,
     prepare_molmo2_multimodal_batch,
 )
 from lerobot.policies.smolvla.processor_smolvla import (
@@ -262,3 +264,57 @@ def test_native_processor_accepts_only_singleton_training_time_axis() -> None:
             temporal.expand(-1, 2, -1, -1, -1),
             max_text_length=48,
         )
+
+
+def test_fixed_image_fast_path_matches_per_sample_native_matrix_reference() -> None:
+    image_processor = SimpleNamespace(
+        size={"height": 378, "width": 378},
+        max_crops=8,
+        overlap_margins=(4, 4),
+        patch_size=14,
+        pooling_size=(2, 2),
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        resample=2,
+    )
+    processor = SimpleNamespace(
+        image_processor=image_processor,
+        get_image_tokens=lambda _grid: ["<native-image>"],
+        image_placeholder_token="<image>",
+    )
+    torch.manual_seed(17)
+    images = torch.rand(3, 3, 256, 256, dtype=torch.float32)
+    fast = _prepare_fixed_molmo2_images_fast(processor, images)
+    assert fast is not None
+
+    resize = torchvision.transforms.Resize([378, 378], 2, antialias=False)
+    reference_crops = []
+    for image in images:
+        resized = resize(image.unsqueeze(0)).squeeze(0).clamp(0.0, 1.0)
+        hwc = resized.permute(1, 2, 0).contiguous()
+        hwc = (hwc - hwc.new_tensor((0.5, 0.5, 0.5))) / hwc.new_tensor(
+            (0.5, 0.5, 0.5)
+        )
+        patches = hwc.reshape(27, 14, 27, 14, 3)
+        patches = patches.permute(0, 2, 1, 3, 4).contiguous().reshape(729, 588)
+        reference_crops.extend([patches, patches])
+    reference_pixels = torch.stack(reference_crops)
+
+    assert torch.equal(fast["pixel_values"], reference_pixels)
+    assert fast["pixel_values"].shape == (6, 729, 588)
+    assert fast["image_token_pooling"].shape == (3 * 392, 4)
+    assert torch.equal(
+        fast["image_token_pooling"][:392],
+        fast["image_token_pooling"][392:784],
+    )
+    assert torch.equal(fast["image_grids"], torch.full((3, 4), 14))
+    assert torch.equal(fast["image_num_crops"], torch.full((3,), 2))
+
+    drifted = SimpleNamespace(**vars(image_processor))
+    drifted.patch_size = 16
+    incompatible = SimpleNamespace(
+        image_processor=drifted,
+        get_image_tokens=processor.get_image_tokens,
+        image_placeholder_token="<image>",
+    )
+    assert _prepare_fixed_molmo2_images_fast(incompatible, images) is None

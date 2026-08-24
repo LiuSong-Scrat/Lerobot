@@ -37,6 +37,26 @@ T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
 
 
+def _validate_pretrained_raw_policy_config(config: dict[str, Any], model_id: str) -> None:
+    """Reject incompatible Full-Molmo checkpoints before allocating their model."""
+
+    if config.get("vlm_backend") != "molmo2_full":
+        return
+
+    # Keep this import local: the SmolVLA config subclasses PreTrainedConfig, so
+    # importing policy modules while this base module initializes would cycle.
+    from lerobot.policies.smolvla.constants import FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
+
+    topology = config.get("full_molmo_topology")
+    if config.get("molmo_inference_only") is True or topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY:
+        raise ValueError(
+            f"Checkpoint '{model_id}' uses the retired detached-scene-suffix Full-Molmo topology "
+            "or has no valid WEP-prefix topology marker. Its 1920-wide external FG/BG projections "
+            "are incompatible with the 2560-wide WEP-prefix model. Start a fresh run or create an "
+            "explicit converted warm-start checkpoint; do not load it as a v3 checkpoint."
+        )
+
+
 @dataclass
 class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: ignore[misc,name-defined] #TODO: draccus issue
     """
@@ -202,18 +222,18 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
+        _validate_pretrained_raw_policy_config(config, model_id)
+
+        # HACK: Parse the original config to get the config subclass, so that we can
+        # apply cli overrides. Validate the raw JSON first: dataclass defaults must
+        # never make a legacy checkpoint look like the current topology.
+        with draccus.config_type("json"):
+            orig_config = draccus.parse(cls, config_file, args=[])
 
         config.pop("type")
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
