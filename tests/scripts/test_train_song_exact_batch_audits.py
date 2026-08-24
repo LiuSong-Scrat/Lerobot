@@ -151,7 +151,19 @@ def _tiny_frozen_full_policy():
     vision_backbone = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
     for parameter in (*vlm.parameters(), *vision_backbone.parameters()):
         parameter.requires_grad_(False)
-    backend = SimpleNamespace(vlm=vlm, vision_backbone=vision_backbone)
+
+    def named_frozen_molmo_parameters():
+        yield from ((f"vlm.{name}", parameter) for name, parameter in vlm.named_parameters())
+        yield from (
+            (f"vision_backbone.{name}", parameter)
+            for name, parameter in vision_backbone.named_parameters()
+        )
+
+    backend = SimpleNamespace(
+        vlm=vlm,
+        vision_backbone=vision_backbone,
+        named_frozen_molmo_parameters=named_frozen_molmo_parameters,
+    )
     return SimpleNamespace(model=SimpleNamespace(vlm_with_expert=backend))
 
 

@@ -52,6 +52,7 @@ from lerobot.policies.smolvla.configuration_smolvla import (
 from lerobot.policies.smolvla.modeling_smolvla import (
     expected_full_molmo2er_parameter_budget,
     full_molmo2er_trainable_parameter_prefixes,
+    is_full_molmo2er_lora_policy_parameter_name,
 )
 from lerobot.policies.smolvla.processor_smolvla import validate_smolvla_worldflow_preprocessor
 from lerobot.policies.smolvla.song_pointseg import (
@@ -604,12 +605,9 @@ def hash_full_molmo2er_frozen_parameters(
     chunk_bytes = _require_positive_int("chunk_bytes", chunk_bytes)
     backend = policy.model.vlm_with_expert
     named_parameters = [
-        (f"backend.vlm.{name}", parameter) for name, parameter in backend.vlm.named_parameters()
+        (f"backend.{name}", parameter)
+        for name, parameter in backend.named_frozen_molmo_parameters()
     ]
-    named_parameters.extend(
-        (f"backend.vision_backbone.{name}", parameter)
-        for name, parameter in backend.vision_backbone.named_parameters()
-    )
     named_parameters.sort(key=lambda item: item[0])
     if not named_parameters:
         raise RuntimeError("Full-Molmo2-ER frozen hash found no VLM/vision parameters.")
@@ -2467,8 +2465,12 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         )
 
     worldflow_enabled = bool(getattr(config, "worldflow_enable", False))
+    lora_enabled = bool(getattr(config, "molmo_lora_enable", False))
+    lora_rank = int(getattr(config, "molmo_lora_rank", 8))
     expected_budget = expected_full_molmo2er_parameter_budget(
-        worldflow_enable=worldflow_enabled
+        worldflow_enable=worldflow_enabled,
+        molmo_lora_enable=lora_enabled,
+        molmo_lora_rank=lora_rank,
     )
     expected_total = expected_budget["total"]
     expected_trainable = expected_budget["trainable"]
@@ -2484,10 +2486,15 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
     trainable_prefixes = full_molmo2er_trainable_parameter_prefixes(
         worldflow_enable=worldflow_enabled
     )
+    backend = policy.model.vlm_with_expert
+    lora_named_parameters = dict(backend.named_molmo_lora_parameters())
+    lora_parameter_ids = {id(parameter) for parameter in lora_named_parameters.values()}
     unexpected_trainable = [
         name
         for name, parameter in policy.named_parameters()
-        if parameter.requires_grad and not name.startswith(trainable_prefixes)
+        if parameter.requires_grad
+        and not name.startswith(trainable_prefixes)
+        and id(parameter) not in lora_parameter_ids
     ]
     if unexpected_trainable:
         raise RuntimeError(
@@ -2495,11 +2502,14 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
             f"{unexpected_trainable[:12]}"
         )
 
-    backend = policy.model.vlm_with_expert
     architecture = backend.architecture_contract
     wep_prefix_contract = {
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
-        "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
+        "vlm_execution": (
+            "frozen_base_with_lora_and_prefix_input_autograd"
+            if lora_enabled
+            else "frozen_parameters_with_prefix_input_autograd"
+        ),
         "per_layer_memory": "evolving_image_text_fg_bg_prefix",
         "fg_bg_location": "trainable_vlm_prefix",
         "action_location": "expert_suffix_only",
@@ -2510,6 +2520,13 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         "gradient_checkpointing_layers_per_segment": int(
             getattr(config, "molmo_gradient_checkpointing_layers_per_segment", 1)
         ),
+        "molmo_lora_enable": lora_enabled,
+        "molmo_lora_rank": lora_rank,
+        "molmo_lora_alpha": float(getattr(config, "molmo_lora_alpha", 8.0)),
+        "molmo_lora_dropout": float(getattr(config, "molmo_lora_dropout", 0.0)),
+        "molmo_lora_target_modules": ("att_proj", "attn_out"),
+        "molmo_lora_module_count": 36 + 35 if lora_enabled else 0,
+        "molmo_lora_parameter_count": int(expected_budget.get("molmo_lora", 0)),
     }
     drift = {
         key: {"expected": expected, "actual": architecture.get(key)}
@@ -2522,9 +2539,24 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         raise RuntimeError("Full-Molmo2-ER requires exactly 36 VLM and 36 Expert layers.")
     if not hasattr(backend, "vision_backbone"):
         raise RuntimeError("Full-Molmo2-ER did not instantiate its native vision backbone.")
-    frozen_modules = (backend.vlm, backend.vision_backbone)
-    if any(parameter.requires_grad for module in frozen_modules for parameter in module.parameters()):
-        raise RuntimeError("Molmo ViT/connector/text parameters must all be frozen.")
+    frozen_named_parameters = dict(backend.named_frozen_molmo_parameters())
+    if any(parameter.requires_grad for parameter in frozen_named_parameters.values()):
+        raise RuntimeError("Molmo ViT/connector/text base parameters must all be frozen.")
+    # Two tensors (A/B) for all 36 att_proj modules and the 35 reachable
+    # attn_out modules. The final VLM output is not consumed by the V3 loss.
+    expected_lora_tensors = 2 * (36 + 35) if lora_enabled else 0
+    if len(lora_named_parameters) != expected_lora_tensors:
+        raise RuntimeError(
+            "Full-Molmo2-ER LoRA tensor contract drifted: "
+            f"expected={expected_lora_tensors}, actual={len(lora_named_parameters)}."
+        )
+    if any(
+        not is_full_molmo2er_lora_policy_parameter_name(f"model.vlm_with_expert.{name}")
+        for name in lora_named_parameters
+    ):
+        raise RuntimeError("Molmo V3 LoRA was registered outside the exact attention allowlist.")
+    if any(not parameter.requires_grad for parameter in lora_named_parameters.values()):
+        raise RuntimeError("Every registered Molmo V3 LoRA parameter must remain trainable.")
     if any(not parameter.requires_grad for parameter in backend.lm_expert.parameters()):
         raise RuntimeError("The Full-Molmo2-ER Action Expert contains unexpectedly frozen parameters.")
     if hasattr(backend, "lm_head") or any("lm_head" in name for name, _ in backend.named_parameters()):
@@ -2532,7 +2564,12 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
     if getattr(backend, "scale_input_embeddings", None) is not False:
         raise RuntimeError("Native Molmo embeddings must not be multiplied by sqrt(hidden_size).")
 
-    return {"total_parameters": total, "trainable_parameters": trainable}
+    return {
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "molmo_lora_parameters": int(expected_budget.get("molmo_lora", 0)),
+        "molmo_lora_parameter_tensors": len(lora_named_parameters),
+    }
 
 
 def write_full_molmo2er_parameter_audit(
@@ -2546,13 +2583,16 @@ def write_full_molmo2er_parameter_audit(
     total = int(audit["total_parameters"])
     trainable = int(audit["trainable_parameters"])
     vision_backbone_present = hasattr(backend, "vision_backbone")
-    molmo_frozen = vision_backbone_present and not any(
-        parameter.requires_grad
-        for module in (backend.vlm, backend.vision_backbone)
-        for parameter in module.parameters()
+    molmo_base_frozen = vision_backbone_present and not any(
+        parameter.requires_grad for _, parameter in backend.named_frozen_molmo_parameters()
+    )
+    lora_named_parameters = dict(backend.named_molmo_lora_parameters())
+    lora_enabled = bool(getattr(policy.config, "molmo_lora_enable", False))
+    molmo_lora_trainable = bool(lora_named_parameters) and all(
+        parameter.requires_grad for parameter in lora_named_parameters.values()
     )
     payload = {
-        "version": 3,
+        "version": 4 if lora_enabled else 3,
         "backend": "molmo2_full",
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
         "total_parameters": total,
@@ -2573,9 +2613,29 @@ def write_full_molmo2er_parameter_audit(
         "distributed_strategy": "DDP",
         "expert_layers": len(backend.lm_expert.layers),
         "vision_backbone_present": vision_backbone_present,
-        "molmo_frozen": molmo_frozen,
+        # Preserve the V3 payload byte-for-byte when LoRA is disabled, so an
+        # existing V3 output directory remains resumable on this branch.
+        "molmo_frozen": molmo_base_frozen and not lora_enabled,
         "trainable_allowlist_pass": True,
     }
+    if lora_enabled:
+        payload.update(
+            {
+                "molmo_base_frozen": molmo_base_frozen,
+                "molmo_lora_enable": True,
+                "molmo_lora_rank": int(getattr(policy.config, "molmo_lora_rank", 8)),
+                "molmo_lora_alpha": float(getattr(policy.config, "molmo_lora_alpha", 8.0)),
+                "molmo_lora_dropout": float(getattr(policy.config, "molmo_lora_dropout", 0.0)),
+                "molmo_lora_lr_multiplier": float(
+                    getattr(policy.config, "molmo_lora_lr_multiplier", 0.1)
+                ),
+                "molmo_lora_parameters": int(audit.get("molmo_lora_parameters", 0)),
+                "molmo_lora_parameter_tensors": int(
+                    audit.get("molmo_lora_parameter_tensors", 0)
+                ),
+                "molmo_lora_trainable": molmo_lora_trainable,
+            }
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3095,13 +3155,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         backend = policy.model.vlm_with_expert
         frozen_parameter_ids = {
             id(parameter)
-            for module in (backend.vlm, backend.vision_backbone)
-            for parameter in module.parameters()
+            for _, parameter in backend.named_frozen_molmo_parameters()
         }
         overlap = optimizer_parameter_ids & frozen_parameter_ids
         if overlap:
             raise RuntimeError(
                 f"Full-Molmo2-ER optimizer contains {len(overlap)} frozen Molmo parameter tensors."
+            )
+        lora_parameter_ids = {
+            id(parameter) for _, parameter in backend.named_molmo_lora_parameters()
+        }
+        if not lora_parameter_ids.issubset(optimizer_parameter_ids):
+            missing_lora = len(lora_parameter_ids - optimizer_parameter_ids)
+            raise RuntimeError(
+                f"Full-Molmo2-ER optimizer omitted {missing_lora} Molmo V3 LoRA parameter tensors."
             )
         if any(group.get("foreach") is not False for group in optimizer.param_groups):
             raise RuntimeError("Full-Molmo2-ER requires low-peak AdamW foreach=False on every group.")

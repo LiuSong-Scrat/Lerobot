@@ -53,6 +53,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 """
 
 import copy
+import logging
 import math
 from collections import deque
 from contextlib import contextmanager
@@ -63,6 +64,7 @@ import numpy as np
 import open3d as o3d
 import torch
 import torch.nn.functional as F  # noqa: N812
+from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
@@ -127,6 +129,10 @@ FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET = {
     "trainable": 1_823_509_364,
     "frozen": 4_487_401_370,
 }
+# 36 fused QKV adapters plus 35 attention-output adapters. The final VLM
+# attention output is not consumed by the V3 action loss; omitting that dead
+# adapter keeps every trainable tensor reachable with DDP find_unused=False.
+FULL_MOLMO2ER_V3_LORA_PARAMETERS_PER_RANK = 546_304
 
 FULL_MOLMO2ER_BASE_TRAINABLE_PARAMETER_PREFIXES = (
     "model.vlm_with_expert.lm_expert.",
@@ -150,13 +156,70 @@ FULL_MOLMO2ER_WORLDFLOW_TRAINABLE_PARAMETER_PREFIXES = (
 )
 
 
-def expected_full_molmo2er_parameter_budget(*, worldflow_enable: bool) -> dict[str, int]:
+def expected_full_molmo2er_parameter_budget(
+    *,
+    worldflow_enable: bool,
+    molmo_lora_enable: bool = False,
+    molmo_lora_rank: int = 8,
+) -> dict[str, int]:
     source = (
         FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET
         if worldflow_enable
         else FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET
     )
-    return dict(source)
+    budget = dict(source)
+    if molmo_lora_enable:
+        if (
+            isinstance(molmo_lora_rank, bool)
+            or int(molmo_lora_rank) <= 0
+            or float(molmo_lora_rank) != int(molmo_lora_rank)
+        ):
+            raise ValueError("molmo_lora_rank must be a positive integer.")
+        adapter_parameters = FULL_MOLMO2ER_V3_LORA_PARAMETERS_PER_RANK * int(molmo_lora_rank)
+        budget["total"] += adapter_parameters
+        budget["trainable"] += adapter_parameters
+        budget["molmo_lora"] = adapter_parameters
+    return budget
+
+
+def is_full_molmo2er_lora_policy_parameter_name(name: str) -> bool:
+    prefix = "model.vlm_with_expert.vlm.blocks."
+    if not name.startswith(prefix):
+        return False
+    parts = name[len(prefix) :].split(".")
+    if len(parts) != 4 or not parts[0].isdigit() or not 0 <= int(parts[0]) < 36:
+        return False
+    if parts[1] != "self_attn" or parts[3] not in {"lora_A", "lora_B"}:
+        return False
+    layer_index = int(parts[0])
+    return parts[2] == "att_proj" or (parts[2] == "attn_out" and layer_index < 35)
+
+
+def classify_v3_lora_checkpoint_keys(
+    *,
+    expected_lora_keys: set[str],
+    missing_keys: set[str],
+    unexpected_keys: set[str],
+) -> str:
+    """Classify an exact V3-LoRA load or a function-preserving V3 upgrade.
+
+    Loading with ``strict=False`` is used only to observe the key sets.  This
+    helper immediately restores strict semantics: either no key is missing, or
+    the complete and exact adapter set is missing from an otherwise exact base
+    V3 checkpoint.
+    """
+
+    if not expected_lora_keys:
+        raise RuntimeError("V3-LoRA checkpoint loading found no registered adapter parameters.")
+    if not unexpected_keys and not missing_keys:
+        return "strict_v3_lora"
+    if not unexpected_keys and missing_keys == expected_lora_keys:
+        return "base_v3_zero_lora_upgrade"
+    raise RuntimeError(
+        "V3-LoRA checkpoint contract failed: only a complete base-V3 adapter-key "
+        "upgrade is allowed; "
+        f"missing={sorted(missing_keys)[:12]}, unexpected={sorted(unexpected_keys)[:12]}."
+    )
 
 
 def full_molmo2er_trainable_parameter_prefixes(*, worldflow_enable: bool) -> tuple[str, ...]:
@@ -1087,6 +1150,60 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
 
+    @classmethod
+    def _load_as_safetensor(
+        cls,
+        model: "SmolVLAPolicy",
+        model_file: str,
+        map_location: str,
+        strict: bool,
+    ) -> "SmolVLAPolicy":
+        """Strictly load V3-LoRA, or exactly upgrade a base V3 checkpoint.
+
+        A base V3 policy has all historical tensor keys and no adapter keys.
+        Zero-output-initialized LoRA is therefore a safe function-preserving upgrade,
+        but only when the complete expected A/B set is missing.  Partial LoRA
+        checkpoints and every other missing/unexpected key remain fatal.
+        """
+
+        if not bool(getattr(model.config, "molmo_lora_enable", False)):
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        cls._materialize_lazy_parameters(model, model_file)
+        missing_keys, unexpected_keys = load_model_as_safetensor(
+            model,
+            model_file,
+            strict=False,
+            device=map_location,
+        )
+        missing = set(missing_keys)
+        unexpected = set(unexpected_keys)
+        expected_lora = {
+            name
+            for name, _ in model.named_parameters()
+            if is_full_molmo2er_lora_policy_parameter_name(name)
+        }
+        load_mode = classify_v3_lora_checkpoint_keys(
+            expected_lora_keys=expected_lora,
+            missing_keys=missing,
+            unexpected_keys=unexpected,
+        )
+        migrated = load_mode == "base_v3_zero_lora_upgrade"
+        model.molmo_lora_checkpoint_load_report = {
+            "mode": load_mode,
+            "adapter_parameter_tensor_count": len(expected_lora),
+            "missing_parameter_tensor_count": len(missing),
+            "unexpected_parameter_tensor_count": len(unexpected),
+        }
+        if migrated:
+            logging.warning(
+                "Loaded a base V3 checkpoint into V3-LoRA: exactly %d LoRA A/B tensors "
+                "were absent; their zero-output initialization was retained and every "
+                "historical tensor loaded strictly.",
+                len(expected_lora),
+            )
+        return model
+
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._queues = {
@@ -1218,6 +1335,37 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 for name, parameter in self.named_parameters()
                 if parameter.requires_grad
             ]
+            if bool(getattr(self.config, "molmo_lora_enable", False)):
+                lora = [
+                    parameter
+                    for name, parameter in trainable
+                    if is_full_molmo2er_lora_policy_parameter_name(name)
+                ]
+                v3_trainable = [
+                    parameter
+                    for name, parameter in trainable
+                    if not is_full_molmo2er_lora_policy_parameter_name(name)
+                ]
+                if not lora or not v3_trainable:
+                    raise RuntimeError(
+                        "V3-LoRA optimization requires non-empty adapter and original V3 parameter groups."
+                    )
+                grouped_ids = {id(parameter) for parameter in (*v3_trainable, *lora)}
+                if len(grouped_ids) != len(trainable):
+                    raise RuntimeError("V3-LoRA optimizer groups overlap or omit trainable parameters.")
+                base_lr = float(self.config.optimizer_lr)
+                return [
+                    {
+                        "params": v3_trainable,
+                        "lr": base_lr,
+                        "group_name": "v3_original_trainable",
+                    },
+                    {
+                        "params": lora,
+                        "lr": base_lr * float(self.config.molmo_lora_lr_multiplier),
+                        "group_name": "molmo_v3_lora",
+                    },
+                ]
             if (
                 getattr(self.config, "camera_view_fusion", "legacy_budget") == "primary_residual"
                 and not getattr(self.config, "worldflow_enable", False)
@@ -3417,6 +3565,10 @@ class VLAFlowMatching(nn.Module):
                 gradient_checkpointing_layers_per_segment=(
                     self.config.molmo_gradient_checkpointing_layers_per_segment
                 ),
+                molmo_lora_enable=self.config.molmo_lora_enable,
+                molmo_lora_rank=self.config.molmo_lora_rank,
+                molmo_lora_alpha=self.config.molmo_lora_alpha,
+                molmo_lora_dropout=self.config.molmo_lora_dropout,
                 **backend_kwargs,
             )
         else:

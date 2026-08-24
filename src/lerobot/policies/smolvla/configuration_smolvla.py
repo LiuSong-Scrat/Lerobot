@@ -530,6 +530,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Batch-vectorized fixed 256px/two-crop native image transform. Contract
     # mismatches always fall back to Molmo's trusted slow processor.
     molmo_image_fast_path: bool = True
+    # Native V3 LoRA adapts only the 36 frozen Molmo text-decoder attention
+    # projections.  It is separate from LeRobot's generic PEFT wrapper so the
+    # Action Expert, PointSeg and WorldFlow remain fully trainable.
+    molmo_lora_enable: bool = False
+    molmo_lora_rank: int = 8
+    molmo_lora_alpha: float = 8.0
+    molmo_lora_dropout: float = 0.0
+    molmo_lora_lr_multiplier: float = 0.1
     # Optional raw SmolVLM directory/repository or SmolVLA policy checkpoint
     # used only as the source of the VLM weights. `vlm_model_name` remains the
     # source of the architecture and processor when a policy checkpoint is used.
@@ -720,6 +728,24 @@ class SmolVLAConfig(PreTrainedConfig):
                 "vlm_backend must be one of 'smolvlm', 'molmo2_text', or 'molmo2_full'; "
                 f"got {self.vlm_backend!r}."
             )
+        if self.molmo_lora_enable and self.vlm_backend != "molmo2_full":
+            raise ValueError("molmo_lora_enable is supported only by vlm_backend='molmo2_full'.")
+        if (
+            isinstance(self.molmo_lora_rank, bool)
+            or int(self.molmo_lora_rank) <= 0
+            or float(self.molmo_lora_rank) != int(self.molmo_lora_rank)
+        ):
+            raise ValueError("molmo_lora_rank must be a positive integer.")
+        if not math.isfinite(float(self.molmo_lora_alpha)) or float(self.molmo_lora_alpha) <= 0:
+            raise ValueError("molmo_lora_alpha must be finite and positive.")
+        if not math.isfinite(float(self.molmo_lora_dropout)) or not 0.0 <= float(
+            self.molmo_lora_dropout
+        ) < 1.0:
+            raise ValueError("molmo_lora_dropout must be in [0,1).")
+        if not math.isfinite(float(self.molmo_lora_lr_multiplier)) or float(
+            self.molmo_lora_lr_multiplier
+        ) <= 0:
+            raise ValueError("molmo_lora_lr_multiplier must be finite and positive.")
         if self.vlm_backend == "molmo2_text":
             if len(self.selected_camera_views) != 1:
                 raise ValueError(

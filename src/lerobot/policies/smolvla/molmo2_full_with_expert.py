@@ -25,8 +25,9 @@ connector.  The active source tensors are exactly:
 * all ``model.transformer.blocks.0`` through ``blocks.35``;
 * ``model.transformer.ln_f``.
 
-``lm_head`` is never instantiated.  Every Molmo parameter is frozen and held
-in evaluation mode.  Native vision/WTE embeddings are produced under
+``lm_head`` is never instantiated. Every base Molmo parameter is frozen and
+held in evaluation mode; the optional V3-LoRA A/B tensors are the only
+trainable parameters inside the Molmo decoder. Native vision/WTE embeddings are produced under
 ``torch.no_grad`` and detached, then trainable FG/BG tokens are inserted into
 the prefix.  The 36 decoder blocks therefore remain parameter-frozen but are
 part of the input-autograd graph, exactly like frozen WEPVLA: IMAGE/LANGUAGE
@@ -62,15 +63,20 @@ from lerobot.policies.smolvla.configuration_smolvla import (
     FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
 )
 from lerobot.policies.smolvla.molmo2_with_expert import (
+    MOLMO_V3_LORA_TARGET_MODULES,
     Molmo2ExpertBackbone,
     Molmo2TextBackbone,
     Molmo2TextSpec,
     Molmo2WithExpertModel,
+    MolmoV3LoRALinear,
     _checkpoint_weight_map,
     _initialize_module,
     _resolve_device,
     _resolve_dtype,
+    expected_molmo_v3_lora_parameters,
     get_intermediate_size,
+    inject_molmo_v3_attention_lora,
+    is_molmo_v3_lora_parameter_name,
     load_selective_molmo2_text_weights,
     validate_molmo2_er_text_contract,
 )
@@ -304,7 +310,7 @@ def _audit_source_checkpoint(model_directory: Path) -> dict[str, Any]:
 
 
 class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
-    """Full 36/36 frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
+    """Full 36/36 base-frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
 
     scale_input_embeddings = False
     inference_only_vlm = False
@@ -327,6 +333,10 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         inference_only_vlm: bool = False,
         gradient_checkpointing: bool = True,
         gradient_checkpointing_layers_per_segment: int = 2,
+        molmo_lora_enable: bool = False,
+        molmo_lora_rank: int = 8,
+        molmo_lora_alpha: float = 8.0,
+        molmo_lora_dropout: float = 0.0,
     ):
         # Do not call the half-backend initializer: its 18-layer checks are an
         # intentional contract for the historical point-only control.
@@ -348,7 +358,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         if not freeze_vision_encoder:
             raise ValueError("Full-Molmo2-ER requires the native ViT and connector to remain frozen.")
         if not train_expert_only:
-            raise ValueError("Full-Molmo2-ER freezes every Molmo tensor; train_expert_only must be True.")
+            raise ValueError("Full-Molmo2-ER freezes every base Molmo tensor; train_expert_only must be True.")
         if inference_only_vlm:
             raise ValueError(
                 "WEP-compatible Full-Molmo2-ER requires molmo_inference_only=False: "
@@ -444,6 +454,31 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         elif vlm_weights_path:
             raise ValueError("vlm_weights_path was provided but load_vlm_weights=False.")
 
+        # Inject only after the official Molmo tensors have been loaded.  The
+        # source checkpoint intentionally has no LoRA keys, while policy
+        # checkpoints produced by this variant persist the adapters normally.
+        self.molmo_lora_enable = bool(molmo_lora_enable)
+        self.molmo_lora_rank = int(molmo_lora_rank)
+        self.molmo_lora_alpha = float(molmo_lora_alpha)
+        self.molmo_lora_dropout = float(molmo_lora_dropout)
+        self.molmo_lora_target_modules = MOLMO_V3_LORA_TARGET_MODULES
+        self.molmo_lora_module_names: tuple[str, ...] = ()
+        if self.molmo_lora_enable:
+            self.molmo_lora_module_names = inject_molmo_v3_attention_lora(
+                self.vlm,
+                rank=self.molmo_lora_rank,
+                alpha=self.molmo_lora_alpha,
+                dropout=self.molmo_lora_dropout,
+            )
+        self.molmo_lora_parameter_count = (
+            expected_molmo_v3_lora_parameters(
+                rank=self.molmo_lora_rank,
+                num_layers=num_vlm_layers,
+            )
+            if self.molmo_lora_enable
+            else 0
+        )
+
         self.processor = AutoProcessor.from_pretrained(
             architecture_directory,
             trust_remote_code=True,
@@ -512,7 +547,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         }
         expected_counts = {
             "vision": _EXPECTED_VISION_PARAMETERS,
-            "text": _EXPECTED_TEXT_PARAMETERS,
+            "text": _EXPECTED_TEXT_PARAMETERS + self.molmo_lora_parameter_count,
             "expert": _EXPECTED_EXPERT_PARAMETERS,
         }
         if actual_counts != expected_counts:
@@ -531,7 +566,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "source_checkpoint": source_report,
             "active_parameter_counts": {
                 **actual_counts,
-                "frozen_molmo": actual_counts["vision"] + actual_counts["text"],
+                "frozen_molmo_base": _EXPECTED_FROZEN_PARAMETERS,
+                "trainable_molmo_lora": self.molmo_lora_parameter_count,
                 "trainable_expert": actual_counts["expert"],
                 "backend_total": sum(actual_counts.values()),
             },
@@ -569,7 +605,11 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "wte_applied_to_all_native_tokens": True,
             "vision_feature_fusion": "add_only_at_image_patch_id",
             "molmo_frozen_eval": True,
-            "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
+            "vlm_execution": (
+                "frozen_base_with_lora_and_prefix_input_autograd"
+                if self.molmo_lora_enable
+                else "frozen_parameters_with_prefix_input_autograd"
+            ),
             "per_layer_memory": "evolving_image_text_fg_bg_prefix",
             "fg_bg_location": "trainable_vlm_prefix",
             "action_location": "expert_suffix_only",
@@ -578,11 +618,32 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "gradient_checkpointing_layers_per_segment": (
                 self.gradient_checkpointing_layers_per_segment
             ),
+            "molmo_lora_enable": self.molmo_lora_enable,
+            "molmo_lora_rank": self.molmo_lora_rank,
+            "molmo_lora_alpha": self.molmo_lora_alpha,
+            "molmo_lora_dropout": self.molmo_lora_dropout,
+            "molmo_lora_target_modules": self.molmo_lora_target_modules,
+            "molmo_lora_module_count": len(self.molmo_lora_module_names),
+            "molmo_lora_parameter_count": self.molmo_lora_parameter_count,
+            "base_molmo_parameters_frozen": True,
             "lm_head_present": False,
-            "backend_parameters": _EXPECTED_BACKEND_PARAMETERS,
+            "backend_parameters": _EXPECTED_BACKEND_PARAMETERS + self.molmo_lora_parameter_count,
             "frozen_molmo_parameters": _EXPECTED_FROZEN_PARAMETERS,
             "trainable_expert_parameters": _EXPECTED_EXPERT_PARAMETERS,
+            "trainable_molmo_lora_parameters": self.molmo_lora_parameter_count,
         }
+
+    def named_molmo_lora_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        for name, parameter in self.vlm.named_parameters():
+            if is_molmo_v3_lora_parameter_name(name):
+                yield f"vlm.{name}", parameter
+
+    def named_frozen_molmo_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        for name, parameter in self.vlm.named_parameters():
+            if not is_molmo_v3_lora_parameter_name(name):
+                yield f"vlm.{name}", parameter
+        for name, parameter in self.vision_backbone.named_parameters():
+            yield f"vision_backbone.{name}", parameter
 
     def set_requires_grad(self) -> None:
         if not self.train_expert_only or not self.freeze_vision_encoder:
@@ -590,6 +651,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         self.vlm.requires_grad_(False)
         self.vision_backbone.requires_grad_(False)
         self.lm_expert.requires_grad_(True)
+        for _, parameter in self.named_molmo_lora_parameters():
+            parameter.requires_grad_(True)
         self.vlm.eval()
         self.vision_backbone.eval()
 
@@ -599,6 +662,11 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         super().train(mode)
         self.vlm.eval()
         self.vision_backbone.eval()
+        # Base Molmo stays in eval mode.  Only adapter dropout follows the
+        # policy mode; the registered default is zero for deterministic V3.
+        for module in self.vlm.modules():
+            if isinstance(module, MolmoV3LoRALinear):
+                module.lora_dropout.train(mode)
         return self
 
     @staticmethod

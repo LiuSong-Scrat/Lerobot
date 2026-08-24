@@ -113,6 +113,25 @@ def test_full_config_allows_pose9_action_noise_opt_in() -> None:
     assert config.pose9_action_noise_enable is True
 
 
+def test_full_config_allows_native_v3_lora_without_generic_peft() -> None:
+    config = _full_worldflow_config(
+        molmo_lora_enable=True,
+        molmo_lora_rank=8,
+        molmo_lora_alpha=8.0,
+        molmo_lora_dropout=0.0,
+        molmo_lora_lr_multiplier=0.1,
+    )
+    assert config.molmo_lora_enable and not config.use_peft
+    assert config.molmo_lora_rank == 8
+    assert config.molmo_lora_lr_multiplier == 0.1
+
+
+@pytest.mark.parametrize("invalid_rank", [True, 0, -1, 1.5])
+def test_full_config_rejects_invalid_v3_lora_rank(invalid_rank) -> None:
+    with pytest.raises(ValueError, match="molmo_lora_rank"):
+        _full_worldflow_config(molmo_lora_enable=True, molmo_lora_rank=invalid_rank)
+
+
 def test_full_config_allows_cli_scheduler_override() -> None:
     config = _full_worldflow_config(
         scheduler_warmup_steps=50,
@@ -208,6 +227,11 @@ def test_full_config_rejects_registered_contract_drift(field_name: str, bad_valu
 def test_parameter_budget_matches_v043_shared_doubleflow() -> None:
     off = expected_full_molmo2er_parameter_budget(worldflow_enable=False)
     on = expected_full_molmo2er_parameter_budget(worldflow_enable=True)
+    on_lora = expected_full_molmo2er_parameter_budget(
+        worldflow_enable=True,
+        molmo_lora_enable=True,
+        molmo_lora_rank=8,
+    )
     assert off == FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET == {
         "total": 6_261_215_886,
         "trainable": 1_786_544_601,
@@ -217,6 +241,12 @@ def test_parameter_budget_matches_v043_shared_doubleflow() -> None:
         "total": 6_310_910_734,
         "trainable": 1_823_509_364,
         "frozen": 4_487_401_370,
+    }
+    assert on_lora == {
+        "total": 6_315_281_166,
+        "trainable": 1_827_879_796,
+        "frozen": 4_487_401_370,
+        "molmo_lora": 4_370_432,
     }
     assert {name: on[name] - off[name] for name in on} == (
         FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET

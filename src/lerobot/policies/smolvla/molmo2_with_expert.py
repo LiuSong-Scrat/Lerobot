@@ -55,6 +55,158 @@ from transformers import AutoTokenizer
 _CONFIG_NAME = "config.json"
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 _SAFETENSORS_SINGLE_NAME = "model.safetensors"
+MOLMO_V3_LORA_TARGET_MODULES = ("att_proj", "attn_out")
+_MOLMO_V3_LORA_ATT_PROJ_PARAMETERS_PER_RANK = 2_560 + 6_144
+_MOLMO_V3_LORA_ATTN_OUT_PARAMETERS_PER_RANK = 4_096 + 2_560
+
+
+def expected_molmo_v3_lora_parameters(*, rank: int, num_layers: int = 36) -> int:
+    """Return the exact attention-only LoRA parameter count for Molmo2-ER.
+
+    Molmo2-ER uses a 2560-wide input, fused 6144-wide QKV projection and a
+    4096 -> 2560 attention output projection. All layers expose their Q/K/V to
+    the corresponding Action Expert layer. The final VLM ``attn_out`` result,
+    however, has no downstream action-loss consumer in the V3 coupled graph,
+    so adapting it would create dead DDP parameters. Consequently ``att_proj``
+    is adapted in all layers and ``attn_out`` in all but the final layer.
+    """
+
+    if isinstance(rank, bool) or int(rank) <= 0 or float(rank) != int(rank):
+        raise ValueError(f"Molmo V3 LoRA rank must be a positive integer, got {rank!r}.")
+    if isinstance(num_layers, bool) or int(num_layers) <= 0:
+        raise ValueError(f"Molmo V3 LoRA layer count must be positive, got {num_layers!r}.")
+    layer_count = int(num_layers)
+    parameters_per_rank = (
+        _MOLMO_V3_LORA_ATT_PROJ_PARAMETERS_PER_RANK * layer_count
+        + _MOLMO_V3_LORA_ATTN_OUT_PARAMETERS_PER_RANK * (layer_count - 1)
+    )
+    return int(rank) * parameters_per_rank
+
+
+class MolmoV3LoRALinear(nn.Linear):
+    """A frozen ``nn.Linear`` plus trainable low-rank residual weights.
+
+    The original ``weight`` and optional ``bias`` remain registered at their
+    historical state-dict names.  This is important for strict V3 checkpoint
+    upgrades: a base V3 checkpoint is missing only ``lora_A``/``lora_B`` and
+    never renames or duplicates the 4B Molmo tensors.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:  # pragma: no cover - use from_linear
+        raise RuntimeError("Construct MolmoV3LoRALinear with from_linear().")
+
+    @classmethod
+    def from_linear(
+        cls,
+        base: nn.Linear,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> MolmoV3LoRALinear:
+        if not isinstance(base, nn.Linear) or isinstance(base, cls):
+            raise TypeError(f"Expected an unwrapped nn.Linear, got {type(base).__name__}.")
+        if isinstance(rank, bool) or int(rank) <= 0 or float(rank) != int(rank):
+            raise ValueError(f"Molmo V3 LoRA rank must be positive, got {rank!r}.")
+        if not math.isfinite(float(alpha)) or float(alpha) <= 0:
+            raise ValueError(f"Molmo V3 LoRA alpha must be finite and positive, got {alpha!r}.")
+        if not math.isfinite(float(dropout)) or not 0.0 <= float(dropout) < 1.0:
+            raise ValueError(f"Molmo V3 LoRA dropout must be in [0,1), got {dropout!r}.")
+
+        # Avoid allocating a second full-size base matrix while wrapping the
+        # already-loaded Molmo checkpoint.
+        module = cls.__new__(cls)
+        nn.Module.__init__(module)
+        module.in_features = int(base.in_features)
+        module.out_features = int(base.out_features)
+        module.weight = base.weight
+        if base.bias is None:
+            module.register_parameter("bias", None)
+        else:
+            module.bias = base.bias
+        module.rank = int(rank)
+        module.alpha = float(alpha)
+        module.scaling = float(alpha) / int(rank)
+        module.lora_dropout = nn.Dropout(float(dropout))
+        module.lora_A = nn.Parameter(
+            torch.empty(
+                module.rank,
+                module.in_features,
+                device=base.weight.device,
+                # Keep small adapter weights and Adam states in FP32. At the
+                # default 1e-5 LR, BF16 parameter updates can otherwise round
+                # away. Forward casts only these small matrices, never the
+                # long prefix activation, to the compute dtype.
+                dtype=torch.float32,
+            )
+        )
+        module.lora_B = nn.Parameter(
+            torch.empty(
+                module.out_features,
+                module.rank,
+                device=base.weight.device,
+                dtype=torch.float32,
+            )
+        )
+        if not module.lora_A.is_meta:
+            nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(module.lora_B)
+        return module
+
+    def forward(self, input: Tensor) -> Tensor:
+        base_output = F.linear(input, self.weight, self.bias)
+        lora_input = self.lora_dropout(input)
+        compute_dtype = lora_input.dtype
+        update = F.linear(
+            F.linear(lora_input, self.lora_A.to(dtype=compute_dtype)),
+            self.lora_B.to(dtype=compute_dtype),
+        )
+        return base_output + update.to(dtype=base_output.dtype) * self.scaling
+
+
+def inject_molmo_v3_attention_lora(
+    backbone: nn.Module,
+    *,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> tuple[str, ...]:
+    """Inject LoRA into every Molmo text block's fused QKV/output linears."""
+
+    blocks = getattr(backbone, "blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or not blocks:
+        raise ValueError("Molmo V3 LoRA requires a non-empty text backbone.blocks ModuleList.")
+    injected: list[str] = []
+    for layer_index, block in enumerate(blocks):
+        attention = getattr(block, "self_attn", None)
+        if attention is None:
+            raise TypeError(f"Molmo text block {layer_index} has no self_attn module.")
+        target_names = (
+            MOLMO_V3_LORA_TARGET_MODULES
+            if layer_index + 1 < len(blocks)
+            else ("att_proj",)
+        )
+        for target_name in target_names:
+            target = getattr(attention, target_name, None)
+            if isinstance(target, MolmoV3LoRALinear):
+                raise RuntimeError(
+                    f"Molmo V3 LoRA was already injected at blocks.{layer_index}.self_attn.{target_name}."
+                )
+            wrapped = MolmoV3LoRALinear.from_linear(
+                target,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            setattr(attention, target_name, wrapped)
+            injected.append(f"blocks.{layer_index}.self_attn.{target_name}")
+    return tuple(injected)
+
+
+def is_molmo_v3_lora_parameter_name(name: str) -> bool:
+    """Return whether a VLM-relative parameter name is one of the exact adapters."""
+
+    return name.endswith(".lora_A") or name.endswith(".lora_B")
 
 
 @dataclass(frozen=True)
@@ -1391,12 +1543,17 @@ Molmo2TextHalfWithExpertModel = Molmo2WithExpertModel
 
 
 __all__ = [
+    "MOLMO_V3_LORA_TARGET_MODULES",
     "Molmo2TextSpec",
+    "MolmoV3LoRALinear",
     "Molmo2WithExpertModel",
     "Molmo2TextWithExpertModel",
     "Molmo2TextHalfWithExpertModel",
     "apply_molmo2_rope",
+    "expected_molmo_v3_lora_parameters",
     "get_intermediate_size",
+    "inject_molmo_v3_attention_lora",
+    "is_molmo_v3_lora_parameter_name",
     "load_selective_molmo2_text_weights",
     "validate_molmo2_er_text_contract",
 ]
