@@ -104,6 +104,25 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
+        elif getattr(config, "vlm_backend", None) == "molmo2_full":
+            # A caller-supplied config must not bypass the raw checkpoint
+            # topology gate.  v3 and v4 have shape-compatible parameters but
+            # different token ordering, rotary positions, and attention masks.
+            source_config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+            )
+            if getattr(source_config, "vlm_backend", None) != "molmo2_full":
+                raise ValueError(
+                    "A Full-Molmo policy config cannot load weights from a non-Full-Molmo checkpoint."
+                )
+            strict = True
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):

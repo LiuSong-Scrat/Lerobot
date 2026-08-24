@@ -29,10 +29,11 @@ never materialized in host memory.  Molmo's fused QKV projection, Qwen3-style
 per-head Q/K RMSNorm, grouped-query attention, RoPE, pre-norm residual layout,
 and gated SwiGLU are retained.
 
-The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  In
-particular, the frozen prefix is *not* evaluated under ``torch.no_grad``:
-gradients from the Action Expert can still reach trainable point-cloud prefix
-projections even though no Molmo parameter is trainable.
+The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  Frozen
+VLM parameters do not imply a detached decoder: when trainable FG/BG tokens
+are present in the prefix, input autograd traverses the frozen blocks exactly
+as in WEPVLA.  The historical ``inference_only_vlm`` path remains only for old
+point-memory experiments and is not used by the WEP-compatible Full backend.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from safetensors import safe_open
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
 
 _CONFIG_NAME = "config.json"
@@ -884,6 +886,231 @@ class Molmo2WithExpertModel(nn.Module):
         attention_output = _scaled_dot_product_attention(query, key, value, attention_mask)
         return layer.finish_attention(hidden_states, attention_output), key, value
 
+    def _forward_coupled_prefix_expert_layer(
+        self,
+        layer_idx: int,
+        prefix: Tensor,
+        expert: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run one exact WEP prefix/Action-Expert layer without cache side effects.
+
+        This pure tensor boundary is used by non-reentrant activation
+        checkpointing.  Even layers perform masked joint MHA; odd layers update
+        the prefix with VLM self-attention while actions cross-attend the whole
+        evolving prefix.  Molmo parameters may be frozen, but this function is
+        intentionally differentiable with respect to prefix inputs.
+        """
+
+        vlm_layer = self.vlm.blocks[layer_idx]
+        expert_layer = self.lm_expert.layers[layer_idx]
+        batch_size = prefix.shape[0]
+        prefix_len = prefix.shape[1]
+        expert_len = expert.shape[1]
+        prefix_positions = position_ids[:, :prefix_len]
+        expert_positions = position_ids[:, prefix_len : prefix_len + expert_len]
+
+        prefix_normalized = vlm_layer.attn_norm(prefix)
+        prefix_query, prefix_key, prefix_value = vlm_layer.self_attn.project(
+            prefix_normalized, prefix_positions
+        )
+        expert_normalized = expert_layer.attn_norm(expert)
+        is_self_attention = layer_idx % self.self_attn_every_n_layers == 0
+
+        if is_self_attention:
+            assert isinstance(expert_layer.self_attn, Molmo2FusedAttention)
+            expert_query, expert_key, expert_value = expert_layer.self_attn.project(
+                expert_normalized, expert_positions
+            )
+            query = torch.cat([prefix_query, expert_query], dim=1)
+            key = torch.cat([prefix_key, expert_key], dim=1)
+            value = torch.cat([prefix_value, expert_value], dim=1)
+            joint_len = prefix_len + expert_len
+            joint_mask = self._mask_slice(
+                attention_mask,
+                slice(0, joint_len),
+                slice(0, joint_len),
+                batch_size=batch_size,
+                rows=joint_len,
+                cols=joint_len,
+                device=prefix.device,
+            )
+            joint_output = _scaled_dot_product_attention(query, key, value, joint_mask)
+            prefix_output = joint_output[:, :prefix_len]
+            expert_output = joint_output[:, prefix_len:]
+        else:
+            assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
+            prefix_mask = self._mask_slice(
+                attention_mask,
+                slice(0, prefix_len),
+                slice(0, prefix_len),
+                batch_size=batch_size,
+                rows=prefix_len,
+                cols=prefix_len,
+                device=prefix.device,
+            )
+            prefix_output = _scaled_dot_product_attention(
+                prefix_query, prefix_key, prefix_value, prefix_mask
+            )
+            relative_expert_positions = (
+                expert_positions - expert_positions.min(dim=1, keepdim=True).values
+            )
+            expert_query = expert_layer.self_attn.project_query(
+                expert_normalized, relative_expert_positions
+            )
+            expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
+                prefix_key, prefix_value
+            )
+            cross_mask = self._mask_slice(
+                attention_mask,
+                slice(prefix_len, prefix_len + expert_len),
+                slice(0, prefix_len),
+                batch_size=batch_size,
+                rows=expert_len,
+                cols=prefix_len,
+                device=expert.device,
+            )
+            expert_output = _scaled_dot_product_attention(
+                expert_query, expert_key, expert_value, cross_mask
+            )
+
+        return (
+            vlm_layer.finish_attention(prefix, prefix_output),
+            expert_layer.finish_attention(expert, expert_output),
+        )
+
+    def _prefill_inference_only_vlm(
+        self,
+        prefix: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+    ) -> tuple[Tensor, dict[int, dict[str, Tensor]]]:
+        """Run the frozen VLM as a read-only per-layer memory producer.
+
+        This is the hard Scheme-B boundary: no trainable token is accepted by
+        this method and every Molmo decoder operation executes under
+        ``torch.no_grad``.  The returned K/V tensors are ordinary detached
+        tensors, so Action Expert backward cannot enter the VLM graph.
+        """
+
+        prefix = prefix.to(dtype=self.vlm.wte.embedding.dtype)
+        batch_size, prefix_len = prefix.shape[:2]
+        prefix_positions = position_ids[:, :prefix_len]
+        prefix_mask = self._mask_slice(
+            attention_mask,
+            slice(0, prefix_len),
+            slice(0, prefix_len),
+            batch_size=batch_size,
+            rows=prefix_len,
+            cols=prefix_len,
+            device=prefix.device,
+        )
+        cache: dict[int, dict[str, Tensor]] = {}
+        with torch.no_grad():
+            hidden = prefix
+            for layer_idx, vlm_layer in enumerate(self.vlm.blocks):
+                hidden, key, value = self._forward_vlm_layer(
+                    vlm_layer,
+                    hidden,
+                    prefix_positions,
+                    prefix_mask,
+                )
+                cache[layer_idx] = {
+                    "key_states": key.detach(),
+                    "value_states": value.detach(),
+                }
+            hidden = self.vlm.ln_f(hidden).detach()
+        return hidden, cache
+
+    def _forward_expert_from_frozen_memory(
+        self,
+        expert: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+        cache: dict[int, dict[str, Tensor]],
+    ) -> Tensor:
+        """Run only trainable Expert layers against detached Molmo memory."""
+
+        expert = expert.to(dtype=self.lm_expert.norm.weight.dtype)
+        batch_size, expert_len = expert.shape[:2]
+        first_key = cache.get(0, {}).get("key_states")
+        if not torch.is_tensor(first_key):
+            raise ValueError("Scheme-B Expert forward requires a complete frozen Molmo layer cache.")
+        prefix_len = first_key.shape[1]
+        if position_ids.shape[1] == expert_len:
+            expert_positions = position_ids
+        elif position_ids.shape[1] == prefix_len + expert_len:
+            expert_positions = position_ids[:, prefix_len:]
+        else:
+            raise ValueError(
+                "Scheme-B position_ids must cover either suffix-only or prefix+suffix layout; "
+                f"got {tuple(position_ids.shape)}, prefix={prefix_len}, suffix={expert_len}."
+            )
+
+        if attention_mask is None:
+            suffix_mask = torch.ones(
+                batch_size,
+                expert_len,
+                prefix_len + expert_len,
+                dtype=torch.bool,
+                device=expert.device,
+            )
+        elif attention_mask.shape[1] == expert_len:
+            suffix_mask = attention_mask.to(device=expert.device, dtype=torch.bool)
+        elif attention_mask.shape[1] == prefix_len + expert_len:
+            suffix_mask = attention_mask[:, prefix_len:, :].to(device=expert.device, dtype=torch.bool)
+        else:
+            raise ValueError(
+                "Scheme-B attention rows must cover either suffix-only or prefix+suffix layout; "
+                f"got {tuple(attention_mask.shape)}, prefix={prefix_len}, suffix={expert_len}."
+            )
+
+        for layer_idx, expert_layer in enumerate(self.lm_expert.layers):
+            cached = cache.get(layer_idx)
+            if cached is None:
+                raise ValueError(f"Frozen Molmo cache is missing layer {layer_idx}.")
+            cached_key = cached["key_states"]
+            cached_value = cached["value_states"]
+            if cached_key.requires_grad or cached_value.requires_grad:
+                raise RuntimeError("Frozen Molmo memory must never require gradients.")
+
+            expert_normalized = expert_layer.attn_norm(expert)
+            is_self_attention = layer_idx % self.self_attn_every_n_layers == 0
+            if is_self_attention:
+                assert isinstance(expert_layer.self_attn, Molmo2FusedAttention)
+                expert_query, expert_key, expert_value = expert_layer.self_attn.project(
+                    expert_normalized,
+                    expert_positions,
+                )
+                key = torch.cat([cached_key, expert_key], dim=1)
+                value = torch.cat([cached_value, expert_value], dim=1)
+                expert_output = _scaled_dot_product_attention(
+                    expert_query,
+                    key,
+                    value,
+                    suffix_mask,
+                )
+            else:
+                assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
+                relative_positions = expert_positions - expert_positions.min(dim=1, keepdim=True).values
+                expert_query = expert_layer.self_attn.project_query(
+                    expert_normalized,
+                    relative_positions,
+                )
+                expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
+                    cached_key,
+                    cached_value,
+                )
+                expert_output = _scaled_dot_product_attention(
+                    expert_query,
+                    expert_key,
+                    expert_value,
+                    suffix_mask[:, :, :prefix_len],
+                )
+            expert = expert_layer.finish_attention(expert, expert_output)
+        return self.lm_expert.norm(expert)
+
     def forward(
         self,
         attention_mask: Tensor | None = None,
@@ -927,6 +1154,75 @@ class Molmo2WithExpertModel(nn.Module):
             raise ValueError("fill_kv_cache=True requires prefix embeddings.")
         if use_cache and past_key_values is None:
             past_key_values = {}
+
+        if bool(getattr(self, "inference_only_vlm", False)):
+            prefix_output = None
+            frozen_cache = past_key_values
+            if prefix is not None:
+                prefix_output, frozen_cache = self._prefill_inference_only_vlm(
+                    prefix,
+                    position_ids,
+                    attention_mask,
+                )
+            if expert is None:
+                if frozen_cache is None:
+                    raise RuntimeError("Scheme-B VLM prefill failed to produce frozen memory.")
+                return [prefix_output, None], frozen_cache
+            if frozen_cache is None:
+                raise ValueError("Scheme-B suffix forward requires frozen per-layer Molmo memory.")
+            expert_output = self._forward_expert_from_frozen_memory(
+                expert,
+                position_ids,
+                attention_mask,
+                frozen_cache,
+            )
+            return [prefix_output, expert_output], frozen_cache if use_cache else past_key_values
+
+        use_gradient_checkpointing = bool(
+            self.training
+            and getattr(self, "gradient_checkpointing", False)
+            and torch.is_grad_enabled()
+            and not use_cache
+            and not fill_kv_cache
+            and prefix is not None
+            and expert is not None
+        )
+        if use_gradient_checkpointing:
+            segment_size = int(
+                getattr(self, "gradient_checkpointing_layers_per_segment", 1)
+            )
+            if segment_size < 1:
+                raise ValueError("Gradient-checkpoint segment size must be positive.")
+            layer_count = len(self.vlm.blocks)
+            for segment_start in range(0, layer_count, segment_size):
+                segment_end = min(segment_start + segment_size, layer_count)
+
+                def checkpointed_segment(
+                    prefix_hidden: Tensor,
+                    expert_hidden: Tensor,
+                    *,
+                    start: int = segment_start,
+                    end: int = segment_end,
+                ) -> tuple[Tensor, Tensor]:
+                    for current_layer_idx in range(start, end):
+                        prefix_hidden, expert_hidden = (
+                            self._forward_coupled_prefix_expert_layer(
+                                current_layer_idx,
+                                prefix_hidden,
+                                expert_hidden,
+                                position_ids,
+                                attention_mask,
+                            )
+                        )
+                    return prefix_hidden, expert_hidden
+
+                prefix, expert = checkpoint(
+                    checkpointed_segment,
+                    prefix,
+                    expert,
+                    use_reentrant=False,
+                )
+            return [self.vlm.ln_f(prefix), self.lm_expert.norm(expert)], past_key_values
 
         for layer_idx, (vlm_layer, expert_layer) in enumerate(
             zip(self.vlm.blocks, self.lm_expert.layers, strict=True)

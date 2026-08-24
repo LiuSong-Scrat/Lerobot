@@ -15,7 +15,7 @@
 """Frozen full Molmo2-ER paired with a 36-layer SmolVLA Action Expert.
 
 This backend is the executable counterpart of
-``docs/FROZEN_FULL_MOLMO2ER_WEP_VLA_DESIGN.md``.  It intentionally reuses the
+``docs/SCHEME_B_FROZEN_FULL_MOLMO2ER_WEP_VLA_DESIGN.md``.  It intentionally reuses the
 checkpoint-compatible text and Action Expert implementation from
 ``molmo2_with_expert`` while adding the *native* Molmo2 vision backbone and
 connector.  The active source tensors are exactly:
@@ -25,12 +25,14 @@ connector.  The active source tensors are exactly:
 * all ``model.transformer.blocks.0`` through ``blocks.35``;
 * ``model.transformer.ln_f``.
 
-``lm_head`` is never instantiated.  Every Molmo tensor is frozen and held in
-evaluation mode.  Vision/WTE embedding construction is safely performed under
-``no_grad`` because it has no trainable inputs; the inherited 36-layer text
-forward is deliberately *not* placed under ``no_grad`` so gradients can pass
-through the frozen decoder operations to the inserted trainable FG/BG scene
-tokens.
+``lm_head`` is never instantiated.  Every Molmo parameter is frozen and held
+in evaluation mode.  Native vision/WTE embeddings are produced under
+``torch.no_grad`` and detached, then trainable FG/BG tokens are inserted into
+the prefix.  The 36 decoder blocks therefore remain parameter-frozen but are
+part of the input-autograd graph, exactly like frozen WEPVLA: IMAGE/LANGUAGE
+and FG/BG condition each other at every layer before Action Expert queries use
+that evolving prefix.  Two-layer non-reentrant activation-checkpoint segments
+keep this topology without retaining all decoder activations at once.
 
 For a 256 x 256 square input, Molmo's processor emits two pixel-identical
 378-square crops.  The backend asserts that equality at runtime and, when it
@@ -56,6 +58,9 @@ from torch import Tensor, nn
 from transformers import AutoConfig, AutoProcessor
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from lerobot.policies.smolvla.configuration_smolvla import (
+    FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+)
 from lerobot.policies.smolvla.molmo2_with_expert import (
     Molmo2ExpertBackbone,
     Molmo2TextBackbone,
@@ -302,6 +307,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
     """Full 36/36 frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
 
     scale_input_embeddings = False
+    inference_only_vlm = False
 
     def __init__(
         self,
@@ -318,6 +324,9 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         device: str | torch.device = "auto",
         torch_dtype: str | torch.dtype = torch.bfloat16,
         exact_vision_reuse: bool = True,
+        inference_only_vlm: bool = False,
+        gradient_checkpointing: bool = True,
+        gradient_checkpointing_layers_per_segment: int = 2,
     ):
         # Do not call the half-backend initializer: its 18-layer checks are an
         # intentional contract for the historical point-only control.
@@ -340,6 +349,11 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             raise ValueError("Full-Molmo2-ER requires the native ViT and connector to remain frozen.")
         if not train_expert_only:
             raise ValueError("Full-Molmo2-ER freezes every Molmo tensor; train_expert_only must be True.")
+        if inference_only_vlm:
+            raise ValueError(
+                "WEP-compatible Full-Molmo2-ER requires molmo_inference_only=False: "
+                "trainable FG/BG must remain in the VLM prefix and receive input gradients."
+            )
         if num_vlm_layers != 36:
             raise ValueError(f"Full-Molmo2-ER retains exactly all 36/36 text blocks, got {num_vlm_layers}.")
         if num_expert_layers <= 0:
@@ -468,6 +482,16 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         self.expert_spec = expert_spec
         self.native_config = native_config
         self.exact_vision_reuse = bool(exact_vision_reuse)
+        self.inference_only_vlm = False
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.gradient_checkpointing_layers_per_segment = int(
+            gradient_checkpointing_layers_per_segment
+        )
+        if not 1 <= self.gradient_checkpointing_layers_per_segment <= self.num_vlm_layers:
+            raise ValueError(
+                "gradient_checkpointing_layers_per_segment must be between one and "
+                f"{self.num_vlm_layers}."
+            )
         self.vision_reuse_calls = 0
         self.vision_fallback_calls = 0
         self.last_vision_encode_report: dict[str, Any] | None = None
@@ -518,6 +542,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
     @property
     def architecture_contract(self) -> dict[str, Any]:
         return {
+            "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
             "source_model": "Molmo2-ER",
             "source_vlm_layers": self.text_spec.num_hidden_layers,
             "retained_vlm_layers": self.num_vlm_layers,
@@ -540,10 +565,22 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "vision_features_for_256_square_rgb": 392,
             "native_image_positions_for_256_square_rgb": 410,
             "exact_identical_two_crop_reuse": self.exact_vision_reuse,
+            "total_vocab_size": self.text_spec.total_vocab_size,
             "wte_applied_to_all_native_tokens": True,
             "vision_feature_fusion": "add_only_at_image_patch_id",
             "molmo_frozen_eval": True,
+            "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
+            "per_layer_memory": "evolving_image_text_fg_bg_prefix",
+            "prefix_attention": "molmo_native_image_scene_bidirectional_text_causal",
+            "prefix_token_order": "bos_image_ego_scene_world_scene_text",
+            "prefix_position_ids": "sequential_valid_order_after_scene_insertion",
+            "fg_bg_location": "trainable_vlm_prefix",
+            "action_location": "expert_suffix_only",
             "text_prefix_autograd_preserved": True,
+            "gradient_checkpointing": self.gradient_checkpointing,
+            "gradient_checkpointing_layers_per_segment": (
+                self.gradient_checkpointing_layers_per_segment
+            ),
             "lm_head_present": False,
             "backend_parameters": _EXPECTED_BACKEND_PARAMETERS,
             "frozen_molmo_parameters": _EXPECTED_FROZEN_PARAMETERS,
@@ -560,8 +597,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         self.vision_backbone.eval()
 
     def train(self, mode: bool = True) -> Molmo2FullWithExpertModel:
-        # The inherited implementation keeps the text stack in eval while
-        # preserving autograd through it.  Repeat that guarantee for vision.
+        # Molmo remains deterministic and parameter-frozen in every train mode.
+        # Decoder input autograd is intentionally preserved for prefix FG/BG.
         super().train(mode)
         self.vlm.eval()
         self.vision_backbone.eval()
@@ -656,6 +693,32 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
                 f"expected crops/features={total_crops}/{total_pooled}, "
                 f"actual={pixel_values.shape[0]}/{image_token_pooling.shape[0]}."
             )
+
+        # Registered training/evaluation uses exactly one image and two crops
+        # per sample.  In that contract the flattened processor tensors are
+        # already batch-major, so reshape them as views instead of allocating
+        # and copying a second full pixel/pooling buffer on every rank.
+        fixed_single_image_two_crop = bool(
+            (counts == 1).all()
+            and (image_num_crops == 2).all()
+            and (crops_per_example == 2).all()
+            and (pooled_per_example == pooled_per_example[0]).all()
+            and pixel_values.is_contiguous()
+            and image_token_pooling.is_contiguous()
+        )
+        if fixed_single_image_two_crop:
+            images = pixel_values.view(
+                batch_size,
+                2,
+                pixel_values.shape[1],
+                pixel_values.shape[2],
+            )
+            pooling = image_token_pooling.view(
+                batch_size,
+                int(pooled_per_example[0].item()),
+                image_token_pooling.shape[1],
+            )
+            return images, pooling
 
         max_crops = int(crops_per_example.max().item())
         images = torch.full(
@@ -791,15 +854,22 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B,L], got {tuple(input_ids.shape)}.")
         embedding_device = self.vlm.wte.embedding.device
-        safe_input_ids = input_ids.to(device=embedding_device, dtype=torch.long)
-        if bool((safe_input_ids < -1).any()):
+        native_input_ids = input_ids.to(device=embedding_device, dtype=torch.long)
+        if bool((native_input_ids < -1).any()):
             raise ValueError("Molmo input_ids may use -1 only as a padding sentinel.")
-        safe_input_ids = safe_input_ids * (safe_input_ids != -1).to(safe_input_ids.dtype)
+        if bool((native_input_ids >= self.text_spec.total_vocab_size).any()):
+            raise IndexError(
+                "Molmo input token is outside the complete base+additional vocabulary "
+                f"[0, {self.text_spec.total_vocab_size})."
+            )
+        padding = native_input_ids == -1
+        safe_input_ids = native_input_ids.masked_fill(padding, 0)
 
         # Both WTE and vision are frozen and have no differentiable inputs.
         # Autograd resumes after trainable scene tokens are inserted upstream.
         with torch.no_grad():
             embeddings = self.vlm.wte(safe_input_ids)
+            embeddings = embeddings.masked_fill(padding.unsqueeze(-1), 0)
             if disable_vision:
                 self.last_vision_encode_report = {
                     "path": "disabled_ablation",
