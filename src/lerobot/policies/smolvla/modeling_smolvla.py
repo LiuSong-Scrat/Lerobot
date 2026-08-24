@@ -115,18 +115,18 @@ FULL_MOLMO2ER_TOTAL_VOCAB_SIZE = 152_064
 
 # Locked after the exact v0.4.3 DoubleFlow graph is instantiated and audited.
 FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET = {
-    "total": 6_261_215_886,
-    "trainable": 1_786_544_601,
+    "total": 4_915_225_982,
+    "trainable": 440_554_697,
     "frozen": 4_474_671_285,
 }
 FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET = {
-    "total": 49_694_848,
-    "trainable": 36_964_763,
+    "total": 39_991_648,
+    "trainable": 27_261_563,
     "frozen": 12_730_085,
 }
 FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET = {
-    "total": 6_310_910_734,
-    "trainable": 1_823_509_364,
+    "total": 4_955_217_630,
+    "trainable": 467_816_260,
     "frozen": 4_487_401_370,
 }
 # 36 fused QKV adapters plus 35 attention-output adapters. The final VLM

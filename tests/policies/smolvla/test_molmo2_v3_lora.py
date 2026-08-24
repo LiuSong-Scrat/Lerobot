@@ -70,6 +70,7 @@ def _make_tiny_backend(*, num_layers: int = 3) -> Molmo2FullWithExpertModel:
         prefix_spec,
         num_layers,
         self_attn_every_n_layers=2,
+        share_cross_attention_kv_projection=True,
         device=torch.device("cpu"),
         dtype=torch.float32,
     )

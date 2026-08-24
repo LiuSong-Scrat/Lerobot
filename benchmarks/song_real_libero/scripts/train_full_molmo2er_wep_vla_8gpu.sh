@@ -463,7 +463,7 @@ exec "${PYTHON_BIN}" -m accelerate.commands.accelerate_cli launch \
   --policy.load_action_expert_projection_weights=false \
   --policy.num_vlm_layers=36 \
   --policy.num_expert_layers=36 \
-  --policy.expert_width_multiplier=0.75 \
+  --policy.expert_width_multiplier=0.28125 \
   --policy.self_attn_every_n_layers=2 \
   --policy.attention_mode=cross_attn \
   --policy.add_image_special_tokens=false \

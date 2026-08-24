@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,10 @@ from lerobot.policies.factory import _validate_full_molmo_checkpoint_topology
 from lerobot.policies.smolvla.configuration_smolvla import (
     FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
     SmolVLAConfig,
+)
+from lerobot.policies.smolvla.constants import (
+    FULL_MOLMO2ER_EXPERT_HIDDEN_SIZE,
+    FULL_MOLMO2ER_EXPERT_INTERMEDIATE_SIZE,
 )
 from lerobot.policies.smolvla.modeling_smolvla import (
     FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET,
@@ -48,7 +53,7 @@ def _full_worldflow_config(**overrides) -> SmolVLAConfig:
         "rgb_camera_views": "agentview",
         "num_vlm_layers": 36,
         "num_expert_layers": 36,
-        "expert_width_multiplier": 0.75,
+        "expert_width_multiplier": 0.28125,
         "pointseg_enable": True,
         "pointseg_grid_size": 0.01,
         "pointseg_feature_dim": 64,
@@ -155,7 +160,12 @@ def test_full_checkpoint_topology_gate_rejects_old_and_accepts_wep_prefix(tmp_pa
     with pytest.raises(ValueError, match="retired detached-scene-suffix"):
         _validate_full_molmo_checkpoint_topology(checkpoint)
 
-    for invalid_topology in (None, "detached_scene_suffix_v2", "unknown"):
+    for invalid_topology in (
+        None,
+        "detached_scene_suffix_v2",
+        "wepvla_scene_in_vlm_prefix_v3",
+        "unknown",
+    ):
         legacy_config = {
             "vlm_backend": "molmo2_full",
             "molmo_inference_only": False,
@@ -217,6 +227,7 @@ def test_public_config_loader_accepts_registered_wep_prefix_topology(tmp_path) -
         ("worldflow_require_action_target_sidecar", False),
         ("worldflow_max_points", 0),
         ("molmo_gradient_checkpointing_layers_per_segment", 0),
+        ("expert_width_multiplier", 0.75),
     ),
 )
 def test_full_config_rejects_registered_contract_drift(field_name: str, bad_value) -> None:
@@ -233,26 +244,26 @@ def test_parameter_budget_matches_v043_shared_doubleflow() -> None:
         molmo_lora_rank=8,
     )
     assert off == FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET == {
-        "total": 6_261_215_886,
-        "trainable": 1_786_544_601,
+        "total": 4_915_225_982,
+        "trainable": 440_554_697,
         "frozen": 4_474_671_285,
     }
     assert on == FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET == {
-        "total": 6_310_910_734,
-        "trainable": 1_823_509_364,
+        "total": 4_955_217_630,
+        "trainable": 467_816_260,
         "frozen": 4_487_401_370,
     }
     assert on_lora == {
-        "total": 6_315_281_166,
-        "trainable": 1_827_879_796,
+        "total": 4_959_588_062,
+        "trainable": 472_186_692,
         "frozen": 4_487_401_370,
         "molmo_lora": 4_370_432,
     }
     assert {name: on[name] - off[name] for name in on} == (
         FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET
     ) == {
-        "total": 49_694_848,
-        "trainable": 36_964_763,
+        "total": 39_991_648,
+        "trainable": 27_261_563,
         "frozen": 12_730_085,
     }
     off_prefixes = full_molmo2er_trainable_parameter_prefixes(worldflow_enable=False)
@@ -269,6 +280,55 @@ def test_parameter_budget_matches_v043_shared_doubleflow() -> None:
     }
 
 
+def test_feature_aligned_expert_is_wep_width_with_one_shared_context_adapter() -> None:
+    prefix_spec = molmo_core.Molmo2TextSpec(
+        hidden_size=2560,
+        intermediate_size=9728,
+        num_hidden_layers=36,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        vocab_size=151936,
+        additional_vocab_size=128,
+        hidden_act="silu",
+        layer_norm_eps=1e-6,
+        rope_theta=5_000_000.0,
+        max_position_embeddings=4096,
+        qkv_bias=False,
+        use_qk_norm=True,
+        qk_norm_type="qwen3",
+        embedding_dropout=0.0,
+        attention_dropout=0.0,
+        residual_dropout=0.0,
+        initializer_range=0.02,
+    )
+    expert_spec = replace(
+        prefix_spec,
+        hidden_size=FULL_MOLMO2ER_EXPERT_HIDDEN_SIZE,
+        intermediate_size=FULL_MOLMO2ER_EXPERT_INTERMEDIATE_SIZE,
+    )
+    expert = molmo_core.Molmo2ExpertBackbone(
+        expert_spec,
+        prefix_spec,
+        36,
+        self_attn_every_n_layers=2,
+        share_cross_attention_kv_projection=True,
+        device=torch.device("meta"),
+        dtype=torch.bfloat16,
+    )
+
+    assert expert.spec.hidden_size == 720
+    assert expert.spec.intermediate_size == 2048
+    assert expert.context_k_proj is not None and expert.context_v_proj is not None
+    assert expert.context_k_proj.in_features == 1024
+    assert expert.context_k_proj.out_features == 1024
+    cross_layers = [layer for layer in expert.layers if layer.is_cross_attention]
+    assert len(cross_layers) == 18
+    assert all(layer.self_attn.k_proj is None for layer in cross_layers)
+    assert all(layer.self_attn.v_proj is None for layer in cross_layers)
+    assert sum(parameter.numel() for parameter in expert.parameters()) == 400_290_128
+
+
 def test_worldflow_added_budget_is_the_v043_shared_branch_not_private_language() -> None:
     config = SmolVLAConfig()
     config.worldflow_target_type = "world_eef_trajectory"
@@ -277,21 +337,21 @@ def test_worldflow_added_budget_is_the_v043_shared_branch_not_private_language()
     config.worldflow_action_expert_mode = "shared"
     config.worldflow_feature_dim = 64
     config.worldflow_grid_size = 0.01
-    branch = WorldFlowActionBranch(config, action_hidden_dim=1920, language_vocab_size=152_064)
+    branch = WorldFlowActionBranch(config, action_hidden_dim=720, language_vocab_size=152_064)
     assert branch.language_embedding is None
     branch_total = sum(parameter.numel() for parameter in branch.parameters())
     branch_trainable = sum(
         parameter.numel() for parameter in branch.parameters() if parameter.requires_grad
     )
-    assert (branch_total, branch_trainable) == (49_317_238, 36_587_153)
+    assert (branch_total, branch_trainable) == (39_640_438, 26_910_353)
     outer = (
         2 * (64 * 2560 + 2560)
-        + (1920 * 10 + 10)
-        + (9 * 1920 + 1920)
+        + (720 * 10 + 10)
+        + (9 * 720 + 720)
         + 2560
-        + 2 * 1920
+        + 2 * 720
     )
-    assert outer == 377_610
+    assert outer == 351_210
     assert branch_total + outer == FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET["total"]
     assert branch_trainable + outer == FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET["trainable"]
 
@@ -539,6 +599,7 @@ def _make_tiny_backend(
         prefix_spec,
         num_layers,
         self_attn_every_n_layers=2,
+        share_cross_attention_kv_projection=True,
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
@@ -635,6 +696,10 @@ def test_action_loss_crosses_all_36_frozen_vlm_layers_into_all_scene_prefixes() 
     assert world_scene_projection.weight.grad is not None
     assert actions.grad is not None and actions.grad.abs().sum() > 0
     assert any(parameter.grad is not None for parameter in backend.lm_expert.parameters())
+    assert backend.lm_expert.context_k_proj is not None
+    assert backend.lm_expert.context_v_proj is not None
+    assert backend.lm_expert.context_k_proj.weight.grad is not None
+    assert backend.lm_expert.context_v_proj.weight.grad is not None
 
 
 def test_layer_checkpointing_preserves_forward_and_input_expert_gradients() -> None:

@@ -455,6 +455,7 @@ class Molmo2CrossAttention(nn.Module):
         expert_spec: Molmo2TextSpec,
         prefix_spec: Molmo2TextSpec,
         *,
+        shared_context_projection: bool = False,
         device: torch.device,
         dtype: torch.dtype,
     ):
@@ -473,11 +474,24 @@ class Molmo2CrossAttention(nn.Module):
             device=device,
             dtype=dtype,
         )
-        # These are intentionally prefix-KV-width -> expert-KV-width.  Keeping
-        # expert-hidden-width inputs here would add 16.5M unused parameters and
-        # would not match SmolVLA's alternating cross-attention construction.
-        self.k_proj = nn.Linear(prefix_kv_dim, kv_dim, bias=False, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(prefix_kv_dim, kv_dim, bias=False, device=device, dtype=dtype)
+        self.prefix_kv_dim = prefix_kv_dim
+        self.kv_dim = kv_dim
+        self.shared_context_projection = bool(shared_context_projection)
+        # The historical backends own one pair per cross-attention layer.  The
+        # feature-aligned full backend instead owns a single pair on
+        # Molmo2ExpertBackbone and passes it into every odd layer, matching the
+        # parameter-sharing pattern used by MolmoAct2 without adding a new
+        # residual or changing token reachability.
+        self.k_proj = (
+            None
+            if self.shared_context_projection
+            else nn.Linear(prefix_kv_dim, kv_dim, bias=False, device=device, dtype=dtype)
+        )
+        self.v_proj = (
+            None
+            if self.shared_context_projection
+            else nn.Linear(prefix_kv_dim, kv_dim, bias=False, device=device, dtype=dtype)
+        )
         self.q_norm = Molmo2RMSNorm(
             expert_spec.head_dim, expert_spec.layer_norm_eps, device=device, dtype=dtype
         )
@@ -498,12 +512,33 @@ class Molmo2CrossAttention(nn.Module):
         query = self.q_norm(query)
         return apply_molmo2_rope(query, position_ids, self.rope_theta)
 
-    def project_prefix_kv(self, prefix_key: Tensor, prefix_value: Tensor) -> tuple[Tensor, Tensor]:
+    def project_prefix_kv(
+        self,
+        prefix_key: Tensor,
+        prefix_value: Tensor,
+        *,
+        context_k_proj: nn.Linear | None = None,
+        context_v_proj: nn.Linear | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        k_proj = self.k_proj if context_k_proj is None else context_k_proj
+        v_proj = self.v_proj if context_v_proj is None else context_v_proj
+        if k_proj is None or v_proj is None:
+            raise RuntimeError(
+                "Shared context projection is enabled, but the Expert backbone "
+                "did not supply context_k_proj/context_v_proj."
+            )
+        if (
+            k_proj.in_features != self.prefix_kv_dim
+            or v_proj.in_features != self.prefix_kv_dim
+            or k_proj.out_features != self.kv_dim
+            or v_proj.out_features != self.kv_dim
+        ):
+            raise RuntimeError("Context K/V projection dimensions do not match this Expert layer.")
         batch_size, seq_len = prefix_key.shape[:2]
-        key = self.k_proj(prefix_key.flatten(2)).view(
+        key = k_proj(prefix_key.flatten(2)).view(
             batch_size, seq_len, self.num_key_value_heads, self.head_dim
         )
-        value = self.v_proj(prefix_value.flatten(2)).view(
+        value = v_proj(prefix_value.flatten(2)).view(
             batch_size, seq_len, self.num_key_value_heads, self.head_dim
         )
         return self.k_norm(key), value
@@ -532,6 +567,7 @@ class Molmo2ExpertLayer(nn.Module):
         prefix_spec: Molmo2TextSpec,
         *,
         is_cross_attention: bool,
+        shared_context_projection: bool = False,
         device: torch.device,
         dtype: torch.dtype,
     ):
@@ -541,6 +577,7 @@ class Molmo2ExpertLayer(nn.Module):
             self.self_attn = Molmo2CrossAttention(
                 expert_spec,
                 prefix_spec,
+                shared_context_projection=shared_context_projection,
                 device=device,
                 dtype=dtype,
             )
@@ -617,17 +654,46 @@ class Molmo2ExpertBackbone(nn.Module):
         num_layers: int,
         *,
         self_attn_every_n_layers: int,
+        share_cross_attention_kv_projection: bool = False,
         device: torch.device,
         dtype: torch.dtype,
     ):
         super().__init__()
         self.spec = expert_spec
+        self.share_cross_attention_kv_projection = bool(
+            share_cross_attention_kv_projection
+        )
+        prefix_kv_dim = prefix_spec.num_key_value_heads * prefix_spec.head_dim
+        expert_kv_dim = expert_spec.num_key_value_heads * expert_spec.head_dim
+        self.context_k_proj = (
+            nn.Linear(
+                prefix_kv_dim,
+                expert_kv_dim,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            if self.share_cross_attention_kv_projection
+            else None
+        )
+        self.context_v_proj = (
+            nn.Linear(
+                prefix_kv_dim,
+                expert_kv_dim,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            if self.share_cross_attention_kv_projection
+            else None
+        )
         self.layers = nn.ModuleList(
             [
                 Molmo2ExpertLayer(
                     expert_spec,
                     prefix_spec,
                     is_cross_attention=(layer_idx % self_attn_every_n_layers != 0),
+                    shared_context_projection=self.share_cross_attention_kv_projection,
                     device=device,
                     dtype=dtype,
                 )
@@ -639,6 +705,19 @@ class Molmo2ExpertBackbone(nn.Module):
             expert_spec.layer_norm_eps,
             device=device,
             dtype=dtype,
+        )
+
+    def project_prefix_kv(
+        self,
+        attention: Molmo2CrossAttention,
+        prefix_key: Tensor,
+        prefix_value: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        return attention.project_prefix_kv(
+            prefix_key,
+            prefix_value,
+            context_k_proj=self.context_k_proj,
+            context_v_proj=self.context_v_proj,
         )
 
 
@@ -1111,8 +1190,8 @@ class Molmo2WithExpertModel(nn.Module):
             expert_query = expert_layer.self_attn.project_query(
                 expert_normalized, relative_expert_positions
             )
-            expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
-                prefix_key, prefix_value
+            expert_key, expert_value = self.lm_expert.project_prefix_kv(
+                expert_layer.self_attn, prefix_key, prefix_value
             )
             cross_mask = self._mask_slice(
                 attention_mask,
@@ -1250,7 +1329,8 @@ class Molmo2WithExpertModel(nn.Module):
                     expert_normalized,
                     relative_positions,
                 )
-                expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
+                expert_key, expert_value = self.lm_expert.project_prefix_kv(
+                    expert_layer.self_attn,
                     cached_key,
                     cached_value,
                 )
@@ -1456,8 +1536,8 @@ class Molmo2WithExpertModel(nn.Module):
                     expert_query = expert_layer.self_attn.project_query(
                         expert_normalized, relative_expert_positions
                     )
-                    expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
-                        prefix_key, prefix_value
+                    expert_key, expert_value = self.lm_expert.project_prefix_kv(
+                        expert_layer.self_attn, prefix_key, prefix_value
                     )
                     cross_mask = self._mask_slice(
                         attention_mask,
@@ -1513,8 +1593,8 @@ class Molmo2WithExpertModel(nn.Module):
                     assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
                     relative_positions = expert_positions - expert_positions.min(dim=1, keepdim=True).values
                     expert_query = expert_layer.self_attn.project_query(expert_normalized, relative_positions)
-                    expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
-                        cached_key, cached_value
+                    expert_key, expert_value = self.lm_expert.project_prefix_kv(
+                        expert_layer.self_attn, cached_key, cached_value
                     )
                     cross_mask = self._mask_slice(
                         attention_mask,

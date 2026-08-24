@@ -4,6 +4,7 @@
 - 生效仓库：`/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song`
 - 唯一结构基准：`origin/wep_vla_v0.4.3_multiview_doubleflow`，提交 `da0ad03bf7eff2c6e9edcf04e1b324bebbdf93dd`。
 - 被替代文档：`FROZEN_FULL_MOLMO2ER_WEP_VLA_DESIGN.md`（保留为历史方案 A，不再是启动依据）
+- Feature-align 的精确维度、共享 K/V 与 checkpoint 边界见 `MOLMO2ER_V3_FEATURE_ALIGN.md`。
 - 分布式策略：普通 DDP；当前不使用 DeepSpeed/ZeRO。
 - 物理设备合同：正式训练支持全部 8 张 A800 80GB（GPU 0–7）；当前文档中的短数据调试命令为了保留 GPU 0 做评测，显式使用 GPU 1–7。
 
@@ -64,7 +65,7 @@ fast path 只有在本地 processor 的 resize、patch、pooling、mean/std、pl
 
 ### 1.3 每层与 Expert 的对接
 
-Action Expert 深度 36、hidden 1920、FFN 5120；与 Molmo 36 层严格一一对应。
+Action Expert 深度保持 36，现有主干 hidden 缩为 WEPVLA 的 720、FFN 为 2048；与 Molmo 36 层仍严格一一对应。这里没有新增 residual 分支。
 
 - 偶数层 `0,2,...,34`：prefix 与 action 进行一次 joint MHA；mask 保证 prefix 只读 prefix，而 action 读取完整 prefix 与全部 Ego/World action。
 - 奇数层 `1,3,...,35`：prefix 先做自身 self-attention；action query cross-attend 本层完整、持续演化的 IMAGE/LANGUAGE/FG/BG K/V，本层无 action-action attention。
@@ -137,28 +138,28 @@ UMI feature construction -> policy normalizer -> model
 当前 WorldFlow-on 精确合同：
 
 ```text
-total     = 6,310,910,734
-trainable = 1,823,509,364
+total     = 4,955,217,630
+trainable =   467,816,260
 frozen    = 4,487,401,370
 ```
 
 相对 WorldFlow-off 的精确增量为：
 
 ```text
-total     = 49,694,848
-trainable = 36,964,763
+total     = 39,991,648
+trainable = 27,261,563
 frozen    = 12,730,085
 ```
 
 当前 WorldFlow-off 精确合同：
 
 ```text
-total     = 6,261,215,886
-trainable = 1,786,544,601
+total     = 4,915,225,982
+trainable =   440,554,697
 frozen    = 4,474,671,285
 ```
 
-训练前运行时审计会拒绝任何参数量、trainable allowlist、层数、冻结范围或 WEP-prefix architecture contract 漂移。新 checkpoint 在 `config.json` 中持久化 `full_molmo_topology=wepvla_scene_in_vlm_prefix_v3`；旧 checkpoint 缺少该 marker，且 `molmo_inference_only=true`、四个 FG/BG projection 仅 1920 宽，与新 2560 宽拓扑不兼容，不能 resume 或评测；必须新建输出目录并从头训练，或另做显式 warm-start 转换。
+训练前运行时审计会拒绝任何参数量、trainable allowlist、层数、冻结范围或 WEP-prefix architecture contract 漂移。feature-align checkpoint 在 `config.json` 中持久化 `full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align`；旧 V3 的 1920 维 Action Expert 与本版本 720 维主干形状不兼容，不能直接 resume 或评测，必须从头训练或另做显式 warm-start 转换。Molmo prefix 仍保持原生 2560 维。
 
 ## 4. DDP 与 batch 合同
 

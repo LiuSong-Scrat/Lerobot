@@ -35,7 +35,7 @@ MOLMO_CHECKPOINTS_TO_KEEP=1 \
   --dynamo_backend=no \
   --main_process_port=29670 \
 benchmarks/song_real_libero/scripts/train_song_benchmark.py \
-  --policy.path=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/wepvla_v043_doubleflow_multiview_long68/checkpoints/last/pretrained_model \
+  --policy.type=smolvla \
   --resume=false \
   --policy.push_to_hub=false \
   --dataset.repo_id=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep \
@@ -50,8 +50,8 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --eval_freq=1500 \
   --log_freq=1 \
   --num_workers=12 \
-  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/wepvla_v043_doubleflow_multiview_long68_after_1500 \
-  --job_name=stage1_wepprefix_v3_long68_fresh_after_1500 \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/v3_feature_align_long68_fresh \
+  --job_name=v3_feature_align_long68_fresh \
   --policy.device=cuda \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
@@ -76,7 +76,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.vla_adapter_enable=false \
   --policy.vla_adapter_freeze_vlm=true \
   --policy.vlm_backend=molmo2_full \
-  --policy.full_molmo_topology=wepvla_scene_in_vlm_prefix_v3 \
+  --policy.full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align \
   --policy.molmo_inference_only=false \
   --policy.molmo_gradient_checkpointing=true \
   --policy.molmo_gradient_checkpointing_layers_per_segment=2 \
@@ -88,7 +88,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.load_action_expert_projection_weights=false \
   --policy.num_vlm_layers=36 \
   --policy.num_expert_layers=36 \
-  --policy.expert_width_multiplier=0.75 \
+  --policy.expert_width_multiplier=0.28125 \
   --policy.self_attn_every_n_layers=2 \
   --policy.attention_mode=cross_attn \
   --policy.add_image_special_tokens=false \

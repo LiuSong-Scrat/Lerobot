@@ -22,7 +22,10 @@ from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from lerobot.policies.smolvla.constants import FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
+from lerobot.policies.smolvla.constants import (
+    FULL_MOLMO2ER_EXPERT_WIDTH_MULTIPLIER,
+    FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+)
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
@@ -925,8 +928,17 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.self_attn_every_n_layers != 2:
                 raise ValueError("Full-Molmo2-ER requires alternating even-SA/odd-CA Expert layers.")
-            if abs(float(self.expert_width_multiplier) - 0.75) > 1e-12:
-                raise ValueError("Full-Molmo2-ER requires expert_width_multiplier=0.75.")
+            if (
+                abs(
+                    float(self.expert_width_multiplier)
+                    - FULL_MOLMO2ER_EXPERT_WIDTH_MULTIPLIER
+                )
+                > 1e-12
+            ):
+                raise ValueError(
+                    "Feature-aligned Full-Molmo2-ER requires "
+                    "expert_width_multiplier=0.28125 (720/2560)."
+                )
             # Optimizer and scheduler values are run-time training choices, not
             # part of the Full-Molmo2-ER architecture contract. Keep every
             # optimizer_* and scheduler_* field configurable through the normal

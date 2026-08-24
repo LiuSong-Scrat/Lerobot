@@ -59,7 +59,10 @@ from torch import Tensor, nn
 from transformers import AutoConfig, AutoProcessor
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from lerobot.policies.smolvla.configuration_smolvla import (
+from lerobot.policies.smolvla.constants import (
+    FULL_MOLMO2ER_EXPERT_HIDDEN_SIZE,
+    FULL_MOLMO2ER_EXPERT_INTERMEDIATE_SIZE,
+    FULL_MOLMO2ER_EXPERT_WIDTH_MULTIPLIER,
     FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
 )
 from lerobot.policies.smolvla.molmo2_with_expert import (
@@ -90,7 +93,7 @@ _LM_HEAD_SOURCE_PREFIX = "lm_head."
 # therefore intentionally not included here.
 _EXPECTED_VISION_PARAMETERS = 439_117_264
 _EXPECTED_TEXT_PARAMETERS = 4_022_795_776
-_EXPECTED_EXPERT_PARAMETERS = 1_736_591_232
+_EXPECTED_EXPERT_PARAMETERS = 400_290_128
 _EXPECTED_FROZEN_PARAMETERS = _EXPECTED_VISION_PARAMETERS + _EXPECTED_TEXT_PARAMETERS
 _EXPECTED_BACKEND_PARAMETERS = _EXPECTED_FROZEN_PARAMETERS + _EXPECTED_EXPERT_PARAMETERS
 
@@ -310,7 +313,7 @@ def _audit_source_checkpoint(model_directory: Path) -> dict[str, Any]:
 
 
 class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
-    """Full 36/36 base-frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
+    """Frozen 36-layer Molmo2-ER plus a WEP-width 36-layer Action Expert."""
 
     scale_input_embeddings = False
     inference_only_vlm = False
@@ -326,7 +329,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         num_expert_layers: int = -1,
         num_vlm_layers: int = 36,
         self_attn_every_n_layers: int = 2,
-        expert_width_multiplier: float = 0.75,
+        expert_width_multiplier: float = FULL_MOLMO2ER_EXPERT_WIDTH_MULTIPLIER,
         device: str | torch.device = "auto",
         torch_dtype: str | torch.dtype = torch.bfloat16,
         exact_vision_reuse: bool = True,
@@ -370,9 +373,15 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             num_expert_layers = num_vlm_layers
         if num_expert_layers != 36:
             raise ValueError(f"Full-Molmo2-ER requires a 36-layer Action Expert, got {num_expert_layers}.")
-        if not math.isclose(expert_width_multiplier, 0.75, rel_tol=0.0, abs_tol=1e-12):
+        if not math.isclose(
+            expert_width_multiplier,
+            FULL_MOLMO2ER_EXPERT_WIDTH_MULTIPLIER,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
             raise ValueError(
-                "Full-Molmo2-ER requires expert_width_multiplier=0.75 (H=1920), "
+                "Feature-aligned Full-Molmo2-ER requires "
+                "expert_width_multiplier=0.28125 (H=720), "
                 f"got {expert_width_multiplier}."
             )
         if "cross" not in attention_mode:
@@ -395,6 +404,11 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         resolved_device = _resolve_device(device)
         resolved_dtype = _resolve_dtype(torch_dtype)
         expert_hidden_size = int(text_spec.hidden_size * expert_width_multiplier)
+        if expert_hidden_size != FULL_MOLMO2ER_EXPERT_HIDDEN_SIZE:
+            raise RuntimeError(
+                "Feature-aligned Expert hidden width drifted: "
+                f"expected={FULL_MOLMO2ER_EXPERT_HIDDEN_SIZE}, actual={expert_hidden_size}."
+            )
         expert_spec = Molmo2TextSpec(
             hidden_size=expert_hidden_size,
             intermediate_size=get_intermediate_size(expert_hidden_size),
@@ -416,6 +430,12 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             residual_dropout=0.0,
             initializer_range=text_spec.initializer_range,
         )
+        if expert_spec.intermediate_size != FULL_MOLMO2ER_EXPERT_INTERMEDIATE_SIZE:
+            raise RuntimeError(
+                "Feature-aligned Expert MLP width drifted: "
+                f"expected={FULL_MOLMO2ER_EXPERT_INTERMEDIATE_SIZE}, "
+                f"actual={expert_spec.intermediate_size}."
+            )
 
         self.vlm = Molmo2TextBackbone(
             text_spec,
@@ -434,6 +454,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             text_spec,
             num_expert_layers,
             self_attn_every_n_layers=self_attn_every_n_layers,
+            share_cross_attention_kv_projection=True,
             device=resolved_device,
             dtype=resolved_dtype,
         )
@@ -588,6 +609,9 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "expert_layers": self.num_expert_layers,
             "expert_hidden_size": self.expert_spec.hidden_size,
             "expert_intermediate_size": self.expert_spec.intermediate_size,
+            "expert_attention_geometry": "molmo_native_32q_8kv_head128",
+            "context_kv_projection": "shared_across_cross_attention_layers",
+            "extra_action_point_residual_paths": 0,
             "self_attention_layers": list(range(0, 36, 2)),
             "cross_attention_layers": list(range(1, 36, 2)),
             "num_attention_heads": self.num_attention_heads,
