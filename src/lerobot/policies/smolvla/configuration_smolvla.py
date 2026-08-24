@@ -927,10 +927,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("Full-Molmo2-ER requires alternating even-SA/odd-CA Expert layers.")
             if abs(float(self.expert_width_multiplier) - 0.75) > 1e-12:
                 raise ValueError("Full-Molmo2-ER requires expert_width_multiplier=0.75.")
-            # The optimizer schedule is a run-time training choice rather than
-            # part of the Full-Molmo2-ER architecture contract.  Keep
-            # scheduler_warmup_steps, scheduler_decay_steps and
-            # scheduler_decay_lr configurable through the normal CLI fields.
+            # Optimizer and scheduler values are run-time training choices, not
+            # part of the Full-Molmo2-ER architecture contract. Keep every
+            # optimizer_* and scheduler_* field configurable through the normal
+            # CLI while retaining the topology and information-flow gates below.
             full_contract = {
                 "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
                 "n_obs_steps": 1,
@@ -1011,11 +1011,6 @@ class SmolVLAConfig(PreTrainedConfig):
                 "se3_enable": False,
                 "se3_final_correction_enable": False,
                 "rtc_config": None,
-                "optimizer_lr": 1e-4,
-                "optimizer_betas": (0.9, 0.95),
-                "optimizer_eps": 1e-8,
-                "optimizer_weight_decay": 1e-10,
-                "optimizer_grad_clip_norm": 10,
                 "load_action_expert_weights": False,
                 "load_action_expert_projection_weights": False,
                 "attention_mode": "cross_attn",

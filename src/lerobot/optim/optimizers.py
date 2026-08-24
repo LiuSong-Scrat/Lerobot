@@ -310,13 +310,18 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
 
 
 def load_optimizer_state(
-    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer], save_dir: Path
+    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer],
+    save_dir: Path,
+    *,
+    restore_param_group_hyperparameters: bool = True,
 ) -> torch.optim.Optimizer | dict[str, torch.optim.Optimizer]:
     """Load optimizer state from disk.
 
     Args:
         optimizer: Either a single optimizer or a dictionary of optimizers.
         save_dir: Directory to load the optimizer state from.
+        restore_param_group_hyperparameters: Whether to restore the checkpoint's
+            param-group options in addition to per-parameter optimizer tensors.
 
     Returns:
         The updated optimizer(s) with loaded state.
@@ -327,16 +332,29 @@ def load_optimizer_state(
         for name, opt in optimizer.items():
             optimizer_dir = save_dir / name
             if optimizer_dir.exists():
-                loaded_optimizers[name] = _load_single_optimizer_state(opt, optimizer_dir)
+                loaded_optimizers[name] = _load_single_optimizer_state(
+                    opt,
+                    optimizer_dir,
+                    restore_param_group_hyperparameters=restore_param_group_hyperparameters,
+                )
             else:
                 loaded_optimizers[name] = opt
         return loaded_optimizers
     else:
         # Handle single optimizer
-        return _load_single_optimizer_state(optimizer, save_dir)
+        return _load_single_optimizer_state(
+            optimizer,
+            save_dir,
+            restore_param_group_hyperparameters=restore_param_group_hyperparameters,
+        )
 
 
-def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> torch.optim.Optimizer:
+def _load_single_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    save_dir: Path,
+    *,
+    restore_param_group_hyperparameters: bool = True,
+) -> torch.optim.Optimizer:
     """Load a single optimizer's state from disk."""
     current_state_dict = optimizer.state_dict()
     flat_state = load_file(save_dir / OPTIMIZER_STATE)
@@ -349,9 +367,17 @@ def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
         loaded_state_dict = {"state": {}}
 
     if "param_groups" in current_state_dict:
-        param_groups = deserialize_json_into_object(
-            save_dir / OPTIMIZER_PARAM_GROUPS, current_state_dict["param_groups"]
-        )
+        if restore_param_group_hyperparameters:
+            param_groups = deserialize_json_into_object(
+                save_dir / OPTIMIZER_PARAM_GROUPS, current_state_dict["param_groups"]
+            )
+        else:
+            # Keep the freshly constructed optimizer's CLI/config values while
+            # restoring Adam's per-parameter step, exp_avg and exp_avg_sq.
+            # Parameter ids and group membership still come from the current
+            # optimizer, so load_state_dict performs its normal shape/count
+            # compatibility checks.
+            param_groups = current_state_dict["param_groups"]
         loaded_state_dict["param_groups"] = param_groups
 
     optimizer.load_state_dict(loaded_state_dict)

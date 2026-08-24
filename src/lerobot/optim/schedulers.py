@@ -132,6 +132,88 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambda, -1)
 
 
+def build_phase_cosine_decay_scheduler(
+    optimizer: Optimizer,
+    *,
+    start_lr: float,
+    end_lr: float,
+    num_decay_steps: int,
+    phase_step: int = 0,
+) -> LambdaLR:
+    """Build a phase-relative cosine decay for an optimizer-state-only resume.
+
+    ``phase_step`` is independent from the global training step. At phase step
+    zero the first optimizer update uses ``start_lr``; after exactly
+    ``num_decay_steps`` scheduler updates it uses ``end_lr``. Additional steps
+    remain clamped at ``end_lr``.
+
+    Multiple optimizer groups retain their pre-existing LR ratios. The explicit
+    start/end values refer to group zero, which is the base policy group for the
+    Song training presets.
+    """
+
+    start_lr = float(start_lr)
+    end_lr = float(end_lr)
+    if not math.isfinite(start_lr) or start_lr <= 0.0:
+        raise ValueError(f"start_lr must be finite and positive, got {start_lr!r}.")
+    if not math.isfinite(end_lr) or end_lr < 0.0 or end_lr > start_lr:
+        raise ValueError(f"end_lr must be finite and in [0, start_lr], got {end_lr!r}.")
+    if isinstance(num_decay_steps, bool) or not isinstance(num_decay_steps, int) or num_decay_steps < 1:
+        raise ValueError(f"num_decay_steps must be a positive integer, got {num_decay_steps!r}.")
+    if isinstance(phase_step, bool) or not isinstance(phase_step, int) or phase_step < 0:
+        raise ValueError(f"phase_step must be a non-negative integer, got {phase_step!r}.")
+    if not optimizer.param_groups:
+        raise ValueError("Cannot build a resume scheduler for an optimizer with no parameter groups.")
+
+    reference_lrs = [
+        float(group.get("initial_lr", group["lr"])) for group in optimizer.param_groups
+    ]
+    base_reference_lr = reference_lrs[0]
+    if not math.isfinite(base_reference_lr) or base_reference_lr <= 0.0:
+        raise ValueError(
+            "Optimizer group zero must have a finite positive reference LR before "
+            f"scheduler restart, got {base_reference_lr!r}."
+        )
+
+    group_start_lrs: list[float] = []
+    for group_index, (group, reference_lr) in enumerate(
+        zip(optimizer.param_groups, reference_lrs, strict=True)
+    ):
+        if not math.isfinite(reference_lr) or reference_lr <= 0.0:
+            raise ValueError(
+                f"Optimizer group {group_index} has invalid reference LR {reference_lr!r}."
+            )
+        group_start_lr = start_lr * (reference_lr / base_reference_lr)
+        group["lr"] = group_start_lr
+        # LambdaLR reads this field as its immutable multiplicative base when
+        # last_epoch is non-negative, including reconstruction mid-phase.
+        group["initial_lr"] = group_start_lr
+        group_start_lrs.append(group_start_lr)
+
+    if "lr" in optimizer.defaults:
+        optimizer.defaults["lr"] = start_lr
+
+    end_ratio = end_lr / start_lr
+
+    def lr_lambda(current_phase_step: int) -> float:
+        bounded_step = min(max(int(current_phase_step), 0), num_decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * bounded_step / num_decay_steps))
+        return end_ratio + (1.0 - end_ratio) * cosine
+
+    # LRScheduler performs one initial step in its constructor. Using
+    # phase_step - 1 therefore reconstructs exactly the requested current phase
+    # without replaying optimizer updates or loading the old scheduler state.
+    scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=phase_step - 1)
+    expected_lrs = [base_lr * lr_lambda(phase_step) for base_lr in group_start_lrs]
+    actual_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    if any(not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=0.0) for actual, expected in zip(actual_lrs, expected_lrs, strict=True)):
+        raise RuntimeError(
+            "Phase-relative scheduler initialization produced unexpected optimizer LRs: "
+            f"expected={expected_lrs}, actual={actual_lrs}."
+        )
+    return scheduler
+
+
 def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
     state_dict = scheduler.state_dict()
     write_json(state_dict, save_dir / SCHEDULER_STATE)

@@ -19,6 +19,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig,
     VQBeTSchedulerConfig,
+    build_phase_cosine_decay_scheduler,
     load_scheduler_state,
     save_scheduler_state,
 )
@@ -103,3 +104,58 @@ def test_save_load_scheduler_state(scheduler, tmp_path):
     loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
 
     assert scheduler.state_dict() == loaded_scheduler.state_dict()
+
+
+def test_phase_cosine_resume_scheduler_exact_start_and_end():
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    second_parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [parameter], "lr": 1e-4},
+            {"params": [second_parameter], "lr": 2e-4},
+        ]
+    )
+    scheduler = build_phase_cosine_decay_scheduler(
+        optimizer,
+        start_lr=7e-5,
+        end_lr=2e-5,
+        num_decay_steps=30_000,
+    )
+
+    assert scheduler.last_epoch == 0
+    assert optimizer.param_groups[0]["initial_lr"] == 7e-5
+    assert optimizer.param_groups[0]["lr"] == 7e-5
+    assert optimizer.param_groups[1]["initial_lr"] == 1.4e-4
+    assert optimizer.param_groups[1]["lr"] == 1.4e-4
+
+    for _ in range(30_000):
+        optimizer.step()
+        scheduler.step()
+
+    assert scheduler.last_epoch == 30_000
+    assert optimizer.param_groups[0]["lr"] == 2e-5
+    assert optimizer.param_groups[1]["lr"] == 4e-5
+
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 2e-5
+    assert optimizer.param_groups[1]["lr"] == 4e-5
+
+
+def test_phase_cosine_resume_scheduler_reconstructs_mid_phase():
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+    scheduler = build_phase_cosine_decay_scheduler(
+        optimizer,
+        start_lr=7e-5,
+        end_lr=2e-5,
+        num_decay_steps=30_000,
+        phase_step=12_000,
+    )
+
+    expected_factor = 2 / 7 + (1 - 2 / 7) * 0.5 * (1 + torch.cos(torch.tensor(torch.pi * 0.4)))
+    assert scheduler.last_epoch == 12_000
+    torch.testing.assert_close(
+        torch.tensor(optimizer.param_groups[0]["lr"]),
+        torch.tensor(7e-5) * expected_factor,
+    )

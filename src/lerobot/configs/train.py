@@ -13,6 +13,7 @@
 # limitations under the License.
 import builtins
 import datetime as dt
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,6 +64,19 @@ class TrainPipelineConfig(HubMixin):
     # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
     # regardless of what's provided with the training command at the time of resumption.
     resume: bool = False
+    # Optional optimizer-state-only resume mode. Policy weights, RNG, global
+    # step and Adam's per-parameter tensors (step/exp_avg/exp_avg_sq) are
+    # restored. Param-group hyperparameters remain those constructed from the
+    # current config, the old scheduler is ignored, and a phase-relative cosine
+    # schedule sets lr/initial_lr. Defaults preserve historical full resume.
+    resume_restart_scheduler: bool = False
+    resume_scheduler_start_lr: float | None = None
+    resume_scheduler_end_lr: float | None = None
+    resume_scheduler_decay_steps: int | None = None
+    # Persisted into checkpoints created by the restarted phase. It is filled
+    # from the first restored global step when omitted, allowing an interrupted
+    # restarted phase to reconstruct the same scheduler position later.
+    resume_scheduler_phase_start_step: int | None = None
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -104,6 +118,57 @@ class TrainPipelineConfig(HubMixin):
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
+        if self.resume and parser.get_path_arg("policy"):
+            raise ValueError(
+                "A config_path resume cannot also specify --policy.path; the policy must be "
+                "restored from the same checkpoint as its optimizer and training state."
+            )
+        if self.resume_restart_scheduler:
+            if not self.resume:
+                raise ValueError("resume_restart_scheduler=true requires resume=true.")
+            restart_values = {
+                "resume_scheduler_start_lr": self.resume_scheduler_start_lr,
+                "resume_scheduler_end_lr": self.resume_scheduler_end_lr,
+                "resume_scheduler_decay_steps": self.resume_scheduler_decay_steps,
+            }
+            missing = [name for name, value in restart_values.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "Restarting the resume scheduler requires explicit values for "
+                    f"{missing}."
+                )
+            start_lr = float(self.resume_scheduler_start_lr)
+            end_lr = float(self.resume_scheduler_end_lr)
+            decay_steps = self.resume_scheduler_decay_steps
+            if not math.isfinite(start_lr) or start_lr <= 0.0:
+                raise ValueError(
+                    "resume_scheduler_start_lr must be finite and positive, "
+                    f"got {self.resume_scheduler_start_lr!r}."
+                )
+            if not math.isfinite(end_lr) or end_lr < 0.0 or end_lr > start_lr:
+                raise ValueError(
+                    "resume_scheduler_end_lr must be finite and in [0, start_lr], "
+                    f"got {self.resume_scheduler_end_lr!r}."
+                )
+            if (
+                isinstance(decay_steps, bool)
+                or not isinstance(decay_steps, int)
+                or decay_steps < 1
+            ):
+                raise ValueError(
+                    "resume_scheduler_decay_steps must be a positive integer, "
+                    f"got {decay_steps!r}."
+                )
+            phase_start = self.resume_scheduler_phase_start_step
+            if phase_start is not None and (
+                isinstance(phase_start, bool)
+                or not isinstance(phase_start, int)
+                or phase_start < 0
+            ):
+                raise ValueError(
+                    "resume_scheduler_phase_start_step must be a non-negative integer or None, "
+                    f"got {phase_start!r}."
+                )
         if int(self.gradient_accumulation_steps) < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be at least 1, got {self.gradient_accumulation_steps}."
@@ -245,8 +310,36 @@ class TrainPipelineConfig(HubMixin):
                 ) from e
 
         cli_args = kwargs.pop("cli_args", [])
+        # Draccus builds the CLI parser from the annotated base policy type
+        # before it decodes the concrete policy choice stored in
+        # train_config.json. Consequently, nested ``--policy.*`` fields from a
+        # resume command are otherwise rejected as unknown. Parse the training
+        # config without those arguments, then apply the de-nested overrides to
+        # the concrete policy config next to the checkpoint.
+        policy_cli_overrides = parser.get_cli_overrides("policy", cli_args)
+        requested_policy_type = parser.get_type_arg("policy", cli_args)
+        has_policy_cli = bool(policy_cli_overrides) or requested_policy_type is not None
+        train_cli_args = (
+            [arg for arg in cli_args if not arg.startswith("--policy.")]
+            if has_policy_cli
+            else cli_args
+        )
         with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_args)
+            config = draccus.parse(cls, config_file, args=train_cli_args)
+
+        if requested_policy_type is not None and requested_policy_type != config.policy.type:
+            raise ValueError(
+                "A config_path resume cannot change the checkpoint policy type: "
+                f"checkpoint={config.policy.type!r}, requested={requested_policy_type!r}."
+            )
+        if policy_cli_overrides:
+            policy_dir = Path(config_file).parent
+            config.policy = PreTrainedConfig.from_pretrained(
+                policy_dir,
+                cli_overrides=policy_cli_overrides,
+            )
+            config.policy.pretrained_path = policy_dir
+        return config
 
 
 @dataclass(kw_only=True)

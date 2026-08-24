@@ -65,6 +65,26 @@ def test_save_and_load_optimizer_state(model_params, optimizer, tmp_path):
     torch.testing.assert_close(optimizer.state_dict(), loaded_optimizer.state_dict())
 
 
+def test_load_optimizer_state_can_keep_current_param_group_hyperparameters(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    saved_optimizer = torch.optim.AdamW([parameter], lr=1e-4, betas=(0.9, 0.95))
+    parameter.grad = torch.tensor([0.5, -0.25])
+    saved_optimizer.step()
+    save_optimizer_state(saved_optimizer, tmp_path)
+
+    current_optimizer = torch.optim.AdamW([parameter], lr=7e-5, betas=(0.8, 0.9))
+    loaded_optimizer = load_optimizer_state(
+        current_optimizer,
+        tmp_path,
+        restore_param_group_hyperparameters=False,
+    )
+
+    assert loaded_optimizer.param_groups[0]["lr"] == 7e-5
+    assert loaded_optimizer.param_groups[0]["betas"] == (0.8, 0.9)
+    for state_name, expected_value in saved_optimizer.state[parameter].items():
+        torch.testing.assert_close(loaded_optimizer.state[parameter][state_name], expected_value)
+
+
 @pytest.fixture
 def base_params_dict():
     return {

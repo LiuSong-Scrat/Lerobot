@@ -77,7 +77,7 @@ from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
-    load_training_state,
+    load_training_state_for_resume,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -3199,7 +3199,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        step, optimizer, lr_scheduler = load_training_state_for_resume(
+            cfg,
+            optimizer,
+            lr_scheduler,
+        )
+        if cfg.resume_restart_scheduler and is_main_process:
+            logging.info(
+                "Resumed Adam/RNG/global step with a phase-relative scheduler restart: "
+                "global_step=%s, phase_start_step=%s, phase_step=%s, start_lr=%s, "
+                "end_lr=%s, decay_steps=%s, current_lrs=%s",
+                step,
+                cfg.resume_scheduler_phase_start_step,
+                step - int(cfg.resume_scheduler_phase_start_step),
+                cfg.resume_scheduler_start_lr,
+                cfg.resume_scheduler_end_lr,
+                cfg.resume_scheduler_decay_steps,
+                [group["lr"] for group in optimizer.param_groups],
+            )
     if exact_global_batch_plan is not None and is_main_process:
         logging.info(
             "Exact global-batch partial-rank rotation at optimizer step %s: active ranks=%s",

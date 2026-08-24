@@ -21,7 +21,11 @@ from torch.optim.lr_scheduler import LRScheduler
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.utils import load_json, write_json
 from lerobot.optim.optimizers import load_optimizer_state, save_optimizer_state
-from lerobot.optim.schedulers import load_scheduler_state, save_scheduler_state
+from lerobot.optim.schedulers import (
+    build_phase_cosine_decay_scheduler,
+    load_scheduler_state,
+    save_scheduler_state,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
@@ -138,7 +142,12 @@ def save_training_state(
 
 
 def load_training_state(
-    checkpoint_dir: Path, optimizer: Optimizer, scheduler: LRScheduler | None
+    checkpoint_dir: Path,
+    optimizer: Optimizer,
+    scheduler: LRScheduler | None,
+    *,
+    restore_scheduler_state: bool = True,
+    restore_optimizer_param_group_hyperparameters: bool = True,
 ) -> tuple[int, Optimizer, LRScheduler | None]:
     """
     Loads the training step, optimizer state, scheduler state, and rng state.
@@ -148,6 +157,9 @@ def load_training_state(
         checkpoint_dir (Path): The checkpoint directory. Should contain a 'training_state' dir.
         optimizer (Optimizer): The optimizer to load the state_dict to.
         scheduler (LRScheduler | None): The scheduler to load the state_dict to (can be None).
+        restore_scheduler_state: Whether to restore the checkpoint scheduler state.
+        restore_optimizer_param_group_hyperparameters: Whether to restore the
+            checkpoint optimizer's param-group options in addition to Adam tensors.
 
     Raises:
         NotADirectoryError: If 'checkpoint_dir' doesn't contain a 'training_state' dir
@@ -162,8 +174,72 @@ def load_training_state(
 
     load_rng_state(training_state_dir)
     step = load_training_step(training_state_dir)
-    optimizer = load_optimizer_state(optimizer, training_state_dir)
-    if scheduler is not None:
+    optimizer = load_optimizer_state(
+        optimizer,
+        training_state_dir,
+        restore_param_group_hyperparameters=restore_optimizer_param_group_hyperparameters,
+    )
+    if scheduler is not None and restore_scheduler_state:
         scheduler = load_scheduler_state(scheduler, training_state_dir)
 
+    return step, optimizer, scheduler
+
+
+def load_training_state_for_resume(
+    cfg: TrainPipelineConfig,
+    optimizer: Optimizer,
+    scheduler: LRScheduler | None,
+) -> tuple[int, Optimizer, LRScheduler | None]:
+    """Load a checkpoint using either exact or optimizer-state-only resume.
+
+    The historical path remains the default. With
+    ``resume_restart_scheduler=true``, Adam tensor state and the global/RNG
+    state are restored while checkpoint param-group hyperparameters and
+    scheduler state are not. A phase-relative cosine scheduler then sets each
+    current param group's ``lr``/``initial_lr``.
+    """
+
+    if cfg.checkpoint_path is None:
+        raise ValueError("A checkpoint_path is required to resume training.")
+
+    restart_scheduler = bool(cfg.resume_restart_scheduler)
+    step, optimizer, scheduler = load_training_state(
+        cfg.checkpoint_path,
+        optimizer,
+        scheduler,
+        restore_scheduler_state=not restart_scheduler,
+        restore_optimizer_param_group_hyperparameters=not restart_scheduler,
+    )
+    if not restart_scheduler:
+        return step, optimizer, scheduler
+
+    phase_start_step = cfg.resume_scheduler_phase_start_step
+    if phase_start_step is None:
+        phase_start_step = step
+        # Persist the phase origin in every newly written train_config.json so
+        # an interruption reconstructs the same cosine position instead of
+        # restarting from the start LR a second time.
+        cfg.resume_scheduler_phase_start_step = phase_start_step
+    if phase_start_step > step:
+        raise ValueError(
+            "resume_scheduler_phase_start_step cannot exceed the restored global step: "
+            f"phase_start={phase_start_step}, restored_step={step}."
+        )
+
+    decay_steps = int(cfg.resume_scheduler_decay_steps)
+    scheduled_end_step = phase_start_step + decay_steps
+    if cfg.steps < scheduled_end_step:
+        raise ValueError(
+            "The configured total steps stop before the restarted scheduler reaches its end LR: "
+            f"steps={cfg.steps}, required_at_least={scheduled_end_step}, "
+            f"phase_start={phase_start_step}, decay_steps={decay_steps}."
+        )
+
+    scheduler = build_phase_cosine_decay_scheduler(
+        optimizer,
+        start_lr=float(cfg.resume_scheduler_start_lr),
+        end_lr=float(cfg.resume_scheduler_end_lr),
+        num_decay_steps=decay_steps,
+        phase_step=step - phase_start_step,
+    )
     return step, optimizer, scheduler

@@ -15,7 +15,10 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import torch
 
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
@@ -31,6 +34,7 @@ from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
+    load_training_state_for_resume,
     load_training_step,
     save_checkpoint,
     save_training_state,
@@ -112,3 +116,73 @@ def test_save_load_training_state(tmp_path, optimizer, scheduler):
     assert loaded_step == 10
     assert loaded_optimizer is optimizer
     assert loaded_scheduler is scheduler
+
+
+def test_resume_restart_scheduler_restores_adam_state_but_not_old_lr_state(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    saved_optimizer = torch.optim.AdamW([parameter], lr=1e-4, betas=(0.9, 0.95))
+    saved_scheduler = torch.optim.lr_scheduler.LambdaLR(saved_optimizer, lambda _: 0.3)
+    parameter.grad = torch.tensor([0.5, -0.25])
+    saved_optimizer.step()
+    saved_scheduler.step()
+    saved_optimizer.zero_grad(set_to_none=True)
+    saved_adam_state = {
+        name: value.detach().clone()
+        for name, value in saved_optimizer.state[parameter].items()
+    }
+    save_training_state(tmp_path, 4_500, saved_optimizer, saved_scheduler)
+
+    resumed_optimizer = torch.optim.AdamW([parameter], lr=9e-4, betas=(0.8, 0.9))
+    scheduler_to_discard = torch.optim.lr_scheduler.LambdaLR(resumed_optimizer, lambda _: 0.5)
+    cfg = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        resume_restart_scheduler=True,
+        resume_scheduler_start_lr=7e-5,
+        resume_scheduler_end_lr=2e-5,
+        resume_scheduler_decay_steps=30_000,
+        resume_scheduler_phase_start_step=None,
+        steps=34_500,
+    )
+
+    step, resumed_optimizer, resumed_scheduler = load_training_state_for_resume(
+        cfg,
+        resumed_optimizer,
+        scheduler_to_discard,
+    )
+
+    assert step == 4_500
+    assert cfg.resume_scheduler_phase_start_step == 4_500
+    assert resumed_scheduler is not scheduler_to_discard
+    assert resumed_scheduler.last_epoch == 0
+    assert resumed_optimizer.param_groups[0]["initial_lr"] == 7e-5
+    assert resumed_optimizer.param_groups[0]["lr"] == 7e-5
+    assert resumed_optimizer.param_groups[0]["betas"] == (0.8, 0.9)
+    for state_name, expected_value in saved_adam_state.items():
+        torch.testing.assert_close(resumed_optimizer.state[parameter][state_name], expected_value)
+
+
+def test_resume_helper_default_preserves_checkpoint_optimizer_and_scheduler(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    saved_optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+    saved_scheduler = torch.optim.lr_scheduler.LambdaLR(saved_optimizer, lambda _: 0.3)
+    parameter.grad = torch.tensor(0.5)
+    saved_optimizer.step()
+    saved_scheduler.step()
+    save_training_state(tmp_path, 12, saved_optimizer, saved_scheduler)
+
+    resumed_optimizer = torch.optim.AdamW([parameter], lr=7e-5)
+    resumed_scheduler = torch.optim.lr_scheduler.LambdaLR(resumed_optimizer, lambda _: 0.8)
+    cfg = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        resume_restart_scheduler=False,
+    )
+
+    step, resumed_optimizer, resumed_scheduler = load_training_state_for_resume(
+        cfg,
+        resumed_optimizer,
+        resumed_scheduler,
+    )
+
+    assert step == 12
+    assert resumed_optimizer.param_groups[0]["lr"] == saved_optimizer.param_groups[0]["lr"]
+    assert resumed_scheduler.state_dict() == saved_scheduler.state_dict()
