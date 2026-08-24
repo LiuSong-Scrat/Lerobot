@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import warnings
 from bisect import bisect_right
@@ -23,6 +24,11 @@ try:
 except Exception:  # pragma: no cover - optional CUDA extension.
     _pointops_knn_query = None
 
+try:
+    from pointops.sampling import farthest_point_sampling as _pointops_farthest_point_sampling
+except Exception:  # pragma: no cover - optional CUDA extension.
+    _pointops_farthest_point_sampling = None
+
 ROLE_BACKGROUND = 0
 ROLE_FOREGROUND = 1
 ROLE_IGNORE = -100
@@ -37,7 +43,8 @@ ROLE_COLORS = np.array(
 
 DEFAULT_FUTURE_OFFSETS = (1, 2, 4, 8, 16, 31)
 MOTION_PRIOR_DIM = 8
-POINTSEG_CACHE_VERSION = 11
+POINTSEG_CACHE_VERSION = 12
+POINTSEG_CACHE_COMPATIBLE_VERSIONS = (11, 12)
 POINTSEG_CACHE_FIELDS = (
     "point_cloud",
     "priors",
@@ -63,6 +70,7 @@ POINTSEG_CACHE_LABEL_FIELDS = (
 )
 
 _POINTOPS_KNN_FAILED = False
+_POINTOPS_FPS_FALLBACK_WARNED = False
 _TOOL_SWEEP_LOCAL_FALLBACK_WARNED = False
 _TOOL_SWEEP_OFFSETS_WARNED = False
 
@@ -81,6 +89,46 @@ def infer_litept_output_channels(backbone: nn.Module) -> int:
     if not output_linears:
         raise ValueError("Could not infer LitePT output channels from its final stage.")
     return int(output_linears[-1].out_features)
+
+
+def build_litept_grid_coord(coord: Tensor, batch: Tensor, grid_size: float) -> Tensor:
+    """Build LitePT grid coordinates with an independent origin per sample.
+
+    LitePT's fallback derives one origin from the minimum coordinate of the
+    entire packed batch.  That makes a sample's sparse coordinates depend on
+    which other samples happen to share the batch.  Compute the integer voxel
+    coordinates first, then shift each sample by its own lower grid corner so
+    the same point cloud receives the same ``grid_coord`` in every batch.
+    """
+
+    if coord.ndim != 2 or coord.shape[-1] != 3:
+        raise ValueError(f"Expected coord shape (P, 3), got {tuple(coord.shape)}.")
+    if batch.ndim != 1 or batch.shape[0] != coord.shape[0]:
+        raise ValueError(f"Expected batch shape ({coord.shape[0]},), got {tuple(batch.shape)}.")
+    if not math.isfinite(float(grid_size)) or float(grid_size) <= 0:
+        raise ValueError(f"grid_size must be finite and positive, got {grid_size!r}.")
+    if coord.shape[0] == 0:
+        return torch.empty_like(coord, dtype=torch.int32)
+
+    batch = batch.to(device=coord.device, dtype=torch.long)
+    if bool((batch < 0).any().item()):
+        raise ValueError("batch indices must be non-negative.")
+    raw_grid = torch.floor(coord / float(grid_size)).to(dtype=torch.int32)
+    sample_count = int(batch.max().item()) + 1
+    sample_min = torch.full(
+        (sample_count, 3),
+        torch.iinfo(raw_grid.dtype).max,
+        dtype=raw_grid.dtype,
+        device=raw_grid.device,
+    )
+    sample_min.scatter_reduce_(
+        0,
+        batch[:, None].expand_as(raw_grid),
+        raw_grid,
+        reduce="amin",
+        include_self=True,
+    )
+    return raw_grid - sample_min[batch]
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -552,8 +600,963 @@ def parse_camera_views(value: Any = None) -> tuple[str, ...]:
     return views
 
 
+def parse_camera_view_weights(
+    value: Any = None,
+    *,
+    num_views: int | None = None,
+) -> tuple[float, ...] | None:
+    """Parse optional per-view scene-point sampling weights.
+
+    ``None`` preserves the legacy equal-budget composition.  Weights are
+    normalized by :func:`compose_point_cloud_views`; only their ratios matter.
+    """
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        text = str(value).strip().strip("[]")
+        parts = [part.strip().strip("\"'") for part in text.split(",")]
+    weights = tuple(float(part) for part in parts if str(part).strip())
+    if not weights:
+        return None
+    if num_views is not None and len(weights) != int(num_views):
+        raise ValueError(
+            f"camera view weights must contain one value per view: got {weights} "
+            f"for {int(num_views)} views."
+        )
+    if any(not np.isfinite(weight) or weight <= 0.0 for weight in weights):
+        raise ValueError(f"camera view weights must be finite and positive, got {weights}.")
+    return weights
+
+
 def point_cloud_dir_for_view(dataset_root: str | Path, view: str) -> Path:
     return Path(dataset_root) / POINT_CLOUD_VIEW_DIRS[str(view)]
+
+
+def use_primary_view_for_training_index(dataset_index: int, seed: int = 20260812) -> bool:
+    """Deterministic Bernoulli(0.5) assignment for input-level view dropout.
+
+    SplitMix64 avoids correlations between sequential frame indices while
+    remaining independent of DataLoader worker count and scheduling.  This is
+    training input selection only; it never changes inference or model layers.
+    """
+
+    value = (int(dataset_index) + int(seed)) & 0xFFFFFFFFFFFFFFFF
+    value = (value + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    value ^= value >> 31
+    return bool(value & 1)
+
+
+def paired_view_augmentation_index(
+    augmented_index: int,
+    num_samples: int,
+    seed: int = 20260812,
+) -> tuple[int, bool]:
+    """Map a two-copy augmented index to its frame and complementary view mode."""
+
+    augmented_index = int(augmented_index)
+    num_samples = int(num_samples)
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}.")
+    if augmented_index < 0 or augmented_index >= 2 * num_samples:
+        raise IndexError(
+            f"augmented_index must be in [0, {2 * num_samples}), got {augmented_index}."
+        )
+    base_index = augmented_index % num_samples
+    second_copy = augmented_index >= num_samples
+    use_primary = use_primary_view_for_training_index(base_index, seed)
+    return base_index, bool(use_primary) ^ bool(second_copy)
+
+
+def parse_camera_view_fusion(value: Any = None) -> str:
+    """Parse the multi-view composition mode while preserving old checkpoints."""
+
+    if value is None or not str(value).strip():
+        return "legacy_budget"
+    mode = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "legacy": "legacy_budget",
+        "budget": "legacy_budget",
+        "legacy_budget": "legacy_budget",
+        "fps": "fps",
+        "voxel_fps": "voxel_fps",
+        "voxelized_fps": "voxel_fps",
+        "voxel_cover_fps": "voxel_cover_fps",
+        "voxel_coverage_fps": "voxel_cover_fps",
+        "novelty_union": "novelty_union",
+        "novelty": "novelty_union",
+        "multiscale_novelty_union": "multiscale_novelty_union",
+        "multiscale_novelty": "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union": "consensus_multiscale_novelty_union",
+        "consensus_multiscale_novelty": "consensus_multiscale_novelty_union",
+        "transport_novelty_union": "transport_novelty_union",
+        "transport_novelty": "transport_novelty_union",
+        "uniform_union": "uniform_union",
+        "random_union": "uniform_union",
+        "union_random": "uniform_union",
+        "full_union": "full_union",
+        "union_all": "full_union",
+        "primary_residual": "primary_residual",
+        "residual": "primary_residual",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "camera view fusion must be 'legacy_budget', 'fps', 'voxel_fps', "
+            "'voxel_cover_fps', 'novelty_union', 'multiscale_novelty_union', "
+            "'consensus_multiscale_novelty_union', "
+            "'transport_novelty_union', "
+            "'uniform_union', 'full_union', "
+            "or 'primary_residual'; "
+            f"got {value!r}."
+        )
+    return aliases[mode]
+
+
+def _torch_farthest_point_indices(xyz: Tensor, count: int) -> Tensor:
+    """Deterministic exact FPS fallback for CPU tests or missing pointops."""
+
+    if xyz.ndim != 2 or xyz.shape[-1] != 3:
+        raise ValueError(f"Expected xyz shape (N,3), got {tuple(xyz.shape)}.")
+    count = int(count)
+    if count <= 0 or count > xyz.shape[0]:
+        raise ValueError(f"FPS count must be in [1, {xyz.shape[0]}], got {count}.")
+    selected = torch.empty(count, dtype=torch.long, device=xyz.device)
+    distances = torch.full((xyz.shape[0],), torch.inf, dtype=xyz.dtype, device=xyz.device)
+    farthest = torch.zeros((), dtype=torch.long, device=xyz.device)
+    for sample_index in range(count):
+        selected[sample_index] = farthest
+        centroid = xyz[farthest]
+        distances = torch.minimum(distances, torch.sum((xyz - centroid) ** 2, dim=-1))
+        farthest = torch.argmax(distances)
+    return selected
+
+
+def fps_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """FPS an equal multi-view scene union while preserving one gripper tail."""
+
+    global _POINTOPS_FPS_FALLBACK_WARNED
+    if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
+        raise ValueError(f"Expected point cloud shape (B,N,6), got {tuple(point_cloud.shape)}.")
+    batch_size, source_points, _ = point_cloud.shape
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    if target_points <= 0 or not 0 <= gripper_points < target_points:
+        raise ValueError("FPS target/gripper counts are invalid.")
+    if source_points < target_points:
+        raise ValueError(f"Cannot FPS sample {target_points} points from {source_points} points.")
+    identity = torch.arange(source_points, device=point_cloud.device, dtype=torch.long)
+    identity = identity.unsqueeze(0).expand(batch_size, -1)
+    if source_points == target_points:
+        return point_cloud, point_is_pad, identity
+
+    source_scene_points = source_points - gripper_points
+    target_scene_points = target_points - gripper_points
+    if source_scene_points < target_scene_points:
+        raise ValueError("Source scene has fewer points than the requested FPS scene budget.")
+    if torch.is_tensor(point_is_pad):
+        if point_is_pad.shape != (batch_size, source_points):
+            raise ValueError(
+                f"point_is_pad must have shape {(batch_size, source_points)}, got {tuple(point_is_pad.shape)}."
+            )
+        if bool(point_is_pad[:, :source_scene_points].any().item()):
+            raise ValueError("FPS fusion requires fixed-size, unpadded scene unions.")
+
+    scene_xyz = point_cloud[:, :source_scene_points, :3].contiguous()
+    if point_cloud.is_cuda and _pointops_farthest_point_sampling is not None:
+        flat_xyz = scene_xyz.reshape(-1, 3).contiguous()
+        offsets = torch.arange(1, batch_size + 1, device=point_cloud.device, dtype=torch.int32)
+        offsets = offsets * source_scene_points
+        new_offsets = torch.arange(1, batch_size + 1, device=point_cloud.device, dtype=torch.int32)
+        new_offsets = new_offsets * target_scene_points
+        flat_indices = _pointops_farthest_point_sampling(flat_xyz, offsets, new_offsets).long()
+        batch_offsets = torch.arange(batch_size, device=point_cloud.device, dtype=torch.long)
+        batch_offsets = batch_offsets.repeat_interleave(target_scene_points) * source_scene_points
+        scene_indices = (flat_indices - batch_offsets).reshape(batch_size, target_scene_points)
+    else:
+        if not _POINTOPS_FPS_FALLBACK_WARNED:
+            warnings.warn(
+                "pointops CUDA FPS is unavailable; using deterministic PyTorch FPS. "
+                "This fallback is intended for small tests only.",
+                stacklevel=2,
+            )
+            _POINTOPS_FPS_FALLBACK_WARNED = True
+        scene_indices = torch.stack(
+            [_torch_farthest_point_indices(scene_xyz[index], target_scene_points) for index in range(batch_size)],
+            dim=0,
+        )
+
+    gripper_indices = torch.arange(
+        source_scene_points, source_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.cat([scene_indices, gripper_indices], dim=1)
+    gather_indices = indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1])
+    sampled = torch.gather(point_cloud, 1, gather_indices)
+    sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
+    return sampled, sampled_pad, indices
+
+
+def voxel_fps_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.005,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Deduplicate overlapping view samples by voxel, then apply shared-space FPS.
+
+    The operation is view-count agnostic.  Each occupied voxel contributes its
+    first point in the configured view order; when too few voxels remain for the
+    requested budget, the function safely falls back to the original union FPS.
+    The primary gripper tail is always preserved exactly.
+    """
+
+    if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
+        raise ValueError(f"Expected point cloud shape (B,N,6), got {tuple(point_cloud.shape)}.")
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    voxel_size = float(voxel_size)
+    if not np.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise ValueError(f"voxel_size must be finite and positive, got {voxel_size}.")
+    batch_size, source_points, _ = point_cloud.shape
+    if source_points <= target_points:
+        return fps_sample_fused_point_cloud(
+            point_cloud,
+            target_points=target_points,
+            gripper_points=gripper_points,
+            point_is_pad=point_is_pad,
+        )
+    source_scene_points = source_points - gripper_points
+    target_scene_points = target_points - gripper_points
+    if torch.is_tensor(point_is_pad) and bool(point_is_pad[:, :source_scene_points].any().item()):
+        raise ValueError("Voxel-FPS fusion requires fixed-size, unpadded scene unions.")
+
+    scene_xyz = point_cloud[:, :source_scene_points, :3].contiguous()
+    flat_scene_xyz = scene_xyz.reshape(-1, 3)
+    batch_ids = torch.arange(batch_size, device=point_cloud.device, dtype=torch.int64)
+    batch_ids = batch_ids.repeat_interleave(source_scene_points).unsqueeze(1)
+    voxel_coords = torch.floor(flat_scene_xyz / voxel_size).to(torch.int64)
+    unique_voxels, inverse = torch.unique(
+        torch.cat([batch_ids, voxel_coords], dim=1), dim=0, return_inverse=True
+    )
+    flat_indices = torch.arange(
+        batch_size * source_scene_points, device=point_cloud.device, dtype=torch.long
+    )
+    representatives = torch.full(
+        (unique_voxels.shape[0],),
+        batch_size * source_scene_points,
+        device=point_cloud.device,
+        dtype=torch.long,
+    )
+    representatives.scatter_reduce_(0, inverse, flat_indices, reduce="amin", include_self=True)
+    voxel_counts = torch.bincount(unique_voxels[:, 0], minlength=batch_size).cpu().tolist()
+
+    candidate_indices: list[Tensor] = []
+    candidate_global_indices: list[Tensor] = []
+    all_scene_indices = torch.arange(source_scene_points, device=point_cloud.device, dtype=torch.long)
+    voxel_start = 0
+    for batch_index in range(batch_size):
+        voxel_count = int(voxel_counts[batch_index])
+        if voxel_count >= target_scene_points:
+            global_indices = representatives[voxel_start : voxel_start + voxel_count]
+            candidate_global_indices.append(global_indices)
+            candidate_indices.append(global_indices - batch_index * source_scene_points)
+        else:
+            candidate_global_indices.append(all_scene_indices + batch_index * source_scene_points)
+            candidate_indices.append(all_scene_indices)
+        voxel_start += voxel_count
+
+    candidate_xyz = flat_scene_xyz.index_select(0, torch.cat(candidate_global_indices)).contiguous()
+    candidate_source_indices = torch.cat(candidate_indices, dim=0)
+    candidate_counts = torch.tensor(
+        [indices.numel() for indices in candidate_indices], device=point_cloud.device, dtype=torch.int32
+    )
+    offsets = torch.cumsum(candidate_counts, dim=0)
+    new_offsets = torch.arange(1, batch_size + 1, device=point_cloud.device, dtype=torch.int32)
+    new_offsets = new_offsets * target_scene_points
+    if point_cloud.is_cuda and _pointops_farthest_point_sampling is not None:
+        selected_flat = _pointops_farthest_point_sampling(candidate_xyz, offsets, new_offsets).long()
+        selected_source = candidate_source_indices.index_select(0, selected_flat)
+        scene_indices = selected_source.reshape(batch_size, target_scene_points)
+    else:
+        starts = torch.cat([offsets.new_zeros(1), offsets[:-1]]).long()
+        selected_rows = []
+        for batch_index, indices in enumerate(candidate_indices):
+            start = int(starts[batch_index].item())
+            count = int(indices.numel())
+            local = _torch_farthest_point_indices(candidate_xyz[start : start + count], target_scene_points)
+            selected_rows.append(indices.index_select(0, local))
+        scene_indices = torch.stack(selected_rows, dim=0)
+
+    gripper_indices = torch.arange(
+        source_scene_points, source_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.cat([scene_indices, gripper_indices], dim=1)
+    sampled = torch.gather(point_cloud, 1, indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1]))
+    sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
+    return sampled, sampled_pad, indices
+
+
+def voxel_cover_fps_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Cover occupied shared-space voxels, then use union FPS for detail.
+
+    Every occupied voxel is represented whenever the voxel count fits the
+    scene budget.  Remaining slots are filled in deterministic union-FPS order,
+    which retains geometric detail without assigning a fixed budget to any
+    camera.  If occupied voxels exceed the budget, FPS is applied to the voxel
+    representatives.  The operation is view-count agnostic and is an identity
+    for an already target-sized single-view cloud.
+    """
+
+    if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
+        raise ValueError(f"Expected point cloud shape (B,N,6), got {tuple(point_cloud.shape)}.")
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    voxel_size = float(voxel_size)
+    if not np.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise ValueError(f"voxel_size must be finite and positive, got {voxel_size}.")
+    batch_size, source_points, _ = point_cloud.shape
+    if source_points == target_points:
+        identity = torch.arange(source_points, device=point_cloud.device, dtype=torch.long)
+        identity = identity.unsqueeze(0).expand(batch_size, -1)
+        return point_cloud, point_is_pad, identity
+    if source_points < target_points:
+        raise ValueError(f"Cannot sample {target_points} points from {source_points} points.")
+    source_scene_points = source_points - gripper_points
+    target_scene_points = target_points - gripper_points
+    if source_scene_points < target_scene_points:
+        raise ValueError("Source scene has fewer points than the requested scene budget.")
+    if torch.is_tensor(point_is_pad):
+        if point_is_pad.shape != (batch_size, source_points):
+            raise ValueError(
+                f"point_is_pad must have shape {(batch_size, source_points)}, got {tuple(point_is_pad.shape)}."
+            )
+        if bool(point_is_pad[:, :source_scene_points].any().item()):
+            raise ValueError("Voxel-cover FPS requires fixed-size, unpadded scene unions.")
+
+    scene_xyz = point_cloud[:, :source_scene_points, :3].contiguous()
+    flat_scene_xyz = scene_xyz.reshape(-1, 3)
+    batch_ids = torch.arange(batch_size, device=point_cloud.device, dtype=torch.int64)
+    batch_ids = batch_ids.repeat_interleave(source_scene_points).unsqueeze(1)
+    voxel_coords = torch.floor(flat_scene_xyz / voxel_size).to(torch.int64)
+    unique_voxels, inverse = torch.unique(
+        torch.cat([batch_ids, voxel_coords], dim=1), dim=0, return_inverse=True
+    )
+    flat_indices = torch.arange(
+        batch_size * source_scene_points, device=point_cloud.device, dtype=torch.long
+    )
+    representatives = torch.full(
+        (unique_voxels.shape[0],),
+        batch_size * source_scene_points,
+        device=point_cloud.device,
+        dtype=torch.long,
+    )
+    representatives.scatter_reduce_(0, inverse, flat_indices, reduce="amin", include_self=True)
+    voxel_counts = torch.bincount(unique_voxels[:, 0], minlength=batch_size).cpu().tolist()
+
+    # A complete union-FPS ordering supplies spatially distributed extra detail
+    # for samples whose voxel cover uses fewer than the available scene slots.
+    _, _, union_fps_indices = fps_sample_fused_point_cloud(
+        point_cloud,
+        target_points=target_points,
+        gripper_points=gripper_points,
+        point_is_pad=point_is_pad,
+    )
+    union_fps_scene = union_fps_indices[:, :target_scene_points]
+
+    scene_rows: list[Tensor] = []
+    voxel_start = 0
+    all_scene_indices = torch.arange(source_scene_points, device=point_cloud.device, dtype=torch.long)
+    for batch_index in range(batch_size):
+        voxel_count = int(voxel_counts[batch_index])
+        reps = representatives[voxel_start : voxel_start + voxel_count]
+        reps = reps - batch_index * source_scene_points
+        voxel_start += voxel_count
+        if voxel_count >= target_scene_points:
+            rep_xyz = scene_xyz[batch_index].index_select(0, reps).contiguous()
+            if point_cloud.is_cuda and _pointops_farthest_point_sampling is not None:
+                offsets = torch.tensor([voxel_count], device=point_cloud.device, dtype=torch.int32)
+                new_offsets = torch.tensor(
+                    [target_scene_points], device=point_cloud.device, dtype=torch.int32
+                )
+                local = _pointops_farthest_point_sampling(rep_xyz, offsets, new_offsets).long()
+            else:
+                local = _torch_farthest_point_indices(rep_xyz, target_scene_points)
+            scene_rows.append(reps.index_select(0, local))
+            continue
+
+        selected_mask = torch.zeros(source_scene_points, dtype=torch.bool, device=point_cloud.device)
+        selected_mask[reps] = True
+        fps_extras = union_fps_scene[batch_index]
+        fps_extras = fps_extras[~selected_mask[fps_extras]]
+        need = target_scene_points - voxel_count
+        if fps_extras.numel() < need:
+            selected_mask[fps_extras] = True
+            fallback_extras = all_scene_indices[~selected_mask]
+            fps_extras = torch.cat([fps_extras, fallback_extras[: need - fps_extras.numel()]])
+        scene_rows.append(torch.cat([reps, fps_extras[:need]]))
+    scene_indices = torch.stack(scene_rows)
+
+    gripper_indices = torch.arange(
+        source_scene_points, source_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.cat([scene_indices, gripper_indices], dim=1)
+    sampled = torch.gather(point_cloud, 1, indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1]))
+    sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
+    return sampled, sampled_pad, indices
+
+
+def novelty_union_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    point_is_pad: Tensor | None = None,
+    local_transport: bool = False,
+    coarse_novelty_scale: float | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Preserve the primary cloud and insert only secondary-view novel voxels.
+
+    Secondary representatives replace primary samples only from voxels that
+    already contain another retained primary point.  Thus every primary-view
+    occupied voxel and the complete primary gripper tail survive, while the
+    number of secondary points is determined by geometric coverage rather than
+    a camera ratio or a learned gate.
+    """
+
+    if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
+        raise ValueError(f"Expected point cloud shape (B,N,6), got {tuple(point_cloud.shape)}.")
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    voxel_size = float(voxel_size)
+    if not np.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise ValueError(f"voxel_size must be finite and positive, got {voxel_size}.")
+    if coarse_novelty_scale is not None and (
+        not np.isfinite(float(coarse_novelty_scale)) or float(coarse_novelty_scale) <= 1.0
+    ):
+        raise ValueError("coarse_novelty_scale must be finite and greater than one.")
+    batch_size, source_points, _ = point_cloud.shape
+    if source_points == target_points:
+        identity = torch.arange(source_points, device=point_cloud.device, dtype=torch.long)
+        identity = identity.unsqueeze(0).expand(batch_size, -1)
+        return point_cloud, point_is_pad, identity
+    source_scene_points = source_points - gripper_points
+    target_scene_points = target_points - gripper_points
+    if source_scene_points < target_scene_points or source_scene_points % target_scene_points != 0:
+        raise ValueError(
+            "Novelty-union expects an ordered union of equal per-view scene budgets; "
+            f"source_scene_points={source_scene_points}, target_scene_points={target_scene_points}."
+        )
+    if torch.is_tensor(point_is_pad) and bool(point_is_pad[:, :source_scene_points].any().item()):
+        raise ValueError("Novelty-union fusion requires fixed-size, unpadded scene unions.")
+
+    scene_xyz = point_cloud[:, :source_scene_points, :3].contiguous()
+    flat_xyz = scene_xyz.reshape(-1, 3)
+    local_indices = torch.arange(source_scene_points, device=point_cloud.device, dtype=torch.long)
+    flat_local_indices = local_indices.repeat(batch_size)
+    batch_ids = torch.arange(batch_size, device=point_cloud.device, dtype=torch.int64)
+    batch_ids = batch_ids.repeat_interleave(source_scene_points)
+    quantized = torch.floor(flat_xyz / voxel_size).to(torch.int64)
+    unique_voxels, inverse = torch.unique(
+        torch.cat([batch_ids.unsqueeze(1), quantized], dim=1), dim=0, return_inverse=True
+    )
+    total_scene_points = batch_size * source_scene_points
+    flat_global_indices = torch.arange(total_scene_points, device=point_cloud.device, dtype=torch.long)
+    sentinel = total_scene_points
+    first_primary = torch.full(
+        (unique_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+    )
+    first_secondary = first_primary.clone()
+    primary_mask = flat_local_indices < target_scene_points
+    first_primary.scatter_reduce_(
+        0,
+        inverse[primary_mask],
+        flat_global_indices[primary_mask],
+        reduce="amin",
+        include_self=True,
+    )
+    first_secondary.scatter_reduce_(
+        0,
+        inverse[~primary_mask],
+        flat_global_indices[~primary_mask],
+        reduce="amin",
+        include_self=True,
+    )
+    if coarse_novelty_scale is None:
+        novel_global = first_secondary[(first_primary == sentinel) & (first_secondary != sentinel)]
+    else:
+        # A secondary point is admitted only when its coarser occupied cell is
+        # absent from the complete primary cloud.  One representative per
+        # coarse novel cell suppresses fine-grid boundary/sampling noise while
+        # the independent fine grid below still protects every primary
+        # occupied cell.  The insertion count is determined by geometry; no
+        # camera ratio, point quota, task rule, or primary/secondary pairing is
+        # used.
+        coarse_quantized = torch.floor(
+            flat_xyz / (voxel_size * float(coarse_novelty_scale))
+        ).to(torch.int64)
+        coarse_voxels, coarse_inverse = torch.unique(
+            torch.cat([batch_ids.unsqueeze(1), coarse_quantized], dim=1),
+            dim=0,
+            return_inverse=True,
+        )
+        coarse_first_primary = torch.full(
+            (coarse_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+        )
+        coarse_first_secondary = coarse_first_primary.clone()
+        coarse_first_primary.scatter_reduce_(
+            0,
+            coarse_inverse[primary_mask],
+            flat_global_indices[primary_mask],
+            reduce="amin",
+            include_self=True,
+        )
+        coarse_first_secondary.scatter_reduce_(
+            0,
+            coarse_inverse[~primary_mask],
+            flat_global_indices[~primary_mask],
+            reduce="amin",
+            include_self=True,
+        )
+        novel_global = coarse_first_secondary[
+            (coarse_first_primary == sentinel) & (coarse_first_secondary != sentinel)
+        ]
+    redundant_primary_global = flat_global_indices[
+        primary_mask & (flat_global_indices != first_primary[inverse])
+    ]
+    novel_batches = torch.div(novel_global, source_scene_points, rounding_mode="floor")
+    redundant_batches = torch.div(
+        redundant_primary_global, source_scene_points, rounding_mode="floor"
+    )
+    novel_counts = torch.bincount(novel_batches, minlength=batch_size).cpu().tolist()
+    redundant_counts = torch.bincount(redundant_batches, minlength=batch_size).cpu().tolist()
+
+    scene_indices = torch.arange(
+        target_scene_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).repeat(batch_size, 1)
+    novel_start = 0
+    redundant_start = 0
+    for batch_index in range(batch_size):
+        novel_count = int(novel_counts[batch_index])
+        redundant_count = int(redundant_counts[batch_index])
+        insert_count = min(novel_count, redundant_count)
+        if insert_count:
+            removable = redundant_primary_global[
+                redundant_start : redundant_start + redundant_count
+            ] % source_scene_points
+            additions = novel_global[novel_start : novel_start + novel_count] % source_scene_points
+            if local_transport:
+                removable_local, additions_local = _local_transport_replacement_pairs(
+                    scene_xyz[batch_index].index_select(0, additions),
+                    scene_xyz[batch_index].index_select(0, removable),
+                )
+                removable = removable.index_select(0, removable_local)
+                additions = additions.index_select(0, additions_local)
+            else:
+                removable = removable[:insert_count]
+                additions = additions[:insert_count]
+            scene_indices[batch_index, removable] = additions
+        novel_start += novel_count
+        redundant_start += redundant_count
+
+    gripper_indices = torch.arange(
+        source_scene_points, source_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.cat([scene_indices, gripper_indices], dim=1)
+    sampled = torch.gather(point_cloud, 1, indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1]))
+    sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
+    return sampled, sampled_pad, indices
+
+
+def multiscale_novelty_union_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    coarse_novelty_scale: float = 3.0,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Insert only coarse-persistent secondary coverage into a fine-protected primary cloud.
+
+    The configured voxel size protects every occupied primary cell.  Secondary
+    coverage must remain novel on the configured coarser grid, and only one
+    representative of each coarse novel cell is inserted.  This is a
+    view-count-agnostic input coreset: it changes no model module and assigns no
+    fixed point budget to any camera.
+    """
+
+    return novelty_union_sample_fused_point_cloud(
+        point_cloud,
+        target_points=target_points,
+        gripper_points=gripper_points,
+        voxel_size=voxel_size,
+        point_is_pad=point_is_pad,
+        coarse_novelty_scale=coarse_novelty_scale,
+    )
+
+
+def consensus_multiscale_novelty_union_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    coarse_novelty_scale: float = 4.0,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Fuse overlapping views by voxel medoids and retain coarse novel coverage.
+
+    Every fine voxel occupied by the primary view keeps exactly one protected
+    representative.  When points from other views occupy that same voxel, the
+    protected representative is the *real input point* nearest the union
+    centroid, rather than always the first (therefore primary) array entry.
+    Secondary-only coverage is admitted only when it remains novel on the
+    configured coarser grid, with one secondary medoid per coarse cell.
+
+    The output is an exact-index coreset: no synthetic point, camera quota,
+    learned gate, semantic rule, or local point-to-point transport is used.
+    The primary fine-cell cover and primary gripper tail are preserved, and an
+    already target-sized single-view cloud remains byte-identical.
+    """
+
+    if point_cloud.ndim != 3 or point_cloud.shape[-1] != 6:
+        raise ValueError(f"Expected point cloud shape (B,N,6), got {tuple(point_cloud.shape)}.")
+    target_points = int(target_points)
+    gripper_points = int(gripper_points)
+    voxel_size = float(voxel_size)
+    coarse_novelty_scale = float(coarse_novelty_scale)
+    if not np.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise ValueError(f"voxel_size must be finite and positive, got {voxel_size}.")
+    if not np.isfinite(coarse_novelty_scale) or coarse_novelty_scale <= 1.0:
+        raise ValueError("coarse_novelty_scale must be finite and greater than one.")
+
+    batch_size, source_points, _ = point_cloud.shape
+    if source_points == target_points:
+        identity = torch.arange(source_points, device=point_cloud.device, dtype=torch.long)
+        identity = identity.unsqueeze(0).expand(batch_size, -1)
+        return point_cloud, point_is_pad, identity
+
+    source_scene_points = source_points - gripper_points
+    target_scene_points = target_points - gripper_points
+    if source_scene_points < target_scene_points or source_scene_points % target_scene_points != 0:
+        raise ValueError(
+            "Consensus multiscale fusion expects an ordered union of equal per-view scene budgets; "
+            f"source_scene_points={source_scene_points}, target_scene_points={target_scene_points}."
+        )
+    if torch.is_tensor(point_is_pad):
+        if point_is_pad.shape != (batch_size, source_points):
+            raise ValueError(
+                f"point_is_pad must have shape {(batch_size, source_points)}, got {tuple(point_is_pad.shape)}."
+            )
+        if bool(point_is_pad[:, :source_scene_points].any().item()):
+            raise ValueError("Consensus multiscale fusion requires fixed-size, unpadded scene unions.")
+
+    scene_xyz = point_cloud[:, :source_scene_points, :3].contiguous()
+    flat_xyz = scene_xyz.reshape(-1, 3)
+    flat_local_indices = torch.arange(
+        source_scene_points, device=point_cloud.device, dtype=torch.long
+    ).repeat(batch_size)
+    batch_ids = torch.arange(batch_size, device=point_cloud.device, dtype=torch.int64)
+    batch_ids = batch_ids.repeat_interleave(source_scene_points)
+    primary_mask = flat_local_indices < target_scene_points
+    flat_global_indices = torch.arange(
+        batch_size * source_scene_points, device=point_cloud.device, dtype=torch.long
+    )
+    sentinel = batch_size * source_scene_points
+
+    fine_quantized = torch.floor(flat_xyz / voxel_size).to(torch.int64)
+    fine_voxels, fine_inverse = torch.unique(
+        torch.cat([batch_ids.unsqueeze(1), fine_quantized], dim=1),
+        dim=0,
+        return_inverse=True,
+    )
+    fine_count = torch.bincount(fine_inverse, minlength=fine_voxels.shape[0])
+    fine_sum = torch.zeros(
+        (fine_voxels.shape[0], 3), device=point_cloud.device, dtype=flat_xyz.dtype
+    )
+    fine_sum.index_add_(0, fine_inverse, flat_xyz)
+    fine_centroid = fine_sum / fine_count.to(flat_xyz.dtype).unsqueeze(1)
+    fine_distance = torch.sum((flat_xyz - fine_centroid.index_select(0, fine_inverse)) ** 2, dim=1)
+    fine_min_distance = torch.full(
+        (fine_voxels.shape[0],), torch.inf, device=point_cloud.device, dtype=flat_xyz.dtype
+    )
+    fine_min_distance.scatter_reduce_(
+        0, fine_inverse, fine_distance, reduce="amin", include_self=True
+    )
+    fine_medoid = torch.full(
+        (fine_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+    )
+    fine_is_medoid = fine_distance == fine_min_distance.index_select(0, fine_inverse)
+    fine_medoid.scatter_reduce_(
+        0,
+        fine_inverse[fine_is_medoid],
+        flat_global_indices[fine_is_medoid],
+        reduce="amin",
+        include_self=True,
+    )
+    first_primary = torch.full_like(fine_medoid, sentinel)
+    first_primary.scatter_reduce_(
+        0,
+        fine_inverse[primary_mask],
+        flat_global_indices[primary_mask],
+        reduce="amin",
+        include_self=True,
+    )
+    primary_fine_voxel = first_primary != sentinel
+
+    coarse_quantized = torch.floor(
+        flat_xyz / (voxel_size * coarse_novelty_scale)
+    ).to(torch.int64)
+    coarse_voxels, coarse_inverse = torch.unique(
+        torch.cat([batch_ids.unsqueeze(1), coarse_quantized], dim=1),
+        dim=0,
+        return_inverse=True,
+    )
+    coarse_first_primary = torch.full(
+        (coarse_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+    )
+    coarse_first_primary.scatter_reduce_(
+        0,
+        coarse_inverse[primary_mask],
+        flat_global_indices[primary_mask],
+        reduce="amin",
+        include_self=True,
+    )
+    secondary_mask = ~primary_mask
+    coarse_secondary_count = torch.bincount(
+        coarse_inverse[secondary_mask], minlength=coarse_voxels.shape[0]
+    )
+    coarse_secondary_sum = torch.zeros(
+        (coarse_voxels.shape[0], 3), device=point_cloud.device, dtype=flat_xyz.dtype
+    )
+    coarse_secondary_sum.index_add_(
+        0, coarse_inverse[secondary_mask], flat_xyz[secondary_mask]
+    )
+    coarse_secondary_centroid = coarse_secondary_sum / coarse_secondary_count.clamp_min(1).to(
+        flat_xyz.dtype
+    ).unsqueeze(1)
+    secondary_coarse_inverse = coarse_inverse[secondary_mask]
+    secondary_distance = torch.sum(
+        (
+            flat_xyz[secondary_mask]
+            - coarse_secondary_centroid.index_select(0, secondary_coarse_inverse)
+        )
+        ** 2,
+        dim=1,
+    )
+    coarse_min_secondary_distance = torch.full(
+        (coarse_voxels.shape[0],), torch.inf, device=point_cloud.device, dtype=flat_xyz.dtype
+    )
+    coarse_min_secondary_distance.scatter_reduce_(
+        0,
+        secondary_coarse_inverse,
+        secondary_distance,
+        reduce="amin",
+        include_self=True,
+    )
+    coarse_secondary_medoid = torch.full(
+        (coarse_voxels.shape[0],), sentinel, device=point_cloud.device, dtype=torch.long
+    )
+    secondary_global_indices = flat_global_indices[secondary_mask]
+    secondary_is_medoid = secondary_distance == coarse_min_secondary_distance.index_select(
+        0, secondary_coarse_inverse
+    )
+    coarse_secondary_medoid.scatter_reduce_(
+        0,
+        secondary_coarse_inverse[secondary_is_medoid],
+        secondary_global_indices[secondary_is_medoid],
+        reduce="amin",
+        include_self=True,
+    )
+    coarse_novel = (coarse_first_primary == sentinel) & (coarse_secondary_count > 0)
+    novel_global = coarse_secondary_medoid[coarse_novel]
+
+    scene_indices = torch.arange(
+        target_scene_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).repeat(batch_size, 1)
+    protected_positions = torch.zeros(
+        (batch_size, target_scene_points), device=point_cloud.device, dtype=torch.bool
+    )
+
+    primary_voxel_ids = torch.nonzero(primary_fine_voxel, as_tuple=False).flatten()
+    primary_representatives = fine_medoid.index_select(0, primary_voxel_ids)
+    primary_slots = first_primary.index_select(0, primary_voxel_ids)
+    representative_batches = fine_voxels.index_select(0, primary_voxel_ids)[:, 0].long()
+    representative_local = primary_representatives % source_scene_points
+    slot_local = primary_slots % source_scene_points
+    secondary_representative = representative_local >= target_scene_points
+    if bool(secondary_representative.any().item()):
+        scene_indices[
+            representative_batches[secondary_representative],
+            slot_local[secondary_representative],
+        ] = representative_local[secondary_representative]
+    protected_local = torch.where(secondary_representative, slot_local, representative_local)
+    protected_positions[representative_batches, protected_local] = True
+
+    novel_batches = torch.div(novel_global, source_scene_points, rounding_mode="floor")
+    novel_counts = torch.bincount(novel_batches, minlength=batch_size).cpu().tolist()
+    novel_start = 0
+    for batch_index in range(batch_size):
+        additions = novel_global[novel_start : novel_start + int(novel_counts[batch_index])]
+        additions = additions % source_scene_points
+        removable = torch.nonzero(~protected_positions[batch_index], as_tuple=False).flatten()
+        insert_count = min(int(additions.numel()), int(removable.numel()))
+        if insert_count:
+            scene_indices[batch_index, removable[:insert_count]] = additions[:insert_count]
+        novel_start += int(novel_counts[batch_index])
+
+    gripper_indices = torch.arange(
+        source_scene_points, source_points, device=point_cloud.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.cat([scene_indices, gripper_indices], dim=1)
+    sampled = torch.gather(point_cloud, 1, indices.unsqueeze(-1).expand(-1, -1, point_cloud.shape[-1]))
+    sampled_pad = torch.gather(point_is_pad, 1, indices) if torch.is_tensor(point_is_pad) else None
+    return sampled, sampled_pad, indices
+
+
+def _local_transport_replacement_pairs(
+    novel_xyz: Tensor,
+    redundant_primary_xyz: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Greedily match every possible novel/redundant pair by nearest XYZ.
+
+    In each round every unmatched secondary point proposes to its nearest still
+    available redundant primary sample. Each primary sample accepts the closest
+    proposal (stable secondary order resolves exact ties), then both endpoints
+    leave the next round. This yields exactly ``min(N, M)`` one-to-one pairs,
+    without a camera quota, distance threshold, or point-array-order pairing.
+    """
+
+    if novel_xyz.ndim != 2 or novel_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected novel_xyz shape (N,3), got {tuple(novel_xyz.shape)}.")
+    if redundant_primary_xyz.ndim != 2 or redundant_primary_xyz.shape[-1] != 3:
+        raise ValueError(
+            "Expected redundant_primary_xyz shape (M,3), got "
+            f"{tuple(redundant_primary_xyz.shape)}."
+        )
+    novel_count = int(novel_xyz.shape[0])
+    redundant_count = int(redundant_primary_xyz.shape[0])
+    if novel_count == 0 or redundant_count == 0:
+        empty = torch.empty(0, dtype=torch.long, device=novel_xyz.device)
+        return empty, empty
+
+    novel_ids = torch.arange(novel_count, device=novel_xyz.device, dtype=torch.long)
+    matched = torch.zeros(novel_count, device=novel_xyz.device, dtype=torch.bool)
+    used_redundant = torch.zeros(
+        redundant_count, device=novel_xyz.device, dtype=torch.bool
+    )
+    selected_redundant = torch.full(
+        (novel_count,), -1, device=novel_xyz.device, dtype=torch.long
+    )
+    sentinel = novel_count
+    target_matches = min(novel_count, redundant_count)
+
+    while int(matched.sum().item()) < target_matches:
+        remaining_novel = novel_ids[~matched]
+        remaining_redundant = torch.arange(
+            redundant_count, device=novel_xyz.device, dtype=torch.long
+        )[~used_redundant]
+        query = novel_xyz.index_select(0, remaining_novel).contiguous()
+        target = redundant_primary_xyz.index_select(0, remaining_redundant).contiguous()
+        if novel_xyz.is_cuda and _pointops_knn_query is not None:
+            query_offset = torch.tensor(
+                [query.shape[0]], device=novel_xyz.device, dtype=torch.int32
+            )
+            target_offset = torch.tensor(
+                [target.shape[0]], device=novel_xyz.device, dtype=torch.int32
+            )
+            try:
+                with torch.cuda.device(novel_xyz.device):
+                    proposed_local, proposal_distances = _pointops_knn_query(
+                        1, target, target_offset, query, query_offset
+                    )
+                proposed_local = proposed_local.reshape(-1).long()
+                proposal_distances = proposal_distances.reshape(-1)
+            except Exception as exc:
+                if _env_flag("SONG_POINTSEG_REQUIRE_POINTOPS", True):
+                    raise RuntimeError(
+                        "pointops KNN failed while matching local multi-view transport."
+                    ) from exc
+                distances = torch.cdist(query, target)
+                proposal_distances, proposed_local = distances.min(dim=1)
+        else:
+            if novel_xyz.is_cuda and _env_flag("SONG_POINTSEG_REQUIRE_POINTOPS", True):
+                raise _pointops_required_error()
+            distances = torch.cdist(query, target)
+            proposal_distances, proposed_local = distances.min(dim=1)
+
+        proposed = remaining_redundant.index_select(0, proposed_local)
+        best_distance = torch.full(
+            (redundant_count,),
+            torch.inf,
+            device=novel_xyz.device,
+            dtype=proposal_distances.dtype,
+        )
+        best_distance.scatter_reduce_(
+            0, proposed, proposal_distances, reduce="amin", include_self=True
+        )
+        winners = proposal_distances == best_distance[proposed]
+        # Resolve exact-distance ties by the stable secondary point order.
+        best_novel = torch.full(
+            (redundant_count,), sentinel, device=novel_xyz.device, dtype=torch.long
+        )
+        best_novel.scatter_reduce_(
+            0,
+            proposed[winners],
+            remaining_novel[winners],
+            reduce="amin",
+            include_self=True,
+        )
+        winners &= remaining_novel == best_novel[proposed]
+        accepted_novel = remaining_novel[winners]
+        accepted_redundant = proposed[winners]
+        if accepted_novel.numel() == 0:
+            raise RuntimeError("Local transport matching made no progress.")
+        selected_redundant[accepted_novel] = accepted_redundant
+        matched[accepted_novel] = True
+        used_redundant[accepted_redundant] = True
+
+    matched_novel = novel_ids[matched]
+    return selected_redundant[matched], matched_novel
+
+
+def transport_novelty_union_sample_fused_point_cloud(
+    point_cloud: Tensor,
+    *,
+    target_points: int = 10_000,
+    gripper_points: int = 500,
+    voxel_size: float = 0.01,
+    point_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Novelty union with local one-to-one primary replacement transport."""
+
+    return novelty_union_sample_fused_point_cloud(
+        point_cloud,
+        target_points=target_points,
+        gripper_points=gripper_points,
+        voxel_size=voxel_size,
+        point_is_pad=point_is_pad,
+        local_transport=True,
+    )
 
 
 def compose_point_cloud_views(
@@ -561,13 +1564,29 @@ def compose_point_cloud_views(
     *,
     gripper_points: int = 500,
     seed: int = 0,
+    view_weights: Any = None,
+    fusion: Any = "legacy_budget",
 ) -> np.ndarray:
-    """Return one fixed-size model cloud from one or two stored camera clouds.
+    """Compose one or more stored camera clouds for the selected fusion policy.
 
     Every stored camera cloud keeps the original ``num_points`` layout and the
-    original gripper tail.  Single-view mode returns that cloud unchanged.  In
-    multi-view mode, the non-gripper budget is divided equally across views and
-    the gripper tail from the first view is appended exactly once.
+    original gripper tail. Single-view mode returns that cloud unchanged.
+    ``legacy_budget`` divides a fixed scene budget across views and appends the
+    primary-view gripper tail once. ``fps`` returns the equal scene union plus
+    that same gripper tail; the shared GPU sampler reduces it to the model point
+    budget later so cache generation, online training, and inference agree.
+    ``uniform_union`` draws the checkpoint-native scene budget uniformly
+    without replacement from the complete scene union, so camera contribution
+    is sampled instead of assigned by a fixed quota. ``full_union`` returns
+    that ordered union directly, preserving every scene
+    point from every view and one primary-view gripper tail. The downstream
+    point stack is length agnostic and the collator supplies padding masks when
+    single- and multi-view examples share a batch. ``primary_residual`` returns
+    the same ordered union without downsampling:
+    the model reconstructs a byte-identical primary cloud and a separate wrist
+    cloud, then injects the wrist representation through a zero-initialized
+    matrix residual. This preserves the primary checkpoint function without a
+    learned gate or a hand-chosen view ratio.
     """
 
     clouds = [np.asarray(cloud, dtype=np.float32) for cloud in view_clouds]
@@ -578,7 +1597,7 @@ def compose_point_cloud_views(
             raise ValueError(f"Expected point cloud shape (N,6), got {cloud.shape}.")
     if len(clouds) == 1:
         return np.ascontiguousarray(clouds[0], dtype=np.float32)
-
+    fusion = parse_camera_view_fusion(fusion)
     total_points = int(clouds[0].shape[0])
     if any(int(cloud.shape[0]) != total_points for cloud in clouds[1:]):
         raise ValueError(
@@ -589,10 +1608,57 @@ def compose_point_cloud_views(
         raise ValueError(
             f"gripper_points must be in [0, {total_points - 1}], got {gripper_points}."
         )
+    if fusion == "uniform_union":
+        if parse_camera_view_weights(view_weights, num_views=len(clouds)) is not None:
+            raise ValueError("camera view weights cannot be combined with uniform_union fusion.")
+        scene_budget = total_points - gripper_points
+        scene_union = np.concatenate(
+            [cloud[:-gripper_points] if gripper_points else cloud for cloud in clouds],
+            axis=0,
+        )
+        if scene_union.shape[0] < scene_budget:
+            raise ValueError(
+                f"Scene union has {scene_union.shape[0]} points but requires {scene_budget}."
+            )
+        rng = np.random.default_rng(int(seed))
+        indices = rng.choice(scene_union.shape[0], scene_budget, replace=False)
+        parts = [np.ascontiguousarray(scene_union[indices], dtype=np.float32)]
+        if gripper_points:
+            parts.append(np.ascontiguousarray(clouds[0][-gripper_points:], dtype=np.float32))
+        return np.ascontiguousarray(np.concatenate(parts, axis=0), dtype=np.float32)
+    if fusion in {
+        "fps",
+        "voxel_fps",
+        "voxel_cover_fps",
+        "novelty_union",
+        "multiscale_novelty_union",
+        "consensus_multiscale_novelty_union",
+        "transport_novelty_union",
+        "full_union",
+        "primary_residual",
+    }:
+        if parse_camera_view_weights(view_weights, num_views=len(clouds)) is not None:
+            raise ValueError(f"camera view weights cannot be combined with {fusion} fusion.")
+        parts = [
+            np.ascontiguousarray(cloud[:-gripper_points] if gripper_points else cloud, dtype=np.float32)
+            for cloud in clouds
+        ]
+        if gripper_points:
+            parts.append(np.ascontiguousarray(clouds[0][-gripper_points:], dtype=np.float32))
+        return np.ascontiguousarray(np.concatenate(parts, axis=0), dtype=np.float32)
 
     scene_budget = total_points - gripper_points
-    base, remainder = divmod(scene_budget, len(clouds))
-    allocations = [base + (1 if index < remainder else 0) for index in range(len(clouds))]
+    parsed_weights = parse_camera_view_weights(view_weights, num_views=len(clouds))
+    weights = np.ones(len(clouds), dtype=np.float64)
+    if parsed_weights is not None:
+        weights = np.asarray(parsed_weights, dtype=np.float64)
+    expected = scene_budget * weights / weights.sum()
+    allocations_array = np.floor(expected).astype(np.int64)
+    remainder = int(scene_budget - allocations_array.sum())
+    if remainder:
+        fractional_order = np.argsort(-(expected - allocations_array), kind="stable")
+        allocations_array[fractional_order[:remainder]] += 1
+    allocations = allocations_array.tolist()
     rng = np.random.default_rng(int(seed))
     parts: list[np.ndarray] = []
     for cloud, count in zip(clouds, allocations, strict=True):
@@ -615,6 +1681,45 @@ def compose_point_cloud_views(
     return composed
 
 
+def infer_single_view_point_count(
+    fused_point_count: int,
+    *,
+    num_views: int,
+    gripper_points: int,
+) -> int:
+    """Recover the native per-view point count from an equal-view union.
+
+    Reduction-based multi-view fusion concatenates every view's scene points
+    and appends exactly one primary-view gripper tail.  Its input adapter must
+    therefore reduce the union back to the point count of one stored view,
+    whatever that count happens to be (for example 10k in simulation or 50k
+    on a real robot).  This helper deliberately encodes that relationship
+    instead of a dataset-specific numeric constant.
+    """
+
+    fused_point_count = int(fused_point_count)
+    num_views = int(num_views)
+    gripper_points = int(gripper_points)
+    if fused_point_count <= 0:
+        raise ValueError(f"fused_point_count must be positive, got {fused_point_count}.")
+    if num_views <= 0:
+        raise ValueError(f"num_views must be positive, got {num_views}.")
+    if gripper_points < 0 or gripper_points >= fused_point_count:
+        raise ValueError(
+            f"gripper_points must be in [0, {fused_point_count - 1}], got {gripper_points}."
+        )
+    if num_views == 1:
+        return fused_point_count
+    fused_scene_points = fused_point_count - gripper_points
+    if fused_scene_points % num_views != 0:
+        raise ValueError(
+            "The fused cloud does not match the equal-view union layout: "
+            f"({fused_point_count} total - {gripper_points} gripper) scene points "
+            f"are not divisible by {num_views} views."
+        )
+    return fused_scene_points // num_views + gripper_points
+
+
 class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
     """Adds a temporal point-cloud window used only to build PointSeg supervision.
 
@@ -631,12 +1736,14 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         point_cloud_dir: str | Path,
         *,
         camera_views: str | tuple[str, ...] | list[str] | None = None,
+        camera_view_weights: Any = None,
+        camera_view_fusion: Any = "legacy_budget",
         gripper_points: int | None = None,
         future_offsets: tuple[int, ...] | list[int] = DEFAULT_FUTURE_OFFSETS,
         bidirectional: bool = True,
         trajectory_samples: int = 32,
-        current_points: int = 8192,
-        future_points: int = 16384,
+        current_points: int | None = 8192,
+        future_points: int | None = 16384,
         seed: int = 1000,
         return_full_point_cloud: bool = False,
         include_base_item: bool = True,
@@ -646,9 +1753,16 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.point_cloud_dir = Path(point_cloud_dir)
         if camera_views is None:
             camera_views = os.environ.get("SONG_CAMERA_VIEWS", "agentview")
+        if camera_view_weights is None:
+            camera_view_weights = os.environ.get("SONG_CAMERA_VIEW_WEIGHTS")
         if gripper_points is None:
             gripper_points = int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500"))
         self.camera_views = parse_camera_views(camera_views)
+        self.camera_view_weights = parse_camera_view_weights(
+            camera_view_weights,
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.dataset_root = self.point_cloud_dir.parent
         self.point_cloud_dirs = {
             view: (
@@ -670,8 +1784,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         self.trajectory_samples = int(trajectory_samples)
         if self.trajectory_samples < 0:
             raise ValueError("trajectory_samples must be non-negative.")
-        self.current_points = int(current_points)
-        self.future_points = int(future_points)
+        self.current_points = None if current_points is None else int(current_points)
+        self.future_points = None if future_points is None else int(future_points)
         self.seed = int(seed)
         self.return_full_point_cloud = return_full_point_cloud
         self.include_base_item = bool(include_base_item)
@@ -725,6 +1839,8 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
+            view_weights=self.camera_view_weights,
+            fusion=self.camera_view_fusion,
         )
 
     def _episode_motion_states(self, episode_index: int) -> Tensor:
@@ -851,7 +1967,27 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
         rng = np.random.default_rng(self.seed + idx)
 
         current_full = self._point_cloud_frame(episode_index, frame_index)
-        current_sample, current_indices = _sample_rows_with_indices(current_full, self.current_points, rng)
+        if self.camera_view_fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+            "uniform_union",
+            "full_union",
+            "primary_residual",
+        }:
+            current_sample = current_full
+            current_indices = np.arange(current_full.shape[0], dtype=np.int64)
+        elif self.current_points is None:
+            current_sample = current_full
+            current_indices = np.arange(current_full.shape[0], dtype=np.int64)
+        else:
+            current_sample, current_indices = _sample_rows_with_indices(
+                current_full, self.current_points, rng
+            )
         item["observation.point_cloud"] = torch.from_numpy(current_sample)
         item["observation.point_cloud_indices"] = torch.from_numpy(current_indices)
         # Explicit source metadata lets diagnostics distinguish a raw high-resolution
@@ -867,11 +2003,26 @@ class SongTemporalPointCloudDataset(torch.utils.data.Dataset):
             clamped_index = min(max(raw_index, 0), episode_len - 1)
             future_is_pad.append(raw_index < 0 or raw_index >= episode_len)
             temporal_frame_indices.append(clamped_index)
+            future_cloud = self._point_cloud_frame(episode_index, clamped_index)
             future_samples.append(
-                _sample_rows(
-                    self._point_cloud_frame(episode_index, clamped_index),
-                    self.future_points,
-                    rng,
+                future_cloud
+                if self.camera_view_fusion
+                in {
+                    "fps",
+                    "voxel_fps",
+                    "voxel_cover_fps",
+                    "novelty_union",
+                    "multiscale_novelty_union",
+                    "consensus_multiscale_novelty_union",
+                    "transport_novelty_union",
+                    "uniform_union",
+                    "full_union",
+                    "primary_residual",
+                }
+                else (
+                    future_cloud
+                    if self.future_points is None
+                    else _sample_rows(future_cloud, self.future_points, rng)
                 )
             )
 
@@ -913,9 +2064,10 @@ class SongPointSegCachedDataset(torch.utils.data.Dataset):
             self.manifest = json.load(f)
 
         version = int(self.manifest.get("version", -1))
-        if version != POINTSEG_CACHE_VERSION:
+        if version not in POINTSEG_CACHE_COMPATIBLE_VERSIONS:
             raise ValueError(
-                f"Unsupported Song pointseg cache version {version}; expected {POINTSEG_CACHE_VERSION}. "
+                f"Unsupported Song pointseg cache version {version}; expected one of "
+                f"{POINTSEG_CACHE_COMPATIBLE_VERSIONS}. "
                 "Rebuild the cache because motion-prior semantics changed."
             )
 
@@ -2460,11 +3612,13 @@ class SongPointSegNet(nn.Module):
         feat = features[valid_batch].reshape(-1, features.shape[-1])[flat_valid].contiguous().to(dtype=torch.float32)
         counts = counts[valid_batch]
         offset = torch.cumsum(counts, dim=0)
+        grid_coord = build_litept_grid_coord(coord, valid_local[:, 0], self.grid_size)
         point = self.backbone(
             {
                 "coord": coord,
                 "feat": feat,
                 "offset": offset,
+                "grid_coord": grid_coord,
                 "grid_size": self.grid_size,
             }
         )

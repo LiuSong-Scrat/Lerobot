@@ -4,216 +4,285 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import (
+    FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET,
+    FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET,
+    FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET,
+    VLAFlowMatching,
+    WorldFlowActionBranch,
+    expected_full_molmo2er_parameter_budget,
+    full_molmo2er_trainable_parameter_prefixes,
+    make_att_2d_masks,
+)
 from lerobot.policies.smolvla import molmo2_with_expert as molmo_core
-from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching, make_att_2d_masks
 from lerobot.policies.smolvla.molmo2_full_with_expert import Molmo2FullWithExpertModel
 
 TEXT_ROLE = 0
 IMAGE_ROLE = 1
-SCENE_ROLE = 2
 PAD_ROLE = 3
 NATIVE_IMAGE_POSITIONS = 410
 
 
-def _make_prefix_shell(*, hidden_size: int = 8, chunk_size: int = 3) -> VLAFlowMatching:
+def _full_worldflow_config(**overrides) -> SmolVLAConfig:
+    values = {
+        "vlm_backend": "molmo2_full",
+        "vlm_model_name": "/does/not/load/during/config-test",
+        "vlm_weights_path": "/does/not/load/during/config-test",
+        "load_vlm_weights": True,
+        "train_expert_only": True,
+        "freeze_vision_encoder": True,
+        "camera_views": "agentview",
+        "rgb_camera_views": "agentview",
+        "num_vlm_layers": 36,
+        "num_expert_layers": 36,
+        "expert_width_multiplier": 0.75,
+        "pointseg_enable": True,
+        "pointseg_grid_size": 0.01,
+        "pointseg_feature_dim": 64,
+        "pointseg_foreground_ratio": 0.025,
+        "pointseg_background_ratio": 0.025,
+        "pointseg_min_foreground_points": 2500,
+        "pointseg_min_background_points": 0,
+        "pointseg_aux_loss_weight": 0.0005,
+        "pointseg_use_temporal_priors_as_input": False,
+        "pointseg_use_pseudo_selection": False,
+        "worldflow_enable": True,
+        "worldflow_target_type": "world_eef_trajectory",
+        "worldflow_world_eef_velocity_mode": "base_pose9_euclidean",
+        "worldflow_reference_frame": "robot_base",
+        "worldflow_frame_origin": "global",
+        "worldflow_scene_frame_origin": "global",
+        "worldflow_noise_coupling": "left_compose_ego",
+        "worldflow_action_fusion": "point_action_expert_conjugate_bridge",
+        "worldflow_action_expert_mode": "shared",
+        "worldflow_current_ee_pose_token": False,
+        "worldflow_bootstrap_from_ego": False,
+        "worldflow_freeze_pretrained_ego": False,
+        "worldflow_training_coordinate_frame_augmentation": False,
+        "worldflow_feature_dim": 64,
+        "worldflow_grid_size": 0.01,
+        "worldflow_loss_weight": 1.0,
+        "worldflow_geo_loss_weight": 0.0,
+        "worldflow_bridge_loss_weight": 0.0,
+        "worldflow_equiv_loss_weight": 0.0,
+        "worldflow_pretrained_lr_multiplier": 1.0,
+        "worldflow_new_lr_multiplier": 1.0,
+        "worldflow_max_points": 2048,
+        "worldflow_require_action_target_sidecar": True,
+        "worldflow_ego_residual_gate_init": None,
+        "scheduler_decay_steps": 30_000,
+        "scheduler_decay_lr": 3e-5,
+        "device": "cpu",
+    }
+    values.update(overrides)
+    return SmolVLAConfig(**values)
+
+
+def test_full_config_locks_v043_multiview_doubleflow_contract() -> None:
+    config = _full_worldflow_config()
+    assert config.selected_camera_views == ("agentview",)
+    assert config.selected_rgb_camera_views == ("agentview",)
+    assert config.molmo_inference_only and config.molmo_image_fast_path
+    assert config.num_vlm_layers == config.num_expert_layers == 36
+    assert config.worldflow_action_fusion == "point_action_expert_conjugate_bridge"
+    assert config.worldflow_action_expert_mode == "shared"
+    assert config.worldflow_noise_coupling == "left_compose_ego"
+    assert config.worldflow_target_type == "world_eef_trajectory"
+    assert config.worldflow_world_eef_velocity_mode == "base_pose9_euclidean"
+    assert config.pose9_action_noise_enable is False
+
+
+def test_full_config_allows_pose9_action_noise_opt_in() -> None:
+    config = _full_worldflow_config(pose9_action_noise_enable=True)
+    assert config.pose9_action_noise_enable is True
+
+
+def test_full_config_allows_cli_scheduler_override() -> None:
+    config = _full_worldflow_config(
+        scheduler_warmup_steps=50,
+        scheduler_decay_steps=1_500,
+        scheduler_decay_lr=1e-5,
+    )
+    assert config.scheduler_warmup_steps == 50
+    assert config.scheduler_decay_steps == 1_500
+    assert config.scheduler_decay_lr == 1e-5
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    (
+        ("molmo_inference_only", False),
+        ("molmo_image_fast_path", False),
+        ("worldflow_enable", False),
+        ("worldflow_noise_coupling", "conjugate_ego"),
+        ("worldflow_action_fusion", "cross_attention"),
+        ("worldflow_action_expert_mode", "independent"),
+        ("worldflow_require_action_target_sidecar", False),
+        ("worldflow_max_points", 0),
+    ),
+)
+def test_full_config_rejects_registered_contract_drift(field_name: str, bad_value) -> None:
+    with pytest.raises(ValueError):
+        _full_worldflow_config(**{field_name: bad_value})
+
+
+def test_parameter_budget_matches_v043_shared_doubleflow() -> None:
+    off = expected_full_molmo2er_parameter_budget(worldflow_enable=False)
+    on = expected_full_molmo2er_parameter_budget(worldflow_enable=True)
+    assert off == FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET == {
+        "total": 6_261_132_686,
+        "trainable": 1_786_461_401,
+        "frozen": 4_474_671_285,
+    }
+    assert on == FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET == {
+        "total": 6_310_743_694,
+        "trainable": 1_823_342_324,
+        "frozen": 4_487_401_370,
+    }
+    assert {name: on[name] - off[name] for name in on} == (
+        FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET
+    ) == {
+        "total": 49_611_008,
+        "trainable": 36_880_923,
+        "frozen": 12_730_085,
+    }
+    off_prefixes = full_molmo2er_trainable_parameter_prefixes(worldflow_enable=False)
+    on_prefixes = full_molmo2er_trainable_parameter_prefixes(worldflow_enable=True)
+    assert not any("worldflow" in prefix for prefix in off_prefixes)
+    assert set(on_prefixes) - set(off_prefixes) == {
+        "model.worldflow_branch.",
+        "model.world_pointseg_object_proj.",
+        "model.world_pointseg_background_proj.",
+        "model.world_point_prefix_type_embedding",
+        "model.world_action_out_proj.",
+        "model.world_ego_action_type_embedding",
+        "model.conjugate_motion_in_proj.",
+    }
+
+
+def test_worldflow_added_budget_is_the_v043_shared_branch_not_private_language() -> None:
+    config = SmolVLAConfig()
+    config.worldflow_target_type = "world_eef_trajectory"
+    config.worldflow_world_eef_velocity_mode = "base_pose9_euclidean"
+    config.worldflow_action_fusion = "point_action_expert_conjugate_bridge"
+    config.worldflow_action_expert_mode = "shared"
+    config.worldflow_feature_dim = 64
+    config.worldflow_grid_size = 0.01
+    branch = WorldFlowActionBranch(config, action_hidden_dim=1920, language_vocab_size=152_064)
+    assert branch.language_embedding is None
+    branch_total = sum(parameter.numel() for parameter in branch.parameters())
+    branch_trainable = sum(
+        parameter.numel() for parameter in branch.parameters() if parameter.requires_grad
+    )
+    assert (branch_total, branch_trainable) == (49_317_238, 36_587_153)
+    outer = (
+        2 * (64 * 1920 + 1920)
+        + (1920 * 10 + 10)
+        + (9 * 1920 + 1920)
+        + 1920
+        + 2 * 1920
+    )
+    assert outer == 293_770
+    assert branch_total + outer == FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET["total"]
+    assert branch_trainable + outer == FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET["trainable"]
+
+
+def _right_padded_native_batch(
+    text_lengths: tuple[int, ...], *, hidden_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = len(text_lengths)
+    length = 1 + NATIVE_IMAGE_POSITIONS + max(text_lengths)
+    embeddings = torch.randn(batch_size, length, hidden_size)
+    valid = torch.zeros(batch_size, length, dtype=torch.bool)
+    image = torch.zeros_like(valid)
+    for index, text_length in enumerate(text_lengths):
+        valid[index, : 1 + NATIVE_IMAGE_POSITIONS + text_length] = True
+        image[index, 1 : 1 + NATIVE_IMAGE_POSITIONS] = True
+    return embeddings, valid, image
+
+
+def _make_prefix_shell(hidden_size: int = 8) -> VLAFlowMatching:
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
     model.last_prefix_metrics = {}
     model.last_molmo_scene_insert_positions = None
     model.last_molmo_token_roles = None
     model.last_prefix_token_layout = ()
-    model.config = SimpleNamespace(
-        chunk_size=chunk_size,
-        min_period=4e-3,
-        max_period=4.0,
-    )
     model.vlm_with_expert = SimpleNamespace(expert_hidden_size=hidden_size)
-    model.action_in_proj = nn.Linear(3, hidden_size)
-    model.action_time_mlp_in = nn.Linear(hidden_size * 2, hidden_size)
-    model.action_time_mlp_out = nn.Linear(hidden_size, hidden_size)
     return model
 
 
-def _right_padded_native_batch(
-    text_lengths: tuple[int, ...],
-    *,
-    hidden_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build BOS + 410 IMAGE + variable causal TEXT + right padding."""
-
-    batch_size = len(text_lengths)
-    native_length = 1 + NATIVE_IMAGE_POSITIONS + max(text_lengths)
-    embeddings = torch.zeros(batch_size, native_length, hidden_size)
-    valid = torch.zeros(batch_size, native_length, dtype=torch.bool)
-    image_tokens = torch.zeros_like(valid)
-    for batch_index, text_length in enumerate(text_lengths):
-        valid_length = 1 + NATIVE_IMAGE_POSITIONS + text_length
-        valid[batch_index, :valid_length] = True
-        image_tokens[batch_index, 1 : 1 + NATIVE_IMAGE_POSITIONS] = True
-        position_markers = torch.arange(valid_length, dtype=embeddings.dtype)
-        embeddings[batch_index, :valid_length, 0] = position_markers + 1000 * batch_index
-    return embeddings, valid, image_tokens
-
-
-def test_full_prefix_inserts_scene_before_variable_text_and_keeps_right_padding() -> None:
-    model = _make_prefix_shell(hidden_size=8)
-    native, native_valid, native_image = _right_padded_native_batch((2, 5), hidden_size=8)
-    scene = torch.zeros(2, 2, 8)
-    scene[:, 0, 0] = torch.tensor([-10.0, -11.0])
-    scene[:, 1, 0] = torch.tensor([-20.0, -21.0])
-    scene_valid = torch.ones(2, 2, dtype=torch.bool)
-
-    prefix, valid, boundaries = model._build_full_molmo_prefix(
-        native,
-        native_valid,
-        native_image,
-        scene,
-        scene_valid,
-        ablate_language=False,
+def test_native_prefix_contains_only_frozen_image_text() -> None:
+    model = _make_prefix_shell()
+    native, valid, image = _right_padded_native_batch((3,), hidden_size=8)
+    native.requires_grad_()
+    prefix, prefix_valid, boundaries = model._build_full_molmo_native_prefix(
+        native, valid, image, ablate_language=False
     )
-
-    # BOS(1) + IMAGE(410) determines the insertion point independently of text
-    # length.  The shorter sample is repacked and remains strictly right padded.
-    assert torch.equal(model.last_molmo_scene_insert_positions, torch.tensor([411, 411]))
-    assert prefix.shape == (2, 418, 8)
-    assert torch.equal(valid.sum(dim=1), torch.tensor([415, 418]))
-    assert valid[0, :415].all() and not valid[0, 415:].any()
-    assert valid[1].all()
-
-    # Native IMAGE structure is untouched, FG/BG are inserted after its final
-    # position, and each sample's complete text follows the two scene tokens.
-    assert torch.equal(prefix[:, :411], native[:, :411])
-    assert torch.equal(prefix[:, 411:413], scene)
-    assert torch.equal(prefix[0, 413:415], native[0, 411:413])
-    assert torch.equal(prefix[1, 413:418], native[1, 411:416])
-    assert not prefix[0, 415:].any()
-
+    assert torch.equal(prefix, native)
+    assert not prefix.requires_grad
+    assert model.last_prefix_token_layout == ("bos", "native_image", "causal_text")
     roles = model.last_molmo_token_roles
     assert roles is not None
-    assert torch.equal(roles[:, 0], torch.full((2,), TEXT_ROLE, dtype=torch.int8))
-    assert (roles[:, 1:411] == IMAGE_ROLE).all()
-    assert (roles[:, 411:413] == SCENE_ROLE).all()
-    assert (roles[0, 413:415] == TEXT_ROLE).all()
-    assert (roles[0, 415:] == PAD_ROLE).all()
-    assert (roles[1, 413:] == TEXT_ROLE).all()
-
-    # BOS starts its own causal block; IMAGE+SCENE share one perception block;
-    # every valid text token starts a new causal block; padding starts none.
-    assert boundaries[:, 0].all()
-    assert boundaries[:, 1].all()
-    assert not boundaries[:, 2:413].any()
-    assert boundaries[0, 413:415].all() and not boundaries[0, 415:].any()
-    assert boundaries[1, 413:].all()
+    assert set(roles.unique().tolist()) <= {TEXT_ROLE, IMAGE_ROLE, PAD_ROLE}
+    assert boundaries[:, 0].all() and boundaries[:, 1].all()
+    assert not boundaries[:, 2:411].any()
+    allowed = make_att_2d_masks(prefix_valid, boundaries)
+    assert allowed[:, 1:411, 1:411].all()
+    assert not allowed[:, 1:411, 411:].any()
+    assert allowed[:, 411:, 1:411].all()
 
 
-def test_full_prefix_uses_each_samples_actual_last_image_position() -> None:
-    model = _make_prefix_shell(hidden_size=4)
-    native = torch.randn(2, 414, 4)
-    native_valid = torch.ones(2, 414, dtype=torch.bool)
-    native_image = torch.zeros_like(native_valid)
-    native_image[0, 1:411] = True
-    # A deliberately shifted template proves insertion is derived from each
-    # token_type_ids row rather than from a hard-coded position.
-    native_image[1, 2:412] = True
-    scene = torch.randn(2, 2, 4)
-
-    prefix, valid, _ = model._build_full_molmo_prefix(
-        native,
-        native_valid,
-        native_image,
-        scene,
-        torch.ones(2, 2, dtype=torch.bool),
-        ablate_language=False,
+def test_shared_suffix_is_v043_fg_bg_pairs_plus_paired_actions() -> None:
+    torch.manual_seed(7)
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    hidden = 8
+    model.config = SimpleNamespace(vlm_backend="molmo2_full", chunk_size=2)
+    model.conjugate_motion_in_proj = nn.Linear(9, hidden)
+    model.world_ego_action_type_embedding = nn.Parameter(torch.randn(2, hidden))
+    model.world_pointseg_object_proj = nn.Linear(4, hidden)
+    model.world_pointseg_background_proj = nn.Linear(4, hidden)
+    model.world_point_prefix_type_embedding = nn.Parameter(torch.zeros(hidden))
+    model.last_expert_scene_tokens = torch.randn(1, 2, hidden)
+    model.last_expert_scene_mask = torch.ones(1, 2, dtype=torch.bool)
+    model.inference_ablation_modalities = frozenset()
+    ego_actions = torch.randn(1, 2, hidden)
+    world_tokens = {
+        "scene_global_tokens": torch.randn(1, 2, 4),
+        "scene_global_mask": torch.ones(1, 2, dtype=torch.bool),
+        "action_tokens": torch.randn(1, 2, hidden),
+        "action_mask": torch.ones(1, 2, dtype=torch.bool),
+        "ego_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "world_conjugate_motion_pose9": torch.randn(1, 2, 9),
+        "conjugate_motion_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    suffix, mask, positions, layout = model._build_shared_point_action_expert_joint_suffix(
+        ego_actions, torch.ones(1, 2, dtype=torch.bool), world_tokens
     )
-
-    assert torch.equal(model.last_molmo_scene_insert_positions, torch.tensor([411, 412]))
-    assert torch.equal(prefix[0, 411:413], scene[0])
-    assert torch.equal(prefix[1, 412:414], scene[1])
-    assert valid.all()
-    roles = model.last_molmo_token_roles
-    assert roles is not None
-    assert (roles[0, 411:413] == SCENE_ROLE).all()
-    assert (roles[1, 412:414] == SCENE_ROLE).all()
-
-
-def test_full_hybrid_mask_truth_table_with_variable_text_and_action_padding() -> None:
-    model = _make_prefix_shell(hidden_size=8, chunk_size=3)
-    native, native_valid, native_image = _right_padded_native_batch((2, 5), hidden_size=8)
-    prefix, prefix_valid, prefix_boundaries = model._build_full_molmo_prefix(
-        native,
-        native_valid,
-        native_image,
-        torch.randn(2, 2, 8),
-        torch.ones(2, 2, dtype=torch.bool),
-        ablate_language=False,
-    )
-    _, action_valid, action_boundaries = model.embed_suffix(
-        torch.randn(2, 3, 3),
-        torch.tensor([0.25, 0.75]),
-        actions_is_pad=torch.tensor([[False, False, True], [False, False, False]]),
-    )
-    full_valid = torch.cat([prefix_valid, action_valid], dim=1)
-    full_boundaries = torch.cat([prefix_boundaries, action_boundaries.bool()], dim=1)
-    allowed = make_att_2d_masks(full_valid, full_boundaries)
-
-    prefix_length = prefix.shape[1]
-    bos = 0
-    perception = torch.arange(1, 413)  # 410 IMAGE + FG + BG
-    actions = torch.arange(prefix_length, prefix_length + 3)
-
-    for batch_index, text_length in enumerate((2, 5)):
-        text = torch.arange(413, 413 + text_length)
-        valid_actions = actions[: 2 if batch_index == 0 else 3]
-
-        # BOS is causal and cannot read the later perceptual block.
-        assert allowed[batch_index, bos, bos]
-        assert not allowed[batch_index, bos, perception].any()
-        assert not allowed[batch_index, bos, text].any()
-        assert not allowed[batch_index, bos, valid_actions].any()
-
-        # IMAGE and SCENE form one bidirectional perception block.  They can
-        # read BOS but never the following instruction or action block.
-        assert allowed[batch_index, perception[:, None], perception].all()
-        assert allowed[batch_index, perception, bos].all()
-        assert not allowed[batch_index, perception[:, None], text].any()
-        assert not allowed[batch_index, perception[:, None], valid_actions].any()
-
-        # TEXT reads BOS and all perception, remains strictly causal within
-        # TEXT, and cannot read ACTION.
-        assert allowed[batch_index, text, bos].all()
-        assert allowed[batch_index, text[:, None], perception].all()
-        text_to_text = allowed[batch_index, text[:, None], text]
-        assert torch.equal(text_to_text, torch.ones(text_length, text_length, dtype=torch.bool).tril())
-        assert not allowed[batch_index, text[:, None], valid_actions].any()
-
-        # Every valid ACTION reads the complete valid prefix and the complete
-        # valid action chunk; no prefix query can read ACTION.
-        valid_prefix = torch.nonzero(prefix_valid[batch_index], as_tuple=False).flatten()
-        assert allowed[batch_index, valid_actions[:, None], valid_prefix].all()
-        assert allowed[batch_index, valid_actions[:, None], valid_actions].all()
-        assert not allowed[batch_index, valid_prefix[:, None], valid_actions].any()
-
-        # Padding is invalid as both a query and key, including padding between
-        # the short prefix and the globally aligned action suffix.
-        padding = torch.nonzero(~full_valid[batch_index], as_tuple=False).flatten()
-        if padding.numel():
-            assert not allowed[batch_index, padding].any()
-            assert not allowed[batch_index, :, padding].any()
+    assert suffix.shape == (1, 8, hidden)
+    assert mask.all()
+    assert layout == {
+        "ego_foreground": slice(0, 1),
+        "ego_background": slice(1, 2),
+        "world_foreground": slice(2, 3),
+        "world_background": slice(3, 4),
+        "ego_action": slice(4, 6),
+        "world_action": slice(6, 8),
+    }
+    assert torch.equal(positions, torch.tensor([[0, 1, 0, 1, 2, 3, 2, 3]]))
 
 
-def _tiny_spec(
-    *,
-    hidden_size: int,
-    intermediate_size: int,
-    num_layers: int = 36,
-) -> molmo_core.Molmo2TextSpec:
+def _tiny_spec(hidden_size: int, intermediate_size: int) -> molmo_core.Molmo2TextSpec:
     return molmo_core.Molmo2TextSpec(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        num_hidden_layers=num_layers,
+        num_hidden_layers=36,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=4,
@@ -233,21 +302,18 @@ def _tiny_spec(
     )
 
 
-def _make_tiny_frozen_36_layer_backend() -> Molmo2FullWithExpertModel:
-    prefix_spec = _tiny_spec(hidden_size=8, intermediate_size=16)
-    expert_spec = _tiny_spec(hidden_size=6, intermediate_size=12)
+def _make_tiny_backend() -> Molmo2FullWithExpertModel:
+    prefix_spec = _tiny_spec(8, 16)
+    expert_spec = _tiny_spec(6, 12)
     backend = Molmo2FullWithExpertModel.__new__(Molmo2FullWithExpertModel)
     nn.Module.__init__(backend)
     backend.vlm = molmo_core.Molmo2TextBackbone(
-        prefix_spec,
-        num_layers=36,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
+        prefix_spec, 36, device=torch.device("cpu"), dtype=torch.float32
     )
     backend.lm_expert = molmo_core.Molmo2ExpertBackbone(
         expert_spec,
         prefix_spec,
-        num_layers=36,
+        36,
         self_attn_every_n_layers=2,
         device=torch.device("cpu"),
         dtype=torch.float32,
@@ -267,61 +333,63 @@ def _make_tiny_frozen_36_layer_backend() -> Molmo2FullWithExpertModel:
     return backend
 
 
-def test_scene_gradient_crosses_all_36_frozen_text_layers_without_unfreezing_molmo() -> None:
+def test_all_36_vlm_layers_are_detached_while_four_scene_tokens_train() -> None:
     torch.manual_seed(23)
-    prefix_builder = _make_prefix_shell(hidden_size=8, chunk_size=2)
-    backend = _make_tiny_frozen_36_layer_backend()
-    native, native_valid, native_image = _right_padded_native_batch((2,), hidden_size=8)
-    native = native + 0.01 * torch.randn_like(native)
-    scene_projection = nn.Linear(4, 8)
-    scene_embeddings = scene_projection(torch.randn(1, 2, 4))
-    scene_embeddings.retain_grad()
-
-    prefix, prefix_valid, prefix_boundaries = prefix_builder._build_full_molmo_prefix(
-        native,
-        native_valid,
-        native_image,
-        scene_embeddings,
-        torch.ones(1, 2, dtype=torch.bool),
-        ablate_language=False,
+    backend = _make_tiny_backend()
+    builder = _make_prefix_shell()
+    native, valid, image = _right_padded_native_batch((2,), hidden_size=8)
+    native.requires_grad_()
+    prefix, prefix_valid, prefix_boundaries = builder._build_full_molmo_native_prefix(
+        native, valid, image, ablate_language=False
     )
-    prefix.retain_grad()
-    expert = torch.randn(1, 2, 6)
-    expert_valid = torch.ones(1, 2, dtype=torch.bool)
-    expert_boundaries = torch.tensor([[True, False]])
-    full_valid = torch.cat([prefix_valid, expert_valid], dim=1)
-    full_boundaries = torch.cat([prefix_boundaries, expert_boundaries], dim=1)
-    position_ids = torch.cumsum(full_valid, dim=1) - 1
-    (_, expert_output), _ = backend(
-        attention_mask=make_att_2d_masks(full_valid, full_boundaries),
-        position_ids=position_ids,
+    scene_projection = nn.Linear(4, 6)
+    scene = scene_projection(torch.randn(1, 4, 4))
+    scene.retain_grad()
+    actions = torch.randn(1, 2, 6, requires_grad=True)
+    expert = torch.cat([scene, actions], dim=1)
+    expert_valid = torch.ones(1, 6, dtype=torch.bool)
+    prefix_attention = make_att_2d_masks(prefix_valid, prefix_boundaries)
+    suffix_is_action = torch.tensor([False, False, False, False, True, True])
+    suffix_attention = (
+        (suffix_is_action[:, None] | ~suffix_is_action[None, :])[None]
+        & expert_valid[:, :, None]
+        & expert_valid[:, None, :]
+    )
+    prefix_to_suffix = (
+        prefix_valid[:, :, None]
+        & expert_valid[:, None, :]
+        & (~suffix_is_action)[None, None, :]
+    )
+    suffix_to_prefix = expert_valid[:, :, None] & prefix_valid[:, None, :]
+    attention = torch.cat(
+        [
+            torch.cat([prefix_attention, prefix_to_suffix], dim=2),
+            torch.cat([suffix_to_prefix, suffix_attention], dim=2),
+        ],
+        dim=1,
+    )
+    prefix_positions = torch.cumsum(prefix_valid, dim=1) - 1
+    offset = prefix_positions.amax(dim=1, keepdim=True) + 1
+    expert_positions = offset + torch.tensor([[0, 1, 0, 1, 2, 3]])
+    positions = torch.cat([prefix_positions, expert_positions], dim=1)
+    (_, output), cache = backend(
+        attention_mask=attention,
+        position_ids=positions,
         inputs_embeds=[prefix, expert],
-        use_cache=False,
+        use_cache=True,
         fill_kv_cache=False,
     )
-    assert expert_output is not None
-    loss = (expert_output * torch.randn_like(expert_output)).sum()
+    loss = output[:, -2:].square().mean()
     loss.backward()
-
-    assert len(backend.vlm.blocks) == 36
-    assert len(backend.lm_expert.layers) == 36
-    assert not backend.vlm.training and not backend.vision_backbone.training
-    assert all(not parameter.requires_grad for parameter in backend.vlm.parameters())
-    assert all(not parameter.requires_grad for parameter in backend.vision_backbone.parameters())
+    assert native.grad is None
     assert all(parameter.grad is None for parameter in backend.vlm.parameters())
-    assert all(parameter.grad is None for parameter in backend.vision_backbone.parameters())
-
-    # The action loss reaches both inserted scene positions and their trainable
-    # projection despite traversing every frozen Molmo decoder operation.
-    assert scene_embeddings.grad is not None
-    assert torch.isfinite(scene_embeddings.grad).all()
-    assert scene_embeddings.grad.abs().sum() > 0
-    assert prefix.grad is not None
-    assert prefix.grad[:, 411:413].abs().sum() > 0
-    assert scene_projection.weight.grad is not None
-    assert torch.isfinite(scene_projection.weight.grad).all()
-    assert scene_projection.weight.grad.abs().sum() > 0
-    assert any(
-        parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0
-        for parameter in backend.lm_expert.parameters()
+    assert cache is not None and len(cache) == 36
+    assert all(
+        not tensor.requires_grad and tensor.grad_fn is None
+        for layer in cache.values()
+        for tensor in layer.values()
     )
+    assert scene.grad is not None and scene.grad.abs().sum() > 0
+    assert scene_projection.weight.grad is not None
+    assert actions.grad is not None and actions.grad.abs().sum() > 0
+    assert any(parameter.grad is not None for parameter in backend.lm_expert.parameters())

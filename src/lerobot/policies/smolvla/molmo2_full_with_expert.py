@@ -26,11 +26,10 @@ connector.  The active source tensors are exactly:
 * ``model.transformer.ln_f``.
 
 ``lm_head`` is never instantiated.  Every Molmo tensor is frozen and held in
-evaluation mode.  Vision/WTE embedding construction is safely performed under
-``no_grad`` because it has no trainable inputs; the inherited 36-layer text
-forward is deliberately *not* placed under ``no_grad`` so gradients can pass
-through the frozen decoder operations to the inserted trainable FG/BG scene
-tokens.
+evaluation mode.  Vision, WTE and all 36 decoder blocks execute under
+``torch.no_grad``.  Their per-layer K/V tensors are detached read-only memory
+for the Action Expert; FG/BG and action tokens stay on the trainable side of
+the boundary, so no action loss graph ever traverses Molmo.
 
 For a 256 x 256 square input, Molmo's processor emits two pixel-identical
 378-square crops.  The backend asserts that equality at runtime and, when it
@@ -302,6 +301,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
     """Full 36/36 frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
 
     scale_input_embeddings = False
+    inference_only_vlm = True
 
     def __init__(
         self,
@@ -540,10 +540,14 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "vision_features_for_256_square_rgb": 392,
             "native_image_positions_for_256_square_rgb": 410,
             "exact_identical_two_crop_reuse": self.exact_vision_reuse,
+            "total_vocab_size": self.text_spec.total_vocab_size,
             "wte_applied_to_all_native_tokens": True,
             "vision_feature_fusion": "add_only_at_image_patch_id",
             "molmo_frozen_eval": True,
-            "text_prefix_autograd_preserved": True,
+            "vlm_execution": "no_grad_inference_only",
+            "per_layer_memory": "detached_image_text_kv",
+            "fg_bg_location": "trainable_expert_scene_block",
+            "text_prefix_autograd_preserved": False,
             "lm_head_present": False,
             "backend_parameters": _EXPECTED_BACKEND_PARAMETERS,
             "frozen_molmo_parameters": _EXPECTED_FROZEN_PARAMETERS,
@@ -560,8 +564,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         self.vision_backbone.eval()
 
     def train(self, mode: bool = True) -> Molmo2FullWithExpertModel:
-        # The inherited implementation keeps the text stack in eval while
-        # preserving autograd through it.  Repeat that guarantee for vision.
+        # Molmo remains deterministic and outside autograd in every train mode.
         super().train(mode)
         self.vlm.eval()
         self.vision_backbone.eval()
@@ -791,15 +794,22 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B,L], got {tuple(input_ids.shape)}.")
         embedding_device = self.vlm.wte.embedding.device
-        safe_input_ids = input_ids.to(device=embedding_device, dtype=torch.long)
-        if bool((safe_input_ids < -1).any()):
+        native_input_ids = input_ids.to(device=embedding_device, dtype=torch.long)
+        if bool((native_input_ids < -1).any()):
             raise ValueError("Molmo input_ids may use -1 only as a padding sentinel.")
-        safe_input_ids = safe_input_ids * (safe_input_ids != -1).to(safe_input_ids.dtype)
+        if bool((native_input_ids >= self.text_spec.total_vocab_size).any()):
+            raise IndexError(
+                "Molmo input token is outside the complete base+additional vocabulary "
+                f"[0, {self.text_spec.total_vocab_size})."
+            )
+        padding = native_input_ids == -1
+        safe_input_ids = native_input_ids.masked_fill(padding, 0)
 
         # Both WTE and vision are frozen and have no differentiable inputs.
         # Autograd resumes after trainable scene tokens are inserted upstream.
         with torch.no_grad():
             embeddings = self.vlm.wte(safe_input_ids)
+            embeddings = embeddings.masked_fill(padding.unsqueeze(-1), 0)
             if disable_vision:
                 self.last_vision_encode_report = {
                     "path": "disabled_ablation",

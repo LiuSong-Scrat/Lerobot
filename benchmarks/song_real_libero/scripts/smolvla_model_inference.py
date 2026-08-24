@@ -22,9 +22,19 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.smolvla.song_pointseg import (
     compose_point_cloud_views,
+    consensus_multiscale_novelty_union_sample_fused_point_cloud,
+    fps_sample_fused_point_cloud,
+    infer_single_view_point_count,
+    multiscale_novelty_union_sample_fused_point_cloud,
+    novelty_union_sample_fused_point_cloud,
+    transport_novelty_union_sample_fused_point_cloud,
     open_episode_point_clouds,
     parse_camera_views,
+    parse_camera_view_weights,
+    parse_camera_view_fusion,
     point_cloud_dir_for_view,
+    voxel_fps_sample_fused_point_cloud,
+    voxel_cover_fps_sample_fused_point_cloud,
 )
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -82,12 +92,19 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
         key: str = "observation.point_cloud",
         mmap_mode: str = "r",
         camera_views: str | tuple[str, ...] | list[str] = "agentview",
+        camera_view_weights: Any = None,
+        camera_view_fusion: Any = "legacy_budget",
         gripper_points: int = 500,
     ) -> None:
         self.dataset = dataset
         self.point_cloud_dir = Path(point_cloud_dir)
         self.dataset_root = self.point_cloud_dir.parent
         self.camera_views = parse_camera_views(camera_views)
+        self.camera_view_weights = parse_camera_view_weights(
+            camera_view_weights,
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(camera_view_fusion)
         self.point_cloud_dirs = {
             view: (
                 self.point_cloud_dir
@@ -145,6 +162,8 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
             clouds,
             gripper_points=self.gripper_points,
             seed=seed,
+            view_weights=self.camera_view_weights,
+            fusion=self.camera_view_fusion,
         ).copy()
         item[self.key] = torch.from_numpy(point_cloud).unsqueeze(0)
         return item
@@ -154,6 +173,8 @@ def maybe_wrap_point_cloud_memmap_dataset(
     dataset,
     *,
     camera_views: str | tuple[str, ...] | list[str] = "agentview",
+    camera_view_weights: Any = None,
+    camera_view_fusion: Any = "legacy_budget",
     gripper_points: int = 500,
 ):
     root_value = getattr(dataset, "root", None)
@@ -179,6 +200,8 @@ def maybe_wrap_point_cloud_memmap_dataset(
         point_cloud_dir=point_cloud_dir,
         mmap_mode=mmap_mode,
         camera_views=views,
+        camera_view_weights=camera_view_weights,
+        camera_view_fusion=camera_view_fusion,
         gripper_points=int(gripper_points),
     )
 
@@ -296,6 +319,7 @@ class SmolVLA_ModelInference:
         visualize_foreground: bool | None = None,
         foreground_visualizer_max_points: int = 50000,
         camera_views: str | tuple[str, ...] | list[str] | None = None,
+        worldflow_action_fusion_override: str | None = None,
     ) -> None:
         self.policy_path = str(policy_path)
         self.policy_repo_id = str(policy_repo_id) if policy_repo_id is not None else None
@@ -305,6 +329,14 @@ class SmolVLA_ModelInference:
         if camera_views is not None:
             selected_override = ",".join(parse_camera_views(camera_views))
             cli_overrides.append(f"--camera_views={selected_override}")
+        if worldflow_action_fusion_override is not None:
+            selected_fusion = str(worldflow_action_fusion_override).strip()
+            if selected_fusion != "cross_attention":
+                raise ValueError(
+                    "Inference-only worldflow_action_fusion_override currently permits only "
+                    f"'cross_attention', got {selected_fusion!r}."
+                )
+            cli_overrides.append(f"--worldflow_action_fusion={selected_fusion}")
         config = PreTrainedConfig.from_pretrained(
             self.policy_path,
             cli_overrides=cli_overrides,
@@ -313,6 +345,11 @@ class SmolVLA_ModelInference:
         if not isinstance(config, SmolVLAConfig):
             raise TypeError(f"Expected SmolVLAConfig, got {type(config).__name__}.")
         self.camera_views = parse_camera_views(getattr(config, "camera_views", "agentview"))
+        self.camera_view_weights = parse_camera_view_weights(
+            getattr(config, "camera_view_weights", None),
+            num_views=len(self.camera_views),
+        )
+        self.camera_view_fusion = parse_camera_view_fusion(getattr(config, "camera_view_fusion", None))
         self.policy = SmolVLAPolicy.from_pretrained(
             self.policy_path,
             config=config,
@@ -469,6 +506,8 @@ class SmolVLA_ModelInference:
         self.dataset = maybe_wrap_point_cloud_memmap_dataset(
             dataset,
             camera_views=self.camera_views,
+            camera_view_weights=self.camera_view_weights,
+            camera_view_fusion=self.camera_view_fusion,
             gripper_points=int(os.environ.get("SONG_POINTCLOUD_GRIPPER_POINTS", "500")),
         )
         return self.dataset
@@ -678,10 +717,15 @@ class SmolVLA_ModelInference:
         model = self.policy.model
         if noise_seed is None or not model.config.worldflow_enable:
             return None
-        if getattr(model.config, "worldflow_noise_coupling", "independent") == "conjugate_ego":
-            # The model derives G_0 = C B_0 C^{-1} from the already seeded Ego
-            # noise. Supplying an independently sampled World tensor here would
-            # silently break the stochastic double-flow contract.
+        if getattr(model.config, "worldflow_noise_coupling", "independent") in {
+            "left_compose_ego",
+            "conjugate_ego",
+            "projected_ego_chart",
+            "projected_ego_path",
+        }:
+            # The model derives the World prior from the already seeded Ego
+            # noise and current pose. Supplying independent World noise here
+            # would silently break the stochastic double-flow contract.
             return None
         state = self.policy.prepare_state(model_batch)
         batch_size = int(state.shape[0])
@@ -798,6 +842,13 @@ class SmolVLA_ModelInference:
                 "point_cloud": one_step_point_cloud,
                 "state": one_step_agent_pos,
             }
+            if bool(getattr(self.policy.config, "worldflow_enable", False)):
+                # This API receives both the cloud and EEF pose in the caller's
+                # fixed world frame, so preserve that pose explicitly even
+                # though the Ego action state is identity-normalized below.
+                model_observation["worldflow.current_ee_pose"] = np.asarray(
+                    one_step_agent_pos[:9], dtype=np.float32
+                )
             for image_alias in ("overhead", "hand"):
                 if image_alias in cur_model_observation:
                     model_observation[image_alias] = cur_model_observation[image_alias]
@@ -847,6 +898,57 @@ class SmolVLA_ModelInference:
             pc = pc.squeeze(1)
         if pc.ndim != 3 or pc.shape[-1] != 6:
             raise ValueError(f"Expected point cloud shape (N, 6) or (B, N, 6), got {tuple(pc.shape)}")
+        pc = pc.to(self.device)
+        fusion = self.camera_view_fusion
+        if len(self.camera_views) > 1 and fusion in {
+            "fps",
+            "voxel_fps",
+            "voxel_cover_fps",
+            "novelty_union",
+            "multiscale_novelty_union",
+            "consensus_multiscale_novelty_union",
+            "transport_novelty_union",
+        }:
+            sampler = {
+                "fps": fps_sample_fused_point_cloud,
+                "voxel_fps": voxel_fps_sample_fused_point_cloud,
+                "voxel_cover_fps": voxel_cover_fps_sample_fused_point_cloud,
+                "novelty_union": novelty_union_sample_fused_point_cloud,
+                "multiscale_novelty_union": multiscale_novelty_union_sample_fused_point_cloud,
+                "consensus_multiscale_novelty_union": consensus_multiscale_novelty_union_sample_fused_point_cloud,
+                "transport_novelty_union": transport_novelty_union_sample_fused_point_cloud,
+            }[fusion]
+            sampler_kwargs = {}
+            if fusion in {
+                "voxel_fps",
+                "voxel_cover_fps",
+                "novelty_union",
+                "multiscale_novelty_union",
+                "consensus_multiscale_novelty_union",
+                "transport_novelty_union",
+            }:
+                sampler_kwargs["voxel_size"] = float(
+                    getattr(self.policy.config, "camera_view_voxel_size", 0.005)
+                )
+            if fusion in {"multiscale_novelty_union", "consensus_multiscale_novelty_union"}:
+                sampler_kwargs["coarse_novelty_scale"] = float(
+                    getattr(self.policy.config, "camera_view_coarse_novelty_scale", 3.0)
+                )
+            pc, _point_is_pad, _indices = sampler(
+                pc,
+                target_points=infer_single_view_point_count(
+                    pc.shape[1],
+                    num_views=len(self.camera_views),
+                    gripper_points=int(
+                        getattr(self.policy.config, "camera_view_fps_gripper_points", 500)
+                    ),
+                ),
+                gripper_points=int(
+                    getattr(self.policy.config, "camera_view_fps_gripper_points", 500)
+                ),
+                point_is_pad=None,
+                **sampler_kwargs,
+            )
         batch_size = pc.shape[0]
 
         state_tensor = self._prepare_state_tensor(
@@ -859,30 +961,26 @@ class SmolVLA_ModelInference:
         if self.policy.config.worldflow_enable:
             worldflow_value = observation.get("worldflow.current_ee_pose")
             if worldflow_value is None:
-                if state is None:
-                    raise ValueError(
-                        "WorldFlow inference requires 'worldflow.current_ee_pose' or a raw current pose9 state."
-                    )
-                worldflow_current_pose = self._prepare_state_tensor(
-                    state,
-                    state_pose_mode="raw",
-                    batch_size=batch_size,
-                )[..., :9]
-            else:
-                worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
-                if worldflow_current_pose.ndim == 1:
-                    worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
-                if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
-                    raise ValueError(
-                        "worldflow.current_ee_pose must have shape (9,) or (B,9), "
-                        f"got {tuple(worldflow_current_pose.shape)}."
-                    )
-                worldflow_current_pose = worldflow_current_pose[..., :9]
+                raise ValueError(
+                    "WorldFlow inference requires an explicit 'worldflow.current_ee_pose' "
+                    "expressed in the checkpoint's fixed world reference frame; it must not "
+                    "be inferred from identity-normalized observation.state."
+                )
+            worldflow_current_pose = self._to_tensor(worldflow_value, dtype=torch.float32)
+            if worldflow_current_pose.ndim == 1:
+                worldflow_current_pose = worldflow_current_pose.unsqueeze(0)
+            if worldflow_current_pose.ndim != 2 or worldflow_current_pose.shape[-1] < 9:
+                raise ValueError(
+                    "worldflow.current_ee_pose must have shape (9,) or (B,9), "
+                    f"got {tuple(worldflow_current_pose.shape)}."
+                )
+            worldflow_current_pose = worldflow_current_pose[..., :9]
             worldflow_current_pose = self._match_batch_size(
                 worldflow_current_pose,
                 batch_size,
                 "worldflow.current_ee_pose",
             )
+
         batch = {
             "observation.point_cloud": pc.to(self.device),
             OBS_STATE: state_tensor.to(self.device),
@@ -952,7 +1050,7 @@ class SmolVLA_ModelInference:
                 ).to(self.device)
         if not image_batch:
             raise ValueError(
-                "Frozen-VLM adapter inference requires RGB input. "
+                "RGB-dependent policy inference requires RGB input. "
                 f"Expected one of {list(image_features)} or aliases 'overhead'/'hand'; "
                 f"available keys are {sorted(str(key) for key in observation)}."
             )

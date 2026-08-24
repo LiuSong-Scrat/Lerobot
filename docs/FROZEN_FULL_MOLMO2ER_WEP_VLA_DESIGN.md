@@ -1,4 +1,11 @@
-# Frozen Full-Molmo2-ER WEP-VLA 设计合同
+# 历史方案 A：Frozen Full-Molmo2-ER WEP-VLA 设计（已废弃）
+
+> **废弃通知（2026-08-22）**：本文记录 FG/BG 插入 Molmo prefix、并让梯度穿过
+> 冻结 Molmo 运算的旧方案 A。它不再是实现或启动依据。当前唯一有效合同是
+> [SCHEME_B_FROZEN_FULL_MOLMO2ER_WEP_VLA_DESIGN.md](SCHEME_B_FROZEN_FULL_MOLMO2ER_WEP_VLA_DESIGN.md)：
+> Molmo 全链路 `eval + torch.no_grad`，逐层 IMAGE/TEXT K/V detach，FG/BG 位于可训练
+> Expert scene block，训练继续使用普通 DDP。以下参数、mask、显存和启动描述只用于历史
+> 追溯，严禁据此启动新训练。
 
 - 状态：架构设计冻结；Full-Molmo2 主干已实现，单视角 World–Ego DoubleFlow 尚待按本文完成启动配置与门禁
 - 目标基线：已复现的 500M WEP-VLA / v0.4.3 方法
@@ -579,11 +586,14 @@ worldflow_rot_weight = 1.0
 worldflow_se3_head_enable = false
 se3_enable = false
 se3_final_correction_enable = false
-pose9_action_noise_enable = true
+pose9_action_noise_enable = false  # 默认值；允许显式开启
 RTC = false
 ```
 
-旧 v0.4.3 文档中的 `left_compose_ego` 与当前实现的 `conjugate_ego` 表达同一核心要求：从一个有效 Ego SE(3) prior 解析地产生 World prior，而不是让两条 flow 从互不相关的随机轨迹开始。当前配置因此同时要求 `pose9_action_noise_enable=true`。不得照搬旧命令中“无效 rotation-6D Gaussian + conjugate”的历史组合。
+`pose9_action_noise_enable` 不再属于 Full-Molmo2-ER 的强制合同，默认关闭以对齐
+WEPVLA v0.4.3 的 raw-channel Gaussian Ego flow；需要有效 SE(3) pose9 prior 的实验可显式开启。
+该开关不改变模块或参数形状，因此两种设置可以加载同一份完整 policy checkpoint，
+但它会改变训练和推理的 flow 起点分布，实验记录必须明确保存最终解析值。
 
 `worldflow_bootstrap_from_ego=false` 是因为本主实验的 Ego/World 前端和 Action Expert均从头训练；它不是从成熟 500M Ego checkpoint 新增 World 分支的适配实验。若未来从已训练 Ego checkpoint 加入 World，`bootstrap_from_ego=true` 必须作为单独 warm-start 方案记录。
 

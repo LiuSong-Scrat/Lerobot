@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import json
 import logging
 import os
 import sys
@@ -22,6 +23,16 @@ from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
 from typing import Any
+
+# When this file is launched directly from an IDE, Python only adds the
+# ``.../src/lerobot/scripts`` directory to sys.path.  The reap environment also
+# has the original LeRobot checkout installed in editable mode, so without this
+# bootstrap all absolute ``lerobot.*`` imports resolve to that other checkout.
+# Put this repository's ``src`` directory first before importing lerobot.
+if __name__ == "__main__":
+    _CURRENT_REPOSITORY_SRC = str(Path(__file__).resolve().parents[2])
+    if sys.path[0] != _CURRENT_REPOSITORY_SRC:
+        sys.path.insert(0, _CURRENT_REPOSITORY_SRC)
 
 import numpy as np
 import torch
@@ -128,12 +139,12 @@ class PointCloudMemmapDataset(torch.utils.data.Dataset):
 
 
 class WorldFlowMemmapDataset(torch.utils.data.Dataset):
-    """Inject fixed-reference EEF poses for WorldFlow supervision.
+    """Inject strict fixed-reference supervision for the selected World target.
 
-    The current pose is the achieved observation pose. Future World targets use
-    ``action_target_ee_poses`` when present so they describe the same controller
-    targets as the Ego action chunk. Legacy datasets without that sidecar fall
-    back to achieved future poses.
+    ``worldflow.current_ee_pose`` is the achieved pose at the observation
+    frame. In ``world_eef_trajectory`` mode both it and the commanded future
+    EEF targets are expressed directly in the complete robot-base frame.
+    Legacy camera-frame datasets retain their historical behavior.
     """
 
     def __init__(
@@ -142,21 +153,39 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         root: str | Path,
         *,
         chunk_size: int,
+        target_type: str = "legacy_eef",
         action_start_offset: int = 0,
         require_action_target_sidecar: bool = False,
         mmap_mode: str = "r",
     ):
         self.dataset = dataset
         self.root = Path(root)
-        self.pose_dir = self.root / "world_ee_poses"
-        command_target_dir = self.root / "action_target_ee_poses"
-        if require_action_target_sidecar and not command_target_dir.is_dir():
+        self.target_type = str(target_type)
+        if self.target_type not in {"legacy_eef", "world_eef_trajectory"}:
+            raise ValueError(f"Unsupported WorldFlow target_type={self.target_type!r}.")
+        self.pose_dir = self.root / (
+            "world_base_ee_poses"
+            if self.target_type == "world_eef_trajectory"
+            else "world_ee_poses"
+        )
+        command_target_dir = self.root / (
+            "world_base_action_target_ee_poses"
+            if self.target_type == "world_eef_trajectory"
+            else "action_target_ee_poses"
+        )
+        if (
+            self.target_type == "legacy_eef"
+            and require_action_target_sidecar
+            and not command_target_dir.is_dir()
+        ):
             raise FileNotFoundError(
                 "WorldFlow requires commanded action targets but the sidecar directory is missing: "
                 f"{command_target_dir}. Regenerate the dataset with action_target_ee_poses or set "
                 "worldflow_require_action_target_sidecar=False only for an explicitly achieved-trajectory dataset."
             )
-        self.target_pose_dir = command_target_dir if command_target_dir.is_dir() else self.pose_dir
+        self.target_pose_dir = (
+            command_target_dir if command_target_dir.is_dir() else self.pose_dir
+        )
         self.chunk_size = int(chunk_size)
         self.action_start_offset = int(action_start_offset)
         if self.action_start_offset < 0:
@@ -169,7 +198,33 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(
                 f"WorldFlow is enabled but reference-frame ee pose directory is missing: {self.pose_dir}"
             )
-        if self.target_pose_dir == self.pose_dir:
+        if self.target_type == "world_eef_trajectory" and not command_target_dir.is_dir():
+            raise FileNotFoundError(
+                "Robot-base WorldFlow requires the commanded EEF trajectory sidecar: "
+                f"{command_target_dir}. Camera-frame or achieved-pose fallbacks are forbidden."
+            )
+        if self.target_type == "world_eef_trajectory":
+            base_meta_path = self.pose_dir / "meta.json"
+            target_meta_path = command_target_dir / "meta.json"
+            if not base_meta_path.is_file() or not target_meta_path.is_file():
+                raise FileNotFoundError(
+                    "Robot-base WorldFlow requires explicit coordinate metadata at "
+                    f"{base_meta_path} and {target_meta_path}."
+                )
+            with open(base_meta_path, encoding="utf-8") as f:
+                base_meta = json.load(f)
+            with open(target_meta_path, encoding="utf-8") as f:
+                target_meta = json.load(f)
+            if (
+                base_meta.get("coordinate_frame") != "robot_base"
+                or target_meta.get("coordinate_frame") != "robot_base"
+                or target_meta.get("target_semantics") != "commanded_eef_pose"
+            ):
+                raise ValueError(
+                    "Robot-base WorldFlow metadata must declare robot_base coordinates and "
+                    "target_semantics='commanded_eef_pose'."
+                )
+        if self.target_type == "legacy_eef" and self.target_pose_dir == self.pose_dir:
             logging.warning(
                 "WorldFlow command-target sidecar is absent at %s; falling back to achieved future poses. "
                 "The World--Ego bridge is exactly label-consistent only when action_target_ee_poses is present.",
@@ -236,10 +291,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         episode_index = self._to_int(item["episode_index"])
         frame_index = self._to_int(item["frame_index"])
         poses = self._episode_poses(episode_index)
-        target_poses = self._episode_target_poses(episode_index)
         episode_len = int(len(poses))
         if episode_len <= 0:
             raise ValueError(f"Worldflow episode {episode_index} is empty.")
+        target_poses = self._episode_target_poses(episode_index)
         if len(target_poses) != episode_len:
             raise ValueError(
                 f"WorldFlow episode {episode_index} achieved/target lengths differ: "
@@ -263,10 +318,18 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             + np.arange(chunk_size, dtype=np.int64)
         )
         clamped_indices = np.clip(frame_indices, 0, episode_len - 1)
-        item["worldflow.ee_poses"] = torch.from_numpy(
+        target_key = (
+            "worldflow.eef_trajectory"
+            if self.target_type == "world_eef_trajectory"
+            else "worldflow.ee_poses"
+        )
+        item[target_key] = torch.from_numpy(
             np.array(target_poses[clamped_indices], dtype=np.float32, copy=True)
         )
-        item["worldflow.step_is_pad"] = torch.from_numpy(frame_indices >= episode_len)
+        target_frame_indices = frame_indices
+        item["worldflow.step_is_pad"] = torch.from_numpy(
+            target_frame_indices >= episode_len
+        )
         return item
 
 
@@ -625,6 +688,7 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         dataset,
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
+        target_type=str(getattr(policy_cfg, "worldflow_target_type", "legacy_eef")),
         action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         require_action_target_sidecar=bool(
             getattr(policy_cfg, "worldflow_require_action_target_sidecar", False)
@@ -1655,46 +1719,163 @@ def main():
 def _apply_song_debug_defaults() -> None:
     if len(sys.argv) > 1 and os.environ.get("SONG_TRAIN_DEBUG_DEFAULTS") != "1":
         return
+
+    # Directly running this file is a single-process/single-GPU debug path. Keep
+    # the shell-side settings used by the matching training command available
+    # when the IDE does not define them explicitly.
+    debug_environment = {
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "OMP_NUM_THREADS": "8",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+        "MALLOC_ARENA_MAX": "2",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "SONG_POINTSEG_REQUIRE_POINTOPS": "1",
+        "SONG_POINTCLOUD_GRIPPER_POINTS": "500",
+        "TOKENIZERS_PARALLELISM": "false",
+        "WANDB_MODE": "offline",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "MOLMO_FULL_CUDA_LEASE_ENABLE": "0",
+        "MOLMO_CHECKPOINTS_TO_KEEP": "1",
+    }
+    for name, value in debug_environment.items():
+        os.environ.setdefault(name, value)
+
     sys.argv = [
         "train_song.py",
-        "--policy.path=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/outputs/real_setting/train/ep_vla/checkpoints/last/pretrained_model",
-        # "--policy.type=smolvla",
-        # "--policy.repo_id=/home/liusong/scp_receive/smolvla",
+        "--policy.path=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow_three_stage/stage1_fresh_000000_to030000_v043data_long68_after1500/checkpoints/last/pretrained_model",
+        "--resume=false",
         "--policy.push_to_hub=false",
-        "--dataset.repo_id=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset",
-        "--pointseg_sample_cache_dir=/opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/real_priorseg_cache",
-        "--policy.vla_adapter_enable=true",
-        "--policy.vla_adapter_freeze_vlm=true",
-        "--policy.vlm_model_name=/home/liusong/hf_models/SmolVLM2-500M-Video-Instruct",
-        "--policy.vlm_weights_path=/home/liusong/hf_models/smolvla_base",
-        "--policy.load_vlm_weights=true",
-        "--batch_size=4",
-        "--steps=80000",
+        "--dataset.repo_id=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep",
+        "--pointseg_sample_cache_dir=/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep_pointseg_cache",
+        "--batch_size=40",
+        "--gradient_accumulation_steps=1",
+        "--global_batch_size=40",
+        "--steps=30000",
+        "--seed=1000",
+        "--save_checkpoint=true",
+        "--save_freq=500",
+        "--eval_freq=500",
         "--log_freq=1",
-        "--output_dir=/home/liusong/temp/train_test",
-        "--job_name=temp",
+        "--num_workers=12",
+        "--output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow_three_stage/stage1_fresh_000000_to030000_v043data_long68_after1500_single_gpu_debug",
+        "--job_name=stage1_fresh_000000_to030000_v043data_long68",
         "--policy.device=cuda",
         "--wandb.enable=true",
         "--wandb.disable_artifact=true",
-        "--save_freq=30000",
-        "--eval_freq=30000",
-        "--num_workers=8",
-        "--policy.pointseg_enable=true ",
-        "--policy.pointseg_backbone_type=litept" ,
-        "--policy.pointseg_grid_size=0.01" ,
-        "--policy.pointseg_feature_dim=64" ,
-        "--policy.pointseg_aux_loss_weight=0.001" ,
-        "--policy.pointseg_foreground_ratio=0.08" ,
-        "--policy.pointseg_background_ratio=0.08" ,
-        "--policy.pointseg_min_foreground_points=4000" ,
-        "--policy.pointseg_min_background_points=0  " ,
-        "--policy.pointseg_use_temporal_priors_as_input=false  " ,
-        "--policy.pointseg_use_pseudo_selection=false" ,
-        "--policy.worldflow_enable=false" ,
-        "--policy.worldflow_se3_head_enable=false" ,
-        "--policy.se3_enable=false" ,
-        "--policy.se3_final_correction_enable=false"
+        "--policy.n_obs_steps=1",
+        "--policy.chunk_size=32",
+        "--policy.n_action_steps=16",
+        "--policy.action_chunk_start_offset=0",
+        "--policy.max_state_dim=10",
+        "--policy.max_action_dim=10",
+        "--policy.camera_views=agentview",
+        "--policy.rgb_camera_views=agentview",
+        "--policy.empty_cameras=0",
+        "--policy.tokenizer_max_length=48",
+        "--policy.num_steps=10",
+        "--policy.flow_time_sampling=beta",
+        "--policy.flow_time_zero_probability=0.0",
+        "--policy.use_cache=true",
+        "--policy.freeze_vision_encoder=true",
+        "--policy.train_expert_only=true",
+        "--policy.train_state_proj=true",
+        "--policy.encode_robot_state=false",
+        "--policy.vla_adapter_enable=false",
+        "--policy.vla_adapter_freeze_vlm=true",
+        "--policy.vlm_backend=molmo2_full",
+        "--policy.molmo_inference_only=true",
+        "--policy.molmo_image_fast_path=true",
+        "--policy.vlm_model_name=/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song/Molmo2-ER",
+        "--policy.vlm_weights_path=/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song/Molmo2-ER",
+        "--policy.load_vlm_weights=true",
+        "--policy.load_action_expert_weights=false",
+        "--policy.load_action_expert_projection_weights=false",
+        "--policy.num_vlm_layers=36",
+        "--policy.num_expert_layers=36",
+        "--policy.expert_width_multiplier=0.75",
+        "--policy.self_attn_every_n_layers=2",
+        "--policy.attention_mode=cross_attn",
+        "--policy.add_image_special_tokens=false",
+        "--policy.prefix_length=-1",
+        "--policy.pad_language_to=longest",
+        "--policy.pointseg_enable=true",
+        "--policy.pointseg_checkpoint_path=null",
+        "--policy.pointseg_backbone_type=litept",
+        "--policy.pointseg_grid_size=0.01",
+        "--policy.pointseg_feature_dim=64",
+        "--policy.pointseg_aux_loss_weight=0.0005",
+        "--policy.pointseg_foreground_ratio=0.025",
+        "--policy.pointseg_background_ratio=0.025",
+        "--policy.pointseg_min_foreground_points=2500",
+        "--policy.pointseg_min_background_points=0",
+        "--policy.pointseg_use_temporal_priors_as_input=false",
+        "--policy.pointseg_use_pseudo_selection=false",
+        "--policy.point_action_fusion_enable=true",
+        "--policy.point_action_fusion_heads=4",
+        "--policy.point_action_fusion_dropout=0.0",
+        "--policy.action_loss_translation_weight=1.0",
+        "--policy.action_loss_rotation_weight=1.0",
+        "--policy.action_loss_gripper_weight=1.0",
+        "--policy.pose9_action_noise_enable=false",
+        "--policy.pointseg_freeze_batchnorm_stats=true",
+        "--policy.pose9_action_noise_trans_scale=0.15",
+        "--policy.pose9_action_noise_rot_scale=0.35",
+        "--policy.pose9_action_noise_gripper_scale=0.05",
+        "--policy.worldflow_enable=true",
+        "--policy.worldflow_target_type=world_eef_trajectory",
+        "--policy.worldflow_world_eef_velocity_mode=base_pose9_euclidean",
+        "--policy.worldflow_reference_frame=robot_base",
+        "--policy.worldflow_frame_origin=global",
+        "--policy.worldflow_scene_frame_origin=global",
+        "--policy.worldflow_action_fusion=point_action_expert_conjugate_bridge",
+        "--policy.worldflow_action_expert_mode=shared",
+        "--policy.worldflow_current_ee_pose_token=false",
+        "--policy.worldflow_freeze_pretrained_ego=false",
+        "--policy.worldflow_training_coordinate_frame_augmentation=false",
+        "--policy.worldflow_pretrained_lr_multiplier=1.0",
+        "--policy.worldflow_new_lr_multiplier=1.0",
+        "--policy.worldflow_eef_probe_radius_m=0.10",
+        "--policy.worldflow_bootstrap_from_ego=false",
+        "--policy.worldflow_ego_residual_gate_init=null",
+        "--policy.worldflow_noise_coupling=left_compose_ego",
+        "--policy.worldflow_require_action_target_sidecar=true",
+        "--policy.worldflow_feature_dim=64",
+        "--policy.worldflow_grid_size=0.01",
+        "--policy.worldflow_max_points=2048",
+        "--policy.worldflow_loss_weight=1.0",
+        "--policy.worldflow_geo_loss_weight=0.0",
+        "--policy.worldflow_bridge_loss_weight=0.0",
+        "--policy.worldflow_equiv_loss_weight=0.0",
+        "--policy.worldflow_trans_weight=1.0",
+        "--policy.worldflow_rot_weight=1.0",
+        "--policy.worldflow_noise_trans_scale=0.15",
+        "--policy.worldflow_noise_rot_scale=0.20",
+        "--policy.worldflow_augmentation_trans_scale=0.20",
+        "--policy.worldflow_augmentation_rot_scale=0.75",
+        "--policy.worldflow_action_expert_layers=-1",
+        "--policy.worldflow_action_expert_dropout=0.0",
+        "--policy.worldflow_min_transport_points=3",
+        "--policy.worldflow_transport_score_threshold=0.05",
+        "--policy.worldflow_se3_head_enable=false",
+        "--policy.se3_enable=false",
+        "--policy.se3_final_correction_enable=false",
+        "--policy.optimizer_lr=0.0001",
+        "--policy.optimizer_betas=[0.9,0.95]",
+        "--policy.optimizer_eps=1e-8",
+        "--policy.optimizer_weight_decay=1e-10",
+        "--policy.optimizer_grad_clip_norm=10",
+        "--policy.scheduler_warmup_steps=100",
+        "--policy.scheduler_decay_steps=30000",
+        "--policy.scheduler_decay_lr=3e-5",
+        "--policy.compile_model=false",
+        "--policy.use_amp=false",
+        "--policy.use_peft=false",
     ]
+
 
 if __name__ == "__main__":
     _apply_song_debug_defaults()

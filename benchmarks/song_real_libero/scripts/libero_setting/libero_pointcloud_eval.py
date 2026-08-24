@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "strict_official_multiview_camera_selection_v13_20260811"
+EVAL_BUILD_TAG = "checkpoint_preload_gate_v23_20260816"
 
 import argparse
 import atexit
@@ -49,7 +49,7 @@ _ISOLATED_POLICY_WORKER_BOOTSTRAP = (
 _SUITE_LAUNCHER_BOOTSTRAP = any(
     arg == "--suite-gpu-ids" or arg.startswith("--suite-gpu-ids=") for arg in sys.argv[1:]
 )
-_EVALUATION_RUN_LOCK_FILE: Any | None = None
+_EVALUATION_RUN_LOCK_CLAIM_DIR: Path | None = None
 # This must be set before the policy import performs the first CUDA operation.
 # PyTorch uses it when deterministic cuBLAS execution is requested below.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -76,10 +76,59 @@ FAIR_EVALUATION_PROTOCOL = {
     "benchmark_comparable": True,
 }
 
+OFFICIAL_LIBERO_CONTROL_FREQ = 20.0
+
+
+def validate_control_frequency(value: Any) -> float:
+    control_freq = float(value)
+    if not np.isfinite(control_freq) or control_freq <= 0.0:
+        raise ValueError(
+            f"control_freq must be a finite positive frequency in Hz, got {value!r}."
+        )
+    return control_freq
+
 
 def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Describe whether this is a standard benchmark or a source-demo domain diagnostic."""
 
+    if cfg.get("worldflow_action_fusion_override") is not None:
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "worldflow_action_fusion_override_rollout",
+            "worldflow_action_fusion_override": str(
+                cfg["worldflow_action_fusion_override"]
+            ),
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
+    if bool(cfg.get("secondary_view_causal_ablation", False)):
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "secondary_view_causal_ablation_rollout",
+            "secondary_view_causal_ablation": True,
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
+    if bool(cfg.get("world_to_ego_causal_ablation", False)):
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "world_to_ego_causal_ablation_rollout",
+            "world_to_ego_causal_ablation": True,
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
+    control_freq = validate_control_frequency(
+        cfg.get("control", {}).get("control_freq", OFFICIAL_LIBERO_CONTROL_FREQ)
+    )
+    if not np.isclose(control_freq, OFFICIAL_LIBERO_CONTROL_FREQ):
+        return {
+            **FAIR_EVALUATION_PROTOCOL,
+            "name": "nonstandard_control_frequency_rollout",
+            "control_freq": control_freq,
+            "official_control_freq": OFFICIAL_LIBERO_CONTROL_FREQ,
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
     if not bool(cfg.get("dataset_domain_env", False)):
         return dict(FAIR_EVALUATION_PROTOCOL)
     state_offset = int(cfg.get("dataset_domain_state_observation_offset", 1))
@@ -109,58 +158,40 @@ def acquire_evaluation_run_lock(output_dir: Path) -> None:
 
     Multi-GPU suite children intentionally share their launcher's output root,
     so only the top-level launcher (or a normal single-process run) owns this
-    lock. The file descriptor remains open until process exit.
+    claim. The persistent atomic directory also records completed ownership and
+    avoids flock(2), which can block indefinitely on NFS mounts.
     """
-    global _EVALUATION_RUN_LOCK_FILE
+    global _EVALUATION_RUN_LOCK_CLAIM_DIR
     if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") == "1":
         return
-    if _EVALUATION_RUN_LOCK_FILE is not None:
+    if _EVALUATION_RUN_LOCK_CLAIM_DIR is not None:
         return
 
-    import fcntl
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / ".evaluation_run.lock"
-    lock_file = open(lock_path, "a+", encoding="utf-8")
+    claim_dir = output_dir / ".evaluation_run.claim"
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        lock_file.seek(0)
-        owner = lock_file.read().strip() or "unknown owner"
-        lock_file.close()
+        claim_dir.mkdir()
+    except FileExistsError as exc:
         raise RuntimeError(
-            f"Evaluation output directory is already active: {output_dir}. "
-            f"Lock owner: {owner}"
+            f"Evaluation output directory is already claimed: {output_dir}. "
+            f"Persistent claim: {claim_dir}"
         ) from exc
-
-    lock_file.seek(0)
-    lock_file.truncate()
-    json.dump(
-        {
-            "pid": os.getpid(),
-            "hostname": os.uname().nodename,
-            "started_unix_s": time.time(),
-            "argv": sys.argv,
-        },
-        lock_file,
-        ensure_ascii=False,
+    owner_path = claim_dir / "owner.json"
+    owner_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "hostname": os.uname().nodename,
+                "started_unix_s": time.time(),
+                "argv": sys.argv,
+                "backend": "persistent_atomic_mkdir",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
     )
-    lock_file.flush()
-    os.fsync(lock_file.fileno())
-    _EVALUATION_RUN_LOCK_FILE = lock_file
-
-    def _release() -> None:
-        global _EVALUATION_RUN_LOCK_FILE
-        active_lock = _EVALUATION_RUN_LOCK_FILE
-        if active_lock is None:
-            return
-        try:
-            fcntl.flock(active_lock.fileno(), fcntl.LOCK_UN)
-        finally:
-            active_lock.close()
-            _EVALUATION_RUN_LOCK_FILE = None
-
-    atexit.register(_release)
+    _EVALUATION_RUN_LOCK_CLAIM_DIR = claim_dir
 
 
 def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
@@ -184,6 +215,8 @@ if __package__ and __package__.startswith("benchmarks."):
     from .libero_pointcloud_utils import (
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
+        eef_pose9_world_to_reference_camera,
+        eef_pose9_world_to_robot_base,
         ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
@@ -202,6 +235,8 @@ else:
     from libero_setting.libero_pointcloud_utils import (
         attach_mujoco_3d_viewer,
         eef_pose9_gripper_from_obs,
+        eef_pose9_world_to_reference_camera,
+        eef_pose9_world_to_robot_base,
         ensure_libero_config,
         fast_inverse_homogeneous,
         get_task_init_states,
@@ -277,6 +312,17 @@ def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any
         "smolvlm_with_expert_sha256": _sha256_file(
             repo_root / "src" / "lerobot" / "policies" / "smolvla" / "smolvlm_with_expert.py"
         ),
+        "molmo2_full_with_expert_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "molmo2_full_with_expert.py"
+        ),
+        "molmo2_processing_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "molmo2_processing.py"
+        ),
+        "processor_smolvla_sha256": _sha256_file(
+            repo_root / "src" / "lerobot" / "policies" / "smolvla" / "processor_smolvla.py"
+        ),
+        "molmo2_modeling_sha256": _sha256_file(repo_root / "Molmo2-ER" / "modeling_molmo2.py"),
+        "molmo2_processor_sha256": _sha256_file(repo_root / "Molmo2-ER" / "processing_molmo2.py"),
         "policy_config_sha256": _sha256_file(config_path) if config_path is not None else None,
     }
     package_versions: dict[str, str] = {}
@@ -570,6 +616,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_LIBERO_CONFIG)
     parser.add_argument("--policy.path", "--policy_path", dest="policy_path", default=None)
     parser.add_argument("--policy.repo_id", "--policy_repo_id", dest="policy_repo_id", default=None)
+    parser.add_argument(
+        "--preload-ready-file",
+        type=Path,
+        default=None,
+        help=(
+            "After loading and validating the policy, atomically write this readiness file. "
+            "Must be paired with --evaluation-start-gate."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-start-gate",
+        type=Path,
+        default=None,
+        help=(
+            "After policy preload, wait for this file before creating evaluation environments. "
+            "Must be paired with --preload-ready-file."
+        ),
+    )
+    parser.add_argument(
+        "--secondary-view-causal-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Diagnostic only: load the same primary_residual checkpoint but skip its secondary-view "
+            "encoder and residual, leaving the checkpoint's primary path unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--world-to-ego-causal-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Diagnostic only: keep the World stream and Ego-to-World path active, but remove "
+            "both World-to-Ego cross-attention and the World residual twist correction."
+        ),
+    )
+    parser.add_argument(
+        "--worldflow-action-fusion-override",
+        choices=("cross_attention",),
+        default=None,
+        help=(
+            "Diagnostic only: override a WorldFlow checkpoint's final action routing at load "
+            "time without modifying the checkpoint. Currently only cross_attention is allowed."
+        ),
+    )
     parser.add_argument("--suite", action="append", default=None)
     parser.add_argument(
         "--suite-gpu-ids",
@@ -974,6 +1065,41 @@ def parse_args() -> argparse.Namespace:
         help="Short collection window used by the shared-GPU dynamic batcher.",
     )
     parser.add_argument(
+        "--inference-batching-mode",
+        choices=("dynamic", "fixed_barrier"),
+        default=None,
+        help=(
+            "How process environment requests are batched. 'dynamic' maximizes throughput by arrival "
+            "time. 'fixed_barrier' keeps one stable slot per environment worker and a constant physical "
+            "batch shape, removing arrival-order numerical variation from comparable evaluations."
+        ),
+    )
+    parser.add_argument(
+        "--inference-repeatability-probe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "On the first fixed-barrier batch only, repeat the exact same policy forward and also "
+            "run a batch whose rows duplicate one request. This diagnostic adds two forwards but "
+            "does not alter the rollout action or any model/external-library implementation."
+        ),
+    )
+    parser.add_argument(
+        "--inference-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Persistent exact-input action-chunk cache. The cache key includes the checkpoint identity, "
+            "ordered fixed batch, complete observation bytes, instruction, and explicit noise seed."
+        ),
+    )
+    parser.add_argument(
+        "--inference-cache-mode",
+        choices=("off", "read_write", "readonly"),
+        default=None,
+        help="Use the deterministic inference cache (default: read_write when a cache directory is supplied).",
+    )
+    parser.add_argument(
         "--recreate-env-per-episode",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1029,18 +1155,69 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
+def wait_for_preloaded_evaluation_gate(
+    *,
+    ready_file: Path | None,
+    start_gate: Path | None,
+    policy_path: str,
+) -> None:
+    """Expose model readiness, then preserve it in memory until scheduling starts."""
+
+    if (ready_file is None) != (start_gate is None):
+        raise ValueError(
+            "--preload-ready-file and --evaluation-start-gate must be supplied together"
+        )
+    if ready_file is None or start_gate is None:
+        return
+
+    ready_file = ready_file.expanduser().resolve()
+    start_gate = start_gate.expanduser().resolve()
+    if ready_file == start_gate:
+        raise ValueError("preload readiness and evaluation start gate must be different files")
+    write_json_atomic(
+        ready_file,
+        {
+            "status": "policy_loaded_waiting_for_evaluation",
+            "pid": os.getpid(),
+            "policy_path": policy_path,
+            "ready_unix_s": time.time(),
+            "start_gate": str(start_gate),
+        },
+    )
+    print(
+        f"[preload-gate] policy ready pid={os.getpid()} ready_file={ready_file}; "
+        f"waiting for {start_gate}",
+        flush=True,
+    )
+    while not start_gate.is_file():
+        time.sleep(0.25)
+    print(f"[preload-gate] evaluation released by {start_gate}", flush=True)
+
+
 @contextmanager
 def interprocess_file_lock(path: Path):
-    """Serialize report updates from independent MuJoCo worker processes."""
+    """Serialize report updates from independent same-host MuJoCo workers.
+
+    Lock only the host-local surrogate. Opening an NFS lock file and waiting for
+    ENOLCK is insufficient because some NFS servers block inside flock instead.
+    """
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+", encoding="utf-8") as lock_file:
+    local_lock_root = Path(
+        os.environ.get("SONG_LIBERO_LOCAL_LOCK_ROOT", "/tmp/song_libero_file_locks")
+    )
+    local_lock_root.mkdir(parents=True, exist_ok=True)
+    lock_digest = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()
+    lock_file = open(local_lock_root / f"{lock_digest}.lock", "a+", encoding="utf-8")
+    try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 def _read_json_or_default(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -3529,7 +3706,9 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "dataset_domain_oracle_actions": bool(
                 cfg.get("dataset_domain_oracle_actions", False)
             ),
-            "benchmark_comparable": not bool(cfg.get("dataset_domain_env", False)),
+            "benchmark_comparable": bool(
+                evaluation_protocol_for_config(cfg)["benchmark_comparable"]
+            ),
             "demo_root": (
                 str(cfg.get("dataset_domain_demo_root"))
                 if bool(cfg.get("dataset_domain_env", False))
@@ -3558,6 +3737,9 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "task_worker_backend": str(cfg["task_worker_backend"]),
             "inference_batch_size": int(cfg["inference_batch_size"]),
             "inference_batch_wait_ms": float(cfg["inference_batch_wait_ms"]),
+            "inference_batching_mode": str(cfg["inference_batching_mode"]),
+            "inference_cache_mode": str(cfg.get("inference_cache_mode", "off")),
+            "inference_cache_dir": cfg.get("inference_cache_dir"),
             "recreate_env_per_episode": bool(cfg["recreate_env_per_episode"]),
             "deterministic_torch": bool(cfg["deterministic_torch"]),
             "torch_determinism": cfg.get("torch_determinism", {}),
@@ -4107,6 +4289,8 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
             False if len(camera_names) > 1 else bool(cfg.get("gripper_shuffle_points", False))
         ),
         seed=int(seed),
+        camera_view_weights=cfg.get("camera_view_weights"),
+        camera_view_fusion=cfg.get("camera_view_fusion", "legacy_budget"),
     )
     world_pose9 = np.asarray(pose9_gripper[:9], dtype=np.float32)
     gripper = float(pose9_gripper[-1])
@@ -4138,6 +4322,15 @@ def image_camera_names_from_config(cfg: dict[str, Any]) -> list[str]:
     if value is None:
         return []
     return _unique_camera_names(value, field_name="image_cameras")
+
+
+def policy_requires_rgb(policy_cfg: Any) -> bool:
+    """Return whether inference needs rendered RGB, independently of adapter mode."""
+
+    requires_rgb = getattr(policy_cfg, "requires_rgb", None)
+    if requires_rgb is not None:
+        return bool(requires_rgb)
+    return bool(getattr(policy_cfg, "vla_adapter_enable", False))
 
 
 def _camera_names_from_input_features(policy_cfg: dict[str, Any]) -> list[str]:
@@ -4388,7 +4581,7 @@ def resolve_policy_rgb_cameras(
                 key for key, value in raw_obs.items() if key.endswith("_image") and np.asarray(value).ndim == 3
             )
             raise KeyError(
-                f"Adapter checkpoint requires {image_key!r}, but no matching LIBERO image was found. "
+                f"RGB-dependent checkpoint requires {image_key!r}, but no matching LIBERO image was found. "
                 f"Tried cameras={candidates!r}; selected RGB cameras={allowed_cameras!r}; "
                 f"available image keys={available!r}. "
                 "Set policy_image_camera_map in the eval config when using a custom camera alias."
@@ -4454,7 +4647,7 @@ def inspect_policy_camera_alignment(
     )
     policy_rgb_cameras: tuple[str, ...] = ()
     policy_cfg = infer.policy.config
-    if bool(getattr(policy_cfg, "requires_rgb", getattr(policy_cfg, "vla_adapter_enable", False))):
+    if policy_requires_rgb(policy_cfg):
         configured_rgb = getattr(policy_cfg, "rgb_camera_views", None)
         if configured_rgb is not None:
             policy_rgb_cameras = _camera_names_from_policy_value(configured_rgb)
@@ -4507,7 +4700,7 @@ def reconcile_eval_camera_views_with_loaded_policy(
     policy_cfg = infer.policy.config
     loaded_rgb: list[str] = []
     loaded_rgb_source: str | None = None
-    if bool(getattr(policy_cfg, "requires_rgb", getattr(policy_cfg, "vla_adapter_enable", False))):
+    if policy_requires_rgb(policy_cfg):
         configured_rgb = getattr(policy_cfg, "rgb_camera_views", None)
         if configured_rgb is not None:
             parsed_rgb = list(_camera_names_from_policy_value(configured_rgb))
@@ -4534,7 +4727,7 @@ def reconcile_eval_camera_views_with_loaded_policy(
                 loaded_rgb_source = "loaded_policy.config.image_features"
         if not loaded_rgb:
             raise ValueError(
-                "The loaded VLA-adapter policy exposes no usable RGB camera in "
+                "The loaded RGB-dependent policy exposes no usable RGB camera in "
                 "rgb_camera_views or image_features."
             )
 
@@ -4573,6 +4766,12 @@ def reconcile_eval_camera_views_with_loaded_policy(
         "rgb": list(loaded_rgb),
         "rgb_source": loaded_rgb_source,
     }
+    cfg["camera_view_weights"] = (
+        list(infer.camera_view_weights)
+        if getattr(infer, "camera_view_weights", None) is not None
+        else None
+    )
+    cfg["camera_view_fusion"] = getattr(infer, "camera_view_fusion", "legacy_budget")
     return inspect_policy_camera_alignment(infer, cfg)
 
 
@@ -4792,6 +4991,139 @@ class _ProcessInferenceRequest:
     noise_seed: int | None
 
 
+class FixedBatchInferenceCache:
+    """Memoize exact fixed-slot model calls without changing model outputs."""
+
+    schema_version = "fixed_batch_exact_action_chunk_v2"
+
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        policy_path: Path,
+        mode: str,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> None:
+        self.directory = directory.resolve()
+        self.mode = str(mode)
+        if self.mode not in {"read_write", "readonly"}:
+            raise ValueError(f"Unsupported inference cache mode: {self.mode!r}")
+        policy_path = policy_path.resolve()
+        model_path = policy_path / "model.safetensors"
+        if not model_path.is_file():
+            raise FileNotFoundError(model_path)
+
+        def _small_sha256(path: Path) -> str | None:
+            return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+        model_stat = model_path.stat()
+        identity_files = (
+            policy_path / "config.json",
+            policy_path / "policy_preprocessor.json",
+            policy_path / "policy_postprocessor.json",
+        )
+        self.identity = {
+            "schema_version": self.schema_version,
+            "eval_build_tag": EVAL_BUILD_TAG,
+            "policy_path": str(policy_path),
+            "model_resolved_path": str(model_path.resolve()),
+            "model_size": int(model_stat.st_size),
+            "model_mtime_ns": int(model_stat.st_mtime_ns),
+            "small_file_sha256": {path.name: _small_sha256(path) for path in identity_files},
+            "runtime_context": dict(runtime_context or {}),
+        }
+        self.identity_sha256 = hashlib.sha256(
+            json.dumps(self.identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if self.mode == "read_write":
+            self.directory.mkdir(parents=True, exist_ok=True)
+        manifest = self.directory / "manifest.json"
+        if manifest.exists():
+            existing = json.loads(manifest.read_text(encoding="utf-8"))
+            if existing != self.identity:
+                raise RuntimeError(f"Inference cache identity mismatch: {manifest}")
+        elif self.mode == "readonly":
+            raise FileNotFoundError(f"Readonly inference cache has no manifest: {manifest}")
+        else:
+            temporary = self.directory / f".manifest.{os.getpid()}.tmp"
+            temporary.write_text(json.dumps(self.identity, indent=2) + "\n", encoding="utf-8")
+            if manifest.exists():
+                temporary.unlink(missing_ok=True)
+                existing = json.loads(manifest.read_text(encoding="utf-8"))
+                if existing != self.identity:
+                    raise RuntimeError(f"Inference cache identity race mismatch: {manifest}")
+            else:
+                os.replace(temporary, manifest)
+        self.hit_count = 0
+        self.miss_count = 0
+        self.write_count = 0
+
+    def key(self, slots: list[_ProcessInferenceRequest]) -> str:
+        records = []
+        for row_index, request in enumerate(slots):
+            records.append(
+                {
+                    "row_index": row_index,
+                    "worker_id": int(request.worker_id),
+                    "observation_sha256": model_observation_fingerprints(request.observation)["__all__"],
+                    "task": str(request.task),
+                    "postprocess": bool(request.postprocess),
+                    "state_pose_mode": str(request.state_pose_mode),
+                    "noise_seed": None if request.noise_seed is None else int(request.noise_seed),
+                }
+            )
+        payload = {
+            "schema_version": self.schema_version,
+            "policy_identity_sha256": self.identity_sha256,
+            "ordered_slots": records,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _path(self, key: str) -> Path:
+        return self.directory / "entries" / key[:2] / f"{key}.npy"
+
+    def load(self, key: str) -> np.ndarray | None:
+        path = self._path(key)
+        if not path.is_file():
+            self.miss_count += 1
+            if self.mode == "readonly":
+                raise KeyError(f"Readonly inference cache miss: {key}")
+            return None
+        with path.open("rb") as stream:
+            value = np.load(stream, allow_pickle=False)
+        self.hit_count += 1
+        return np.ascontiguousarray(value)
+
+    def store(self, key: str, value: Any) -> None:
+        if self.mode != "read_write":
+            return
+        path = self._path(key)
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        array = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+        array = np.ascontiguousarray(array)
+        temporary = path.parent / f".{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with temporary.open("xb") as stream:
+            np.save(stream, array, allow_pickle=False)
+        if path.exists():
+            temporary.unlink(missing_ok=True)
+        else:
+            os.replace(temporary, path)
+            self.write_count += 1
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "directory": str(self.directory),
+            "hits": self.hit_count,
+            "misses": self.miss_count,
+            "writes": self.write_count,
+        }
+
+
 class ProcessInferenceProxy:
     """Child-process policy facade backed by the parent GPU model service."""
 
@@ -4805,6 +5137,9 @@ class ProcessInferenceProxy:
         response_queue: Any,
         vla_adapter_enable: bool,
         image_feature_keys: list[str],
+        requires_rgb: bool | None = None,
+        worldflow_enable: bool = False,
+        worldflow_reference_frame: str = "pointcloud_reference_camera",
     ) -> None:
         self.worker_id = int(worker_id)
         self.request_queue = request_queue
@@ -4813,8 +5148,14 @@ class ProcessInferenceProxy:
         self.policy = SimpleNamespace(
             config=SimpleNamespace(
                 vla_adapter_enable=bool(vla_adapter_enable),
-                requires_rgb=bool(vla_adapter_enable),
+                requires_rgb=bool(
+                    vla_adapter_enable
+                    if requires_rgb is None
+                    else requires_rgb
+                ),
                 image_features={str(key): None for key in image_feature_keys},
+                worldflow_enable=bool(worldflow_enable),
+                worldflow_reference_frame=str(worldflow_reference_frame),
             )
         )
 
@@ -4890,6 +5231,9 @@ def _process_task_worker_entry(
     start_event: Any,
     vla_adapter_enable: bool,
     image_feature_keys: list[str],
+    requires_rgb: bool,
+    worldflow_enable: bool,
+    worldflow_reference_frame: str,
 ) -> None:
     """Own one MuJoCo task environment in a process that never loads the policy."""
     try:
@@ -4901,6 +5245,9 @@ def _process_task_worker_entry(
             response_queue=response_queue,
             vla_adapter_enable=vla_adapter_enable,
             image_feature_keys=image_feature_keys,
+            requires_rgb=requires_rgb,
+            worldflow_enable=worldflow_enable,
+            worldflow_reference_frame=worldflow_reference_frame,
         )
 
         def _announce_ready_and_wait() -> None:
@@ -4978,6 +5325,148 @@ def _execute_process_inference_batch(
         error_text = traceback.format_exc()
         for request in requests:
             response_queues[request.worker_id].put(("error", request.request_id, error_text))
+
+
+def _execute_process_inference_fixed_slots(
+    infer: SmolVLA_ModelInference,
+    requests_by_worker: dict[int, _ProcessInferenceRequest],
+    response_queues: dict[int, Any],
+    *,
+    slot_count: int,
+    padding_requests_by_worker: dict[int, _ProcessInferenceRequest],
+    repeatability_probe_path: Path | None = None,
+    inference_cache: FixedBatchInferenceCache | None = None,
+) -> None:
+    """Execute a constant-shape batch whose row index is the stable worker id.
+
+    Dynamic arrival batching changes both the physical batch shape and each
+    episode's row position across otherwise identical runs. Small CUDA numeric
+    differences then bifurcate contact-rich closed-loop trajectories. This
+    mode waits for one request from every still-active worker, places it in its
+    immutable slot, and pads slots belonging to completed workers with their
+    last request. Only real requests receive responses.
+
+    Padding is deliberately inference-only: no extra environment rollout or
+    action selection is introduced, and each real request retains its keyed
+    per-episode/per-call Flow Matching noise.
+    """
+    if not requests_by_worker:
+        return
+    invalid = sorted(worker_id for worker_id in requests_by_worker if not 0 <= worker_id < slot_count)
+    if invalid:
+        raise RuntimeError(f"Fixed inference batch contains invalid worker slots: {invalid}.")
+
+    fallback = requests_by_worker[min(requests_by_worker)]
+    slots: list[_ProcessInferenceRequest] = []
+    real_slots: list[tuple[int, _ProcessInferenceRequest]] = []
+    for worker_id in range(int(slot_count)):
+        request = requests_by_worker.get(worker_id)
+        if request is not None:
+            padding_requests_by_worker[worker_id] = request
+            real_slots.append((worker_id, request))
+        else:
+            request = padding_requests_by_worker.get(worker_id, fallback)
+        slots.append(request)
+
+    try:
+        postprocess_values = {request.postprocess for request in slots}
+        state_modes = {request.state_pose_mode for request in slots}
+        if len(postprocess_values) != 1 or len(state_modes) != 1:
+            raise ValueError("All fixed-slot requests must use the same inference options.")
+        observation_batch = _stack_model_observations([request.observation for request in slots])
+        cache_key = inference_cache.key(slots) if inference_cache is not None else None
+        action_chunks = inference_cache.load(cache_key) if inference_cache is not None else None
+        if action_chunks is None:
+            action_chunks = infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in slots]
+                if all(request.noise_seed is not None for request in slots)
+                else None,
+            )
+            if inference_cache is not None:
+                inference_cache.store(cache_key, action_chunks)
+        if repeatability_probe_path is not None and not repeatability_probe_path.exists():
+            repeated_action_chunks = infer.predict_action_chunk_obs(
+                observation_batch,
+                task=[request.task for request in slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in slots]
+                if all(request.noise_seed is not None for request in slots)
+                else None,
+            )
+            duplicated_slots = [slots[0] for _ in slots]
+            duplicated_observation_batch = _stack_model_observations(
+                [request.observation for request in duplicated_slots]
+            )
+            duplicated_action_chunks = infer.predict_action_chunk_obs(
+                duplicated_observation_batch,
+                task=[request.task for request in duplicated_slots],
+                postprocess=slots[0].postprocess,
+                state_pose_mode=slots[0].state_pose_mode,
+                noise_seed=[request.noise_seed for request in duplicated_slots]
+                if duplicated_slots[0].noise_seed is not None
+                else None,
+            )
+
+            def _as_numpy(value: Any) -> np.ndarray:
+                if hasattr(value, "detach"):
+                    value = value.detach().cpu().numpy()
+                return np.ascontiguousarray(np.asarray(value))
+
+            first_array = _as_numpy(action_chunks)
+            repeated_array = _as_numpy(repeated_action_chunks)
+            duplicated_array = _as_numpy(duplicated_action_chunks)
+            temporal_abs = np.abs(first_array.astype(np.float64) - repeated_array.astype(np.float64))
+            row_reference = np.broadcast_to(duplicated_array[0:1], duplicated_array.shape)
+            row_abs = np.abs(duplicated_array.astype(np.float64) - row_reference.astype(np.float64))
+            probe = {
+                "probe_version": "same_process_same_batch_v1",
+                "slot_count": int(slot_count),
+                "same_process": True,
+                "same_loaded_policy": True,
+                "same_input_batch": True,
+                "same_explicit_noise_seeds": True,
+                "rollout_action_source": "first_forward",
+                "extra_forward_count": 2,
+                "model_or_external_library_modified": False,
+                "temporal_repeat": {
+                    "exact": bool(np.array_equal(first_array, repeated_array)),
+                    "max_abs_diff": float(temporal_abs.max(initial=0.0)),
+                    "mean_abs_diff": float(temporal_abs.mean()),
+                    "first_sha256": hashlib.sha256(first_array.view(np.uint8)).hexdigest(),
+                    "repeated_sha256": hashlib.sha256(repeated_array.view(np.uint8)).hexdigest(),
+                },
+                "duplicated_rows_single_forward": {
+                    "all_rows_exact": bool(np.all(duplicated_array == row_reference)),
+                    "max_abs_diff": float(row_abs.max(initial=0.0)),
+                    "mean_abs_diff": float(row_abs.mean()),
+                },
+            }
+            repeatability_probe_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = repeatability_probe_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(probe, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, repeatability_probe_path)
+            print(f"[repeatability-probe] {json.dumps(probe, sort_keys=True)}", flush=True)
+        if hasattr(action_chunks, "detach"):
+            action_chunks = action_chunks.detach().cpu().numpy()
+        else:
+            action_chunks = np.asarray(action_chunks)
+        if int(action_chunks.shape[0]) != int(slot_count):
+            raise RuntimeError(
+                f"Policy returned fixed batch {int(action_chunks.shape[0])}, expected {slot_count}."
+            )
+        for worker_id, request in real_slots:
+            response_queues[worker_id].put(
+                ("ok", request.request_id, np.asarray(action_chunks[worker_id : worker_id + 1]))
+            )
+    except BaseException:
+        error_text = traceback.format_exc()
+        for worker_id, request in real_slots:
+            response_queues[worker_id].put(("error", request.request_id, error_text))
 
 
 def _collect_process_request_batch(
@@ -6151,11 +6640,11 @@ def run_episode(
         infer.policy_reset()
 
     policy_rgb_camera_map: dict[str, str] = {}
-    if infer.policy.config.requires_rgb:
+    if policy_requires_rgb(infer.policy.config):
         policy_rgb_camera_map = resolve_policy_rgb_cameras(infer, raw_obs, cfg)
         mapping_signature = tuple(sorted(policy_rgb_camera_map.items()))
         if cfg.get("_reported_policy_rgb_camera_mapping") != mapping_signature:
-            print(f"[info] adapter RGB camera mapping: {policy_rgb_camera_map}", flush=True)
+            print(f"[info] policy RGB camera mapping: {policy_rgb_camera_map}", flush=True)
             cfg["_reported_policy_rgb_camera_mapping"] = mapping_signature
 
     object_pose_names = observable_object_pose_names(raw_obs)
@@ -6603,6 +7092,8 @@ def run_episode(
                     else bool(cfg.get("gripper_shuffle_points", False))
                 ),
                 seed=steps,
+                camera_view_weights=cfg.get("camera_view_weights"),
+                camera_view_fusion=cfg.get("camera_view_fusion", "legacy_budget"),
             )
 
             transported_grasp = update_grasp_transport_state(eef_pose)
@@ -6611,6 +7102,28 @@ def run_episode(
                 "point_cloud": point_cloud,
                 "state": identity_pose9_gripper(float(eef_pose[-1])),
             }
+            if bool(getattr(infer.policy.config, "worldflow_enable", False)):
+                worldflow_reference_frame = str(
+                    getattr(
+                        infer.policy.config,
+                        "worldflow_reference_frame",
+                        "pointcloud_reference_camera",
+                    )
+                )
+                if worldflow_reference_frame == "robot_base":
+                    current_worldflow_pose = eef_pose9_world_to_robot_base(env, eef_pose)
+                elif worldflow_reference_frame == "pointcloud_reference_camera":
+                    current_worldflow_pose = eef_pose9_world_to_reference_camera(
+                        env,
+                        eef_pose,
+                        str(cfg["pointcloud_reference_camera"]),
+                    )
+                else:
+                    raise ValueError(
+                        "Unsupported checkpoint worldflow_reference_frame="
+                        f"{worldflow_reference_frame!r}."
+                    )
+                model_observation["worldflow.current_ee_pose"] = current_worldflow_pose[:9]
             chunk_start_model_world = pose9_to_homo_np(np.asarray(eef_pose[:9], dtype=np.float32))
             chunk_start_model_worlds.append(np.asarray(chunk_start_model_world, dtype=np.float32))
             if previous_issued_target_model_world is not None:
@@ -6622,7 +7135,7 @@ def run_episode(
                 chunk_boundary_rotation_errors.append(
                     rotation_error_radians(chunk_start_model_world[:3, :3], previous_target[:3, :3])
                 )
-            if infer.policy.config.requires_rgb:
+            if policy_requires_rgb(infer.policy.config):
                 model_observation.update(build_policy_rgb_observation(policy_rgb_camera_map, raw_obs))
             input_fingerprints = model_observation_fingerprints(model_observation)
             model_input_hashes.append(input_fingerprints["__all__"])
@@ -7692,7 +8205,9 @@ def evaluate_task(
                     and not bool(cfg.get("dataset_domain_env", False))
                 )
                 or bool(cfg.get("dataset_domain_oracle_actions", False)),
-                control_freq=float(cfg["control"].get("control_freq", 20.0)),
+                control_freq=float(
+                    cfg["control"].get("control_freq", OFFICIAL_LIBERO_CONTROL_FREQ)
+                ),
                 horizon=(
                     int(LIBERO_STANDARD_MAX_STEPS[suite_name])
                     if bool(cfg.get("use_suite_max_steps", False))
@@ -7838,7 +8353,9 @@ def evaluate_task(
                     if environment_alignment is not None
                     else {
                         "enabled": False,
-                        "benchmark_comparable": True,
+                        "benchmark_comparable": bool(
+                            evaluation_protocol_for_config(cfg)["benchmark_comparable"]
+                        ),
                         "initial_state_source": "task_suite.get_task_init_states",
                     }
                 )
@@ -7981,25 +8498,50 @@ class _EpisodeWorkerJob:
 def _build_episode_worker_jobs(
     task_ids: list[int],
     *,
-    episode_count: int,
+    episode_indices: list[int],
     episode_workers_per_task: int,
 ) -> list[_EpisodeWorkerJob]:
-    shard_count = min(max(1, int(episode_workers_per_task)), max(1, int(episode_count)))
+    resolved_episode_indices = [int(index) for index in episode_indices]
+    shard_count = min(
+        max(1, int(episode_workers_per_task)),
+        max(1, len(resolved_episode_indices)),
+    )
     jobs: list[_EpisodeWorkerJob] = []
     for task_id in task_ids:
         for shard_index in range(shard_count):
-            episode_indices = tuple(range(shard_index, int(episode_count), shard_count))
-            if not episode_indices:
+            worker_episode_indices = tuple(
+                resolved_episode_indices[shard_index::shard_count]
+            )
+            if not worker_episode_indices:
                 continue
             jobs.append(
                 _EpisodeWorkerJob(
                     worker_id=len(jobs),
                     task_id=int(task_id),
                     shard_index=shard_index,
-                    episode_indices=episode_indices,
+                    episode_indices=worker_episode_indices,
                 )
             )
     return jobs
+
+
+def _process_worker_environment() -> dict[str, str]:
+    environment = {
+        "SONG_LIBERO_ENV_WORKER": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "MALLOC_ARENA_MAX": "2",
+    }
+    for override_name, child_name in (
+        ("SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
+        ("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", "MUJOCO_EGL_DEVICE_ID"),
+    ):
+        override = os.environ.get(override_name)
+        if override is not None:
+            environment[child_name] = override
+    return environment
 
 
 def serialize_libero_task(task: Any) -> dict[str, str]:
@@ -8035,7 +8577,7 @@ def merge_task_episode_shards(
     *,
     suite_name: str,
     task_ids: list[int],
-    episode_count: int,
+    episode_indices: list[int],
     partial_summaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     partials_by_task: dict[int, list[dict[str, Any]]] = {int(task_id): [] for task_id in task_ids}
@@ -8046,7 +8588,7 @@ def merge_task_episode_shards(
         partials_by_task[task_id].append(summary)
 
     merged: list[dict[str, Any]] = []
-    expected_episode_indices = set(range(int(episode_count)))
+    expected_episode_indices = {int(index) for index in episode_indices}
     for task_id in task_ids:
         partials = partials_by_task[int(task_id)]
         if not partials:
@@ -8100,27 +8642,72 @@ def evaluate_suite_process_parallel(
     worker_count, while episode shards of every active task run together.
     """
     context = mp.get_context("spawn")
-    adapter_enabled = bool(infer.policy.config.requires_rgb)
+    adapter_enabled = bool(infer.policy.config.vla_adapter_enable)
+    policy_requires_rgb = bool(infer.policy.config.requires_rgb)
     image_feature_keys = [str(key) for key in infer.policy.config.image_features]
+    worldflow_enabled = bool(getattr(infer.policy.config, "worldflow_enable", False))
+    worldflow_reference_frame = str(
+        getattr(
+            infer.policy.config,
+            "worldflow_reference_frame",
+            "pointcloud_reference_camera",
+        )
+    )
     max_batch_size = max(1, int(cfg["inference_batch_size"]))
     batch_wait_s = max(0.0, float(cfg["inference_batch_wait_ms"])) / 1000.0
+    batching_mode = str(cfg.get("inference_batching_mode", "dynamic"))
+    if batching_mode not in {"dynamic", "fixed_barrier"}:
+        raise ValueError(f"Unknown inference_batching_mode={batching_mode!r}.")
     partial_summaries: list[dict[str, Any]] = []
     request_count = 0
     batch_count = 0
     max_observed_batch = 0
     infrastructure_failures: list[str] = []
+    inference_cache = None
+    if str(cfg.get("inference_cache_mode", "off")) != "off":
+        inference_cache = FixedBatchInferenceCache(
+            Path(cfg["inference_cache_dir"]),
+            policy_path=Path(cfg["policy_path"]),
+            mode=str(cfg["inference_cache_mode"]),
+            runtime_context={
+                "world_to_ego_causal_ablation": bool(
+                    cfg.get("world_to_ego_causal_ablation", False)
+                ),
+                "secondary_view_causal_ablation": bool(
+                    cfg.get("secondary_view_causal_ablation", False)
+                ),
+                "worldflow_action_fusion_override": cfg.get(
+                    "worldflow_action_fusion_override"
+                ),
+                "pointcloud_camera_names": pointcloud_camera_names_from_config(cfg),
+                "image_camera_names": image_camera_names_from_config(cfg),
+            },
+        )
+    repeatability_probe_path = (
+        output_dir / "inference_repeatability_probe.json"
+        if bool(cfg.get("inference_repeatability_probe", False))
+        else None
+    )
+    configured_episode_indices = [
+        int(index) for index in (cfg.get("episode_ids") or range(int(cfg["episodes"])))
+    ]
     episode_workers_per_task = min(
         max(1, int(cfg.get("episode_workers_per_task", 1))),
-        max(1, int(cfg["episodes"])),
+        max(1, len(configured_episode_indices)),
     )
 
     for wave_start in range(0, len(task_ids), max(1, int(worker_count))):
         wave_task_ids = [int(task_id) for task_id in task_ids[wave_start : wave_start + worker_count]]
         jobs = _build_episode_worker_jobs(
             wave_task_ids,
-            episode_count=int(cfg["episodes"]),
+            episode_indices=configured_episode_indices,
             episode_workers_per_task=episode_workers_per_task,
         )
+        if batching_mode == "fixed_barrier" and len(jobs) > max_batch_size:
+            raise ValueError(
+                "fixed_barrier requires inference_batch_size to cover every stable worker slot in "
+                f"the wave: slots={len(jobs)}, inference_batch_size={max_batch_size}."
+            )
         request_queue = context.Queue(maxsize=max(2, len(jobs) * 2))
         ready_queue = context.Queue()
         result_queue = context.Queue()
@@ -8131,14 +8718,7 @@ def evaluate_suite_process_parallel(
         processes: dict[int, Any] = {}
         job_by_worker = {job.worker_id: job for job in jobs}
 
-        worker_environment = {
-            "SONG_LIBERO_ENV_WORKER": "1",
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
-            "MALLOC_ARENA_MAX": "2",
-        }
+        worker_environment = _process_worker_environment()
         previous_worker_environment = {
             key: os.environ.get(key) for key in worker_environment
         }
@@ -8164,6 +8744,9 @@ def evaluate_suite_process_parallel(
                         "start_event": start_event,
                         "vla_adapter_enable": adapter_enabled,
                         "image_feature_keys": image_feature_keys,
+                        "requires_rgb": policy_requires_rgb,
+                        "worldflow_enable": worldflow_enabled,
+                        "worldflow_reference_frame": worldflow_reference_frame,
                     },
                     name=(
                         f"libero-{suite_name}-task-{job.task_id}-"
@@ -8182,6 +8765,8 @@ def evaluate_suite_process_parallel(
         ready_workers: set[int] = set()
         finished_workers: set[int] = set()
         worker_summaries: dict[int, dict[str, Any]] = {}
+        pending_fixed_requests: dict[int, _ProcessInferenceRequest] = {}
+        fixed_slot_padding: dict[int, _ProcessInferenceRequest] = {}
 
         def _record_result(message: tuple[Any, ...]) -> None:
             status = str(message[0])
@@ -8283,20 +8868,64 @@ def evaluate_suite_process_parallel(
                 _record_dead_workers()
                 if len(finished_workers) >= len(jobs):
                     break
-                try:
-                    first_request = request_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                requests = _collect_process_request_batch(
-                    request_queue,
-                    first_request,
-                    max_batch_size=max_batch_size,
-                    batch_wait_s=batch_wait_s,
-                )
-                _execute_process_inference_batch(infer, requests, response_queues)
-                request_count += len(requests)
-                batch_count += 1
-                max_observed_batch = max(max_observed_batch, len(requests))
+                if batching_mode == "fixed_barrier":
+                    active_workers = set(processes) - finished_workers
+                    while not active_workers.issubset(pending_fixed_requests):
+                        try:
+                            request = request_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            _drain_results()
+                            _record_dead_workers()
+                            active_workers = set(processes) - finished_workers
+                            if not active_workers:
+                                break
+                            continue
+                        worker_id = int(request.worker_id)
+                        if worker_id not in processes:
+                            raise RuntimeError(
+                                f"Received inference request from unknown worker {worker_id}."
+                            )
+                        if worker_id in pending_fixed_requests:
+                            raise RuntimeError(
+                                f"Worker {worker_id} submitted two requests before receiving a response."
+                            )
+                        pending_fixed_requests[worker_id] = request
+                        _drain_results()
+                        _record_dead_workers()
+                        active_workers = set(processes) - finished_workers
+                    if not active_workers:
+                        break
+                    requests_by_worker = {
+                        worker_id: pending_fixed_requests.pop(worker_id)
+                        for worker_id in sorted(active_workers)
+                    }
+                    _execute_process_inference_fixed_slots(
+                        infer,
+                        requests_by_worker,
+                        response_queues,
+                        slot_count=len(jobs),
+                        padding_requests_by_worker=fixed_slot_padding,
+                        repeatability_probe_path=repeatability_probe_path,
+                        inference_cache=inference_cache,
+                    )
+                    request_count += len(requests_by_worker)
+                    batch_count += 1
+                    max_observed_batch = max(max_observed_batch, len(jobs))
+                else:
+                    try:
+                        first_request = request_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    requests = _collect_process_request_batch(
+                        request_queue,
+                        first_request,
+                        max_batch_size=max_batch_size,
+                        batch_wait_s=batch_wait_s,
+                    )
+                    _execute_process_inference_batch(infer, requests, response_queues)
+                    request_count += len(requests)
+                    batch_count += 1
+                    max_observed_batch = max(max_observed_batch, len(requests))
         except BaseException:
             start_event.set()
             for process in processes.values():
@@ -8328,10 +8957,13 @@ def evaluate_suite_process_parallel(
     mean_batch = request_count / batch_count if batch_count else 0.0
     print(
         "[parallel] process inference batches: "
+        f"mode={batching_mode}, "
         f"requests={request_count}, batches={batch_count}, "
         f"mean_batch={mean_batch:.2f}, max_batch={max_observed_batch}",
         flush=True,
     )
+    if inference_cache is not None:
+        print(f"[inference-cache] {json.dumps(inference_cache.report(), sort_keys=True)}", flush=True)
     if infrastructure_failures:
         preview = "\n".join(infrastructure_failures[:10])
         if len(infrastructure_failures) > 10:
@@ -8348,7 +8980,7 @@ def evaluate_suite_process_parallel(
     return merge_task_episode_shards(
         suite_name=suite_name,
         task_ids=task_ids,
-        episode_count=int(cfg["episodes"]),
+        episode_indices=configured_episode_indices,
         partial_summaries=partial_summaries,
     )
 
@@ -8382,6 +9014,9 @@ def _isolated_policy_worker_entry(
             device=cfg["device"],
             visualize_foreground=False,
             foreground_visualizer_max_points=int(cfg["foreground_vis_max_points"]),
+            worldflow_action_fusion_override=cfg.get(
+                "worldflow_action_fusion_override"
+            ),
         )
         reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
         suite = benchmark.get_benchmark_dict()[suite_name]()
@@ -8584,6 +9219,28 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
     cfg["dataset_domain_env"] = bool(
         cfg_get(cfg, args.dataset_domain_env, "dataset_domain_env", False)
     )
+    cfg["secondary_view_causal_ablation"] = bool(
+        cfg_get(
+            cfg,
+            args.secondary_view_causal_ablation,
+            "secondary_view_causal_ablation",
+            False,
+        )
+    )
+    cfg["world_to_ego_causal_ablation"] = bool(
+        cfg_get(
+            cfg,
+            args.world_to_ego_causal_ablation,
+            "world_to_ego_causal_ablation",
+            False,
+        )
+    )
+    cfg["worldflow_action_fusion_override"] = cfg_get(
+        cfg,
+        args.worldflow_action_fusion_override,
+        "worldflow_action_fusion_override",
+        None,
+    )
     cfg["dataset_domain_oracle_actions"] = bool(
         cfg_get(
             cfg,
@@ -8633,7 +9290,10 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             if cfg["dataset_domain_env"]
             else None
         ),
-        "benchmark_comparable": not bool(cfg["dataset_domain_env"]),
+        "benchmark_comparable": not bool(cfg["dataset_domain_env"])
+        and not bool(cfg["world_to_ego_causal_ablation"])
+        and not bool(cfg["secondary_view_causal_ablation"])
+        and cfg["worldflow_action_fusion_override"] is None,
     }
     cfg["env_seed"] = int(cfg_get(cfg, args.env_seed, "env_seed", 0))
     cfg["device"] = cfg_get(cfg, args.device, "device", "cuda")
@@ -8721,14 +9381,31 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         cfg["gripper_points"] = int(args.gripper_points)
     configure_eval_camera_views(cfg, args, checkpoint_camera_selection)
 
-    cfg["control"]["control_freq"] = float(
-        cfg_get(cfg["control"], args.control_freq, "control_freq", cfg.get("control_freq", 20.0))
-    )
-    if not np.isclose(cfg["control"]["control_freq"], 20.0):
-        raise ValueError(
-            "This LIBERO evaluator requires control_freq=20 Hz; "
-            f"got {cfg['control']['control_freq']}."
+    cfg["control"]["control_freq"] = validate_control_frequency(
+        cfg_get(
+            cfg["control"],
+            args.control_freq,
+            "control_freq",
+            cfg.get("control_freq", OFFICIAL_LIBERO_CONTROL_FREQ),
         )
+    )
+    if not np.isclose(
+        cfg["control"]["control_freq"],
+        OFFICIAL_LIBERO_CONTROL_FREQ,
+    ):
+        print(
+            "[warn] nonstandard LIBERO control frequency: "
+            f"{cfg['control']['control_freq']:g} Hz instead of "
+            f"{OFFICIAL_LIBERO_CONTROL_FREQ:g} Hz; the rollout is diagnostic "
+            "and is not directly comparable with the 20 Hz reference protocol.",
+            flush=True,
+        )
+    cfg["evaluation_identity"]["environment_domain"]["control_freq"] = float(
+        cfg["control"]["control_freq"]
+    )
+    cfg["evaluation_identity"]["environment_domain"]["benchmark_comparable"] = bool(
+        evaluation_protocol_for_config(cfg)["benchmark_comparable"]
+    )
     cfg["control"]["action_index"] = int(cfg_get(cfg["control"], args.action_index, "action_index", 0))
     cfg["control"]["exec_action_steps"] = int(cfg_get(cfg["control"], args.exec_action_steps, "exec_action_steps", 12))
     cfg["control"]["adaptive_exec_max_steps"] = max(
@@ -9091,12 +9768,35 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         0.0,
         float(cfg_get(cfg, args.inference_batch_wait_ms, "inference_batch_wait_ms", 5.0)),
     )
-    cfg["keyboard_control_enabled"] = configured_environment_workers == 1
-    if cfg.get("episode_ids") is not None and configured_environment_workers > 1:
-        raise ValueError(
-            "--episode-id is a targeted debugging mode and currently requires "
-            "--task-workers 1 --episode-workers-per-task 1."
+    cfg["inference_batching_mode"] = str(
+        cfg_get(
+            cfg,
+            args.inference_batching_mode,
+            "inference_batching_mode",
+            "dynamic",
         )
+    ).lower()
+    cfg["inference_repeatability_probe"] = bool(
+        cfg_get(
+            cfg,
+            args.inference_repeatability_probe,
+            "inference_repeatability_probe",
+            False,
+        )
+    )
+    cache_dir_value = cfg_get(cfg, args.inference_cache_dir, "inference_cache_dir", None)
+    cfg["inference_cache_dir"] = (
+        str(Path(cache_dir_value).expanduser().resolve()) if cache_dir_value is not None else None
+    )
+    cfg["inference_cache_mode"] = str(
+        cfg_get(
+            cfg,
+            args.inference_cache_mode,
+            "inference_cache_mode",
+            "read_write" if cache_dir_value is not None else "off",
+        )
+    ).lower()
+    cfg["keyboard_control_enabled"] = configured_environment_workers == 1
     if configured_environment_workers > 1:
         if cfg["task_worker_backend"] not in {"process", "thread"}:
             raise ValueError(
@@ -9114,6 +9814,18 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             )
     if cfg["episode_workers_per_task"] > 1 and cfg["task_worker_backend"] != "process":
         raise ValueError("--episode-workers-per-task > 1 requires --task-worker-backend process.")
+    if cfg["inference_batching_mode"] == "fixed_barrier" and cfg["task_worker_backend"] != "process":
+        raise ValueError("--inference-batching-mode fixed_barrier requires --task-worker-backend process.")
+    if cfg["inference_repeatability_probe"] and cfg["inference_batching_mode"] != "fixed_barrier":
+        raise ValueError("--inference-repeatability-probe requires --inference-batching-mode fixed_barrier.")
+    if cfg["inference_cache_mode"] not in {"off", "read_write", "readonly"}:
+        raise ValueError(f"Unknown inference_cache_mode={cfg['inference_cache_mode']!r}.")
+    if cfg["inference_cache_mode"] != "off" and cfg["inference_cache_dir"] is None:
+        raise ValueError("An enabled inference cache requires --inference-cache-dir.")
+    if cfg["inference_cache_mode"] != "off" and cfg["inference_batching_mode"] != "fixed_barrier":
+        raise ValueError("The deterministic inference cache requires --inference-batching-mode fixed_barrier.")
+    if cfg["inference_repeatability_probe"] and cfg["inference_cache_mode"] != "off":
+        raise ValueError("The repeatability probe must run with the inference cache disabled.")
     if cfg["isolated_policy_workers"] > 1 and cfg["episode_workers_per_task"] > 1:
         raise ValueError(
             "--isolated-policy-workers > 1 already provides independent rollout processes; "
@@ -9349,7 +10061,34 @@ def main() -> None:
         device=cfg["device"],
         visualize_foreground=cfg["visualize_foreground"],
         foreground_visualizer_max_points=cfg["foreground_vis_max_points"],
+        worldflow_action_fusion_override=cfg.get(
+            "worldflow_action_fusion_override"
+        ),
     )
+    if cfg.get("worldflow_action_fusion_override") is not None:
+        print(
+            "[diagnostic] WorldFlow action fusion overridden at load time: "
+            f"{cfg['worldflow_action_fusion_override']}; checkpoint files are unchanged.",
+            flush=True,
+        )
+    inference_ablation_modalities: set[str] = set()
+    if bool(cfg.get("secondary_view_causal_ablation", False)):
+        if getattr(infer.policy.config, "camera_view_fusion", "legacy_budget") != "primary_residual":
+            raise ValueError(
+                "--secondary-view-causal-ablation requires a primary_residual checkpoint."
+            )
+        inference_ablation_modalities.add("secondary_view")
+        print(
+            "[diagnostic] Secondary-view residual disabled; checkpoint primary path is unchanged.",
+            flush=True,
+        )
+    if bool(cfg.get("world_to_ego_causal_ablation", False)):
+        inference_ablation_modalities.add("world_to_ego")
+        print(
+            "[diagnostic] World-to-Ego causal path disabled: cross-attention and residual twist correction.",
+            flush=True,
+        )
+    infer.policy.model.inference_ablation_modalities = frozenset(inference_ablation_modalities)
     camera_alignment = reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
     print(
         "[info] model camera alignment: "
@@ -9378,6 +10117,12 @@ def main() -> None:
             flush=True,
         )
 
+    wait_for_preloaded_evaluation_gate(
+        ready_file=args.preload_ready_file,
+        start_gate=args.evaluation_start_gate,
+        policy_path=str(cfg["policy_path"]),
+    )
+
     print(
         "[info] clean absolute-pose eval: "
         f"suites={suite_names}, episodes={selected_episode_count}, "
@@ -9386,6 +10131,7 @@ def main() -> None:
         f"episode_workers_per_task={cfg['episode_workers_per_task']}, "
         f"task_worker_backend={cfg['task_worker_backend']}, "
         f"inference_batch_size={cfg['inference_batch_size']}, "
+        f"inference_batching_mode={cfg['inference_batching_mode']}, "
         f"recreate_env_per_episode={cfg['recreate_env_per_episode']}, "
         f"exec_action_steps={cfg['control']['exec_action_steps']}, "
         f"adaptive_exec_max_steps={cfg['control']['adaptive_exec_max_steps']}, "
@@ -9411,7 +10157,10 @@ def main() -> None:
         f"env_seed={cfg['env_seed']}, "
         f"dataset_domain_env={cfg['dataset_domain_env']}, "
         f"dataset_domain_oracle_actions={cfg['dataset_domain_oracle_actions']}, "
-        f"benchmark_comparable={not cfg['dataset_domain_env']}, "
+        f"benchmark_comparable={evaluation_protocol_for_config(cfg)['benchmark_comparable']}, "
+        f"secondary_view_causal_ablation={cfg['secondary_view_causal_ablation']}, "
+        f"world_to_ego_causal_ablation={cfg['world_to_ego_causal_ablation']}, "
+        f"worldflow_action_fusion_override={cfg['worldflow_action_fusion_override']}, "
         f"use_suite_max_steps={cfg['use_suite_max_steps']}, "
         f"episode_horizons={episode_horizons}, "
         f"save_video={cfg['save_video']}, "

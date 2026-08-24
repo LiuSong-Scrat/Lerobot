@@ -8,6 +8,7 @@ annotated-types==0.8.0
 antlr4-python3-runtime==4.9.3
 anyio==4.14.2
 asttokens==3.0.2
+asciitree==0.3.3
 attrs==26.1.0
 av==15.1.0
 bddl==1.0.1
@@ -39,6 +40,7 @@ etils==1.14.0
 evdev==1.9.3
 executing==2.2.1
 Farama-Notifications==0.0.6
+fasteners==0.20
 fastjsonschema==2.22.2
 filelock==3.32.3
 fire==0.7.1
@@ -104,6 +106,7 @@ nbformat==5.11.1
 nest-asyncio==1.6.0
 networkx==3.6.1
 ninja==1.13.0
+numcodecs==0.13.1
 num2words==0.5.14
 numba==0.67.0
 numpy==2.4.6
@@ -204,4 +207,5 @@ wheel==0.45.1
 widgetsnbextension==4.0.16
 xxhash==4.0.1
 yarl==1.24.5
+zarr==2.18.3
 zipp==4.1.0
