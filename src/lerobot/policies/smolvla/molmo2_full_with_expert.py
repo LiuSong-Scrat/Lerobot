@@ -26,13 +26,14 @@ connector.  The active source tensors are exactly:
 * ``model.transformer.ln_f``.
 
 ``lm_head`` is never instantiated.  Every Molmo parameter is frozen and held
-in evaluation mode.  Native vision/WTE embeddings are produced under
-``torch.no_grad`` and detached, then trainable FG/BG tokens are inserted into
-the prefix.  The 36 decoder blocks therefore remain parameter-frozen but are
-part of the input-autograd graph, exactly like frozen WEPVLA: IMAGE/LANGUAGE
-and FG/BG condition each other at every layer before Action Expert queries use
-that evolving prefix.  Two-layer non-reentrant activation-checkpoint segments
-keep this topology without retaining all decoder activations at once.
+in evaluation mode.  Native image/language tokens run alone under
+``torch.no_grad`` with Molmo's original hybrid mask and positions.  Four
+trainable Ego/World FG/BG tokens form a separate scene-shadow prefix: they
+reuse every frozen Molmo block and read native per-layer K/V, but native never
+reads them.  Action Expert even layers read native+scene+all actions; odd
+layers pure-cross native+scene.  Native GQA K/V are cached once and only Action
+Expert segments are recomputed during backward, preserving the v5 graph while
+removing the dominant frozen-prefix recomputation.
 
 For a 256 x 256 square input, Molmo's processor emits two pixel-identical
 378-square crops.  The backend asserts that equality at runtime and, when it
@@ -101,6 +102,11 @@ _EXPECTED_VISION_CONTRACT: dict[str, dict[str, Any]] = {
         "image_num_pos": 729,
         "image_patch_size": 14,
         "float32_attention": True,
+        "layer_norm_eps": 1e-6,
+        "attention_dropout": 0.0,
+        "residual_dropout": 0.0,
+        "initializer_range": 0.02,
+        "_attn_implementation": "sdpa",
     },
     "adapter_config": {
         "hidden_size": 1152,
@@ -113,6 +119,11 @@ _EXPECTED_VISION_CONTRACT: dict[str, dict[str, Any]] = {
         "vit_layers": (-3, -9),
         "pooling_attention_mask": True,
         "float32_attention": True,
+        "attention_dropout": 0.0,
+        "residual_dropout": 0.0,
+        "image_feature_dropout": 0.0,
+        "initializer_range": 0.02,
+        "_attn_implementation": "sdpa",
     },
 }
 
@@ -351,8 +362,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             raise ValueError("Full-Molmo2-ER freezes every Molmo tensor; train_expert_only must be True.")
         if inference_only_vlm:
             raise ValueError(
-                "WEP-compatible Full-Molmo2-ER requires molmo_inference_only=False: "
-                "trainable FG/BG must remain in the VLM prefix and receive input gradients."
+                "Full-Molmo2-ER v5 requires molmo_inference_only=False: native Molmo is "
+                "read-only, but the FG/BG scene-shadow stream must retain input gradients."
             )
         if num_vlm_layers != 36:
             raise ValueError(f"Full-Molmo2-ER retains exactly all 36/36 text blocks, got {num_vlm_layers}.")
@@ -483,6 +494,10 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         self.native_config = native_config
         self.exact_vision_reuse = bool(exact_vision_reuse)
         self.inference_only_vlm = False
+        # Fail closed if a production caller forgets the explicit N/S split.
+        # Without this gate the inherited compatibility path would silently
+        # run the old coupled-prefix graph and condition native Molmo on FG/BG.
+        self.requires_native_scene_split = True
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.gradient_checkpointing_layers_per_segment = int(
             gradient_checkpointing_layers_per_segment
@@ -569,14 +584,20 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             "wte_applied_to_all_native_tokens": True,
             "vision_feature_fusion": "add_only_at_image_patch_id",
             "molmo_frozen_eval": True,
-            "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
-            "per_layer_memory": "evolving_image_text_fg_bg_prefix",
-            "prefix_attention": "molmo_native_image_scene_bidirectional_text_causal",
-            "prefix_token_order": "bos_image_ego_scene_world_scene_text",
-            "prefix_position_ids": "sequential_valid_order_after_scene_insertion",
-            "fg_bg_location": "trainable_vlm_prefix",
+            "vlm_execution": "native_no_grad_scene_input_autograd",
+            "per_layer_memory": "detached_native_kv_plus_differentiable_scene_kv",
+            "prefix_attention": "native_official_hybrid_scene_reads_native_and_scene",
+            "prefix_token_order": "native_image_language_then_ego_world_scene_shadow",
+            "prefix_position_ids": "native_unchanged_scene_after_image_world_reuses_ego",
+            "fg_bg_location": "separate_trainable_scene_shadow_stream",
             "action_location": "expert_suffix_only",
-            "text_prefix_autograd_preserved": True,
+            "native_conditioned_by_scene": False,
+            "native_kv_detached": True,
+            "scene_input_autograd_preserved": True,
+            "action_even_attention": "native_scene_all_actions",
+            "action_odd_attention": "pure_cross_native_scene",
+            "checkpointed_streams": "action_only",
+            "runtime_dtype": str(self.vlm.wte.embedding.dtype).removeprefix("torch."),
             "gradient_checkpointing": self.gradient_checkpointing,
             "gradient_checkpointing_layers_per_segment": (
                 self.gradient_checkpointing_layers_per_segment
@@ -598,7 +619,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
 
     def train(self, mode: bool = True) -> Molmo2FullWithExpertModel:
         # Molmo remains deterministic and parameter-frozen in every train mode.
-        # Decoder input autograd is intentionally preserved for prefix FG/BG.
+        # Native image/language runs under no_grad; input autograd is retained
+        # only for the separate FG/BG scene-shadow stream.
         super().train(mode)
         self.vlm.eval()
         self.vision_backbone.eval()
@@ -652,6 +674,51 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         image_token_pooling = image_token_pooling.to(device=device, dtype=torch.long)
         image_grids = image_grids.to(device=device, dtype=torch.long)
         image_num_crops = image_num_crops.to(device=device, dtype=torch.long)
+        self._current_visual_batch_uses_registered_fast_contract = False
+
+        # Registered Full-Molmo training has one image, two pixel-identical
+        # crops and 392 pooled features per sample. Detect/validate that
+        # contract once, then use pure views on subsequent steps. Previously
+        # the generic path performed several GPU .item()/.tolist() syncs and
+        # Python per-sample bookkeeping before reaching the same view fast path.
+        batch_size = input_ids.shape[0]
+        pooled_features_per_sample = 392
+        fixed_shape_candidate = (
+            image_grids.shape[0] == batch_size
+            and image_num_crops.shape[0] == batch_size
+            and pixel_values.shape[0] == 2 * batch_size
+            and image_token_pooling.shape[0] == pooled_features_per_sample * batch_size
+            and pixel_values.is_contiguous()
+            and image_token_pooling.is_contiguous()
+        )
+        if fixed_shape_candidate:
+            if not getattr(self, "_fixed_visual_batch_contract_validated", False):
+                raw_counts = (input_ids == self.image_end_token_id).sum(dim=1)
+                pooled_per_image = (
+                    image_grids[:, :2].prod(dim=1) + image_grids[:, 2:].prod(dim=1)
+                )
+                fixed_values_valid = (
+                    (raw_counts == 2).all()
+                    & (image_num_crops == 2).all()
+                    & (pooled_per_image == pooled_features_per_sample).all()
+                )
+                if bool(fixed_values_valid):
+                    self._fixed_visual_batch_contract_validated = True
+            if getattr(self, "_fixed_visual_batch_contract_validated", False):
+                self._current_visual_batch_uses_registered_fast_contract = True
+                return (
+                    pixel_values.view(
+                        batch_size,
+                        2,
+                        pixel_values.shape[1],
+                        pixel_values.shape[2],
+                    ),
+                    image_token_pooling.view(
+                        batch_size,
+                        pooled_features_per_sample,
+                        image_token_pooling.shape[1],
+                    ),
+                )
 
         raw_counts = (input_ids == self.image_end_token_id).sum(dim=1)
         if bool((raw_counts % 2 != 0).any()):
@@ -660,7 +727,6 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
                 f"got per-sample counts {raw_counts.tolist()}."
             )
         counts = raw_counts // 2
-        batch_size = input_ids.shape[0]
         num_images = int(counts.sum().item())
         if image_grids.shape[0] != num_images or image_num_crops.shape[0] != num_images:
             raise ValueError(
@@ -804,9 +870,18 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             try:
                 assert images.ndim == 4, f"expected [B,crops,patches,pixels], got {images.shape}"
                 assert images.shape[1] == 2, f"expected exactly two crops, got {images.shape[1]}"
-                assert torch.equal(images[:, 0], images[:, 1]), (
-                    "global and high-resolution crops are not pixel-identical"
+                registered_fast_contract = bool(
+                    getattr(self, "_current_visual_batch_uses_registered_fast_contract", False)
                 )
+                if (
+                    not registered_fast_contract
+                    or not getattr(self, "_exact_vision_reuse_contract_validated", False)
+                ):
+                    assert torch.equal(images[:, 0], images[:, 1]), (
+                        "global and high-resolution crops are not pixel-identical"
+                    )
+                    if registered_fast_contract:
+                        self._exact_vision_reuse_contract_validated = True
                 encoded_once = self.vision_backbone.encode_image(images[:, :1])
                 reused_features = encoded_once.expand(-1, 2, -1, -1)
                 output = self._pool_and_project_preencoded(reused_features, pooled_patches_idx)
@@ -855,13 +930,17 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             raise ValueError(f"input_ids must have shape [B,L], got {tuple(input_ids.shape)}.")
         embedding_device = self.vlm.wte.embedding.device
         native_input_ids = input_ids.to(device=embedding_device, dtype=torch.long)
-        if bool((native_input_ids < -1).any()):
-            raise ValueError("Molmo input_ids may use -1 only as a padding sentinel.")
-        if bool((native_input_ids >= self.text_spec.total_vocab_size).any()):
-            raise IndexError(
-                "Molmo input token is outside the complete base+additional vocabulary "
-                f"[0, {self.text_spec.total_vocab_size})."
-            )
+        validate_token_contract = not getattr(
+            self, "_native_multimodal_token_contract_validated", False
+        )
+        if validate_token_contract:
+            if bool((native_input_ids < -1).any()):
+                raise ValueError("Molmo input_ids may use -1 only as a padding sentinel.")
+            if bool((native_input_ids >= self.text_spec.total_vocab_size).any()):
+                raise IndexError(
+                    "Molmo input token is outside the complete base+additional vocabulary "
+                    f"[0, {self.text_spec.total_vocab_size})."
+                )
         padding = native_input_ids == -1
         safe_input_ids = native_input_ids.masked_fill(padding, 0)
 
@@ -894,12 +973,14 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
                 dtype=embeddings.dtype,
             )
             is_image_patch = safe_input_ids == self.image_patch_id
-            patch_count = int(is_image_patch.sum().item())
-            if patch_count != image_features.shape[0]:
-                raise RuntimeError(
-                    "Molmo native image feature/template mismatch: "
-                    f"patch_positions={patch_count}, connector_features={image_features.shape[0]}."
-                )
+            if validate_token_contract:
+                patch_count = int(is_image_patch.sum().item())
+                if patch_count != image_features.shape[0]:
+                    raise RuntimeError(
+                        "Molmo native image feature/template mismatch: "
+                        f"patch_positions={patch_count}, connector_features={image_features.shape[0]}."
+                    )
+                self._native_multimodal_token_contract_validated = True
             embeddings = embeddings.clone()
             embeddings.view(-1, embeddings.shape[-1])[is_image_patch.flatten()] += image_features
             return self.vlm.emb_drop(embeddings)

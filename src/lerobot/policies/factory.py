@@ -423,14 +423,15 @@ def _validate_full_molmo_checkpoint_topology(pretrained_path: str | Path) -> Non
         return
     checkpoint_topology = checkpoint_config.get("full_molmo_topology")
     if (
-        checkpoint_config.get("molmo_inference_only") is True
+        checkpoint_config.get("molmo_inference_only") is not False
         or checkpoint_topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
     ):
         raise ValueError(
             "This checkpoint uses an incompatible Full-Molmo topology or has no registered "
-            "topology marker. The current v4 model preserves Molmo's native hybrid prefix "
-            "attention and the WEPVLA Expert graph; detached-scene and v3 globally "
-            "bidirectional-prefix checkpoints cannot resume or evaluate as v4. Start a fresh "
+            "topology marker. The current v5 model preserves an independent read-only native "
+            "Molmo stream plus the WEPVLA scene-shadow/Action Expert graph; detached-scene, "
+            "v3 globally bidirectional-prefix, and v4 native-conditioned checkpoints cannot "
+            "resume or evaluate as v5. Start a fresh "
             "run, or first create an explicit converted warm-start checkpoint; do not use "
             "--resume."
         )

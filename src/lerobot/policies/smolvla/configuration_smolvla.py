@@ -510,22 +510,19 @@ class SmolVLAConfig(PreTrainedConfig):
     # Molmo backends replace only the frozen VLM implementation.
     vlm_backend: str = "smolvlm"
     # Persist the token/attention topology in every policy checkpoint.  This
-    # prevents detached-scene and all-prefix-bidirectional checkpoints from
-    # being mistaken for the native-hybrid Molmo + WEP-Expert model.
+    # prevents detached-scene and native-conditioned-by-scene checkpoints from
+    # being mistaken for the read-only-native + WEP-Expert scene-shadow model.
     full_molmo_topology: str = FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
-    # Historical Scheme B kept Full-Molmo2-ER outside the training graph and
-    # exposed detached IMAGE/TEXT K/V only.  The WEP-compatible Full-Molmo
-    # topology instead places trainable FG/BG in the VLM prefix, so decoder
-    # input gradients must be enabled even though every Molmo parameter stays
-    # frozen.  Keep this field for checkpoint/CLI compatibility, but the full
-    # backend contract requires it to be false.
+    # Historical Scheme B exposed detached IMAGE/TEXT K/V but omitted the
+    # WEPVLA scene-token path.  v5 keeps native Molmo strictly read-only while
+    # a differentiable FG/BG scene-shadow stream reuses the frozen blocks.
+    # Keep this legacy field for checkpoint/CLI compatibility; it remains
+    # false because the complete backend is not inference-only.
     molmo_inference_only: bool = False
-    # Recompute coupled frozen-Molmo/Action-Expert segments during backward.
-    # This preserves the exact WEP attention graph while avoiding retention of
-    # all 36 layers' decoder activations.
+    # Cache native detached GQA K/V and checkpoint Action Expert segments only.
+    # The four-token scene-shadow graph is evaluated once and retained.
     molmo_gradient_checkpointing: bool = True
-    # Two layers per segment halves retained boundary tensors relative to
-    # one-layer segments while keeping the recomputation peak bounded.
+    # Two Action Expert layers per segment keeps recomputation peaks bounded.
     molmo_gradient_checkpointing_layers_per_segment: int = 2
     # Batch-vectorized fixed 256px/two-crop native image transform. Contract
     # mismatches always fall back to Molmo's trusted slow processor.

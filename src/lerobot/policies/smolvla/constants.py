@@ -3,4 +3,4 @@
 """Stable identifiers shared by SmolVLA config and checkpoint loaders."""
 
 
-FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY = "molmo_native_hybrid_wepvla_expert_v4"
+FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY = "molmo_native_readonly_scene_shadow_wepvla_expert_v5"

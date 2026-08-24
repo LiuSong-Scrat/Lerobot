@@ -2462,8 +2462,8 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
 
     if getattr(config, "molmo_inference_only", None) is not False:
         raise RuntimeError(
-            "WEP-prefix Full-Molmo2-ER requires molmo_inference_only=false so FG/BG "
-            "input gradients can traverse the frozen decoder."
+            "Full-Molmo2-ER v5 requires molmo_inference_only=false so the separate "
+            "FG/BG scene-shadow stream keeps input gradients through frozen decoder ops."
         )
 
     worldflow_enabled = bool(getattr(config, "worldflow_enable", False))
@@ -2499,14 +2499,19 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
     architecture = backend.architecture_contract
     wep_prefix_contract = {
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
-        "vlm_execution": "frozen_parameters_with_prefix_input_autograd",
-        "per_layer_memory": "evolving_image_text_fg_bg_prefix",
-        "prefix_attention": "molmo_native_image_scene_bidirectional_text_causal",
-        "prefix_token_order": "bos_image_ego_scene_world_scene_text",
-        "prefix_position_ids": "sequential_valid_order_after_scene_insertion",
-        "fg_bg_location": "trainable_vlm_prefix",
+        "vlm_execution": "native_no_grad_scene_input_autograd",
+        "per_layer_memory": "detached_native_kv_plus_differentiable_scene_kv",
+        "prefix_attention": "native_official_hybrid_scene_reads_native_and_scene",
+        "prefix_token_order": "native_image_language_then_ego_world_scene_shadow",
+        "prefix_position_ids": "native_unchanged_scene_after_image_world_reuses_ego",
+        "fg_bg_location": "separate_trainable_scene_shadow_stream",
         "action_location": "expert_suffix_only",
-        "text_prefix_autograd_preserved": True,
+        "native_conditioned_by_scene": False,
+        "native_kv_detached": True,
+        "scene_input_autograd_preserved": True,
+        "action_even_attention": "native_scene_all_actions",
+        "action_odd_attention": "pure_cross_native_scene",
+        "checkpointed_streams": "action_only",
         "gradient_checkpointing": bool(
             getattr(config, "molmo_gradient_checkpointing", True)
         ),
@@ -2555,7 +2560,7 @@ def write_full_molmo2er_parameter_audit(
         for parameter in module.parameters()
     )
     payload = {
-        "version": 4,
+        "version": 5,
         "backend": "molmo2_full",
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
         "total_parameters": total,
@@ -2722,17 +2727,16 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    # Normalize the logging contract across policies (including RA-BC): this
-    # is the exact scalar whose scaled gradient is accumulated below.
-    output_dict["loss"] = loss.detach().item()
-
+    output_dict["loss"] = loss.detach()
     finite_loss = torch.isfinite(loss.detach()).to(device=loss.device, dtype=torch.int32)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        # Every rank must make the same backward/no-backward decision.  A
-        # rank-local early return would leave its peers blocked forever in a
-        # DDP gradient collective.
         torch.distributed.all_reduce(finite_loss, op=torch.distributed.ReduceOp.MIN)
-    if not bool(finite_loss.item()):
+    # Preserve the original rank-coherent pre-backward failure gate, while
+    # carrying the loss log scalar in the same required device synchronization.
+    finite_loss_flag, logged_loss = torch.stack(
+        (finite_loss.to(dtype=torch.float64), loss.detach().to(dtype=torch.float64))
+    ).cpu().tolist()
+    if not bool(finite_loss_flag):
         optimizer.zero_grad(set_to_none=True)
         raise FloatingPointError("Non-finite loss detected on at least one distributed rank.")
 
@@ -2742,8 +2746,9 @@ def update_policy(
     accelerator.backward(loss * float(loss_scale))
 
     if not perform_optimizer_step:
+        output_dict["loss"] = float(logged_loss)
         if record_loss:
-            train_metrics.loss = loss.item()
+            train_metrics.loss = float(logged_loss)
         train_metrics.lr = optimizer.param_groups[0]["lr"]
         train_metrics.update_s = time.perf_counter() - start_time
         return train_metrics, output_dict
@@ -2756,10 +2761,16 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
-    finite_grad = torch.isfinite(torch.as_tensor(grad_norm, device=loss.device)).to(torch.int32)
+    grad_norm_tensor = torch.as_tensor(grad_norm, device=loss.device).detach()
+    finite_grad = torch.isfinite(grad_norm_tensor).to(torch.int32)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(finite_grad, op=torch.distributed.ReduceOp.MIN)
-    if not bool(finite_grad.item()):
+    # The post-backward optimizer decision also necessarily synchronizes once;
+    # carry grad-norm logging in that same transfer.
+    finite_grad_flag, logged_grad_norm = torch.stack(
+        (finite_grad.to(dtype=torch.float64), grad_norm_tensor.to(dtype=torch.float64))
+    ).cpu().tolist()
+    if not bool(finite_grad_flag):
         optimizer.zero_grad(set_to_none=True)
         raise FloatingPointError("Non-finite gradient norm detected on at least one distributed rank.")
 
@@ -2790,9 +2801,10 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
+    output_dict["loss"] = float(logged_loss)
     if record_loss:
-        train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
+        train_metrics.loss = float(logged_loss)
+    train_metrics.grad_norm = float(logged_grad_norm)
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
@@ -3448,6 +3460,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
+            if output_dict:
+                # Full-Molmo forward deliberately leaves diagnostics as
+                # detached device scalars so backward can be enqueued without
+                # synchronizing. Materialize all CUDA diagnostics together,
+                # once and only on the logging rank.
+                cuda_scalar_keys = [
+                    key
+                    for key, value in output_dict.items()
+                    if torch.is_tensor(value) and value.is_cuda and value.numel() == 1
+                ]
+                if cuda_scalar_keys:
+                    cuda_scalar_values = torch.stack(
+                        [
+                            output_dict[key].detach().to(dtype=torch.float64).reshape(())
+                            for key in cuda_scalar_keys
+                        ]
+                    ).cpu().tolist()
+                    output_dict.update(
+                        {
+                            key: float(value)
+                            for key, value in zip(cuda_scalar_keys, cuda_scalar_values, strict=True)
+                        }
+                    )
             logging.info(train_tracker)
             if output_dict:
                 debug_keys = (

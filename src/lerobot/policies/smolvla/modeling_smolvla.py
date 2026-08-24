@@ -1709,34 +1709,50 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
         pointseg_aux_loss = self.model.last_pointseg_aux_loss
         pointseg_aux_weight = self.config.pointseg_aux_loss_weight if pointseg_aux_loss is not None else 0.0
-        loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        # Full-Molmo training must enqueue backward immediately after forward.
+        # Converting every diagnostic scalar with .item() here forces a full
+        # CUDA synchronization before backward on every DDP rank. Keep
+        # detached 0-D tensors until the post-update logging boundary instead.
+        defer_metric_sync = bool(
+            self.training and getattr(self.config, "vlm_backend", "smolvlm") == "molmo2_full"
+        )
+
+        def metric_value(value: Tensor) -> Tensor | float:
+            detached = value.detach()
+            return detached if defer_metric_sync else detached.item()
+
+        loss_dict["losses_after_forward"] = metric_value(losses.mean())
         loss_dict["loss_pointseg_aux"] = (
-            pointseg_aux_loss.detach().item() if torch.is_tensor(pointseg_aux_loss) else 0.0
+            metric_value(pointseg_aux_loss) if torch.is_tensor(pointseg_aux_loss) else 0.0
         )
         for key, value in self.model.last_pointseg_metrics.items():
             if torch.is_tensor(value):
-                loss_dict[key] = value.detach().item()
+                loss_dict[key] = metric_value(value)
         for key, value in self.model.last_se3_metrics.items():
             if torch.is_tensor(value):
-                loss_dict[key] = value.detach().item()
+                loss_dict[key] = metric_value(value)
         for key, value in self.model.last_action_metrics.items():
             if torch.is_tensor(value):
-                loss_dict[key] = value.detach().item()
+                loss_dict[key] = metric_value(value)
         worldflow_aux = self.model.compute_worldflow_aux_loss()
         for key, value in self.model.last_worldflow_metrics.items():
             if torch.is_tensor(value):
-                loss_dict[key] = value.detach().item()
+                loss_dict[key] = metric_value(value)
         ego_trans_error = loss_dict.get("action_endpoint_trans_err")
         world_trans_error = loss_dict.get("worldflow_trans_err")
         if ego_trans_error is not None and world_trans_error is not None:
-            loss_dict["worldflow_to_ego_trans_err_ratio"] = float(world_trans_error) / max(
-                float(ego_trans_error), 1e-12
+            loss_dict["worldflow_to_ego_trans_err_ratio"] = (
+                world_trans_error / ego_trans_error.clamp_min(1e-12)
+                if torch.is_tensor(ego_trans_error)
+                else float(world_trans_error) / max(float(ego_trans_error), 1e-12)
             )
         ego_rot_error = loss_dict.get("action_endpoint_rot_err_deg")
         world_rot_error = loss_dict.get("worldflow_rot_err_deg")
         if ego_rot_error is not None and world_rot_error is not None:
-            loss_dict["worldflow_to_ego_rot_err_ratio"] = float(world_rot_error) / max(
-                float(ego_rot_error), 1e-12
+            loss_dict["worldflow_to_ego_rot_err_ratio"] = (
+                world_rot_error / ego_rot_error.clamp_min(1e-12)
+                if torch.is_tensor(ego_rot_error)
+                else float(world_rot_error) / max(float(ego_rot_error), 1e-12)
             )
 
         # Remove padding
@@ -1747,7 +1763,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             device=losses.device,
             dtype=losses.dtype,
         )
-        loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
+        loss_dict["losses_after_rm_padding"] = metric_value(losses.mean())
 
         valid_action_counts = torch.full(
             (losses.shape[0],),
@@ -1762,30 +1778,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
             losses = losses * in_episode_bound.unsqueeze(-1)
             valid_action_counts = in_episode_bound.sum(dim=1).clamp_min(1).to(dtype=losses.dtype)
             valid_denominator = valid_action_counts.sum() * original_action_dim
-            loss_dict["losses_after_in_ep_bound"] = (losses.sum() / valid_denominator).item()
+            loss_dict["losses_after_in_ep_bound"] = metric_value(
+                losses.sum() / valid_denominator
+            )
 
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_action_loss = losses.sum(dim=(1, 2)) / (valid_action_counts * original_action_dim)
-            loss_dict["loss_action"] = per_sample_action_loss.mean().item()
+            loss_dict["loss_action"] = metric_value(per_sample_action_loss.mean())
             per_sample_loss = per_sample_action_loss
             if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
                 per_sample_loss = per_sample_loss + pointseg_aux_weight * pointseg_aux_loss
             if worldflow_aux is not None:
                 per_sample_loss = per_sample_loss + worldflow_aux["per_sample_loss"]
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            loss_dict["loss"] = metric_value(per_sample_loss.mean())
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
             action_loss = losses.sum() / (valid_action_counts.sum() * original_action_dim)
-            loss_dict["loss_action"] = action_loss.item()
+            loss_dict["loss_action"] = metric_value(action_loss)
             loss = action_loss
             if torch.is_tensor(pointseg_aux_loss) and pointseg_aux_weight > 0:
                 loss = loss + pointseg_aux_weight * pointseg_aux_loss
             if worldflow_aux is not None:
                 loss = loss + worldflow_aux["per_sample_loss"].mean()
-            loss_dict["loss"] = loss.item()
+            loss_dict["loss"] = metric_value(loss)
             return loss, loss_dict
 
     def _action_loss_dimension_weights(
@@ -2077,6 +2095,87 @@ class SelfAttention(nn.Module):
 
         return x_out
 
+
+def _litept_valid_sample_mask(pc: Tensor, point_is_pad: Tensor, eps: float = 1e-6) -> Tensor:
+    """Vectorized equivalent of LitePTTokenizer's per-sample degeneracy test."""
+
+    point_valid = ~point_is_pad
+    xyz = pc[..., :3]
+    finite_or_pad = torch.isfinite(xyz) | ~point_valid.unsqueeze(-1)
+    all_valid_points_finite = finite_or_pad.all(dim=(1, 2))
+    positive_inf = torch.full((), float("inf"), device=xyz.device, dtype=xyz.dtype)
+    negative_inf = torch.full((), float("-inf"), device=xyz.device, dtype=xyz.dtype)
+    xyz_min = torch.where(point_valid.unsqueeze(-1), xyz, positive_inf).amin(dim=1)
+    xyz_max = torch.where(point_valid.unsqueeze(-1), xyz, negative_inf).amax(dim=1)
+    extent = (xyz_max - xyz_min).abs().sum(dim=-1)
+    return point_valid.any(dim=1) & all_valid_points_finite & (extent >= eps)
+
+
+def _pack_litept_tokens_by_batch(
+    xyz: Tensor,
+    features: Tensor,
+    point_batch: Tensor,
+    valid_sample_indices: Tensor,
+    *,
+    total_batch_size: int,
+    output_dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pack variable LitePT outputs without per-sample GPU synchronizations.
+
+    Stable sorting by ``point_batch`` exactly reproduces the old loop's
+    ``nonzero(point_batch == i)`` order, including when backbone output is not
+    already batch-major. Global max pooling is then the same batched
+    ``max(dim=1)`` operation over those ordered feature rows.
+    """
+
+    valid_batch_size = valid_sample_indices.shape[0]
+    token_counts = torch.bincount(point_batch, minlength=valid_batch_size)
+    max_tokens = max(int(token_counts.max().item()), 1)
+    global_xyz = torch.zeros(
+        total_batch_size,
+        max_tokens,
+        3,
+        device=xyz.device,
+        dtype=output_dtype,
+    )
+    packed_features = torch.zeros(
+        total_batch_size,
+        max_tokens,
+        features.shape[-1],
+        device=features.device,
+        dtype=output_dtype,
+    )
+    token_mask = torch.zeros(
+        total_batch_size,
+        max_tokens,
+        device=features.device,
+        dtype=torch.bool,
+    )
+    global_features = torch.zeros(
+        total_batch_size,
+        features.shape[-1],
+        device=features.device,
+        dtype=output_dtype,
+    )
+
+    stable_order = torch.argsort(point_batch, stable=True)
+    sorted_batch = point_batch[stable_order]
+    group_starts = torch.cumsum(token_counts, dim=0) - token_counts
+    local_positions = torch.arange(
+        point_batch.shape[0], device=point_batch.device, dtype=torch.long
+    ) - torch.repeat_interleave(group_starts, token_counts)
+    global_rows = valid_sample_indices[sorted_batch]
+    global_xyz[global_rows, local_positions] = xyz[stable_order].to(dtype=output_dtype)
+    packed_features[global_rows, local_positions] = features[stable_order].to(dtype=output_dtype)
+    token_mask[global_rows, local_positions] = True
+
+    valid_packed = packed_features[valid_sample_indices]
+    valid_mask = token_mask[valid_sample_indices]
+    pooled = valid_packed.masked_fill(~valid_mask.unsqueeze(-1), float("-inf")).max(dim=1).values
+    pooled = torch.where(token_counts[:, None] > 0, pooled, torch.zeros_like(pooled))
+    global_features[valid_sample_indices] = pooled
+    return global_xyz, packed_features, global_features, token_mask
+
 class LitePTTokenizer(nn.Module):
     """
     input:  pc (B,N,C) XYZ m RGB 0-255
@@ -2158,13 +2257,9 @@ class LitePTTokenizer(nn.Module):
         tok_mask = torch.zeros(B, empty_len, device=device, dtype=torch.bool)
 
         # ========= mask valid =========
-        valid_mask = []
-        for b in range(B):
-            point_valid = ~point_is_pad[b]
-            valid_mask.append(bool(point_valid.any().item()) and not self._is_degenerate(pc[b, point_valid, :3]))
-        valid_mask = torch.tensor(valid_mask, device=device)
+        valid_mask = _litept_valid_sample_mask(pc, point_is_pad)
 
-        if valid_mask.sum() == 0:
+        if not bool(valid_mask.any()):
             return global_xyz_tok, tok, g, tok_mask
 
         pc_v = pc[valid_mask]  # (Bv,N,C)
@@ -2219,31 +2314,16 @@ class LitePTTokenizer(nn.Module):
                 right=True,
             )
 
-        # ========= 按batch拆分 =========
+        # ========= 按batch拆分（稳定批量回填） =========
         valid_idx = torch.nonzero(valid_mask).squeeze(1)
-        token_counts = torch.bincount(b_p, minlength=Bv)
-        max_tokens = max(int(token_counts.max().item()), 1)
-
-        global_xyz_tok = torch.zeros(B, max_tokens, 3, device=device, dtype=pc.dtype)
-        tok = torch.zeros(B, max_tokens, self.dim, device=device, dtype=pc.dtype)
-        tok_mask = torch.zeros(B, max_tokens, device=device, dtype=torch.bool)
-
-        for i in range(Bv):
-            global_b = valid_idx[i].item()
-
-            P = int(token_counts[i].item())
-
-            if P == 0:
-                continue
-
-            idx_all = torch.nonzero(b_p == i, as_tuple=False).squeeze(1)
-
-            global_xyz_tok[global_b, :P] = xyz_p[idx_all]
-            tok[global_b, :P] = feat_p[idx_all]
-            tok_mask[global_b, :P] = True
-            g[global_b] = feat_p[idx_all].max(dim=0).values
-
-        return global_xyz_tok, tok, g, tok_mask
+        return _pack_litept_tokens_by_batch(
+            xyz_p,
+            feat_p,
+            b_p,
+            valid_idx,
+            total_batch_size=B,
+            output_dtype=pc.dtype,
+        )
 
 
 class LitePTEncoder(nn.Module):
@@ -2645,15 +2725,16 @@ class WorldFlowActionBranch(nn.Module):
                         f"{background_point_cloud_world.shape[:2]}, got {background_point_is_pad.shape}."
                     )
             background_valid = (~background_point_is_pad).any(dim=1)
-            if bool(background_valid.any().item()):
-                valid_background = background_point_cloud_world[background_valid]
-                valid_background_pad = background_point_is_pad[background_valid]
-                with _batchnorm_eval_on_single_value(self.background_encoder):
-                    _bg_xyz, _bg_tokens, encoded_background, _bg_mask = self.background_encoder(
-                        valid_background.to(dtype=torch.float32),
-                        valid_background_pad,
-                    )
-                background_feat[background_valid] = encoded_background.to(dtype=background_feat.dtype)
+            with _batchnorm_eval_on_single_value(self.background_encoder):
+                _bg_xyz, _bg_tokens, encoded_background, _bg_mask = self.background_encoder(
+                    background_point_cloud_world.to(dtype=torch.float32),
+                    background_point_is_pad,
+                )
+            background_feat = torch.where(
+                background_valid[:, None],
+                encoded_background.to(dtype=background_feat.dtype),
+                background_feat,
+            )
 
         foreground_valid = scene["scene_mask1"].to(dtype=torch.bool).any(dim=1)
         result = {
@@ -3325,13 +3406,19 @@ class SongPointCloudConditioner(nn.Module):
         background_feat = self.null_background_feat.to(
             device=object_feat.device, dtype=object_feat.dtype
         ).unsqueeze(0).expand(point_cloud.shape[0], -1).clone()
-        if bool(background_has_candidates.any().item()):
-            background_pc_to_encode = background_pc[background_has_candidates]
-            with _batchnorm_eval_on_single_value(self.background_encoder):
-                _scene_xyz, _scene_tok, encoded_background_feat, _scene_mask = self.background_encoder(
-                    background_pc_to_encode
-                )
-            background_feat[background_has_candidates] = encoded_background_feat.to(dtype=background_feat.dtype)
+        background_pad = (~background_has_candidates)[:, None].expand(
+            -1, background_pc.shape[1]
+        )
+        with _batchnorm_eval_on_single_value(self.background_encoder):
+            _scene_xyz, _scene_tok, encoded_background_feat, _scene_mask = self.background_encoder(
+                background_pc,
+                background_pad,
+            )
+        background_feat = torch.where(
+            background_has_candidates[:, None],
+            encoded_background_feat.to(dtype=background_feat.dtype),
+            background_feat,
+        )
 
         result = {
             "object_feat": object_feat,
@@ -3542,6 +3629,9 @@ class VLAFlowMatching(nn.Module):
         self.last_molmo_scene_insert_positions: Tensor | None = None
         self.last_molmo_world_scene_insert_positions: Tensor | None = None
         self.last_molmo_token_roles: Tensor | None = None
+        self.last_molmo_prefix_position_ids: Tensor | None = None
+        self.last_molmo_native_length: int = 0
+        self.last_molmo_scene_token_count: int = 0
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -4329,6 +4419,85 @@ class VLAFlowMatching(nn.Module):
             ).detach(),
         }
 
+    def _full_molmo_prefix_layout(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+    ) -> tuple[Tensor | None, int]:
+        """Return the validated v5 prefix positions and physical scene length."""
+
+        if getattr(self.config, "vlm_backend", "smolvlm") != "molmo2_full":
+            return None, 0
+        native_length = int(getattr(self, "last_molmo_native_length", 0))
+        scene_length = int(prefix_embs.shape[1] - native_length)
+        registered_scene_length = int(getattr(self, "last_molmo_scene_token_count", 0))
+        if native_length < 1 or scene_length not in {2, 4} or scene_length != registered_scene_length:
+            raise ValueError(
+                "Full-Molmo2-ER v5 prefix metadata drifted: "
+                f"prefix/native/scene/registered={prefix_embs.shape[1]}/{native_length}/"
+                f"{scene_length}/{registered_scene_length}."
+            )
+        positions = getattr(self, "last_molmo_prefix_position_ids", None)
+        if not torch.is_tensor(positions) or positions.shape[0] != prefix_embs.shape[0] or (
+            positions.shape[1] < prefix_embs.shape[1]
+        ):
+            raise ValueError("Full-Molmo2-ER v5 prefix positions are missing or stale.")
+        if prefix_pad_masks.shape != prefix_embs.shape[:2]:
+            raise ValueError("Full-Molmo2-ER v5 prefix embeddings/mask shapes disagree.")
+        return positions[:, : prefix_embs.shape[1]].to(device=prefix_embs.device), scene_length
+
+    @staticmethod
+    def _compose_prefix_suffix_position_ids(
+        prefix_pad_masks: Tensor,
+        suffix_pad_masks: Tensor,
+        prefix_position_ids: Tensor | None,
+    ) -> Tensor:
+        if prefix_position_ids is None:
+            return torch.cumsum(
+                torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1),
+                dim=1,
+                dtype=torch.long,
+            ) - 1
+        valid_prefix_positions = prefix_position_ids.masked_fill(~prefix_pad_masks, -1)
+        prefix_offsets = valid_prefix_positions.amax(dim=1, keepdim=True) + 1
+        suffix_positions = prefix_offsets + torch.cumsum(
+            suffix_pad_masks, dim=1, dtype=torch.long
+        ) - 1
+        return torch.cat([prefix_position_ids, suffix_positions], dim=1)
+
+    def _cached_prefix_position_offsets(self, prefix_pad_masks: Tensor) -> Tensor:
+        """Return the next RoPE position for a cached prefix.
+
+        Full-Molmo v5 deliberately reuses RoPE positions for Ego/World scene
+        pairs, so the physical number of valid prefix tokens is not the next
+        position. Cached suffix inference must use the same registered
+        maximum-position rule as joint training.
+        """
+
+        if getattr(self.config, "vlm_backend", "smolvlm") != "molmo2_full":
+            return torch.sum(prefix_pad_masks, dim=-1, dtype=torch.long)[:, None]
+        positions = getattr(self, "last_molmo_prefix_position_ids", None)
+        native_length = int(getattr(self, "last_molmo_native_length", 0))
+        scene_length = int(getattr(self, "last_molmo_scene_token_count", 0))
+        if (
+            not torch.is_tensor(positions)
+            or positions.shape != prefix_pad_masks.shape
+            or native_length < 1
+            or scene_length not in {2, 4}
+            or native_length + scene_length != prefix_pad_masks.shape[1]
+        ):
+            raise ValueError(
+                "Full-Molmo2-ER v5 cached prefix position metadata is missing or stale."
+            )
+        positions = positions.to(device=prefix_pad_masks.device, dtype=torch.long)
+        valid_positions = positions.masked_fill(
+            ~prefix_pad_masks.to(dtype=torch.bool), -1
+        )
+        maximum = valid_positions.amax(dim=1, keepdim=True)
+        if bool((maximum < 0).any()):
+            raise ValueError("Full-Molmo2-ER v5 cached prefix has no valid token.")
+        return maximum + 1
+
     def _se3_predict_from_suffix(
         self,
         prefix_embs: Tensor,
@@ -4348,7 +4517,12 @@ class VLAFlowMatching(nn.Module):
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        prefix_position_ids, scene_length = self._full_molmo_prefix_layout(
+            prefix_embs, prefix_pad_masks
+        )
+        position_ids = self._compose_prefix_suffix_position_ids(
+            prefix_pad_masks, suffix_pad_masks, prefix_position_ids
+        )
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
@@ -4356,6 +4530,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            prefix_scene_length=scene_length,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
         return self._predict_ego_se3_velocity(
@@ -4384,7 +4559,12 @@ class VLAFlowMatching(nn.Module):
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
             attention_mask = make_att_2d_masks(pad_masks, att_masks)
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            prefix_position_ids, scene_length = self._full_molmo_prefix_layout(
+                prefix_embs, prefix_pad_masks
+            )
+            position_ids = self._compose_prefix_suffix_position_ids(
+                prefix_pad_masks, suffix_pad_masks, prefix_position_ids
+            )
             (_, suffix_out), _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -4392,6 +4572,7 @@ class VLAFlowMatching(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 fill_kv_cache=False,
+                prefix_scene_length=scene_length,
             )
         else:
             if past_key_values is None:
@@ -4403,7 +4584,7 @@ class VLAFlowMatching(nn.Module):
             )
             suffix_attention = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
             attention_mask = torch.cat([prefix_attention, suffix_attention], dim=2)
-            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            prefix_offsets = self._cached_prefix_position_offsets(prefix_pad_masks)
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
@@ -4980,14 +5161,14 @@ class VLAFlowMatching(nn.Module):
         *,
         ablate_language: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Insert trainable Ego FG/BG into Molmo's native perception block.
+        """Build ``[native Molmo N][Ego FG/BG scene shadow S]``.
 
-        Native IMAGE/LANGUAGE embeddings are detached because their producers
-        are frozen and have no trainable inputs.  The concatenated prefix is
-        nevertheless differentiable through the two scene tokens.  Attention
-        keeps Molmo's native hybrid semantics: BOS is causal, IMAGE and Ego
-        FG/BG form one bidirectional perception block, and LANGUAGE remains
-        causal.  Noisy actions are added later as the sole Expert suffix.
+        N retains its official token order, validity, positions and hybrid
+        mask.  S is physically appended rather than inserted into the native
+        IMAGE block, because shifting LANGUAGE or letting native queries read
+        S would change Molmo's pretrained representation.  The backend later
+        evaluates N independently and gives S a one-way ``S -> N+S`` path.
+        Actions remain the sole Expert suffix.
         """
 
         if native_embeddings.ndim != 3:
@@ -5015,129 +5196,121 @@ class VLAFlowMatching(nn.Module):
             device=native_embeddings.device, dtype=torch.bool
         )
         ego_scene_mask = ego_scene_mask.to(device=native_embeddings.device, dtype=torch.bool)
-        image_counts = (native_image_tokens & native_valid).sum(dim=1)
-        if not bool((image_counts == 410).all()):
-            raise ValueError(f"Expected exactly 410 native IMAGE positions, got {image_counts.tolist()}.")
-
         text_role, image_role, scene_role, pad_role = 0, 1, 2, 3
-        output_length = native_length + 2
-        embedding_rows: list[Tensor] = []
-        validity_rows: list[Tensor] = []
-        boundary_rows: list[Tensor] = []
-        role_rows: list[Tensor] = []
-        insertion_positions: list[int] = []
-        for batch_index in range(batch_size):
-            valid_length = int(native_valid[batch_index].sum().item())
-            valid_images = torch.nonzero(
-                native_image_tokens[batch_index, :valid_length], as_tuple=False
-            ).flatten()
-            if valid_images.numel() != 410:
+        valid_image_tokens = native_image_tokens & native_valid
+        native_indices = torch.arange(native_length, device=native_embeddings.device)
+        first_images = torch.where(
+            valid_image_tokens,
+            native_indices[None, :],
+            native_length,
+        ).amin(dim=1)
+        last_images = torch.where(
+            valid_image_tokens,
+            native_indices[None, :],
+            -1,
+        ).amax(dim=1)
+        image_counts = valid_image_tokens.sum(dim=1)
+        if not getattr(self, "_molmo_native_prefix_contract_validated", False):
+            valid_contract = (image_counts == 410) & (
+                last_images - first_images + 1 == image_counts
+            )
+            if not bool(valid_contract.all()):
                 raise ValueError(
-                    f"Sample {batch_index} has {valid_images.numel()} IMAGE positions; expected 410."
+                    "Expected exactly one contiguous 410-position native IMAGE block; "
+                    f"counts={image_counts.tolist()}, first={first_images.tolist()}, "
+                    f"last={last_images.tolist()}."
                 )
-            if int(valid_images[-1].item() - valid_images[0].item() + 1) != int(
-                valid_images.numel()
-            ):
-                raise ValueError("Molmo IMAGE positions must form one contiguous native block.")
-            insert_at = int(valid_images[-1].item()) + 1
-            insertion_positions.append(insert_at)
+            self._molmo_native_prefix_contract_validated = True
 
-            # Detach only the native branch.  Concatenating the trainable scene
-            # row restores decoder input autograd without asking WTE/ViT for a
-            # gradient or retaining their activation graph.
-            valid_native_embeddings = native_embeddings[batch_index, :valid_length].detach()
-            row_embeddings = torch.cat(
-                [
-                    valid_native_embeddings[:insert_at],
-                    ego_scene_embeddings[batch_index],
-                    valid_native_embeddings[insert_at:],
-                ],
-                dim=0,
-            )
-            row_embeddings = F.pad(
-                row_embeddings, (0, 0, 0, output_length - row_embeddings.shape[0])
-            )
-            embedding_rows.append(row_embeddings)
+        native_roles = torch.full(
+            (batch_size, native_length),
+            text_role,
+            dtype=torch.int8,
+            device=native_embeddings.device,
+        )
+        native_roles = torch.where(
+            native_image_tokens,
+            torch.full_like(native_roles, image_role),
+            native_roles,
+        )
+        native_roles = torch.where(
+            native_valid,
+            native_roles,
+            torch.full_like(native_roles, pad_role),
+        )
+        effective_native_valid = native_valid
+        if ablate_language:
+            native_columns = native_indices[None, :].expand(batch_size, -1)
+            ablated_text = (native_roles == text_role) & (native_columns != 0)
+            effective_native_valid = effective_native_valid & ~ablated_text
 
-            native_roles = torch.where(
-                native_image_tokens[batch_index, :valid_length],
+        native_embeddings = native_embeddings.detach().masked_fill(
+            (~effective_native_valid)[:, :, None], 0
+        )
+        prefix_embeddings = torch.cat([native_embeddings, ego_scene_embeddings], dim=1)
+        prefix_valid = torch.cat([effective_native_valid, ego_scene_mask], dim=1)
+        prefix_roles = torch.cat(
+            [
+                native_roles,
                 torch.full(
-                    (valid_length,), image_role, dtype=torch.int8, device=native_embeddings.device
+                    (batch_size, 2),
+                    scene_role,
+                    dtype=torch.int8,
+                    device=native_embeddings.device,
                 ),
-                torch.full(
-                    (valid_length,), text_role, dtype=torch.int8, device=native_embeddings.device
-                ),
-            )
-            row_roles = torch.cat(
-                [
-                    native_roles[:insert_at],
-                    torch.full(
-                        (2,), scene_role, dtype=torch.int8, device=native_embeddings.device
-                    ),
-                    native_roles[insert_at:],
-                ]
-            )
-            row_roles = F.pad(
-                row_roles, (0, output_length - row_roles.shape[0]), value=pad_role
-            )
-            role_rows.append(row_roles)
+            ],
+            dim=1,
+        )
 
-            row_valid = torch.cat(
-                [
-                    native_valid[batch_index, :insert_at],
-                    ego_scene_mask[batch_index],
-                    native_valid[batch_index, insert_at:valid_length],
-                ]
-            )
-            row_valid = F.pad(
-                row_valid, (0, output_length - row_valid.shape[0]), value=False
-            )
-            if ablate_language:
-                text_positions = row_roles == text_role
-                text_positions[0] = False
-                row_valid = row_valid & ~text_positions
-            validity_rows.append(row_valid)
+        # Native boundaries exactly encode Molmo's hybrid mask.  Scene starts
+        # one new bidirectional block after native; the backend's independent
+        # N call makes the same N->S prohibition structural as well as masked.
+        native_boundaries = (native_roles == text_role) | (
+            native_indices[None, :] == first_images[:, None]
+        )
+        native_boundaries = native_boundaries & (native_roles != pad_role)
+        scene_boundaries = torch.tensor(
+            [True, False],
+            dtype=torch.bool,
+            device=native_embeddings.device,
+        )[None, :].expand(batch_size, -1)
+        boundaries = torch.cat([native_boundaries, scene_boundaries], dim=1)
 
-            # Extend Molmo's native causal+IMAGE-bidirectional mask to the
-            # trainable scene tokens.  Every TEXT position starts a new causal
-            # block; the first IMAGE starts one perception block and neither
-            # later IMAGE nor FG/BG starts another block.  Consequently:
-            #   BOS -> BOS
-            #   IMAGE/FG/BG -> BOS + every IMAGE/FG/BG
-            #   LANGUAGE_i -> BOS + perception + LANGUAGE_<=i
-            row_boundaries = row_roles == text_role
-            first_image = int(
-                torch.nonzero(row_roles == image_role, as_tuple=False)[0].item()
-            )
-            row_boundaries[first_image] = True
-            row_boundaries[row_roles == pad_role] = False
-            boundary_rows.append(row_boundaries)
+        native_position_ids = (
+            torch.cumsum(effective_native_valid, dim=1, dtype=torch.long) - 1
+        )
+        last_image_positions = native_position_ids.gather(1, last_images[:, None])
+        ego_scene_position_ids = last_image_positions + torch.tensor(
+            [1, 2], dtype=torch.long, device=native_embeddings.device
+        )[None, :]
+        prefix_position_ids = torch.cat(
+            [native_position_ids, ego_scene_position_ids], dim=1
+        )
 
-        prefix_embeddings = torch.stack(embedding_rows, dim=0)
-        prefix_valid = torch.stack(validity_rows, dim=0)
-        prefix_roles = torch.stack(role_rows, dim=0)
-        boundaries = torch.stack(boundary_rows, dim=0)
-
-        self.last_molmo_scene_insert_positions = torch.tensor(
-            insertion_positions,
-            device=prefix_embeddings.device,
-            dtype=torch.long,
+        self.last_molmo_scene_insert_positions = torch.full(
+            (batch_size,), native_length, dtype=torch.long, device=native_embeddings.device
         )
         self.last_molmo_world_scene_insert_positions = None
         self.last_molmo_token_roles = prefix_roles.detach()
+        self.last_molmo_prefix_position_ids = prefix_position_ids.detach()
+        self.last_molmo_native_length = native_length
+        self.last_molmo_scene_token_count = 2
         self.last_ego_point_prefix_slices = ()
         self.last_prefix_token_layout = (
-            "native_bos_image",
-            "ego_foreground",
-            "ego_background",
-            "native_language",
+            "native_molmo_image_language",
+            "ego_foreground_shadow",
+            "ego_background_shadow",
         )
 
+        prefix_square_mean = prefix_embeddings.detach().float().square().mean(dim=-1)
+
         def role_rms(role: int) -> Tensor:
-            selected = prefix_embeddings.detach().float()[prefix_roles == role]
-            if selected.numel() == 0:
-                return torch.zeros((), device=prefix_embeddings.device, dtype=torch.float32)
-            return selected.square().mean().sqrt()
+            role_mask = prefix_roles == role
+            role_count = role_mask.sum().clamp_min(1).to(dtype=prefix_square_mean.dtype)
+            return (
+                (prefix_square_mean * role_mask.to(dtype=prefix_square_mean.dtype)).sum()
+                / role_count
+            ).sqrt()
 
         image_rms = role_rms(image_role)
         scene_rms = role_rms(scene_role)
@@ -5151,6 +5324,7 @@ class VLAFlowMatching(nn.Module):
                 "scene_language_rms_ratio": scene_rms / text_rms.clamp_min(1e-8),
                 "vlm_inference_only": torch.zeros((), device=native_embeddings.device),
                 "prefix_input_autograd": torch.ones((), device=native_embeddings.device),
+                "native_vlm_no_grad": torch.ones((), device=native_embeddings.device),
             }
         )
         return prefix_embeddings, prefix_valid, boundaries
@@ -5184,6 +5358,9 @@ class VLAFlowMatching(nn.Module):
         self.last_molmo_scene_insert_positions = None
         self.last_molmo_world_scene_insert_positions = None
         self.last_molmo_token_roles = None
+        self.last_molmo_prefix_position_ids = None
+        self.last_molmo_native_length = 0
+        self.last_molmo_scene_token_count = 0
         # Some lightweight unit-test / export shells construct this module
         # without running the full initializer.
         diagnostic_ablations = getattr(self, "inference_ablation_modalities", frozenset())
@@ -5204,7 +5381,7 @@ class VLAFlowMatching(nn.Module):
         is_molmo_full = getattr(getattr(self, "config", None), "vlm_backend", "smolvlm") == "molmo2_full"
         if is_molmo_point_only:
             if images is not None or image_masks is not None:
-                raise ValueError("The Molmo2-ER point-only backend must never receive RGB inputs.")
+                raise ValueError("The Molmo2-ER point-only backend must never receive 2-D RGB inputs.")
             valid_language = lang_masks.to(dtype=torch.bool)
             if not bool(valid_language.any(dim=1).all()):
                 raise ValueError("Every Molmo language prefix must contain at least one valid token.")
@@ -6214,7 +6391,12 @@ class VLAFlowMatching(nn.Module):
             pad_masks = torch.cat([world_prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
             attention_mask = make_att_2d_masks(pad_masks, att_masks)
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            prefix_position_ids, scene_length = self._full_molmo_prefix_layout(
+                prefix_embs, world_prefix_pad_masks
+            )
+            position_ids = self._compose_prefix_suffix_position_ids(
+                world_prefix_pad_masks, suffix_pad_masks, prefix_position_ids
+            )
             (_, suffix_out), _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -6223,6 +6405,7 @@ class VLAFlowMatching(nn.Module):
                 use_cache=False,
                 fill_kv_cache=False,
                 expert_model=world_lm_expert,
+                prefix_scene_length=scene_length,
             )
         else:
             if past_key_values is None:
@@ -6234,7 +6417,7 @@ class VLAFlowMatching(nn.Module):
             )
             suffix_attention = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
             attention_mask = torch.cat([prefix_attention, suffix_attention], dim=2)
-            prefix_offsets = torch.sum(world_prefix_pad_masks, dim=-1)[:, None]
+            prefix_offsets = self._cached_prefix_position_offsets(world_prefix_pad_masks)
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
@@ -6255,13 +6438,14 @@ class VLAFlowMatching(nn.Module):
         prefix_att_masks: Tensor,
         world_tokens: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Place World FG/BG beside Ego FG/BG in the non-action prefix.
+        """Append World FG/BG to the separate non-native scene-shadow stream.
 
-        Full Molmo inserts World FG/BG immediately after Ego FG/BG and before
-        native language.  The four scene tokens therefore extend Molmo's
-        bidirectional IMAGE perception block while LANGUAGE keeps its native
-        causal ordering.  Other backends retain the historical append/reused-
-        position behavior.
+        Full Molmo keeps its native image/language sequence byte-for-byte in
+        front and appends Ego then World scene shadows after it.  The backend
+        evaluates native tokens independently, so these four trainable tokens
+        can read native per-layer K/V without changing native hidden states.
+        World reuses Ego's two RoPE positions, matching WEPVLA's paired
+        coordinate streams.  Other backends retain their historical behavior.
         """
 
         required_modules = (
@@ -6302,104 +6486,72 @@ class VLAFlowMatching(nn.Module):
 
         config = getattr(self, "config", None)
         if getattr(config, "vlm_backend", "smolvlm") == "molmo2_full":
-            insertion_positions = getattr(self, "last_molmo_scene_insert_positions", None)
-            if (
-                not torch.is_tensor(insertion_positions)
-                or insertion_positions.shape != (prefix_embs.shape[0],)
-            ):
+            prefix_position_ids = getattr(self, "last_molmo_prefix_position_ids", None)
+            if not torch.is_tensor(prefix_position_ids):
                 raise ValueError(
-                    "Full Molmo WEP prefix is missing per-sample Ego FG/BG insertion positions."
+                    "Full Molmo v5 prefix is missing native-preserving position ids."
                 )
-            world_insert_positions = insertion_positions.to(
+            if prefix_position_ids.shape[0] != prefix_pad_masks.shape[0] or (
+                prefix_position_ids.shape[1] < prefix_pad_masks.shape[1]
+            ):
+                raise ValueError("Full Molmo v5 position ids no longer align with the Ego prefix.")
+            prefix_position_ids = prefix_position_ids[:, : prefix_pad_masks.shape[1]]
+            native_length = int(getattr(self, "last_molmo_native_length", 0))
+            if prefix_pad_masks.shape[1] - native_length != 2:
+                raise ValueError("Full Molmo v5 expects exactly two Ego scene-shadow tokens.")
+            roles = getattr(self, "last_molmo_token_roles", None)
+            if not torch.is_tensor(roles) or roles.shape[0] != prefix_pad_masks.shape[0] or (
+                roles.shape[1] < prefix_pad_masks.shape[1]
+            ):
+                raise ValueError("Molmo token roles no longer align with the v5 prefix.")
+            roles = roles[:, : prefix_pad_masks.shape[1]]
+
+            batch_size, prefix_length = prefix_pad_masks.shape
+            world_insert_positions = torch.full(
+                (batch_size,),
+                prefix_length,
+                dtype=torch.long,
+                device=prefix_embs.device,
+            )
+            world_boundaries = torch.zeros(
+                batch_size, 2, dtype=torch.bool, device=prefix_att_masks.device
+            )
+            # WEPVLA gives World FG/BG the same two RoPE positions as Ego
+            # FG/BG.  Native positions remain untouched even though this means
+            # scene positions overlap the first native LANGUAGE positions.
+            world_position_ids = prefix_position_ids[:, -2:].to(
                 device=prefix_embs.device, dtype=torch.long
-            ) + 2
-            if bool(
-                (
-                    (world_insert_positions < 0)
-                    | (world_insert_positions > prefix_embs.shape[1])
-                ).any()
-            ):
-                raise ValueError(
-                    "Full Molmo World FG/BG insertion positions fall outside the prefix."
-                )
-
-            augmented_embeddings: list[Tensor] = []
-            augmented_validity: list[Tensor] = []
-            augmented_boundaries: list[Tensor] = []
-            for batch_index in range(prefix_embs.shape[0]):
-                insert_at = int(world_insert_positions[batch_index].item())
-                augmented_embeddings.append(
-                    torch.cat(
-                        [
-                            prefix_embs[batch_index, :insert_at],
-                            world_emb[batch_index],
-                            prefix_embs[batch_index, insert_at:],
-                        ],
-                        dim=0,
-                    )
-                )
-                augmented_validity.append(
-                    torch.cat(
-                        [
-                            prefix_pad_masks[batch_index, :insert_at],
-                            world_mask[batch_index],
-                            prefix_pad_masks[batch_index, insert_at:],
-                        ],
-                        dim=0,
-                    )
-                )
-                # False boundaries keep World FG/BG in the existing
-                # IMAGE+Ego-FG/BG perception block.  The shifted first
-                # LANGUAGE token retains its True boundary.
-                augmented_boundaries.append(
-                    torch.cat(
-                        [
-                            prefix_att_masks[batch_index, :insert_at],
-                            torch.zeros(2, dtype=torch.bool, device=prefix_att_masks.device),
-                            prefix_att_masks[batch_index, insert_at:],
-                        ],
-                        dim=0,
-                    )
-                )
-
-            combined_embs = torch.stack(augmented_embeddings, dim=0)
-            combined_pad_masks = torch.stack(augmented_validity, dim=0)
-            combined_att_masks = torch.stack(augmented_boundaries, dim=0)
-            combined_position_ids = (
-                torch.cumsum(combined_pad_masks, dim=1, dtype=torch.long) - 1
+            )
+            combined_embs = torch.cat([prefix_embs, world_emb], dim=1)
+            combined_pad_masks = torch.cat([prefix_pad_masks, world_mask], dim=1)
+            combined_att_masks = torch.cat(
+                [prefix_att_masks, world_boundaries], dim=1
+            )
+            combined_position_ids = torch.cat(
+                [prefix_position_ids, world_position_ids], dim=1
             )
 
-            roles = getattr(self, "last_molmo_token_roles", None)
-            if torch.is_tensor(roles):
-                if roles.shape != prefix_pad_masks.shape:
-                    raise ValueError("Molmo token roles no longer align with the prefix.")
-                augmented_roles: list[Tensor] = []
-                for batch_index in range(prefix_embs.shape[0]):
-                    insert_at = int(world_insert_positions[batch_index].item())
-                    augmented_roles.append(
-                        torch.cat(
-                            [
-                                roles[batch_index, :insert_at],
-                                torch.full(
-                                    (2,),
-                                    2,
-                                    dtype=roles.dtype,
-                                    device=roles.device,
-                                ),
-                                roles[batch_index, insert_at:],
-                            ],
-                            dim=0,
-                        )
-                    )
-                self.last_molmo_token_roles = torch.stack(augmented_roles, dim=0).detach()
+            self.last_molmo_token_roles = torch.cat(
+                [
+                    roles,
+                    torch.full(
+                        (batch_size, 2),
+                        2,
+                        dtype=roles.dtype,
+                        device=roles.device,
+                    ),
+                ],
+                dim=1,
+            ).detach()
+            self.last_molmo_prefix_position_ids = combined_position_ids.detach()
             self.last_molmo_world_scene_insert_positions = world_insert_positions.detach()
+            self.last_molmo_scene_token_count = 4
             self.last_prefix_token_layout = (
-                "native_bos_image",
-                "ego_foreground",
-                "ego_background",
-                "world_foreground",
-                "world_background",
-                "causal_native_language",
+                "native_molmo_image_language",
+                "ego_foreground_shadow",
+                "ego_background_shadow",
+                "world_foreground_shadow",
+                "world_background_shadow",
             )
             return (
                 combined_embs,
@@ -6595,6 +6747,20 @@ class VLAFlowMatching(nn.Module):
                 & suffix_pad_masks[:, :, None]
                 & suffix_pad_masks[:, None, :]
             )
+            registered_prefix_positions = None
+            scene_length = 0
+            if prefix_embs is not None:
+                registered_prefix_positions, scene_length = self._full_molmo_prefix_layout(
+                    prefix_embs, prefix_pad_masks
+                )
+            if prefix_position_ids is None and registered_prefix_positions is not None:
+                prefix_position_ids = registered_prefix_positions
+            elif (
+                registered_prefix_positions is not None
+                and prefix_position_ids is not None
+                and not torch.equal(prefix_position_ids, registered_prefix_positions)
+            ):
+                raise ValueError("Full-Molmo2-ER v5 caller supplied stale prefix position ids.")
             if prefix_position_ids is None:
                 prefix_position_ids = torch.cumsum(
                     prefix_pad_masks,
@@ -6637,6 +6803,7 @@ class VLAFlowMatching(nn.Module):
                     inputs_embeds=[prefix_embs, suffix_embs],
                     use_cache=False,
                     fill_kv_cache=False,
+                    prefix_scene_length=scene_length,
                 )
             else:
                 if past_key_values is None:
@@ -6719,7 +6886,12 @@ class VLAFlowMatching(nn.Module):
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
             attention_mask = make_att_2d_masks(pad_masks, att_masks)
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            prefix_position_ids, scene_length = self._full_molmo_prefix_layout(
+                prefix_embs, prefix_pad_masks
+            )
+            position_ids = self._compose_prefix_suffix_position_ids(
+                prefix_pad_masks, suffix_pad_masks, prefix_position_ids
+            )
             (_, suffix_out), _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -6727,6 +6899,7 @@ class VLAFlowMatching(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 fill_kv_cache=False,
+                prefix_scene_length=scene_length,
             )
         else:
             if past_key_values is None:
@@ -6740,7 +6913,7 @@ class VLAFlowMatching(nn.Module):
             )
             suffix_attention = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
             attention_mask = torch.cat([prefix_attention, suffix_attention], dim=2)
-            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            prefix_offsets = self._cached_prefix_position_offsets(prefix_pad_masks)
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention_mask,
@@ -8309,7 +8482,13 @@ class VLAFlowMatching(nn.Module):
                     )
                 world_x_t = worldflow_noise.to(device=device, dtype=torch.float32)
 
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1, dtype=torch.long) - 1
+        prefix_position_ids, _ = self._full_molmo_prefix_layout(
+            prefix_embs, prefix_pad_masks
+        )
+        if prefix_position_ids is None:
+            prefix_position_ids = torch.cumsum(
+                prefix_pad_masks, dim=1, dtype=torch.long
+            ) - 1
         if (
             self.worldflow_branch is not None
             and self.config.worldflow_action_fusion == "point_action_expert_conjugate_bridge"
@@ -8328,6 +8507,9 @@ class VLAFlowMatching(nn.Module):
                 world_scene,
             )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        _, prefix_scene_length = self._full_molmo_prefix_layout(
+            prefix_embs, prefix_pad_masks
+        )
         # Compute image and language key value cache
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
@@ -8336,6 +8518,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            prefix_scene_length=prefix_scene_length,
         )
         num_steps = self.config.num_steps
         dt = 1.0 / num_steps
@@ -8727,7 +8910,13 @@ class VLAFlowMatching(nn.Module):
                         f"Expected worldflow_noise shape {expected_shape}, got {worldflow_noise.shape}."
                     )
                 world_x_t = worldflow_noise.to(device=device, dtype=torch.float32)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1, dtype=torch.long) - 1
+        prefix_position_ids, _ = self._full_molmo_prefix_layout(
+            prefix_embs, prefix_pad_masks
+        )
+        if prefix_position_ids is None:
+            prefix_position_ids = torch.cumsum(
+                prefix_pad_masks, dim=1, dtype=torch.long
+            ) - 1
         if (
             self.worldflow_branch is not None
             and self.config.worldflow_action_fusion == "point_action_expert_conjugate_bridge"
@@ -8746,6 +8935,9 @@ class VLAFlowMatching(nn.Module):
                 world_scene,
             )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        _, prefix_scene_length = self._full_molmo_prefix_layout(
+            prefix_embs, prefix_pad_masks
+        )
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
@@ -8753,6 +8945,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            prefix_scene_length=prefix_scene_length,
         )
         num_steps = self.config.num_steps
         dt = 1.0 / num_steps
@@ -8869,7 +9062,7 @@ class VLAFlowMatching(nn.Module):
             suffix_att_2d_masks = suffix_att_2d_masks & action_identity
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        prefix_offsets = self._cached_prefix_position_offsets(prefix_pad_masks)
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         outputs_embeds, _ = self.vlm_with_expert.forward(

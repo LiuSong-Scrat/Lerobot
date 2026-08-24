@@ -14,26 +14,30 @@
 
 """Text-only Molmo2-ER backbone paired with the SmolVLA Action Expert.
 
-This module deliberately does not instantiate ``Molmo2Model``.  That class
-always constructs the SigLIP vision backbone and all 36 language blocks, while
-SmolVLA only needs the first half of the language stack.  The implementation
-below owns exactly these frozen Molmo parameters:
+This module deliberately does not instantiate ``Molmo2Model``.  The compact
+runtime can retain either the 18-layer point-only control or all 36 text
+layers used by the full Molmo2-ER backend without constructing a second vision
+backbone.  It owns exactly the selected frozen Molmo text parameters:
 
 * ``model.transformer.wte``;
-* ``model.transformer.blocks.0`` through ``blocks.17``;
+* ``model.transformer.blocks.0`` through the configured retained layer;
 * ``model.transformer.ln_f``.
 
-There is no vision module, language-model head, or block 18--35 placeholder.
-Weights are read selectively from sharded safetensors, so excluded tensors are
-never materialized in host memory.  Molmo's fused QKV projection, Qwen3-style
+There is no language-model head.  The point-only control has no vision module;
+the full backend owns the single native vision module in its wrapper.  Weights
+are read selectively from sharded safetensors, so excluded tensors are never
+materialized in host memory.  Molmo's fused QKV projection, Qwen3-style
 per-head Q/K RMSNorm, grouped-query attention, RoPE, pre-norm residual layout,
 and gated SwiGLU are retained.
 
-The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  Frozen
-VLM parameters do not imply a detached decoder: when trainable FG/BG tokens
-are present in the prefix, input autograd traverses the frozen blocks exactly
-as in WEPVLA.  The historical ``inference_only_vlm`` path remains only for old
-point-memory experiments and is not used by the WEP-compatible Full backend.
+The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  The Full
+backend keeps native Molmo image/language tokens in an independent read-only
+stream.  Trainable FG/BG tokens form a small scene-shadow stream which reads
+native per-layer K/V without ever changing native hidden states.  This is the
+largest WEPVLA-compatible directed graph that also preserves Molmo's native
+path: scene reads native, actions read native+scene, and native never reads
+scene/action.  The historical ``inference_only_vlm`` path remains for old
+point-memory experiments.
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ from safetensors import safe_open
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
+
+from lerobot.policies.smolvla.constants import FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
 
 _CONFIG_NAME = "config.json"
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
@@ -80,6 +86,10 @@ class Molmo2TextSpec:
     attention_dropout: float
     residual_dropout: float
     initializer_range: float
+    norm_after: bool = False
+    rope_scaling: dict[str, Any] | None = None
+    rope_scaling_layers: tuple[int, ...] | None = None
+    attn_implementation: str = "sdpa"
 
     @property
     def total_vocab_size(self) -> int:
@@ -115,6 +125,14 @@ class Molmo2TextSpec:
             attention_dropout=float(text.get("attention_dropout", 0.0)),
             residual_dropout=float(text.get("residual_dropout", 0.0)),
             initializer_range=float(text.get("initializer_range", 0.02)),
+            norm_after=bool(text.get("norm_after", False)),
+            rope_scaling=text.get("rope_scaling"),
+            rope_scaling_layers=(
+                tuple(int(index) for index in text["rope_scaling_layers"])
+                if text.get("rope_scaling_layers") is not None
+                else None
+            ),
+            attn_implementation=str(text.get("attn_implementation", "sdpa")),
         )
 
 
@@ -132,6 +150,16 @@ _MOLMO2_ER_EXPECTED_TEXT_CONTRACT: dict[str, int | float | str | bool] = {
     "qkv_bias": False,
     "use_qk_norm": True,
     "qk_norm_type": "qwen3",
+    "layer_norm_eps": 1e-6,
+    "max_position_embeddings": 16_384,
+    "embedding_dropout": 0.0,
+    "attention_dropout": 0.0,
+    "residual_dropout": 0.0,
+    "initializer_range": 0.02,
+    "norm_after": False,
+    "rope_scaling": None,
+    "rope_scaling_layers": None,
+    "attn_implementation": "sdpa",
 }
 
 
@@ -199,12 +227,29 @@ class Molmo2Embedding(nn.Module):
         return self.embedding.shape[1]
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        if token_ids.numel() and (token_ids.min() < 0 or token_ids.max() >= self.num_embeddings):
+        # Molmo stores the base and additional vocabularies in two checkpoint
+        # tensors.  Concatenating them here copied the complete ~152k x 2560
+        # table on every batch (roughly 0.78 GiB in bf16), even though the
+        # table is frozen.  Look up both small token batches independently and
+        # select the correct result instead.  The deliberately *unclamped*
+        # selected ids retain F.embedding's native out-of-range error for both
+        # negative and over-large token ids without a separate CUDA reduction.
+        base_vocab_size = self.embedding.shape[0]
+        if self.new_embedding.shape[0] == 0:
+            return F.embedding(token_ids, self.embedding)
+
+        uses_new_vocabulary = token_ids >= base_vocab_size
+        zero = torch.zeros((), dtype=token_ids.dtype, device=token_ids.device)
+        base_token_ids = torch.where(uses_new_vocabulary, zero, token_ids)
+        new_token_ids = torch.where(uses_new_vocabulary, token_ids - base_vocab_size, zero)
+        try:
+            base_embeddings = F.embedding(base_token_ids, self.embedding)
+            new_embeddings = F.embedding(new_token_ids, self.new_embedding)
+        except IndexError as error:
             raise IndexError(
-                f"Molmo token id outside [0, {self.num_embeddings}): "
-                f"min={int(token_ids.min())}, max={int(token_ids.max())}."
-            )
-        return F.embedding(token_ids, torch.cat([self.embedding, self.new_embedding], dim=0))
+                f"Molmo token id is outside the complete split vocabulary [0, {self.num_embeddings})."
+            ) from error
+        return torch.where(uses_new_vocabulary.unsqueeze(-1), new_embeddings, base_embeddings)
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -212,20 +257,41 @@ def _rotate_half(x: Tensor) -> Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
-def apply_molmo2_rope(x: Tensor, position_ids: Tensor, rope_theta: float) -> Tensor:
-    """Apply Molmo/Qwen-style RoPE to ``x`` in ``(B,L,H,D)`` layout."""
+def _molmo2_rope_factors(
+    position_ids: Tensor,
+    *,
+    head_dim: int,
+    rope_theta: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    """Build the shared Molmo/Qwen RoPE factors for one Q/K projection."""
 
-    head_dim = x.shape[-1]
     if head_dim % 2:
         raise ValueError(f"RoPE head_dim must be even, got {head_dim}.")
     inv_freq = 1.0 / (
-        float(rope_theta) ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim)
+        float(rope_theta) ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
     )
-    frequencies = position_ids.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * inv_freq
+    frequencies = position_ids.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq
     angles = torch.cat([frequencies, frequencies], dim=-1)
-    cos = angles.cos().to(dtype=x.dtype).unsqueeze(2)
-    sin = angles.sin().to(dtype=x.dtype).unsqueeze(2)
+    return angles.cos().to(dtype=dtype).unsqueeze(2), angles.sin().to(dtype=dtype).unsqueeze(2)
+
+
+def _apply_molmo2_rope_factors(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return x * cos + _rotate_half(x) * sin
+
+
+def apply_molmo2_rope(x: Tensor, position_ids: Tensor, rope_theta: float) -> Tensor:
+    """Apply Molmo/Qwen-style RoPE to ``x`` in ``(B,L,H,D)`` layout."""
+
+    cos, sin = _molmo2_rope_factors(
+        position_ids,
+        head_dim=x.shape[-1],
+        rope_theta=rope_theta,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    return _apply_molmo2_rope_factors(x, cos, sin)
 
 
 class Molmo2MLP(nn.Module):
@@ -290,8 +356,18 @@ class Molmo2FusedAttention(nn.Module):
         value = value.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         query = self.q_norm(query)
         key = self.k_norm(key)
-        query = apply_molmo2_rope(query, position_ids, self.rope_theta)
-        key = apply_molmo2_rope(key, position_ids, self.rope_theta)
+        # Q and K have identical positions/head width/dtype. Build their RoPE
+        # factors once per projection instead of repeating pow/cos/sin twice;
+        # this also avoids the duplicate work during checkpoint recomputation.
+        cos, sin = _molmo2_rope_factors(
+            position_ids,
+            head_dim=self.head_dim,
+            rope_theta=self.rope_theta,
+            device=query.device,
+            dtype=query.dtype,
+        )
+        query = _apply_molmo2_rope_factors(query, cos, sin)
+        key = _apply_molmo2_rope_factors(key, cos, sin)
         return query, key, value
 
 
@@ -531,6 +607,10 @@ def _scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mas
         raise ValueError(f"Query heads {query.shape[2]} are not divisible by KV heads {key.shape[2]}.")
     repeats = query.shape[2] // key.shape[2]
     query_heads = query.transpose(1, 2)
+    # PyTorch 2.5's native GQA path falls back to the math kernel when this
+    # model's arbitrary boolean attention mask is present.  Explicitly map
+    # Molmo's 8 KV heads onto its 32 query heads so CUDA can retain the
+    # efficient equal-head SDPA kernel used by the reference implementation.
     key_heads = _repeat_kv(key, repeats)
     value_heads = _repeat_kv(value, repeats)
     output = F.scaled_dot_product_attention(
@@ -1023,12 +1103,417 @@ class Molmo2WithExpertModel(nn.Module):
             hidden = self.vlm.ln_f(hidden).detach()
         return hidden, cache
 
+    def _prefill_native_vlm(
+        self,
+        native: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+    ) -> tuple[Tensor, dict[int, dict[str, Tensor]]]:
+        """Produce the immutable native Molmo memory used by the v5 graph.
+
+        Only official image/language embeddings are accepted here.  In
+        particular, FG/BG and action embeddings must have been split off by
+        :meth:`forward` before this boundary.  Running the native stream as a
+        separate attention problem (rather than merely masking extra columns
+        in a larger SDPA call) also keeps its kernel shape independent of the
+        trainable streams.
+        """
+
+        return self._prefill_inference_only_vlm(native, position_ids, attention_mask)
+
+    def _prefill_scene_from_native_memory(
+        self,
+        scene: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+        native_cache: dict[int, dict[str, Tensor]],
+    ) -> tuple[Tensor, dict[int, dict[str, Tensor]]]:
+        """Evolve FG/BG through frozen Molmo blocks without modifying native.
+
+        Scene queries read the detached native K/V and every scene token.
+        Native queries are absent from this computation, so active point-cloud
+        inputs cannot condition Molmo's pretrained image/language hidden
+        states.  The scene K/V remain differentiable and are consumed by every
+        Action Expert layer.
+        """
+
+        scene = scene.to(dtype=self.vlm.wte.embedding.dtype)
+        batch_size, scene_len = scene.shape[:2]
+        first_native_key = native_cache.get(0, {}).get("key_states")
+        if not torch.is_tensor(first_native_key):
+            raise ValueError("v5 scene prefill requires a complete native Molmo cache.")
+        native_len = first_native_key.shape[1]
+        prefix_len = native_len + scene_len
+        if position_ids.shape[1] < prefix_len:
+            raise ValueError(
+                "v5 position_ids must cover native+scene prefix; "
+                f"got {tuple(position_ids.shape)} for {native_len}+{scene_len} tokens."
+            )
+        scene_positions = position_ids[:, native_len:prefix_len]
+        scene_mask = self._mask_slice(
+            attention_mask,
+            slice(native_len, prefix_len),
+            slice(0, prefix_len),
+            batch_size=batch_size,
+            rows=scene_len,
+            cols=prefix_len,
+            device=scene.device,
+        )
+
+        scene_cache: dict[int, dict[str, Tensor]] = {}
+        for layer_idx, vlm_layer in enumerate(self.vlm.blocks):
+            native_entry = native_cache.get(layer_idx)
+            if native_entry is None:
+                raise ValueError(f"Native Molmo cache is missing layer {layer_idx}.")
+            native_key = native_entry["key_states"]
+            native_value = native_entry["value_states"]
+            if native_key.requires_grad or native_value.requires_grad:
+                raise RuntimeError("Native Molmo K/V must remain detached in the v5 graph.")
+
+            scene_normalized = vlm_layer.attn_norm(scene)
+            scene_query, scene_key, scene_value = vlm_layer.self_attn.project(
+                scene_normalized,
+                scene_positions,
+            )
+            scene_output = _scaled_dot_product_attention(
+                scene_query,
+                torch.cat([native_key, scene_key], dim=1),
+                torch.cat([native_value, scene_value], dim=1),
+                scene_mask,
+            )
+            # Cache the pre-update K/V for the same layer, matching standard
+            # transformer cache semantics.  Do not detach these tensors:
+            # Action loss must reach the FG/BG projections through them.
+            scene_cache[layer_idx] = {
+                "key_states": scene_key,
+                "value_states": scene_value,
+            }
+            scene = vlm_layer.finish_attention(scene, scene_output)
+
+        return self.vlm.ln_f(scene), scene_cache
+
+    def _forward_action_layer_from_native_scene_memory(
+        self,
+        layer_idx: int,
+        expert: Tensor,
+        expert_positions: Tensor,
+        suffix_attention_mask: Tensor,
+        native_entry: dict[str, Tensor],
+        scene_key: Tensor,
+        scene_value: Tensor,
+    ) -> Tensor:
+        """Run one WEP Action Expert layer against native+scene memory."""
+
+        expert_layer = self.lm_expert.layers[layer_idx]
+        native_key = native_entry["key_states"]
+        native_value = native_entry["value_states"]
+        if native_key.requires_grad or native_value.requires_grad:
+            raise RuntimeError("Native Molmo memory must never require gradients.")
+        prefix_key = torch.cat([native_key, scene_key], dim=1)
+        prefix_value = torch.cat([native_value, scene_value], dim=1)
+        prefix_len = prefix_key.shape[1]
+        expert_len = expert.shape[1]
+        expert_normalized = expert_layer.attn_norm(expert)
+        is_self_attention = layer_idx % self.self_attn_every_n_layers == 0
+
+        if is_self_attention:
+            assert isinstance(expert_layer.self_attn, Molmo2FusedAttention)
+            expert_query, expert_key, expert_value = expert_layer.self_attn.project(
+                expert_normalized,
+                expert_positions,
+            )
+            expert_output = _scaled_dot_product_attention(
+                expert_query,
+                torch.cat([prefix_key, expert_key], dim=1),
+                torch.cat([prefix_value, expert_value], dim=1),
+                suffix_attention_mask[:, :, : prefix_len + expert_len],
+            )
+        else:
+            assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
+            relative_positions = expert_positions - expert_positions.min(
+                dim=1, keepdim=True
+            ).values
+            expert_query = expert_layer.self_attn.project_query(
+                expert_normalized,
+                relative_positions,
+            )
+            expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
+                prefix_key,
+                prefix_value,
+            )
+            expert_output = _scaled_dot_product_attention(
+                expert_query,
+                expert_key,
+                expert_value,
+                suffix_attention_mask[:, :, :prefix_len],
+            )
+        return expert_layer.finish_attention(expert, expert_output)
+
+    def _forward_action_from_native_scene_memory(
+        self,
+        expert: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+        native_cache: dict[int, dict[str, Tensor]],
+        scene_cache: dict[int, dict[str, Tensor]],
+    ) -> Tensor:
+        """Run Action Expert while checkpointing only the trainable A stream."""
+
+        expert = expert.to(dtype=self.lm_expert.norm.weight.dtype)
+        batch_size, expert_len = expert.shape[:2]
+        native_key = native_cache.get(0, {}).get("key_states")
+        scene_key = scene_cache.get(0, {}).get("key_states")
+        if not torch.is_tensor(native_key) or not torch.is_tensor(scene_key):
+            raise ValueError("v5 Action Expert requires complete native and scene caches.")
+        prefix_len = native_key.shape[1] + scene_key.shape[1]
+        if position_ids.shape[1] == expert_len:
+            expert_positions = position_ids
+        elif position_ids.shape[1] == prefix_len + expert_len:
+            expert_positions = position_ids[:, prefix_len:]
+        else:
+            raise ValueError(
+                "v5 position_ids must cover either action-only or native+scene+action; "
+                f"got {tuple(position_ids.shape)}, prefix={prefix_len}, action={expert_len}."
+            )
+
+        if attention_mask is None:
+            suffix_mask = torch.ones(
+                batch_size,
+                expert_len,
+                prefix_len + expert_len,
+                dtype=torch.bool,
+                device=expert.device,
+            )
+        elif attention_mask.shape[1] == expert_len:
+            suffix_mask = attention_mask.to(device=expert.device, dtype=torch.bool)
+        elif attention_mask.shape[1] == prefix_len + expert_len:
+            suffix_mask = attention_mask[:, prefix_len:, :].to(
+                device=expert.device, dtype=torch.bool
+            )
+        else:
+            raise ValueError(
+                "v5 attention rows must cover either action-only or full layout; "
+                f"got {tuple(attention_mask.shape)}, prefix={prefix_len}, action={expert_len}."
+            )
+        if suffix_mask.shape[2] != prefix_len + expert_len:
+            raise ValueError(
+                "v5 action attention columns must cover native+scene+action; "
+                f"got {suffix_mask.shape[2]} instead of {prefix_len + expert_len}."
+            )
+
+        use_gradient_checkpointing = bool(
+            self.training
+            and getattr(self, "gradient_checkpointing", False)
+            and torch.is_grad_enabled()
+        )
+        if use_gradient_checkpointing:
+            segment_size = int(
+                getattr(self, "gradient_checkpointing_layers_per_segment", 1)
+            )
+            if segment_size < 1:
+                raise ValueError("Gradient-checkpoint segment size must be positive.")
+            layer_count = len(self.lm_expert.layers)
+            for segment_start in range(0, layer_count, segment_size):
+                segment_end = min(segment_start + segment_size, layer_count)
+                scene_inputs: list[Tensor] = []
+                for current_layer_idx in range(segment_start, segment_end):
+                    scene_entry = scene_cache.get(current_layer_idx)
+                    if scene_entry is None:
+                        raise ValueError(
+                            f"Scene cache is missing layer {current_layer_idx}."
+                        )
+                    scene_inputs.extend(
+                        [scene_entry["key_states"], scene_entry["value_states"]]
+                    )
+
+                def checkpointed_action_segment(
+                    expert_hidden: Tensor,
+                    *segment_scene_tensors: Tensor,
+                    start: int = segment_start,
+                    end: int = segment_end,
+                ) -> Tensor:
+                    scene_tensor_index = 0
+                    for current_layer_idx in range(start, end):
+                        current_scene_key = segment_scene_tensors[scene_tensor_index]
+                        current_scene_value = segment_scene_tensors[scene_tensor_index + 1]
+                        scene_tensor_index += 2
+                        expert_hidden = self._forward_action_layer_from_native_scene_memory(
+                            current_layer_idx,
+                            expert_hidden,
+                            expert_positions,
+                            suffix_mask,
+                            native_cache[current_layer_idx],
+                            current_scene_key,
+                            current_scene_value,
+                        )
+                    return expert_hidden
+
+                expert = checkpoint(
+                    checkpointed_action_segment,
+                    expert,
+                    *scene_inputs,
+                    use_reentrant=False,
+                )
+        else:
+            for layer_idx in range(len(self.lm_expert.layers)):
+                scene_entry = scene_cache.get(layer_idx)
+                native_entry = native_cache.get(layer_idx)
+                if scene_entry is None or native_entry is None:
+                    raise ValueError(f"v5 prefix memory is missing layer {layer_idx}.")
+                expert = self._forward_action_layer_from_native_scene_memory(
+                    layer_idx,
+                    expert,
+                    expert_positions,
+                    suffix_mask,
+                    native_entry,
+                    scene_entry["key_states"],
+                    scene_entry["value_states"],
+                )
+        return self.lm_expert.norm(expert)
+
+    def _build_v5_inference_cache(
+        self,
+        native_cache: dict[int, dict[str, Tensor]],
+        scene_cache: dict[int, dict[str, Tensor]],
+    ) -> dict[int, dict[str, Any]]:
+        """Build one denoising cache, pre-projecting odd-layer cross K/V."""
+
+        cache: dict[int, dict[str, Any]] = {}
+        with torch.no_grad():
+            for layer_idx, expert_layer in enumerate(self.lm_expert.layers):
+                native_entry = native_cache[layer_idx]
+                scene_entry = scene_cache[layer_idx]
+                native_length = int(native_entry["key_states"].shape[1])
+                scene_length = int(scene_entry["key_states"].shape[1])
+                key = torch.cat(
+                    [native_entry["key_states"], scene_entry["key_states"]], dim=1
+                )
+                value = torch.cat(
+                    [native_entry["value_states"], scene_entry["value_states"]], dim=1
+                )
+                if layer_idx % self.self_attn_every_n_layers != 0:
+                    assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
+                    key, value = expert_layer.self_attn.project_prefix_kv(key, value)
+                    cache[layer_idx] = {
+                        "key_states": key.detach(),
+                        "value_states": value.detach(),
+                        "cross_attention_projected": True,
+                        "cache_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+                        "native_length": native_length,
+                        "scene_length": scene_length,
+                    }
+                else:
+                    cache[layer_idx] = {
+                        "key_states": key.detach(),
+                        "value_states": value.detach(),
+                        "cross_attention_projected": False,
+                        "cache_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
+                        "native_length": native_length,
+                        "scene_length": scene_length,
+                    }
+        return cache
+
+    def _validate_v5_inference_cache(
+        self,
+        cache: dict[int, dict[str, Any]],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> int:
+        """Fail closed on stale/raw caches before a Full-Molmo denoising step."""
+
+        expected_layers = len(self.lm_expert.layers)
+        if set(cache) != set(range(expected_layers)):
+            raise ValueError(
+                "Full-Molmo2-ER v5 cache must contain every Expert layer exactly once; "
+                f"expected={expected_layers}, keys={sorted(cache)}."
+            )
+        reference_shape: tuple[int, ...] | None = None
+        reference_device: torch.device | None = None
+        reference_dtype: torch.dtype | None = None
+        native_length: int | None = None
+        scene_length: int | None = None
+        first_expert_attention = self.lm_expert.layers[0].self_attn
+        expected_head_shape = (
+            int(first_expert_attention.num_key_value_heads),
+            int(first_expert_attention.head_dim),
+        )
+        for layer_idx in range(expected_layers):
+            entry = cache[layer_idx]
+            if entry.get("cache_topology") != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY:
+                raise ValueError(
+                    f"Layer {layer_idx} does not contain a v5 Full-Molmo cache topology marker."
+                )
+            expected_projected = layer_idx % self.self_attn_every_n_layers != 0
+            if entry.get("cross_attention_projected") is not expected_projected:
+                raise ValueError(
+                    "Full-Molmo2-ER cache projection marker disagrees with the Expert schedule "
+                    f"at layer {layer_idx}."
+                )
+            key = entry.get("key_states")
+            value = entry.get("value_states")
+            if (
+                not torch.is_tensor(key)
+                or not torch.is_tensor(value)
+                or key.shape != value.shape
+                or key.ndim != 4
+            ):
+                raise ValueError(f"Layer {layer_idx} has malformed Full-Molmo K/V tensors.")
+            if key.requires_grad or value.requires_grad:
+                raise RuntimeError("Full-Molmo inference cache tensors must be detached.")
+            if key.device != device or value.device != device:
+                raise ValueError(
+                    f"Layer {layer_idx} cache is on {key.device}/{value.device}, "
+                    f"but the Action Expert is on {device}."
+                )
+            if key.dtype != dtype or value.dtype != dtype:
+                raise ValueError(
+                    f"Layer {layer_idx} cache uses {key.dtype}/{value.dtype}, "
+                    f"but the Action Expert uses {dtype}."
+                )
+            if key.shape[2:] != expected_head_shape:
+                raise ValueError(
+                    f"Layer {layer_idx} cache head shape {tuple(key.shape[2:])} disagrees with "
+                    f"the Expert contract {expected_head_shape}."
+                )
+            current_native_length = entry.get("native_length")
+            current_scene_length = entry.get("scene_length")
+            if type(current_native_length) is not int or type(current_scene_length) is not int:
+                raise ValueError(f"Layer {layer_idx} is missing integer native/scene cache lengths.")
+            if current_native_length < 1 or current_scene_length not in {2, 4}:
+                raise ValueError(
+                    f"Layer {layer_idx} has invalid native/scene lengths "
+                    f"{current_native_length}/{current_scene_length}."
+                )
+            if key.shape[0] != batch_size or key.shape[1] != current_native_length + current_scene_length:
+                raise ValueError(
+                    f"Layer {layer_idx} cache shape {tuple(key.shape)} disagrees with "
+                    f"batch/native/scene={batch_size}/{current_native_length}/{current_scene_length}."
+                )
+            if reference_shape is None:
+                reference_shape = tuple(key.shape)
+                reference_device = key.device
+                reference_dtype = key.dtype
+                native_length = current_native_length
+                scene_length = current_scene_length
+            elif (
+                tuple(key.shape) != reference_shape
+                or key.device != reference_device
+                or key.dtype != reference_dtype
+                or current_native_length != native_length
+                or current_scene_length != scene_length
+            ):
+                raise ValueError(f"Layer {layer_idx} Full-Molmo cache metadata drifted across layers.")
+        assert native_length is not None and scene_length is not None
+        return native_length + scene_length
+
     def _forward_expert_from_frozen_memory(
         self,
         expert: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor | None,
-        cache: dict[int, dict[str, Tensor]],
+        cache: dict[int, dict[str, Any]],
     ) -> Tensor:
         """Run only trainable Expert layers against detached Molmo memory."""
 
@@ -1115,11 +1600,12 @@ class Molmo2WithExpertModel(nn.Module):
         self,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
-        past_key_values: dict[int, dict[str, Tensor]] | None = None,
+        past_key_values: dict[int, dict[str, Any]] | None = None,
         inputs_embeds: list[Tensor | None] | None = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
-    ) -> tuple[list[Tensor | None], dict[int, dict[str, Tensor]] | None]:
+        prefix_scene_length: int = 0,
+    ) -> tuple[list[Tensor | None], dict[int, dict[str, Any]] | None]:
         if inputs_embeds is None or len(inputs_embeds) != 2:
             raise ValueError("inputs_embeds must be [prefix_embeddings, expert_embeddings].")
         prefix, expert = inputs_embeds
@@ -1154,6 +1640,100 @@ class Molmo2WithExpertModel(nn.Module):
             raise ValueError("fill_kv_cache=True requires prefix embeddings.")
         if use_cache and past_key_values is None:
             past_key_values = {}
+
+        # Full-Molmo v5 keeps three logically distinct streams in the public
+        # two-stream API: prefix=[native N, scene S], expert=actions A.  N is
+        # evaluated once under no_grad, S is evaluated once with its tiny
+        # input-autograd graph, and activation checkpointing recomputes A only.
+        # This both protects the native Molmo representation and removes the
+        # dominant frozen-prefix backward recomputation.
+        prefix_scene_length = int(prefix_scene_length)
+        if prefix_scene_length < 0:
+            raise ValueError("prefix_scene_length must be non-negative.")
+        if (
+            prefix is not None
+            and bool(getattr(self, "requires_native_scene_split", False))
+            and prefix_scene_length == 0
+        ):
+            raise ValueError(
+                "Full-Molmo2-ER v5 requires an explicit non-zero prefix_scene_length; "
+                "refusing to fall back to the native-conditioned coupled-prefix graph."
+            )
+        if prefix_scene_length:
+            if prefix is None:
+                raise ValueError(
+                    "prefix_scene_length is only valid while native+scene prefix embeddings are provided."
+                )
+            if prefix_scene_length >= prefix.shape[1]:
+                raise ValueError(
+                    "v5 prefix must contain at least one native token before scene tokens; "
+                    f"got prefix={prefix.shape[1]}, scene={prefix_scene_length}."
+                )
+            if past_key_values and not fill_kv_cache:
+                raise ValueError("v5 joint forward does not accept an existing prefix cache.")
+
+            native_len = prefix.shape[1] - prefix_scene_length
+            native = prefix[:, :native_len]
+            scene = prefix[:, native_len:]
+            if expert is not None and (use_cache or fill_kv_cache):
+                raise ValueError(
+                    "Full-Molmo2-ER v5 joint training forward does not produce a reusable cache; "
+                    "set use_cache=False and fill_kv_cache=False."
+                )
+            native_positions = position_ids[:, :native_len]
+            native_attention = self._mask_slice(
+                attention_mask,
+                slice(0, native_len),
+                slice(0, native_len),
+                batch_size=batch_size,
+                rows=native_len,
+                cols=native_len,
+                device=native.device,
+            )
+            native_output, native_cache = self._prefill_native_vlm(
+                native,
+                native_positions,
+                native_attention,
+            )
+
+            if expert is None:
+                if use_cache != fill_kv_cache:
+                    raise ValueError(
+                        "Full-Molmo2-ER v5 prefix-only forward requires use_cache and "
+                        "fill_kv_cache to be either both enabled or both disabled."
+                    )
+                # KV prefill is an inference boundary; avoid retaining the
+                # trainable scene-projection graph across all denoising steps.
+                with torch.no_grad():
+                    scene_output, scene_cache = self._prefill_scene_from_native_memory(
+                        scene,
+                        position_ids,
+                        attention_mask,
+                        native_cache,
+                    )
+                    v5_cache = (
+                        self._build_v5_inference_cache(native_cache, scene_cache)
+                        if use_cache
+                        else None
+                    )
+                return [torch.cat([native_output, scene_output], dim=1), None], v5_cache
+
+            scene_output, scene_cache = self._prefill_scene_from_native_memory(
+                scene,
+                position_ids,
+                attention_mask,
+                native_cache,
+            )
+            expert_output = self._forward_action_from_native_scene_memory(
+                expert,
+                position_ids,
+                attention_mask,
+                native_cache,
+                scene_cache,
+            )
+            return [torch.cat([native_output, scene_output], dim=1), expert_output], (
+                past_key_values if use_cache else None
+            )
 
         if bool(getattr(self, "inference_only_vlm", False)):
             prefix_output = None
@@ -1335,6 +1915,13 @@ class Molmo2WithExpertModel(nn.Module):
                     raise ValueError(
                         f"Suffix-only inference requires a populated prefix KV cache at layer {layer_idx}."
                     )
+                if layer_idx == 0 and bool(getattr(self, "requires_native_scene_split", False)):
+                    self._validate_v5_inference_cache(
+                        past_key_values,
+                        batch_size=batch_size,
+                        device=expert.device,
+                        dtype=expert.dtype,
+                    )
                 cached_key = past_key_values[layer_idx]["key_states"]
                 cached_value = past_key_values[layer_idx]["value_states"]
                 prefix_len = cached_key.shape[1]
@@ -1361,9 +1948,14 @@ class Molmo2WithExpertModel(nn.Module):
                     assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
                     relative_positions = expert_positions - expert_positions.min(dim=1, keepdim=True).values
                     expert_query = expert_layer.self_attn.project_query(expert_normalized, relative_positions)
-                    expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
-                        cached_key, cached_value
-                    )
+                    if bool(
+                        past_key_values[layer_idx].get("cross_attention_projected", False)
+                    ):
+                        expert_key, expert_value = cached_key, cached_value
+                    else:
+                        expert_key, expert_value = expert_layer.self_attn.project_prefix_kv(
+                            cached_key, cached_value
+                        )
                     cross_mask = self._mask_slice(
                         attention_mask,
                         slice(0, expert_len),

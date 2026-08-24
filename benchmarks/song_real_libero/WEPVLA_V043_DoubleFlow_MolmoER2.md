@@ -1,10 +1,14 @@
-# WEP-VLA v0.4.3 Multiview DoubleFlow + Frozen Molmo2-ER
+# WEP-VLA v0.4.3 Multiview DoubleFlow + Frozen Molmo2-ER v5
 
 结构基准：`origin/wep_vla_v0.4.3_multiview_doubleflow`（`da0ad03bf7eff2c6e9edcf04e1b324bebbdf93dd`）。
 
 以下均为可直接粘贴执行的命令行，不调用任何 `.sh`。当前短数据调试命令使用 GPU 1–7 共 7 张 A800、普通 DDP、每卡 batch 40、global batch 280；改回 0–7 时必须同步把 `num_processes` 改为 8、`global_batch_size` 改为 320。执行前请先确认输出目录不存在或为空；不要覆盖已有训练目录。
 
-## 当前 7 卡短数据训练
+当前唯一有效拓扑是 `molmo_native_readonly_scene_shadow_wepvla_expert_v5`：原生 Molmo image/language 为独立只读 N 流，FG/BG 为可微 scene-shadow S 流，Ego/World action 为 WEP 偶数 joint、奇数 pure-cross 的 A 流。旧 v4 checkpoint 与 optimizer state 不兼容，必须 fresh train。本命令固定 `molmo_inference_only=false`，并令 `molmo_gradient_checkpointing=true` 只 checkpoint Action Expert；N 与 S 各只计算一次。
+
+`--mixed_precision=no` 和 `--policy.use_amp=false` 不表示 Full-Molmo2-ER 全部使用 FP32：backend 的 frozen Molmo 与 trainable Action Expert 显式使用 BF16，PointSeg/部分 task projection 保持 FP32 后在边界做可微 cast。这是相对原 WEPVLA 的有意精度差异，而不是拓扑漂移。
+
+## 当前 7 卡短数据 fresh 训练（v5）
 
 ```bash
 cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
@@ -50,8 +54,8 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --eval_freq=1500 \
   --log_freq=1 \
   --num_workers=12 \
-  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_hybrid_wepvla_expert_v4_long68_fresh \
-  --job_name=molmo_native_hybrid_wepvla_expert_v4_long68_fresh \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_readonly_scene_shadow_wepvla_expert_v5_long68_fresh \
+  --job_name=molmo_native_readonly_scene_shadow_wepvla_expert_v5_long68_fresh \
   --policy.device=cuda \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
@@ -76,7 +80,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.vla_adapter_enable=false \
   --policy.vla_adapter_freeze_vlm=true \
   --policy.vlm_backend=molmo2_full \
-  --policy.full_molmo_topology=molmo_native_hybrid_wepvla_expert_v4 \
+  --policy.full_molmo_topology=molmo_native_readonly_scene_shadow_wepvla_expert_v5 \
   --policy.molmo_inference_only=false \
   --policy.molmo_gradient_checkpointing=true \
   --policy.molmo_gradient_checkpointing_layers_per_segment=2 \
@@ -173,7 +177,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 
 当前 evaluator 会按 checkpoint 的 `worldflow_reference_frame` 显式传入当前 EEF pose；对于本权重使用 robot-base pose，并让 `left_compose_ego` 从同一个 seeded Ego noise 派生 World noise。Molmo2-ER 仍保持 `vla_adapter_enable=false`、`requires_rgb=true`，使用 checkpoint 的原生 256×256 `agentview` multimodal processor。
 
-下面是单卡、单任务、1 episode 的端到端推理 smoke test，用来确认 checkpoint 能加载并完成环境闭环；它不是可汇报的正式 LIBERO 分数。默认测试上面新 WEP-prefix 从头训练目录的 `last` checkpoint，若实际 checkpoint 步数不同，只替换 `--policy.path`。旧 `molmo_inference_only=true` 的 030000 checkpoint 不兼容此拓扑。
+下面是单卡、单任务、1 episode 的端到端推理 smoke test，用来确认 checkpoint 能加载并完成环境闭环；它不是可汇报的正式 LIBERO 分数。默认测试上面 v5 fresh 训练目录的 `last` checkpoint，若实际 checkpoint 步数不同，只替换 `--policy.path`。旧 detached、v3、v4 或 `molmo_inference_only=true` checkpoint 均不兼容此拓扑。
 
 ```bash
 cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
@@ -199,7 +203,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 /home/liusong/anaconda3/envs/reap/bin/python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_hybrid_wepvla_expert_v4_long68_fresh/checkpoints/last/pretrained_model \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_readonly_scene_shadow_wepvla_expert_v5_long68_fresh/checkpoints/last/pretrained_model \
   --suite libero_spatial \
   --task-id 0 \
   --episodes 1 \
@@ -226,7 +230,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --render-mode offscreen \
   --no-visualize-foreground \
   --no-save-video \
-  --output-dir /tmp/molmo2er_native_hybrid_v4_libero_spatial_task0_ep1
+  --output-dir /tmp/molmo2er_native_readonly_scene_shadow_v5_libero_spatial_task0_ep1
 ```
 
 
@@ -252,7 +256,7 @@ cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
   /home/liusong/anaconda3/envs/reap/bin/python \
     benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
     --config benchmarks/song_real_libero/configs/libero.json \
-    --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_hybrid_wepvla_expert_v4_long68_fresh/checkpoints/last/pretrained_model \
+    --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_readonly_scene_shadow_wepvla_expert_v5_long68_fresh/checkpoints/last/pretrained_model \
     --device cuda \
     --suite-gpu-ids 0,1,2,3 \
     --suite libero_spatial \
@@ -287,7 +291,7 @@ cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
     --no-visualize-foreground \
     --save-video \
     --no-world-to-ego-causal-ablation \
-    --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_molmo2er_native_hybrid_v4
+    --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_molmo2er_native_readonly_scene_shadow_v5
 ```
 
 
@@ -325,7 +329,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 /home/liusong/anaconda3/envs/reap/bin/python \
   benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
   --config benchmarks/song_real_libero/configs/libero.json \
-  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/wepvla_v043_doubleflow_multiview_long68/checkpoints/last/pretrained_model \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/molmo_native_readonly_scene_shadow_wepvla_expert_v5_long68_fresh/checkpoints/last/pretrained_model \
   --suite libero_10 \
   --task-id 6 \
   --episodes 10 \
@@ -352,57 +356,5 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --render-mode offscreen \
   --no-visualize-foreground \
   --save-video \
-  --output-dir benchmarks/song_real_libero/outputs/full_molmo2er_worldflow1
+  --output-dir benchmarks/song_real_libero/outputs/full_molmo2er_v5_long68_task6_10ep
 ```
-
-
-
-
-
-  PYTHONHASHSEED=0 \
-  OMP_NUM_THREADS=1 \
-  MKL_NUM_THREADS=1 \
-  OPENBLAS_NUM_THREADS=1 \
-  NUMEXPR_NUM_THREADS=1 \
-  VECLIB_MAXIMUM_THREADS=1 \
-  MALLOC_ARENA_MAX=2 \
-  MUJOCO_GL=egl \
-  PYOPENGL_PLATFORM=egl \
-  CUDA_VISIBLE_DEVICES=0 \
-  MUJOCO_EGL_DEVICE_ID=0 \
-  PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song/src:/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song \
-  /home/liusong/anaconda3/envs/reap/bin/python \
-    benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
-    --config benchmarks/song_real_libero/configs/libero.json \
-    --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/wepvla_v043_doubleflow_multiview_long68/checkpoints/last/pretrained_model \
-    --device cuda \
-    --suite libero_10 \
-    --task-id 6 \
-    --episodes 10 \
-    --policy-noise-seed 0 \
-    --env-seed 7 \
-    --strict-official-init \
-    --gripper-control-mode delta_width_initial_sync \
-    --gripper-delta-threshold 0.002 \
-    --gripper-delta-alignment current_minus_previous \
-    --waypoint-max-hold-steps 1 \
-    --isolated-policy-workers 1 \
-    --task-workers 1 \
-    --episode-workers-per-task 10 \
-    --task-worker-backend process \
-    --inference-batch-size 10 \
-    --inference-batching-mode fixed_barrier \
-    --no-release-event-exec-enable \
-    --control-freq 20 \
-    --action-index 0 \
-    --exec-action-steps 24 \
-    --adaptive-exec-max-steps 24 \
-    --grasp-exec-steps 24 \
-    --max-steps 1000 \
-    --no-use-suite-max-steps \
-    --recreate-env-per-episode \
-    --render-mode offscreen \
-    --no-visualize-foreground \
-    --save-video \
-    --no-world-to-ego-causal-ablation \
-    --output-dir benchmarks/song_real_libero/outputs/full_molmo2er_worldflow12

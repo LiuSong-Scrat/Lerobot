@@ -48,12 +48,13 @@ def _validate_pretrained_raw_policy_config(config: dict[str, Any], model_id: str
     from lerobot.policies.smolvla.constants import FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
 
     topology = config.get("full_molmo_topology")
-    if config.get("molmo_inference_only") is True or topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY:
+    if config.get("molmo_inference_only") is not False or topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY:
         raise ValueError(
             f"Checkpoint '{model_id}' uses an incompatible Full-Molmo topology or has no valid "
-            "topology marker. The current v4 contract keeps Molmo's native causal-language / "
-            "bidirectional-perception mask and couples it to the WEPVLA Expert. Detached-scene "
-            "checkpoints and v3 all-prefix-bidirectional checkpoints must not be loaded silently. "
+            "topology marker. The current v5 contract keeps Molmo native image/language in an "
+            "independent read-only stream and couples scene shadows to the WEPVLA Action Expert. "
+            "Detached-scene, v3 all-prefix-bidirectional, and v4 native-conditioned checkpoints "
+            "must not be loaded silently. "
             "Start a fresh run or create an explicit converted warm-start checkpoint."
         )
 
