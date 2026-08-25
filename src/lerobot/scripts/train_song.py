@@ -1787,7 +1787,7 @@ def _apply_song_debug_defaults() -> None:
         "--policy.vla_adapter_enable=false",
         "--policy.vla_adapter_freeze_vlm=true",
         "--policy.vlm_backend=molmo2_full",
-        "--policy.full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align",
+        "--policy.full_molmo_topology=v3_feature_align_language_casual",
         "--policy.molmo_inference_only=false",
         "--policy.molmo_gradient_checkpointing=true",
         "--policy.molmo_gradient_checkpointing_layers_per_segment=2",

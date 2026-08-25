@@ -1026,6 +1026,7 @@ def make_att_2d_masks(pad_masks, att_masks):
     """
     if att_masks.ndim != 2:
         raise ValueError(att_masks.ndim)
+
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
@@ -3609,9 +3610,9 @@ class VLAFlowMatching(nn.Module):
             None if use_pointseg else nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
         )
         self.pointseg_conditioner = SongPointCloudConditioner(config) if use_pointseg else None
-        # FG/BG are VLM-prefix tokens in every WEP-compatible backend.  Their
-        # projections therefore target the VLM hidden width, never the Action
-        # Expert width (the old strict-no_grad Scheme-B suffix layout).
+        # FG/BG are trainable VLM-side readout tokens in the native-attention
+        # Full backend. Their projections therefore target the VLM hidden
+        # width, never the Action Expert width used by old Scheme B.
         scene_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
         self.pointseg_object_proj = (
             nn.Linear(self.config.pointseg_feature_dim, scene_hidden_size)
@@ -5131,13 +5132,15 @@ class VLAFlowMatching(nn.Module):
         *,
         ablate_language: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Insert trainable Ego FG/BG into Molmo's native WEP prefix.
+        """Append trainable Ego FG/BG after Molmo's complete native sequence.
 
         Native IMAGE/LANGUAGE embeddings are detached because their producers
-        are frozen and have no trainable inputs.  The concatenated prefix is
-        nevertheless differentiable through the two scene tokens.  All prefix
-        tokens form the same bidirectional non-action domain as v0.4.3 WEPVLA;
-        noisy actions are added later as the sole Expert suffix.
+        are frozen and have no trainable inputs. Their physical order, RoPE
+        positions and official causal-text + bidirectional-image attention
+        blocks stay unchanged. Ego FG/BG start one later bidirectional scene
+        readout block: they can read the complete native stream and each other,
+        while no native query can read a scene token. Actions are added later as
+        the sole Expert suffix and can read both native and scene domains.
         """
 
         if native_embeddings.ndim != 3:
@@ -5151,12 +5154,12 @@ class VLAFlowMatching(nn.Module):
             raise ValueError("Molmo token_type_ids must align with the native input sequence.")
         if ego_scene_embeddings.shape != (batch_size, 2, hidden_size):
             raise ValueError(
-                "Full Molmo WEP prefix requires Ego [FG,BG] in VLM hidden width; "
+                "Full Molmo native-readout prefix requires Ego [FG,BG] in VLM hidden width; "
                 f"got {tuple(ego_scene_embeddings.shape)} for native {tuple(native_embeddings.shape)}."
             )
         if ego_scene_mask.shape != (batch_size, 2):
             raise ValueError(
-                "Full Molmo WEP prefix requires one validity flag per Ego FG/BG token; "
+                "Full Molmo native-readout prefix requires one validity flag per Ego FG/BG token; "
                 f"got {tuple(ego_scene_mask.shape)}."
             )
 
@@ -5174,9 +5177,15 @@ class VLAFlowMatching(nn.Module):
         embedding_rows: list[Tensor] = []
         validity_rows: list[Tensor] = []
         role_rows: list[Tensor] = []
+        boundary_rows: list[Tensor] = []
         insertion_positions: list[int] = []
         for batch_index in range(batch_size):
             valid_length = int(native_valid[batch_index].sum().item())
+            expected_right_padded_valid = (
+                torch.arange(native_length, device=native_valid.device) < valid_length
+            )
+            if not torch.equal(native_valid[batch_index], expected_right_padded_valid):
+                raise ValueError("Molmo native validity must be a contiguous right-padded prefix.")
             valid_images = torch.nonzero(
                 native_image_tokens[batch_index, :valid_length], as_tuple=False
             ).flatten()
@@ -5188,7 +5197,10 @@ class VLAFlowMatching(nn.Module):
                 valid_images.numel()
             ):
                 raise ValueError("Molmo IMAGE positions must form one contiguous native block.")
-            insert_at = int(valid_images[-1].item()) + 1
+            # Scene readouts are appended after all native language tokens. This
+            # preserves every native token's original physical index and RoPE
+            # position instead of shifting language by two positions.
+            insert_at = valid_length
             insertion_positions.append(insert_at)
 
             # Detach only the native branch.  Concatenating the trainable scene
@@ -5196,11 +5208,7 @@ class VLAFlowMatching(nn.Module):
             # gradient or retaining their activation graph.
             valid_native_embeddings = native_embeddings[batch_index, :valid_length].detach()
             row_embeddings = torch.cat(
-                [
-                    valid_native_embeddings[:insert_at],
-                    ego_scene_embeddings[batch_index],
-                    valid_native_embeddings[insert_at:],
-                ],
+                [valid_native_embeddings, ego_scene_embeddings[batch_index]],
                 dim=0,
             )
             row_embeddings = F.pad(
@@ -5219,11 +5227,10 @@ class VLAFlowMatching(nn.Module):
             )
             row_roles = torch.cat(
                 [
-                    native_roles[:insert_at],
+                    native_roles,
                     torch.full(
                         (2,), scene_role, dtype=torch.int8, device=native_embeddings.device
                     ),
-                    native_roles[insert_at:],
                 ]
             )
             row_roles = F.pad(
@@ -5232,11 +5239,7 @@ class VLAFlowMatching(nn.Module):
             role_rows.append(row_roles)
 
             row_valid = torch.cat(
-                [
-                    native_valid[batch_index, :insert_at],
-                    ego_scene_mask[batch_index],
-                    native_valid[batch_index, insert_at:valid_length],
-                ]
+                [native_valid[batch_index, :valid_length], ego_scene_mask[batch_index]]
             )
             row_valid = F.pad(
                 row_valid, (0, output_length - row_valid.shape[0]), value=False
@@ -5247,13 +5250,35 @@ class VLAFlowMatching(nn.Module):
                 row_valid = row_valid & ~text_positions
             validity_rows.append(row_valid)
 
+            native_images = native_image_tokens[batch_index, :valid_length]
+            previous_is_image = F.pad(native_images[:-1], (1, 0), value=False)
+            starts_image_block = native_images & ~previous_is_image
+            native_boundaries = (~native_images) | starts_image_block
+            # The first scene boundary must remain true even when an Ego scene
+            # token is invalid; otherwise a later valid World scene token could
+            # share the final native-language block and become visible to native
+            # queries. FG/BG themselves form one bidirectional block.
+            row_boundaries = torch.cat(
+                [
+                    native_boundaries,
+                    torch.tensor(
+                        [True, False],
+                        dtype=torch.bool,
+                        device=native_embeddings.device,
+                    ),
+                ]
+            )
+            row_boundaries = F.pad(
+                row_boundaries,
+                (0, output_length - row_boundaries.shape[0]),
+                value=False,
+            )
+            boundary_rows.append(row_boundaries)
+
         prefix_embeddings = torch.stack(embedding_rows, dim=0)
         prefix_valid = torch.stack(validity_rows, dim=0)
         prefix_roles = torch.stack(role_rows, dim=0)
-        # Exact reference WEP: every valid non-action prefix token is in one
-        # globally bidirectional domain.  This intentionally replaces Molmo's
-        # native causal TEXT mask after multimodal embedding construction.
-        boundaries = torch.zeros_like(prefix_valid, dtype=torch.bool)
+        boundaries = torch.stack(boundary_rows, dim=0)
 
         self.last_molmo_scene_insert_positions = torch.tensor(
             insertion_positions,
@@ -5263,10 +5288,9 @@ class VLAFlowMatching(nn.Module):
         self.last_molmo_token_roles = prefix_roles.detach()
         self.last_ego_point_prefix_slices = ()
         self.last_prefix_token_layout = (
-            "native_bos_image",
+            "native_bos_image_language",
             "ego_foreground",
             "ego_background",
-            "native_language",
         )
 
         def role_rms(role: int) -> Tensor:
@@ -5287,6 +5311,10 @@ class VLAFlowMatching(nn.Module):
                 "scene_language_rms_ratio": scene_rms / text_rms.clamp_min(1e-8),
                 "vlm_inference_only": torch.zeros((), device=native_embeddings.device),
                 "prefix_input_autograd": torch.ones((), device=native_embeddings.device),
+                "native_attention_mask_preserved": torch.ones(
+                    (), device=native_embeddings.device
+                ),
+                "native_reads_scene": torch.zeros((), device=native_embeddings.device),
             }
         )
         return prefix_embeddings, prefix_valid, boundaries
@@ -6390,14 +6418,13 @@ class VLAFlowMatching(nn.Module):
         prefix_att_masks: Tensor,
         world_tokens: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Append World fore/back beside the pretrained Ego prefix interface.
+        """Append World fore/back to the native-preserving scene readout block.
 
-        The original prefix tensor and all of its position ids remain exact.
-        World fore/back are projected by independent copies of the trained Ego
-        object/background projections and receive the paired Ego fore/back
-        position ids.  Physical append order plus an independent trainable
-        World projection/type code retain source identity without moving any
-        pretrained Ego, image, or language token.
+        The original native tensor and all of its position ids remain exact.
+        Ego/World scene tokens share one bidirectional block after the complete
+        native sequence: every scene query reads all native/scene keys, while
+        native queries cannot read any scene key. Independent projections and
+        type codes retain Ego/World source identity.
         """
 
         required_modules = (
@@ -6445,12 +6472,25 @@ class VLAFlowMatching(nn.Module):
                 or insertion_positions.shape != (prefix_embs.shape[0],)
             ):
                 raise ValueError(
-                    "Full Molmo WEP prefix is missing per-sample Ego FG/BG insertion positions."
+                    "Full Molmo native-readout prefix is missing per-sample Ego FG/BG positions."
                 )
             ego_scene_indices = insertion_positions.to(
                 device=base_position_ids.device, dtype=torch.long
             )[:, None] + torch.arange(2, device=base_position_ids.device)[None, :]
-            world_position_ids = base_position_ids.gather(1, ego_scene_indices)
+            ego_scene_positions = base_position_ids.gather(1, ego_scene_indices)
+            ego_scene_valid = prefix_pad_masks.gather(1, ego_scene_indices)
+            both_ego_scene_tokens_valid = ego_scene_valid.all(dim=1)
+            if bool(both_ego_scene_tokens_valid.any()) and not torch.equal(
+                ego_scene_positions[both_ego_scene_tokens_valid, 1],
+                ego_scene_positions[both_ego_scene_tokens_valid, 0] + 1,
+            ):
+                raise RuntimeError("Ego FG/BG readout positions must be consecutive.")
+            last_valid_position = base_position_ids.masked_fill(
+                ~prefix_pad_masks, -1
+            ).amax(dim=1, keepdim=True)
+            world_position_ids = last_valid_position + 1 + torch.arange(
+                2, device=base_position_ids.device
+            )[None, :]
         else:
             point_slices = getattr(self, "last_ego_point_prefix_slices", ())
             if len(point_slices) != 1:
@@ -6466,13 +6506,21 @@ class VLAFlowMatching(nn.Module):
             ):
                 raise ValueError(f"Expected one two-token Ego point-prefix slice, got {ego_slice}.")
             world_position_ids = base_position_ids[:, ego_slice]
-        # All image/language/Ego/World scene tokens are one globally
-        # bidirectional non-action domain in the formal DoubleFlow contract.
-        combined_att_masks = torch.zeros(
-            prefix_pad_masks.shape[0],
-            prefix_pad_masks.shape[1] + 2,
-            device=prefix_att_masks.device,
-            dtype=torch.bool,
+        # World continues the Ego scene block. The unconditional first Ego
+        # boundary created by _build_full_molmo_native_prefix guarantees that
+        # this block remains distinct from native language even if Ego FG/BG is
+        # invalid for a sample.
+        combined_att_masks = torch.cat(
+            [
+                prefix_att_masks.to(dtype=torch.bool),
+                torch.zeros(
+                    prefix_pad_masks.shape[0],
+                    2,
+                    device=prefix_att_masks.device,
+                    dtype=torch.bool,
+                ),
+            ],
+            dim=1,
         )
         return (
             torch.cat([prefix_embs, world_emb], dim=1),

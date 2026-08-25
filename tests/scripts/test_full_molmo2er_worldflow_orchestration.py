@@ -163,7 +163,7 @@ def test_shell_contract_is_full_vision_worldflow_exact192_and_three_stage() -> N
     assert "readonly GLOBAL_BATCH_SIZE=192" in train
     assert '--global_batch_size="${GLOBAL_BATCH_SIZE}"' in train
     assert "--policy.vlm_backend=molmo2_full" in train
-    assert "--policy.full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align" in train
+    assert "--policy.full_molmo_topology=v3_feature_align_language_casual" in train
     assert "--multi_gpu" in train
     assert "--deepspeed" not in train
     assert "zero_stage" not in train

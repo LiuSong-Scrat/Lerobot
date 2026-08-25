@@ -40,13 +40,16 @@ Molmo parameter.grad 始终为 None
 送入 decoder 的完整 prefix 为：
 
 ```text
-[BOS + 410 IMAGE] [EGO_FG] [EGO_BG] [task/chat TEXT] [right PAD] [WORLD_FG] [WORLD_BG]
+[BOS + 410 IMAGE + task/chat TEXT] [EGO_FG] [EGO_BG] [right PAD] [WORLD_FG] [WORLD_BG]
 ```
 
-World FG/BG 与参考 WEPVLA 一样物理追加在已构造的 Ego prefix 后，并复用 Ego FG/BG 的成对 position id；PAD 始终被 key/query mask 屏蔽，不改变有效 token 的信息路径。
+World FG/BG 物理追加在已构造的 Native+Ego prefix 后，并取得紧随最后一个有效 Ego/Native token 的连续 position id；PAD 始终被 key/query mask 屏蔽，不改变有效 token 的信息路径。这样训练与 cache 推理都以同一个 `max_valid_position + 1` 作为 Action 起点。
 
 - 410 个 IMAGE position 和 392 个视觉 feature 合同不变；
-- 为严格对齐参考 WEP，所有有效 IMAGE/LANGUAGE/Ego/World FG/BG 属于一个双向 prefix domain；
+- Native token 严格使用 Molmo2-ER 官方预训练 mask：`causal OR (image_query AND image_key)`；
+- Native query 不读取任何 Ego/World FG/BG，因而图文 hidden/K/V 不被随机初始化的 Scene token 条件化；
+- Ego/World FG/BG query 读取全部有效 Native token，并在四个 Scene token 内双向交互；
+- Native 原始 position id 不因 Scene token 插入而偏移；
 - padding query/key 全屏蔽；
 - native embedding 分支 detach，但拼入 FG/BG 后的完整 prefix 携带输入梯度；
 - FG/BG 投影宽度为 Molmo hidden 2560。
@@ -67,11 +70,11 @@ fast path 只有在本地 processor 的 resize、patch、pooling、mean/std、pl
 
 Action Expert 深度保持 36，现有主干 hidden 缩为 WEPVLA 的 720、FFN 为 2048；与 Molmo 36 层仍严格一一对应。这里没有新增 residual 分支。
 
-- 偶数层 `0,2,...,34`：prefix 与 action 进行一次 joint MHA；mask 保证 prefix 只读 prefix，而 action 读取完整 prefix 与全部 Ego/World action。
-- 奇数层 `1,3,...,35`：prefix 先做自身 self-attention；action query cross-attend 本层完整、持续演化的 IMAGE/LANGUAGE/FG/BG K/V，本层无 action-action attention。
+- 偶数层 `0,2,...,34`：prefix 与 action 进行一次 joint MHA；Native 保持官方 mask，Scene 读取 Native+Scene，action 读取完整 Native+Scene 与全部 Ego/World action；任何 prefix query 都不能读取 action。
+- 奇数层 `1,3,...,35`：prefix 先按同一 Native/Scene 非对称 mask 做 self-attention；action query cross-attend 本层完整、持续演化的 Native+Scene K/V，本层无 action-action attention。
 - Expert residual、MLP、final norm 全部可训练。
 
-因此 IMAGE/LANGUAGE 会被 FG/BG 条件化，FG/BG 也会读取图文；后续 Action 读取的是这种逐层共同演化的 prefix，而不是预计算的静态 native K/V。
+因此 Native IMAGE/LANGUAGE 始终沿官方预训练路径演化，不会被 FG/BG 反向条件化；FG/BG 则逐层读取完整图文并形成 trainable multimodal readout。后续 Action 同时读取官方 Native 表征和融合后的 Scene 表征，而不是只读取预计算的静态 K/V。
 
 ## 2. Trainable scene/action token 布局
 
@@ -79,7 +82,7 @@ token 分区严格为：
 
 ```text
 VLM prefix:
-  [IMAGE/LANGUAGE] [EGO_FOREGROUND] [EGO_BACKGROUND]
+  [BOS/IMAGE/LANGUAGE] [EGO_FOREGROUND] [EGO_BACKGROUND]
                    [WORLD_FOREGROUND] [WORLD_BACKGROUND]
 
 Expert suffix:
@@ -88,7 +91,8 @@ Expert suffix:
 
 四个 scene token 与基准分支逐一对应；不存在额外 attention-pooled scene token，也不在 Expert suffix 中复制 FG/BG。
 
-- prefix 内全部双向，且任何 prefix query 都不能读取 noisy action；
+- Native 内部保持官方 causal-or-image-image mask；Native 不读取 Scene，Scene 读取 Native+Scene；
+- 任何 prefix query 都不能读取 noisy action；
 - 偶数层两个 action stream 双向读取全部 prefix 和完整 action block；
 - 奇数 pure-cross 层不做 trainable-side self-attention，保持原 SmolVLA 交替拓扑；
 - 最终只执行 Ego action；World action 是同一物理轨迹的共轭监督/隐变量；
@@ -159,7 +163,7 @@ trainable =   440,554,697
 frozen    = 4,474,671,285
 ```
 
-训练前运行时审计会拒绝任何参数量、trainable allowlist、层数、冻结范围或 WEP-prefix architecture contract 漂移。feature-align checkpoint 在 `config.json` 中持久化 `full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align`；旧 V3 的 1920 维 Action Expert 与本版本 720 维主干形状不兼容，不能直接 resume 或评测，必须从头训练或另做显式 warm-start 转换。Molmo prefix 仍保持原生 2560 维。
+训练前运行时审计会拒绝任何参数量、trainable allowlist、层数、冻结范围或 Native/Scene architecture contract 漂移。当前 checkpoint 在 `config.json` 中持久化 `full_molmo_topology=v3_feature_align_language_casual`。旧 V3 的 1920 维 Action Expert 与本版本 720 维主干形状不兼容；旧 feature-align 虽然参数形状相同，但 token 顺序和 attention mask 语义不同。两者均不能直接 resume 或评测，当前拓扑必须从头训练，除非另做显式的权重迁移实验。Molmo Native prefix 仍保持原生 2560 维。
 
 ## 4. DDP 与 batch 合同
 
@@ -203,7 +207,7 @@ cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
 代码门禁必须同时证明：
 
 1. `molmo_inference_only=false`，`molmo_gradient_checkpointing=true`；
-2. prefix 包含 native 图文与四个 FG/BG，suffix 只含两个成对 action stream；
+2. prefix 包含 native 图文与四个 FG/BG，suffix 只含两个成对 action stream；Native 使用官方 causal-or-image-image mask，Native 不读 Scene，Scene 读取 Native+Scene；
 3. Molmo/ViT 参数的 `grad` 均为 `None`，但 action loss 对 FG/BG projection 梯度非零；
 4. checkpoint 开/关的固定输入前向、输入梯度和 Expert 参数梯度一致；
 5. 推理完整 prefix cache 与 non-cache joint forward 输出一致；
@@ -212,4 +216,4 @@ cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
 8. 第一个 optimizer step 后所有 trainable tensor 都被 DDP 使用；
 9. 参数 hash 在训练前后证明冻结 Molmo 未改变。
 
-旧 detached-scene-suffix 拓扑的 b8、b24 8-GPU 结果不能作为新 WEP-prefix 拓扑的显存证据。当前已完成 CPU 架构/梯度/cache 回归；真实 8-GPU 两步烟测与新拓扑的 batch 上限仍待实测。
+旧 detached-scene-suffix、全双向 feature-align 拓扑的 b8、b24 8-GPU 结果不能作为当前 Native-official-mask 拓扑的功能或收敛证据。当前拓扑必须从头训练；真实 8-GPU 两步烟测与 batch 上限仍待实测。

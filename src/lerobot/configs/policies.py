@@ -50,10 +50,11 @@ def _validate_pretrained_raw_policy_config(config: dict[str, Any], model_id: str
     topology = config.get("full_molmo_topology")
     if config.get("molmo_inference_only") is True or topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY:
         raise ValueError(
-            f"Checkpoint '{model_id}' uses the retired detached-scene-suffix Full-Molmo topology "
-            "or has no valid WEP-prefix topology marker. Its 1920-wide external FG/BG projections "
-            "are incompatible with the 2560-wide WEP-prefix model. Start a fresh run or create an "
-            "explicit converted warm-start checkpoint; do not load it as a v3 checkpoint."
+            f"Checkpoint '{model_id}' does not use the required "
+            f"'{FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY}' Full-Molmo topology. Detached-scene and "
+            "globally-bidirectional Feature-Align checkpoints have different tensor shapes and/or "
+            "attention semantics. Start a fresh run or create an explicit converted warm-start "
+            "checkpoint; do not silently resume it under the native Molmo attention contract."
         )
 
 

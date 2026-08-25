@@ -512,19 +512,19 @@ class SmolVLAConfig(PreTrainedConfig):
     # The v0.4.3 multiview DoubleFlow policy remains the architecture baseline.
     # Molmo backends replace only the frozen VLM implementation.
     vlm_backend: str = "smolvlm"
-    # Persist the token/attention topology in every policy checkpoint.  This
-    # prevents a detached-scene-suffix checkpoint from being mistaken for the
-    # shape- and semantics-incompatible WEP-prefix model.
+    # Persist the token/attention topology in every policy checkpoint. This
+    # prevents detached-scene or globally-bidirectional Feature-Align
+    # checkpoints from being mistaken for the native-attention readout model.
     full_molmo_topology: str = FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
     # Historical Scheme B kept Full-Molmo2-ER outside the training graph and
-    # exposed detached IMAGE/TEXT K/V only.  The WEP-compatible Full-Molmo
-    # topology instead places trainable FG/BG in the VLM prefix, so decoder
-    # input gradients must be enabled even though every Molmo parameter stays
-    # frozen.  Keep this field for checkpoint/CLI compatibility, but the full
-    # backend contract requires it to be false.
+    # exposed detached IMAGE/TEXT K/V only. The native-attention readout
+    # topology instead runs trainable FG/BG through the frozen decoder after
+    # the complete native sequence, so decoder-input gradients must remain
+    # enabled even though every base Molmo parameter stays frozen. Keep this
+    # field for checkpoint/CLI compatibility; the full backend requires false.
     molmo_inference_only: bool = False
     # Recompute coupled frozen-Molmo/Action-Expert segments during backward.
-    # This preserves the exact WEP attention graph while avoiding retention of
+    # This preserves the native/scene/action graph while avoiding retention of
     # all 36 layers' decoder activations.
     molmo_gradient_checkpointing: bool = True
     # Two layers per segment halves retained boundary tensors relative to

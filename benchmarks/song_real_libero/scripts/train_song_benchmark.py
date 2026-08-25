@@ -2460,7 +2460,7 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
 
     if getattr(config, "molmo_inference_only", None) is not False:
         raise RuntimeError(
-            "WEP-prefix Full-Molmo2-ER requires molmo_inference_only=false so FG/BG "
+            "Native-readout Full-Molmo2-ER requires molmo_inference_only=false so FG/BG "
             "input gradients can traverse the frozen decoder."
         )
 
@@ -2503,17 +2503,24 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
         )
 
     architecture = backend.architecture_contract
-    wep_prefix_contract = {
+    native_readout_contract = {
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
         "vlm_execution": (
             "frozen_base_with_lora_and_prefix_input_autograd"
             if lora_enabled
             else "frozen_parameters_with_prefix_input_autograd"
         ),
-        "per_layer_memory": "evolving_image_text_fg_bg_prefix",
-        "fg_bg_location": "trainable_vlm_prefix",
+        "per_layer_memory": "official_native_stream_plus_evolving_fg_bg_readouts",
+        "fg_bg_location": "post_native_trainable_prefix_readout_block",
         "action_location": "expert_suffix_only",
         "text_prefix_autograd_preserved": True,
+        "native_attention": "official_causal_plus_bidirectional_image",
+        "native_rope_positions": "official_unchanged",
+        "native_reads_scene": False,
+        "scene_reads_native": True,
+        "scene_attention": "bidirectional_readout_block",
+        "action_even_reads": "native_scene_action",
+        "action_odd_reads": "native_scene",
         "gradient_checkpointing": bool(
             getattr(config, "molmo_gradient_checkpointing", True)
         ),
@@ -2530,11 +2537,11 @@ def audit_full_molmo2er_policy(policy: torch.nn.Module) -> dict[str, int]:
     }
     drift = {
         key: {"expected": expected, "actual": architecture.get(key)}
-        for key, expected in wep_prefix_contract.items()
+        for key, expected in native_readout_contract.items()
         if architecture.get(key) != expected
     }
     if drift or getattr(backend, "inference_only_vlm", None) is not False:
-        raise RuntimeError(f"Full-Molmo2-ER WEP-prefix execution contract drifted: {drift}.")
+        raise RuntimeError(f"Full-Molmo2-ER native-readout execution contract drifted: {drift}.")
     if len(backend.vlm.blocks) != 36 or len(backend.lm_expert.layers) != 36:
         raise RuntimeError("Full-Molmo2-ER requires exactly 36 VLM and 36 Expert layers.")
     if not hasattr(backend, "vision_backbone"):
@@ -2592,7 +2599,7 @@ def write_full_molmo2er_parameter_audit(
         parameter.requires_grad for parameter in lora_named_parameters.values()
     )
     payload = {
-        "version": 4 if lora_enabled else 3,
+        "version": 6 if lora_enabled else 5,
         "backend": "molmo2_full",
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
         "total_parameters": total,

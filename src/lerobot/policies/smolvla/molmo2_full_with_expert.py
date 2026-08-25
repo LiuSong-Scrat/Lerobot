@@ -313,7 +313,7 @@ def _audit_source_checkpoint(model_directory: Path) -> dict[str, Any]:
 
 
 class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
-    """Frozen 36-layer Molmo2-ER plus a WEP-width 36-layer Action Expert."""
+    """Native-mask frozen Molmo2-ER plus a feature-aligned Action Expert."""
 
     scale_input_embeddings = False
     inference_only_vlm = False
@@ -364,8 +364,8 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             raise ValueError("Full-Molmo2-ER freezes every base Molmo tensor; train_expert_only must be True.")
         if inference_only_vlm:
             raise ValueError(
-                "WEP-compatible Full-Molmo2-ER requires molmo_inference_only=False: "
-                "trainable FG/BG must remain in the VLM prefix and receive input gradients."
+                "Native-readout Full-Molmo2-ER requires molmo_inference_only=False: "
+                "trainable FG/BG scene readouts remain in the prefix and receive input gradients."
             )
         if num_vlm_layers != 36:
             raise ValueError(f"Full-Molmo2-ER retains exactly all 36/36 text blocks, got {num_vlm_layers}.")
@@ -634,10 +634,17 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
                 if self.molmo_lora_enable
                 else "frozen_parameters_with_prefix_input_autograd"
             ),
-            "per_layer_memory": "evolving_image_text_fg_bg_prefix",
-            "fg_bg_location": "trainable_vlm_prefix",
+            "per_layer_memory": "official_native_stream_plus_evolving_fg_bg_readouts",
+            "fg_bg_location": "post_native_trainable_prefix_readout_block",
             "action_location": "expert_suffix_only",
             "text_prefix_autograd_preserved": True,
+            "native_attention": "official_causal_plus_bidirectional_image",
+            "native_rope_positions": "official_unchanged",
+            "native_reads_scene": False,
+            "scene_reads_native": True,
+            "scene_attention": "bidirectional_readout_block",
+            "action_even_reads": "native_scene_action",
+            "action_odd_reads": "native_scene",
             "gradient_checkpointing": self.gradient_checkpointing,
             "gradient_checkpointing_layers_per_segment": (
                 self.gradient_checkpointing_layers_per_segment

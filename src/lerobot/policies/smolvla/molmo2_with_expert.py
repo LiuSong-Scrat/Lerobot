@@ -32,8 +32,8 @@ and gated SwiGLU are retained.
 The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  Frozen
 VLM parameters do not imply a detached decoder: when trainable FG/BG tokens
 are present in the prefix, input autograd traverses the frozen blocks exactly
-as in WEPVLA.  The historical ``inference_only_vlm`` path remains only for old
-point-memory experiments and is not used by the WEP-compatible Full backend.
+as in WEPVLA. The historical ``inference_only_vlm`` path remains only for old
+point-memory experiments and is not used by the native-attention Full backend.
 """
 
 from __future__ import annotations
@@ -1078,7 +1078,7 @@ class Molmo2WithExpertModel(nn.Module):
     def train(self, mode: bool = True) -> Molmo2WithExpertModel:
         super().train(mode)
         # Frozen VLM dropout must stay disabled, while autograd through its
-        # operations remains enabled for trainable point-prefix projections.
+        # operations remains enabled for trainable scene-readout projections.
         self.vlm.eval()
         return self
 
@@ -1125,7 +1125,7 @@ class Molmo2WithExpertModel(nn.Module):
         position_ids: Tensor,
         attention_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
-        """Run one exact WEP prefix/Action-Expert layer without cache side effects.
+        """Run one native-preserving prefix/Action-Expert layer without cache side effects.
 
         This pure tensor boundary is used by non-reentrant activation
         checkpointing.  Even layers perform masked joint MHA; odd layers update

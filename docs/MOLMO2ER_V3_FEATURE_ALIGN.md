@@ -6,12 +6,24 @@ Action/Point residual branch.
 ## Fixed topology
 
 - Molmo2-ER vision and text parameters remain frozen.
-- Trainable FG/BG tokens remain inside the evolving Molmo prefix.
+- The complete native `BOS + IMAGE + LANGUAGE` sequence remains first in the
+  prefix and keeps Molmo2-ER's pretrained attention semantics exactly:
+  `causal OR (image_query AND image_key)` over valid native tokens.
+- Trainable Ego/World FG/BG tokens remain inside the evolving Molmo prefix,
+  after the complete native sequence and before every action token.
+- Native queries never read FG/BG scene tokens. Scene queries read every valid
+  native token and all valid scene tokens bidirectionally.
 - Action tokens remain in the Expert suffix.
 - All 36 VLM/Expert layer pairs remain aligned.
-- Even layers retain V3 joint prefix/action attention.
-- Odd layers retain prefix self-attention followed by action-to-prefix cross-attention.
+- Even layers retain V3 joint attention: Action reads Native, Scene, and the
+  complete Action block; Native and Scene cannot read Action.
+- Odd layers retain prefix self-attention followed by Action-to-prefix
+  cross-attention, so Action reads Native and Scene without an Action K/V block.
 - PointAction keeps its existing `action + point_conditioned_update` output.
+
+This topology deliberately does not make the whole prefix bidirectional. It
+preserves the pretrained Native image/language path while using FG/BG as a
+trainable multimodal readout block for the Action Expert.
 
 ## Feature dimensions
 
@@ -63,9 +75,11 @@ that component by 76.95%, and the whole WorldFlow policy's trainable count by
 The marker is:
 
 ```text
-wepvla_scene_in_vlm_prefix_v3_feature_align
+v3_feature_align_language_casual
 ```
 
-Old V3 checkpoints are shape-incompatible (`1920 -> 720`) and must not be
-silently resumed. Train this branch from a fresh policy configuration unless a
-separate, explicit weight-conversion procedure is implemented.
+Old V3 checkpoints are shape-incompatible (`1920 -> 720`). Earlier
+feature-align checkpoints have compatible parameter shapes but incompatible
+token order and attention semantics. Neither may be silently resumed. This
+topology must be trained from a fresh policy configuration unless a separate,
+explicit weight-conversion experiment is implemented.

@@ -409,7 +409,7 @@ def make_pre_post_processors(
 
 
 def _validate_full_molmo_checkpoint_topology(pretrained_path: str | Path) -> None:
-    """Reject policy checkpoints from the retired detached-scene topology."""
+    """Reject Full-Molmo checkpoints with incompatible shapes or attention semantics."""
 
     checkpoint_config_path = Path(pretrained_path).expanduser() / "config.json"
     if not checkpoint_config_path.is_file():
@@ -424,11 +424,11 @@ def _validate_full_molmo_checkpoint_topology(pretrained_path: str | Path) -> Non
         or checkpoint_topology != FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY
     ):
         raise ValueError(
-            "This checkpoint uses the retired detached-scene-suffix Full-Molmo topology "
-            "or has no registered WEP-prefix topology marker. The WEP-prefix model "
-            "changes FG/BG projections from 1920 to 2560 and cannot resume or evaluate "
-            "that checkpoint. Start a fresh run, or first create an explicit converted "
-            "warm-start checkpoint; do not use --resume."
+            "This checkpoint does not use the required "
+            f"'{FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY}' Full-Molmo topology. Detached-scene "
+            "and globally-bidirectional Feature-Align checkpoints have different tensor "
+            "shapes and/or attention semantics. Start a fresh run, or first create an "
+            "explicit converted warm-start checkpoint; do not use --resume."
         )
 
 

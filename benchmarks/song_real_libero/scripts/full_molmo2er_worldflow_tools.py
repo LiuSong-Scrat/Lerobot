@@ -663,7 +663,7 @@ def command_data_audit(args: argparse.Namespace) -> int:
 
 POLICY_CONTRACT: dict[str, Any] = {
     "vlm_backend": "molmo2_full",
-    "full_molmo_topology": "wepvla_scene_in_vlm_prefix_v3_feature_align",
+    "full_molmo_topology": "v3_feature_align_language_casual",
     "num_vlm_layers": 36,
     "num_expert_layers": 36,
     "train_expert_only": True,
