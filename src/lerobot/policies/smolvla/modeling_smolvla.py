@@ -3693,6 +3693,7 @@ class VLAFlowMatching(nn.Module):
         self.last_se3_metrics: dict[str, Tensor] = {}
         self.last_action_metrics: dict[str, Tensor] = {}
         self.last_molmo_scene_insert_positions: Tensor | None = None
+        self.last_molmo_scene_token_indices: Tensor | None = None
         self.last_molmo_token_roles: Tensor | None = None
 
         self.action_time_mlp_in = nn.Linear(
@@ -4481,6 +4482,23 @@ class VLAFlowMatching(nn.Module):
             ).detach(),
         }
 
+    def _full_molmo_scene_indices(self, prefix_embs: Tensor) -> Tensor | None:
+        """Return physical FG/BG slots for the native/scene split backend."""
+
+        if getattr(self.config, "vlm_backend", "smolvlm") != "molmo2_full":
+            return None
+        indices = getattr(self, "last_molmo_scene_token_indices", None)
+        if not torch.is_tensor(indices):
+            raise RuntimeError(
+                "Full-Molmo2 prefix execution is missing physical FG/BG scene indices."
+            )
+        if indices.ndim != 2 or indices.shape[0] != prefix_embs.shape[0]:
+            raise ValueError(
+                "Full-Molmo2 scene indices must be [B,S] for the current prefix; "
+                f"got {tuple(indices.shape)} and prefix {tuple(prefix_embs.shape)}."
+            )
+        return indices.to(device=prefix_embs.device, dtype=torch.long)
+
     def _se3_predict_from_suffix(
         self,
         prefix_embs: Tensor,
@@ -4508,6 +4526,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            prefix_scene_indices=self._full_molmo_scene_indices(prefix_embs),
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
         return self._predict_ego_se3_velocity(
@@ -4544,6 +4563,7 @@ class VLAFlowMatching(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 fill_kv_cache=False,
+                prefix_scene_indices=self._full_molmo_scene_indices(prefix_embs),
             )
         else:
             if past_key_values is None:
@@ -5285,6 +5305,10 @@ class VLAFlowMatching(nn.Module):
             device=prefix_embeddings.device,
             dtype=torch.long,
         )
+        self.last_molmo_scene_token_indices = (
+            self.last_molmo_scene_insert_positions[:, None]
+            + torch.arange(2, device=prefix_embeddings.device, dtype=torch.long)[None, :]
+        )
         self.last_molmo_token_roles = prefix_roles.detach()
         self.last_ego_point_prefix_slices = ()
         self.last_prefix_token_layout = (
@@ -5346,6 +5370,7 @@ class VLAFlowMatching(nn.Module):
         self.last_ego_point_prefix_slices = ()
         self.last_pointseg_visualization = None
         self.last_molmo_scene_insert_positions = None
+        self.last_molmo_scene_token_indices = None
         self.last_molmo_token_roles = None
         # Some lightweight unit-test / export shells construct this module
         # without running the full initializer.
@@ -6522,6 +6547,28 @@ class VLAFlowMatching(nn.Module):
             ],
             dim=1,
         )
+        ego_scene_indices = self.last_molmo_scene_token_indices
+        if (
+            not torch.is_tensor(ego_scene_indices)
+            or ego_scene_indices.ndim != 2
+            or ego_scene_indices.shape != (prefix_embs.shape[0], 2)
+        ):
+            raise RuntimeError(
+                "Full Molmo World prefix requires physical Ego FG/BG scene indices."
+            )
+        world_scene_indices = torch.arange(
+            prefix_embs.shape[1],
+            prefix_embs.shape[1] + 2,
+            device=prefix_embs.device,
+            dtype=torch.long,
+        )[None, :].expand(prefix_embs.shape[0], -1)
+        self.last_molmo_scene_token_indices = torch.cat(
+            [
+                ego_scene_indices.to(device=prefix_embs.device, dtype=torch.long),
+                world_scene_indices,
+            ],
+            dim=1,
+        )
         return (
             torch.cat([prefix_embs, world_emb], dim=1),
             torch.cat([prefix_pad_masks, world_mask], dim=1),
@@ -6730,6 +6777,7 @@ class VLAFlowMatching(nn.Module):
                     inputs_embeds=[prefix_embs, suffix_embs],
                     use_cache=False,
                     fill_kv_cache=False,
+                    prefix_scene_indices=self._full_molmo_scene_indices(prefix_embs),
                 )
             else:
                 if past_key_values is None:
@@ -6820,6 +6868,7 @@ class VLAFlowMatching(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 fill_kv_cache=False,
+                prefix_scene_indices=self._full_molmo_scene_indices(prefix_embs),
             )
         else:
             if past_key_values is None:

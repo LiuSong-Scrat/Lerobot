@@ -431,6 +431,7 @@ def _make_prefix_shell(hidden_size: int = 8) -> VLAFlowMatching:
     nn.Module.__init__(model)
     model.last_prefix_metrics = {}
     model.last_molmo_scene_insert_positions = None
+    model.last_molmo_scene_token_indices = None
     model.last_molmo_token_roles = None
     model.last_prefix_token_layout = ()
     model.vlm_with_expert = SimpleNamespace(expert_hidden_size=hidden_size)
@@ -454,6 +455,10 @@ def test_full_prefix_appends_scene_after_native_and_preserves_official_native_ma
     assert prefix.shape == (2, 418, 8)
     assert prefix.requires_grad
     assert torch.equal(model.last_molmo_scene_insert_positions, torch.tensor([413, 416]))
+    assert torch.equal(
+        model.last_molmo_scene_token_indices,
+        torch.tensor([[413, 414], [416, 417]]),
+    )
     assert torch.equal(prefix_valid.sum(dim=1), torch.tensor([415, 418]))
     assert prefix_valid[0, :415].all() and not prefix_valid[0, 415:].any()
     assert prefix_valid[1].all()
@@ -537,6 +542,7 @@ def test_world_fg_bg_continue_scene_block_with_consecutive_positions() -> None:
     model.world_point_prefix_type_embedding = nn.Parameter(torch.zeros(8))
     model.inference_ablation_modalities = frozenset()
     model.last_molmo_scene_insert_positions = torch.tensor([4, 6])
+    model.last_molmo_scene_token_indices = torch.tensor([[4, 5], [6, 7]])
     prefix = torch.randn(2, 8, 8)
     prefix_valid = torch.tensor([[True, True, True, True, True, True, False, False], [True] * 8])
     prefix_boundaries = torch.tensor(
@@ -567,6 +573,10 @@ def test_world_fg_bg_continue_scene_block_with_consecutive_positions() -> None:
     base_positions = torch.cumsum(prefix_valid, dim=1, dtype=torch.long) - 1
     assert torch.equal(positions[:, :8], base_positions)
     assert torch.equal(positions[:, -2:], torch.tensor([[6, 7], [8, 9]]))
+    assert torch.equal(
+        model.last_molmo_scene_token_indices,
+        torch.tensor([[4, 5, 8, 9], [6, 7, 8, 9]]),
+    )
 
     augmented_roles = torch.tensor(
         [

@@ -30,10 +30,13 @@ per-head Q/K RMSNorm, grouped-query attention, RoPE, pre-norm residual layout,
 and gated SwiGLU are retained.
 
 The public ``forward`` contract mirrors ``SmolVLMWithExpertModel``.  Frozen
-VLM parameters do not imply a detached decoder: when trainable FG/BG tokens
-are present in the prefix, input autograd traverses the frozen blocks exactly
-as in WEPVLA. The historical ``inference_only_vlm`` path remains only for old
-point-memory experiments and is not used by the native-attention Full backend.
+VLM parameters do not imply a detached scene decoder: trainable FG/BG tokens
+still traverse every frozen Molmo block exactly as in WEPVLA.  When the native
+mask guarantees that image/language queries cannot read those scene tokens,
+the native stream is evaluated per layer under ``no_grad`` and only the compact
+scene stream retains input autograd.  The historical ``inference_only_vlm``
+path remains only for old point-memory experiments and is not used by the
+native-attention Full backend.
 """
 
 from __future__ import annotations
@@ -1211,6 +1214,264 @@ class Molmo2WithExpertModel(nn.Module):
             expert_layer.finish_attention(expert, expert_output),
         )
 
+    @staticmethod
+    def _gather_sequence(sequence: Tensor, indices: Tensor) -> Tensor:
+        """Gather per-sample sequence positions without flattening the batch."""
+
+        if sequence.ndim < 2 or indices.ndim != 2:
+            raise ValueError(
+                "Sequence gather requires sequence [B,L,...] and indices [B,S]; "
+                f"got {tuple(sequence.shape)} and {tuple(indices.shape)}."
+            )
+        if sequence.shape[0] != indices.shape[0]:
+            raise ValueError("Sequence gather batch dimensions do not match.")
+        index = indices.to(device=sequence.device, dtype=torch.long)
+        index = index.view(*index.shape, *((1,) * (sequence.ndim - 2)))
+        return torch.gather(
+            index=index.expand(-1, -1, *sequence.shape[2:]),
+            input=sequence,
+            dim=1,
+        )
+
+    @staticmethod
+    def _scatter_sequence(base: Tensor, indices: Tensor, updates: Tensor) -> Tensor:
+        """Write compact per-sample sequence values back to their physical slots."""
+
+        if base.ndim < 2 or indices.ndim != 2:
+            raise ValueError(
+                "Sequence scatter requires base [B,L,...] and indices [B,S]; "
+                f"got {tuple(base.shape)} and {tuple(indices.shape)}."
+            )
+        if base.shape[0] != indices.shape[0] or updates.shape[:2] != indices.shape:
+            raise ValueError("Sequence scatter batch/scene dimensions do not match.")
+        if updates.shape[2:] != base.shape[2:]:
+            raise ValueError("Sequence scatter feature dimensions do not match.")
+        index = indices.to(device=base.device, dtype=torch.long)
+        index = index.view(*index.shape, *((1,) * (base.ndim - 2)))
+        return torch.scatter(
+            input=base,
+            dim=1,
+            index=index.expand(-1, -1, *base.shape[2:]),
+            src=updates,
+        )
+
+    def _forward_native_scene_expert_layer(
+        self,
+        layer_idx: int,
+        detached_prefix: Tensor,
+        scene: Tensor,
+        expert: Tensor,
+        scene_indices: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Run one topology-equivalent layer with no native input backward.
+
+        ``detached_prefix`` keeps the original padded physical layout, while
+        ``scene`` contains only the trainable FG/BG rows.  Native Molmo queries
+        cannot read scene/action rows under the registered Full-Molmo mask, so
+        their Jacobian with respect to trainable inputs is exactly zero.  Scene
+        and Action queries still use one softmax over the same physical K/V
+        ordering as the legacy coupled implementation.
+        """
+
+        if detached_prefix.requires_grad:
+            raise ValueError("Native-scene split requires a detached native prefix state.")
+        vlm_layer = self.vlm.blocks[layer_idx]
+        expert_layer = self.lm_expert.layers[layer_idx]
+        batch_size, prefix_len = detached_prefix.shape[:2]
+        expert_len = expert.shape[1]
+        if scene_indices.shape[0] != batch_size or scene.shape[:2] != scene_indices.shape:
+            raise ValueError(
+                "Native-scene split requires scene [B,S,H] and scene_indices [B,S]; "
+                f"got {tuple(scene.shape)} and {tuple(scene_indices.shape)}."
+            )
+
+        prefix_positions = position_ids[:, :prefix_len]
+        expert_positions = position_ids[:, prefix_len : prefix_len + expert_len]
+        prefix_mask = self._mask_slice(
+            attention_mask,
+            slice(0, prefix_len),
+            slice(0, prefix_len),
+            batch_size=batch_size,
+            rows=prefix_len,
+            cols=prefix_len,
+            device=detached_prefix.device,
+        )
+
+        # Preserve the exact physical prefix for the frozen native pass.  Scene
+        # values are present because they occupy real prefix slots, but they are
+        # detached and native query masks make them invisible to native rows.
+        with torch.no_grad():
+            frozen_input = self._scatter_sequence(
+                detached_prefix,
+                scene_indices,
+                scene.detach(),
+            )
+            next_detached_prefix, frozen_key, frozen_value = self._forward_vlm_layer(
+                vlm_layer,
+                frozen_input,
+                prefix_positions,
+                prefix_mask,
+            )
+
+        # Recompute only the compact trainable scene rows with autograd, then
+        # replace their physical K/V slots.  Both scene and action attention
+        # therefore normalize over one unchanged [native, scene, (action)] key
+        # domain rather than adding separately normalized attention results.
+        scene_positions = self._gather_sequence(prefix_positions, scene_indices)
+        scene_normalized = vlm_layer.attn_norm(scene)
+        scene_query, scene_key, scene_value = vlm_layer.self_attn.project(
+            scene_normalized,
+            scene_positions,
+        )
+        prefix_key = self._scatter_sequence(frozen_key, scene_indices, scene_key)
+        prefix_value = self._scatter_sequence(frozen_value, scene_indices, scene_value)
+        scene_mask = self._gather_sequence(prefix_mask, scene_indices)
+        scene_output = _scaled_dot_product_attention(
+            scene_query,
+            prefix_key,
+            prefix_value,
+            scene_mask,
+        )
+        next_scene = vlm_layer.finish_attention(scene, scene_output)
+
+        expert_normalized = expert_layer.attn_norm(expert)
+        is_self_attention = layer_idx % self.self_attn_every_n_layers == 0
+        if is_self_attention:
+            assert isinstance(expert_layer.self_attn, Molmo2FusedAttention)
+            expert_query, expert_key, expert_value = expert_layer.self_attn.project(
+                expert_normalized,
+                expert_positions,
+            )
+            key = torch.cat([prefix_key, expert_key], dim=1)
+            value = torch.cat([prefix_value, expert_value], dim=1)
+            expert_mask = self._mask_slice(
+                attention_mask,
+                slice(prefix_len, prefix_len + expert_len),
+                slice(0, prefix_len + expert_len),
+                batch_size=batch_size,
+                rows=expert_len,
+                cols=prefix_len + expert_len,
+                device=expert.device,
+            )
+            expert_output = _scaled_dot_product_attention(
+                expert_query,
+                key,
+                value,
+                expert_mask,
+            )
+        else:
+            assert isinstance(expert_layer.self_attn, Molmo2CrossAttention)
+            relative_expert_positions = (
+                expert_positions - expert_positions.min(dim=1, keepdim=True).values
+            )
+            expert_query = expert_layer.self_attn.project_query(
+                expert_normalized,
+                relative_expert_positions,
+            )
+            expert_key, expert_value = self.lm_expert.project_prefix_kv(
+                expert_layer.self_attn,
+                prefix_key,
+                prefix_value,
+            )
+            expert_mask = self._mask_slice(
+                attention_mask,
+                slice(prefix_len, prefix_len + expert_len),
+                slice(0, prefix_len),
+                batch_size=batch_size,
+                rows=expert_len,
+                cols=prefix_len,
+                device=expert.device,
+            )
+            expert_output = _scaled_dot_product_attention(
+                expert_query,
+                expert_key,
+                expert_value,
+                expert_mask,
+            )
+
+        return (
+            next_detached_prefix,
+            next_scene,
+            expert_layer.finish_attention(expert, expert_output),
+        )
+
+    def _forward_native_scene_split(
+        self,
+        prefix: Tensor,
+        expert: Tensor,
+        scene_indices: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        use_gradient_checkpointing: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Run all layers while retaining activations only for scene/actions."""
+
+        scene_indices = scene_indices.to(device=prefix.device, dtype=torch.long)
+        detached_prefix = prefix.detach()
+        scene = self._gather_sequence(prefix, scene_indices)
+        layer_count = len(self.vlm.blocks)
+
+        if use_gradient_checkpointing:
+            segment_size = int(
+                getattr(self, "gradient_checkpointing_layers_per_segment", 1)
+            )
+            if segment_size < 1:
+                raise ValueError("Gradient-checkpoint segment size must be positive.")
+            for segment_start in range(0, layer_count, segment_size):
+                segment_end = min(segment_start + segment_size, layer_count)
+
+                def checkpointed_segment(
+                    native_hidden: Tensor,
+                    scene_hidden: Tensor,
+                    expert_hidden: Tensor,
+                    *,
+                    start: int = segment_start,
+                    end: int = segment_end,
+                ) -> tuple[Tensor, Tensor, Tensor]:
+                    for current_layer_idx in range(start, end):
+                        native_hidden, scene_hidden, expert_hidden = (
+                            self._forward_native_scene_expert_layer(
+                                current_layer_idx,
+                                native_hidden,
+                                scene_hidden,
+                                expert_hidden,
+                                scene_indices,
+                                position_ids,
+                                attention_mask,
+                            )
+                        )
+                    return native_hidden, scene_hidden, expert_hidden
+
+                detached_prefix, scene, expert = checkpoint(
+                    checkpointed_segment,
+                    detached_prefix,
+                    scene,
+                    expert,
+                    use_reentrant=False,
+                )
+        else:
+            for layer_idx in range(layer_count):
+                detached_prefix, scene, expert = self._forward_native_scene_expert_layer(
+                    layer_idx,
+                    detached_prefix,
+                    scene,
+                    expert,
+                    scene_indices,
+                    position_ids,
+                    attention_mask,
+                )
+
+        # Prefix output is rarely consumed during training, but preserve the
+        # public contract without creating a full native backward graph.
+        with torch.no_grad():
+            prefix_output = self.vlm.ln_f(detached_prefix)
+        scene_output = self.vlm.ln_f(scene)
+        prefix_output = self._scatter_sequence(prefix_output, scene_indices, scene_output)
+        return prefix_output, self.lm_expert.norm(expert)
+
     def _prefill_inference_only_vlm(
         self,
         prefix: Tensor,
@@ -1351,6 +1612,7 @@ class Molmo2WithExpertModel(nn.Module):
         inputs_embeds: list[Tensor | None] | None = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        prefix_scene_indices: Tensor | None = None,
     ) -> tuple[list[Tensor | None], dict[int, dict[str, Tensor]] | None]:
         if inputs_embeds is None or len(inputs_embeds) != 2:
             raise ValueError("inputs_embeds must be [prefix_embeddings, expert_embeddings].")
@@ -1419,6 +1681,30 @@ class Molmo2WithExpertModel(nn.Module):
             and prefix is not None
             and expert is not None
         )
+        use_native_scene_split = bool(
+            prefix is not None
+            and expert is not None
+            and prefix_scene_indices is not None
+            and attention_mask is not None
+            and not use_cache
+            and not fill_kv_cache
+            # Native LoRA parameters need the complete native backward graph.
+            # Base Molmo is otherwise frozen, so its native input adjoint has no
+            # trainable destination and can be removed exactly.
+            and not any(parameter.requires_grad for parameter in self.vlm.parameters())
+        )
+        if use_native_scene_split:
+            assert prefix is not None and expert is not None
+            prefix, expert = self._forward_native_scene_split(
+                prefix,
+                expert,
+                prefix_scene_indices,
+                position_ids,
+                attention_mask,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+            )
+            return [prefix, expert], past_key_values
+
         if use_gradient_checkpointing:
             segment_size = int(
                 getattr(self, "gradient_checkpointing_layers_per_segment", 1)
