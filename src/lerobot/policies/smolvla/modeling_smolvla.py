@@ -3271,6 +3271,11 @@ class SongPointCloudConditioner(nn.Module):
         self.null_background_feat = nn.Parameter(torch.zeros(self.feature_dim))
         self.pseudo_config = PseudoLabelConfig()
         self.pointseg_loss = SongPointSegLoss(SongPointSegLossConfig())
+        # Strict fixed-anchor evaluation rebuilds the training objective while
+        # deliberately keeping the network in eval mode.  This non-persistent,
+        # scoped flag lets it request only the auxiliary loss calculation,
+        # without enabling BatchNorm updates or point-token shuffling.
+        self._force_pointseg_aux_loss = False
 
     def _load_pointseg_checkpoint(self, checkpoint_path: str | None) -> None:
         if not checkpoint_path:
@@ -3500,13 +3505,16 @@ class SongPointCloudConditioner(nn.Module):
             result["foreground_scene_mask1"] = foreground_encoded["scene_mask1"]
         if pseudo is not None and "role_scores" in pseudo:
             result["role_scores"] = pseudo["role_scores"].to(device=point_cloud.device, dtype=torch.float32)
-        if self.training and self.aux_loss_weight > 0:
-            if pseudo is not None:
-                if point_is_pad is not None:
-                    pseudo["point_is_pad"] = point_is_pad
-                aux_loss, aux_metrics = self.pointseg_loss(seg_outputs, pseudo, point_cloud)
-                result["pointseg_aux_loss"] = aux_loss
-                result["pointseg_aux_metrics"] = aux_metrics
+        if (
+            (self.training or self._force_pointseg_aux_loss)
+            and self.aux_loss_weight > 0
+            and pseudo is not None
+        ):
+            if point_is_pad is not None:
+                pseudo["point_is_pad"] = point_is_pad
+            aux_loss, aux_metrics = self.pointseg_loss(seg_outputs, pseudo, point_cloud)
+            result["pointseg_aux_loss"] = aux_loss
+            result["pointseg_aux_metrics"] = aux_metrics
         return result
 
 

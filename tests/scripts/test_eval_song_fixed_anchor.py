@@ -11,6 +11,7 @@ from lerobot.scripts.eval_song import (
     _anchor_total_from_metrics,
     _changed_tensor_fingerprints,
     _fixed_anchor_phase_seed,
+    _fixed_anchor_pointseg_aux_loss,
     _fixed_anchor_rng,
     _load_fixed_anchor_manifest,
     _tensor_state_fingerprints,
@@ -51,6 +52,30 @@ def test_phase_seeds_are_stable_and_phase_separated() -> None:
     assert seed != _fixed_anchor_phase_seed(20260827, "preprocess", 3, 0)
     assert seed != _fixed_anchor_phase_seed(20260827, "forward", 4, 0)
     assert seed != _fixed_anchor_phase_seed(20260827, "forward", 3, 1)
+
+
+def test_fixed_anchor_pointseg_aux_flag_is_scoped_without_changing_module_modes() -> None:
+    class Conditioner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self._force_pointseg_aux_loss = False
+            self.batch_norm = torch.nn.BatchNorm1d(2)
+
+    policy = torch.nn.Sequential(torch.nn.Linear(2, 2), Conditioner())
+    policy.eval()
+    conditioner = policy[1]
+    modes_before = [module.training for module in policy.modules()]
+
+    with _fixed_anchor_pointseg_aux_loss(policy, True):
+        assert conditioner._force_pointseg_aux_loss is True
+        assert [module.training for module in policy.modules()] == modes_before
+
+    assert conditioner._force_pointseg_aux_loss is False
+    assert [module.training for module in policy.modules()] == modes_before
+
+    conditioner._force_pointseg_aux_loss = True
+    with _fixed_anchor_pointseg_aux_loss(policy, False):
+        assert conditioner._force_pointseg_aux_loss is True
 
 
 def test_manifest_strict_validation_and_canonical_hash(tmp_path) -> None:

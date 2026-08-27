@@ -250,6 +250,41 @@ def _fixed_anchor_rng(seed: int) -> Generator[None, None, None]:
 
 
 @contextmanager
+def _fixed_anchor_pointseg_aux_loss(
+    policy: torch.nn.Module,
+    enabled: bool,
+) -> Generator[None, None, None]:
+    """Request the training PointSeg scalar without switching modules to train mode.
+
+    ``SongPointCloudConditioner`` normally omits its auxiliary loss in eval mode.
+    A fixed-anchor comparison must reconstruct the exact training objective, but
+    calling ``policy.train()`` would also update BatchNorm buffers and enable
+    stochastic layers.  Toggle only the conditioner's non-persistent evaluation
+    flag and restore it even if the forward pass fails.
+    """
+
+    if not enabled:
+        yield
+        return
+    conditioners = [
+        module for module in policy.modules() if hasattr(module, "_force_pointseg_aux_loss")
+    ]
+    if not conditioners:
+        raise RuntimeError(
+            "Fixed-anchor loss contract includes PointSeg, but no compatible "
+            "SongPointCloudConditioner was found in the policy."
+        )
+    previous = [bool(module._force_pointseg_aux_loss) for module in conditioners]
+    try:
+        for module in conditioners:
+            module._force_pointseg_aux_loss = True
+        yield
+    finally:
+        for module, value in zip(conditioners, previous, strict=True):
+            module._force_pointseg_aux_loss = value
+
+
+@contextmanager
 def _fixed_anchor_deterministic_algorithms(enabled: bool) -> Generator[None, None, None]:
     """Temporarily require deterministic kernels for strict anchor evaluation."""
 
@@ -915,6 +950,18 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     requested_output_dir = cfg.output_dir
     if requested_output_dir is not None and Path(requested_output_dir).is_dir():
         cfg.output_dir = None
+    fixed_anchor_enabled = cfg.fixed_anchor_indices_path is not None
+    if fixed_anchor_enabled and cfg.fixed_anchor_deterministic_algorithms:
+        # PyTorch deterministic CUDA GEMMs require this to be set before the
+        # first cuBLAS workspace is created in this process.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if not cfg.resume:
+        # These are training-only checkpoint metadata.  Saved restarted-phase
+        # configs can keep them enabled, but a read-only evaluation neither
+        # restores nor mutates optimizer state.
+        cfg.resume_restart_scheduler = False
+        cfg.resume_reset_optimizer_moments = False
+        cfg.resume_optimizer_moments_reset_step = None
     cfg.validate()
     if requested_output_dir is not None:
         cfg.output_dir = Path(requested_output_dir)
@@ -936,7 +983,6 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
 
     init_logging(accelerator=accelerator)
     is_main_process = accelerator.is_main_process
-    fixed_anchor_enabled = cfg.fixed_anchor_indices_path is not None
     if fixed_anchor_enabled and cfg.libero_dataset_domain_action_mse:
         raise ValueError(
             "fixed_anchor_indices_path and libero_dataset_domain_action_mse cannot be combined; "
@@ -1169,7 +1215,16 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             forward_rng = (
                 _fixed_anchor_rng(eval_seed) if fixed_anchor_enabled else nullcontext()
             )
-            with forward_rng, torch.inference_mode(), accelerator.autocast():
+            force_pointseg_aux = (
+                fixed_anchor_enabled
+                and float(fixed_anchor_loss_contract["pointseg_aux_loss_weight"]) > 0.0
+            )
+            with (
+                forward_rng,
+                _fixed_anchor_pointseg_aux_loss(policy, force_pointseg_aux),
+                torch.inference_mode(),
+                accelerator.autocast(),
+            ):
                 loss, output_dict = policy(batch)
 
             local_metrics = dict(output_dict or {})
