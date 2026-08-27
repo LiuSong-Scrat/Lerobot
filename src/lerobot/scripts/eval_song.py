@@ -30,16 +30,21 @@ evaluation batches.  If it exceeds the DataLoader length, only one complete pass
 over the dataset is evaluated.
 """
 
+import hashlib
 import json
 import logging
 import math
 import os
+import random
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from termcolor import colored
@@ -66,6 +71,8 @@ from lerobot.utils.utils import init_logging, inside_slurm
 
 EVAL_METRIC_KEYS = (
     "loss",
+    "loss_anchor_total",
+    "loss_anchor_total_gap",
     "loss_action",
     "loss_action_translation",
     "loss_action_rotation6d",
@@ -86,6 +93,12 @@ EVAL_METRIC_KEYS = (
     "loss_worldflow_equiv",
     "worldflow_trans_err",
     "worldflow_rot_err_deg",
+    "worldflow_flow_translation_err_m",
+    "worldflow_flow_rotation6d_rmse",
+    "worldflow_endpoint_translation_err_m",
+    "worldflow_endpoint_rotation_probe_err_m",
+    "loss_worldflow_gripper",
+    "worldflow_endpoint_gripper_err",
     "worldflow_valid_ratio",
     "worldflow_foreground_points",
     "worldflow_noise_conjugacy_error",
@@ -130,6 +143,41 @@ class SongEvalPipelineConfig(TrainPipelineConfig):
     sample_action_mse: bool = False
     sample_action_noise_mode: str = "policy"
     flow_time_sweep: bool = False
+    # Strict, checkpoint-independent loss comparison.  The JSON manifest fixes
+    # exact *global* dataset frame indices and is applied only after the same
+    # PointSeg/point-cloud/WorldFlow wrappers used by training have been built.
+    # This mode deliberately remains opt-in so ordinary eval_song behavior is
+    # backward compatible.
+    fixed_anchor_indices_path: str | None = None
+    fixed_anchor_seed: int = 20260827
+    # Supplying one common processor directory for every checkpoint guarantees
+    # that normalization/tokenization does not drift between comparisons.
+    fixed_anchor_preprocessor_path: str | None = None
+    fixed_anchor_strict: bool = True
+    fixed_anchor_hash_inputs: bool = True
+    # Optional second assertion in addition to the manifest's declared loss
+    # contract.  For the current experiment pass 0.0005 explicitly.
+    fixed_anchor_expected_pointseg_weight: float | None = None
+    # Custom CUDA extensions may not advertise determinism to PyTorch.  Keep
+    # strict RNG/index/processor checks while allowing this one kernel gate to
+    # be explicitly disabled and recorded in the comparison contract.
+    fixed_anchor_deterministic_algorithms: bool = True
+
+
+FIXED_ANCHOR_SCHEMA_VERSION = 1
+FIXED_ANCHOR_REQUIRED_METRICS = (
+    "loss_action",
+    "loss_worldflow_flow",
+    "loss_pointseg_aux",
+)
+_FIXED_ANCHOR_PHASE_IDS = {
+    "dataloader": 11,
+    "fetch": 23,
+    "preprocess": 37,
+    "forward": 53,
+    "sample": 71,
+    "sweep": 89,
+}
 
 
 class EvalFrameSubset(torch.utils.data.Dataset):
@@ -147,6 +195,308 @@ class EvalFrameSubset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> Any:
         return self.dataset[self.indices[index]]
+
+
+def _fixed_anchor_phase_seed(
+    base_seed: int,
+    phase: str,
+    batch_index: int = 0,
+    process_index: int = 0,
+) -> int:
+    """Derive a stable seed without depending on Python's randomized hash()."""
+
+    if phase not in _FIXED_ANCHOR_PHASE_IDS:
+        raise ValueError(f"Unknown fixed-anchor RNG phase {phase!r}.")
+    payload = (
+        f"song-fixed-anchor-v{FIXED_ANCHOR_SCHEMA_VERSION}:"
+        f"{int(base_seed)}:{_FIXED_ANCHOR_PHASE_IDS[phase]}:"
+        f"{int(batch_index)}:{int(process_index)}"
+    ).encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") & ((1 << 63) - 1)
+
+
+@contextmanager
+def _fixed_anchor_rng(seed: int) -> Generator[None, None, None]:
+    """Seed and then restore Python, NumPy, CPU Torch, and every CUDA RNG.
+
+    Separate contexts are used for fetch/collate, preprocessing, the native
+    flow loss, the optional sampler, and the flow-time sweep.  Consequently an
+    implementation detail in one phase cannot silently perturb another phase.
+    """
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2**32))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+@contextmanager
+def _fixed_anchor_deterministic_algorithms(enabled: bool) -> Generator[None, None, None]:
+    """Temporarily require deterministic kernels for strict anchor evaluation."""
+
+    if not enabled:
+        yield
+        return
+    algorithms_before = torch.are_deterministic_algorithms_enabled()
+    warn_only_before = torch.is_deterministic_algorithms_warn_only_enabled()
+    benchmark_before = torch.backends.cudnn.benchmark
+    deterministic_before = torch.backends.cudnn.deterministic
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(algorithms_before, warn_only=warn_only_before)
+        torch.backends.cudnn.benchmark = benchmark_before
+        torch.backends.cudnn.deterministic = deterministic_before
+
+
+def _seed_fixed_anchor_worker(_worker_id: int) -> None:
+    """Seed non-Torch RNGs from DataLoader's deterministic worker seed."""
+
+    worker_seed = int(torch.initial_seed()) % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _load_fixed_anchor_manifest(
+    path_value: str | Path,
+    *,
+    dataset_repo_id: str,
+    dataset_length: int,
+    strict: bool,
+) -> dict[str, Any]:
+    """Load and validate a checkpoint-independent global-frame manifest."""
+
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Fixed-anchor indices manifest not found: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if isinstance(payload, list):
+        if strict:
+            raise ValueError(
+                "Strict fixed-anchor evaluation requires an object manifest with "
+                "schema_version, dataset_repo_id, dataset_length, and indices."
+            )
+        payload = {"indices": payload}
+    if not isinstance(payload, dict):
+        raise TypeError("Fixed-anchor manifest must be a JSON object or index list.")
+
+    schema_version = payload.get("schema_version")
+    if strict and schema_version != FIXED_ANCHOR_SCHEMA_VERSION:
+        raise ValueError(
+            "Fixed-anchor manifest schema mismatch: expected "
+            f"{FIXED_ANCHOR_SCHEMA_VERSION}, got {schema_version!r}."
+        )
+    manifest_repo_id = payload.get("dataset_repo_id")
+    if strict and str(manifest_repo_id) != str(dataset_repo_id):
+        raise ValueError(
+            "Fixed-anchor dataset mismatch: manifest has "
+            f"{manifest_repo_id!r}, evaluator has {dataset_repo_id!r}."
+        )
+    manifest_length = payload.get("dataset_length")
+    if strict and manifest_length != int(dataset_length):
+        raise ValueError(
+            "Fixed-anchor dataset length mismatch: manifest has "
+            f"{manifest_length!r}, evaluator has {dataset_length}."
+        )
+
+    raw_loss_contract = payload.get("loss_contract")
+    required_loss_contract_keys = (
+        "pointseg_aux_loss_weight",
+        "worldflow_loss_weight",
+        "worldflow_geo_loss_weight",
+        "worldflow_bridge_loss_weight",
+        "worldflow_equiv_loss_weight",
+    )
+    if strict and not isinstance(raw_loss_contract, dict):
+        raise ValueError("Strict fixed-anchor manifest requires a 'loss_contract' object.")
+    raw_loss_contract = dict(raw_loss_contract or {})
+    missing_loss_contract = [
+        key for key in required_loss_contract_keys if key not in raw_loss_contract
+    ]
+    if strict and missing_loss_contract:
+        raise ValueError(
+            "Fixed-anchor manifest loss_contract is missing: "
+            f"{missing_loss_contract}."
+        )
+    loss_contract: dict[str, float] = {}
+    for key in required_loss_contract_keys:
+        if key not in raw_loss_contract:
+            continue
+        value = float(raw_loss_contract[key])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"Fixed-anchor loss_contract {key} must be finite and non-negative, got {value}."
+            )
+        loss_contract[key] = value
+
+    raw_indices = payload.get("indices")
+    if not isinstance(raw_indices, list) or not raw_indices:
+        raise ValueError("Fixed-anchor manifest requires a non-empty 'indices' list.")
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in raw_indices):
+        raise TypeError("Every fixed-anchor index must be an integer (booleans are invalid).")
+    indices = [int(index) for index in raw_indices]
+    if len(indices) != len(set(indices)):
+        raise ValueError("Fixed-anchor indices must be unique.")
+    out_of_range = [index for index in indices if index < 0 or index >= int(dataset_length)]
+    if out_of_range:
+        raise IndexError(
+            f"Fixed-anchor indices are outside [0, {dataset_length}): {out_of_range[:10]}"
+        )
+
+    canonical = {
+        "schema_version": FIXED_ANCHOR_SCHEMA_VERSION,
+        "dataset_repo_id": str(dataset_repo_id),
+        "dataset_length": int(dataset_length),
+        "indices": indices,
+        "loss_contract": loss_contract,
+    }
+    canonical_json = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return {
+        **canonical,
+        "path": str(path),
+        "sha256": hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+        "count": len(indices),
+    }
+
+
+def _hash_tensor_into(hasher: Any, key: str, tensor: torch.Tensor) -> None:
+    detached = tensor.detach().contiguous()
+    hasher.update(key.encode("utf-8"))
+    hasher.update(str(detached.dtype).encode("ascii"))
+    hasher.update(json.dumps(list(detached.shape), separators=(",", ":")).encode("ascii"))
+    # Viewing bytes before copying also supports bfloat16, which NumPy cannot
+    # convert directly on all supported versions.
+    byte_view = detached.reshape(-1).view(torch.uint8).cpu().numpy()
+    hasher.update(memoryview(byte_view))
+
+
+def _hash_nested_value_into(hasher: Any, key: str, value: Any) -> None:
+    if torch.is_tensor(value):
+        _hash_tensor_into(hasher, key, value)
+        return
+    if isinstance(value, dict):
+        for child_key in sorted(value):
+            _hash_nested_value_into(hasher, f"{key}.{child_key}", value[child_key])
+        return
+    if isinstance(value, list | tuple):
+        for index, child in enumerate(value):
+            _hash_nested_value_into(hasher, f"{key}[{index}]", child)
+        return
+    hasher.update(key.encode("utf-8"))
+    hasher.update(json.dumps(value, sort_keys=True, default=str).encode("utf-8"))
+
+
+def _update_batch_fingerprint(hasher: Any, batch_index: int, batch: dict[str, Any]) -> None:
+    hasher.update(f"batch:{int(batch_index)}".encode("ascii"))
+    _hash_nested_value_into(hasher, "batch", batch)
+
+
+def _tensor_state_fingerprints(module: torch.nn.Module, *, buffers: bool) -> dict[str, str]:
+    named_tensors = module.named_buffers() if buffers else module.named_parameters()
+    fingerprints: dict[str, str] = {}
+    for name, tensor in named_tensors:
+        hasher = hashlib.sha256()
+        _hash_tensor_into(hasher, name, tensor)
+        fingerprints[name] = hasher.hexdigest()
+    return fingerprints
+
+
+def _changed_tensor_fingerprints(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> list[str]:
+    names = sorted(set(before) | set(after))
+    return [name for name in names if before.get(name) != after.get(name)]
+
+
+def _preprocessor_assets_fingerprint(path_value: str | Path) -> dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_dir():
+        raise NotADirectoryError(f"Fixed-anchor preprocessor path is not a directory: {path}")
+    files = sorted(path.glob("policy_preprocessor*"))
+    if not files:
+        raise FileNotFoundError(f"No policy_preprocessor assets found in {path}")
+    aggregate = hashlib.sha256()
+    entries: dict[str, str] = {}
+    for file in files:
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+        entries[file.name] = digest
+        aggregate.update(file.name.encode("utf-8"))
+        aggregate.update(digest.encode("ascii"))
+    return {
+        "path": str(path),
+        "sha256": aggregate.hexdigest(),
+        "files": entries,
+    }
+
+
+def _anchor_total_from_metrics(
+    metrics: dict[str, Any],
+    *,
+    pointseg_weight: float,
+) -> tuple[float, float]:
+    missing = [key for key in FIXED_ANCHOR_REQUIRED_METRICS if _to_scalar(metrics.get(key)) is None]
+    if missing:
+        raise ValueError(f"Fixed-anchor forward is missing required loss metrics: {missing}")
+    action = float(_to_scalar(metrics["loss_action"]))
+    worldflow = float(_to_scalar(metrics["loss_worldflow_flow"]))
+    pointseg = float(_to_scalar(metrics["loss_pointseg_aux"]))
+    total = action + worldflow + float(pointseg_weight) * pointseg
+    native = _to_scalar(metrics.get("loss"))
+    gap = abs(float(native) - total) if native is not None else math.nan
+    return total, gap
+
+
+def _validate_fixed_anchor_loss_contract(
+    policy_config: Any,
+    expected: dict[str, float],
+    *,
+    cli_expected_pointseg_weight: float | None = None,
+) -> dict[str, float]:
+    expected = {name: float(value) for name, value in expected.items()}
+    if cli_expected_pointseg_weight is not None:
+        cli_weight = float(cli_expected_pointseg_weight)
+        manifest_weight = expected.get("pointseg_aux_loss_weight")
+        if manifest_weight is None or not math.isclose(
+            cli_weight,
+            manifest_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "CLI fixed_anchor_expected_pointseg_weight disagrees with manifest: "
+                f"cli={cli_weight}, manifest={manifest_weight}."
+            )
+    actual = {name: float(getattr(policy_config, name)) for name in expected}
+    drift = {
+        name: (expected[name], actual[name])
+        for name in expected
+        if not math.isclose(actual[name], expected[name], rel_tol=0.0, abs_tol=1e-12)
+    }
+    if drift:
+        details = ", ".join(
+            f"{name}: expected={wanted}, actual={got}"
+            for name, (wanted, got) in drift.items()
+        )
+        raise ValueError(f"Fixed-anchor loss contract drifted ({details}).")
+    return actual
 
 
 def _resolve_libero_dataset_domain_selection(
@@ -260,9 +610,19 @@ def _make_eval_dataset(
     return dataset
 
 
-def _make_eval_preprocessor(cfg: TrainPipelineConfig, policy, dataset, device: torch.device):
+def _make_eval_preprocessor(
+    cfg: TrainPipelineConfig,
+    policy,
+    dataset,
+    device: torch.device,
+    *,
+    pretrained_path: str | Path | None = None,
+):
     processor_kwargs: dict[str, Any] = {}
-    if cfg.policy.pretrained_path is not None:
+    resolved_pretrained_path = (
+        pretrained_path if pretrained_path is not None else cfg.policy.pretrained_path
+    )
+    if resolved_pretrained_path is not None:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
@@ -276,15 +636,25 @@ def _make_eval_preprocessor(cfg: TrainPipelineConfig, policy, dataset, device: t
 
     preprocessor, _postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
+        pretrained_path=resolved_pretrained_path,
         **processor_kwargs,
     )
     return preprocessor
 
 
-def _make_eval_dataloader(cfg: SongEvalPipelineConfig, dataset, device: torch.device):
+def _make_eval_dataloader(
+    cfg: SongEvalPipelineConfig,
+    dataset,
+    device: torch.device,
+    *,
+    fixed_anchor: bool = False,
+):
     dataset_domain_action_mse = bool(cfg.libero_dataset_domain_action_mse)
-    if hasattr(cfg.policy, "drop_n_last_frames") and not dataset_domain_action_mse:
+    if (
+        hasattr(cfg.policy, "drop_n_last_frames")
+        and not dataset_domain_action_mse
+        and not fixed_anchor
+    ):
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
@@ -304,17 +674,33 @@ def _make_eval_dataloader(cfg: SongEvalPipelineConfig, dataset, device: torch.de
             )
         dataloader_num_workers = 0
 
+    generator = None
+    worker_init_fn = None
+    if fixed_anchor:
+        generator = torch.Generator()
+        generator.manual_seed(
+            _fixed_anchor_phase_seed(int(cfg.fixed_anchor_seed), "dataloader")
+        )
+        worker_init_fn = _seed_fixed_anchor_worker
+
     return torch.utils.data.DataLoader(
         dataset,
         num_workers=dataloader_num_workers,
         batch_size=cfg.batch_size,
-        shuffle=sampler is None and not cfg.dataset.streaming and not dataset_domain_action_mse,
+        shuffle=(
+            sampler is None
+            and not cfg.dataset.streaming
+            and not dataset_domain_action_mse
+            and not fixed_anchor
+        ),
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if dataloader_num_workers > 0 else None,
         persistent_workers=dataloader_num_workers > 0,
         collate_fn=collate_fn,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
 
 
@@ -538,6 +924,28 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
 
     init_logging(accelerator=accelerator)
     is_main_process = accelerator.is_main_process
+    fixed_anchor_enabled = cfg.fixed_anchor_indices_path is not None
+    if fixed_anchor_enabled and cfg.libero_dataset_domain_action_mse:
+        raise ValueError(
+            "fixed_anchor_indices_path and libero_dataset_domain_action_mse cannot be combined; "
+            "anchor indices are defined in the complete wrapped training dataset."
+        )
+    if fixed_anchor_enabled and cfg.dataset.streaming:
+        raise ValueError("Fixed-anchor evaluation requires a finite non-streaming dataset.")
+    if fixed_anchor_enabled and cfg.dataset.episodes is not None:
+        raise ValueError(
+            "Fixed-anchor indices are global dataset indices; dataset.episodes must remain unset."
+        )
+    if fixed_anchor_enabled and cfg.fixed_anchor_strict and accelerator.num_processes != 1:
+        raise ValueError(
+            "Strict fixed-anchor evaluation requires one process. Run four checkpoints on four "
+            "separate GPUs instead; this avoids distributed tail duplication and makes hashes exact."
+        )
+    if fixed_anchor_enabled and cfg.fixed_anchor_strict and cfg.fixed_anchor_preprocessor_path is None:
+        raise ValueError(
+            "Strict fixed-anchor evaluation requires fixed_anchor_preprocessor_path so every "
+            "checkpoint uses exactly the same normalization/tokenization assets."
+        )
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
 
@@ -545,7 +953,7 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
         set_seed(cfg.seed, accelerator=accelerator)
 
     device = accelerator.device
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = not fixed_anchor_enabled
     torch.backends.cuda.matmul.allow_tf32 = True
     dataset_domain_selection = _resolve_libero_dataset_domain_selection(cfg)
 
@@ -564,14 +972,60 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     if not is_main_process:
         dataset = _make_eval_dataset(cfg, dataset_domain_selection)
 
+    fixed_anchor_manifest = None
+    if fixed_anchor_enabled:
+        fixed_anchor_manifest = _load_fixed_anchor_manifest(
+            cfg.fixed_anchor_indices_path,
+            dataset_repo_id=str(cfg.dataset.repo_id),
+            dataset_length=len(dataset),
+            strict=bool(cfg.fixed_anchor_strict),
+        )
+        dataset = EvalFrameSubset(dataset, fixed_anchor_manifest["indices"])
+        if is_main_process:
+            logging.info(
+                "Fixed anchor loaded: samples=%s sha256=%s path=%s",
+                fixed_anchor_manifest["count"],
+                fixed_anchor_manifest["sha256"],
+                fixed_anchor_manifest["path"],
+            )
+
     if is_main_process:
         logging.info("Loading evaluation policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta, rename_map=cfg.rename_map)
     if is_main_process and hasattr(policy.config, "flow_contract_summary"):
         logging.info("Resolved flow contract: %s", policy.config.flow_contract_summary())
+    fixed_anchor_loss_contract = None
+    if fixed_anchor_enabled:
+        fixed_anchor_loss_contract = _validate_fixed_anchor_loss_contract(
+            policy.config,
+            fixed_anchor_manifest["loss_contract"],
+            cli_expected_pointseg_weight=cfg.fixed_anchor_expected_pointseg_weight,
+        )
     ensure_ddp_parameters_initialized(policy, accelerator)
-    preprocessor = _make_eval_preprocessor(cfg, policy, dataset, device)
-    dataloader = _make_eval_dataloader(cfg, dataset, device)
+    preprocessor_source = (
+        cfg.fixed_anchor_preprocessor_path
+        if fixed_anchor_enabled and cfg.fixed_anchor_preprocessor_path is not None
+        else cfg.policy.pretrained_path
+    )
+    preprocessor_assets = (
+        _preprocessor_assets_fingerprint(preprocessor_source)
+        if fixed_anchor_enabled
+        else None
+    )
+    preprocessor = _make_eval_preprocessor(
+        cfg,
+        policy,
+        dataset,
+        device,
+        pretrained_path=preprocessor_source,
+    )
+    dataloader = _make_eval_dataloader(
+        cfg,
+        dataset,
+        device,
+        fixed_anchor=fixed_anchor_enabled,
+    )
+    effective_num_workers = int(dataloader.num_workers)
 
     policy, dataloader = accelerator.prepare(policy, dataloader)
     policy.eval()
@@ -579,8 +1033,15 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     parameter_versions_before = {
         name: int(parameter._version) for name, parameter in raw_policy.named_parameters()
     }
+    buffer_fingerprints_before = _tensor_state_fingerprints(raw_policy, buffers=True)
+    training_modules = [name for name, module in raw_policy.named_modules() if module.training]
+    if training_modules:
+        raise RuntimeError(
+            "Evaluation policy contains modules left in training mode: "
+            + ", ".join(training_modules[:10])
+        )
     available_batches = len(dataloader)
-    max_batches = min(int(cfg.steps), available_batches)
+    max_batches = available_batches if fixed_anchor_enabled else min(int(cfg.steps), available_batches)
     if max_batches <= 0:
         raise ValueError(
             f"No evaluation batches requested: steps={cfg.steps}, available={available_batches}."
@@ -597,12 +1058,22 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             cfg.batch_size,
             accelerator.num_processes,
         )
+        if fixed_anchor_enabled:
+            logging.info(
+                "Strict fixed anchor: seed=%s deterministic_algorithms=%s preprocessor_sha256=%s",
+                cfg.fixed_anchor_seed,
+                bool(cfg.fixed_anchor_deterministic_algorithms),
+                preprocessor_assets["sha256"],
+            )
     accelerator.wait_for_everyone()
 
     wandb_logger = WandBLogger(cfg) if cfg.wandb.enable and cfg.wandb.project and is_main_process else None
 
     running_sums = dict.fromkeys(EVAL_METRIC_KEYS, 0.0)
     running_counts = dict.fromkeys(EVAL_METRIC_KEYS, 0.0)
+    raw_input_hasher = hashlib.sha256()
+    preprocessed_input_hasher = hashlib.sha256()
+    observed_anchor_indices: list[int] = []
 
     progress = None
     if is_main_process:
@@ -615,72 +1086,160 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             leave=True,
         )
 
-    for eval_step, raw_batch in enumerate(dataloader, start=1):
-        if eval_step > max_batches:
-            break
+    iterator_seed = _fixed_anchor_phase_seed(
+        int(cfg.fixed_anchor_seed), "dataloader", process_index=accelerator.process_index
+    )
+    with (_fixed_anchor_rng(iterator_seed) if fixed_anchor_enabled else nullcontext()):
+        data_iterator = iter(dataloader)
 
-        batch = preprocessor(raw_batch)
-        local_batch_size = int(batch[ACTION].shape[0])
+    with _fixed_anchor_deterministic_algorithms(
+        fixed_anchor_enabled and bool(cfg.fixed_anchor_deterministic_algorithms)
+    ):
+        for eval_step in range(1, max_batches + 1):
+            fetch_seed = _fixed_anchor_phase_seed(
+                int(cfg.fixed_anchor_seed),
+                "fetch",
+                eval_step,
+                accelerator.process_index,
+            )
+            if fixed_anchor_enabled:
+                with _fixed_anchor_rng(fetch_seed):
+                    raw_batch = next(data_iterator)
+            else:
+                raw_batch = next(data_iterator)
 
-        # Make the flow-matching noise/time sampling reproducible for a given
-        # evaluation step while preserving the model's native sampling logic.
-        eval_seed = int(cfg.seed or 0) + eval_step
-        torch.manual_seed(eval_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(eval_seed)
+            if fixed_anchor_enabled:
+                raw_indices = raw_batch.get("index")
+                if not torch.is_tensor(raw_indices):
+                    raise KeyError("Fixed-anchor raw batch is missing tensor key 'index'.")
+                observed_anchor_indices.extend(int(index) for index in raw_indices.reshape(-1).tolist())
+                if cfg.fixed_anchor_hash_inputs:
+                    _update_batch_fingerprint(raw_input_hasher, eval_step, raw_batch)
 
-        with torch.inference_mode(), accelerator.autocast():
-            loss, output_dict = policy(batch)
+            preprocess_seed = _fixed_anchor_phase_seed(
+                int(cfg.fixed_anchor_seed),
+                "preprocess",
+                eval_step,
+                accelerator.process_index,
+            )
+            if fixed_anchor_enabled:
+                with _fixed_anchor_rng(preprocess_seed):
+                    batch = preprocessor(raw_batch)
+            else:
+                batch = preprocessor(raw_batch)
+            local_batch_size = int(batch[ACTION].shape[0])
+            if fixed_anchor_enabled and cfg.fixed_anchor_hash_inputs:
+                _update_batch_fingerprint(preprocessed_input_hasher, eval_step, batch)
 
-        local_metrics = dict(output_dict or {})
-        local_metrics["loss"] = loss.detach()
-        if cfg.sample_action_mse:
-            # Use a separate deterministic seed so this diagnostic neither
-            # depends on nor perturbs the native loss sampling above.
-            sample_seed = int(cfg.seed or 0) + 1_000_000 + eval_step
-            torch.manual_seed(sample_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(sample_seed)
-            with torch.inference_mode(), accelerator.autocast():
-                local_metrics.update(
-                    _sampled_action_metrics(
-                        accelerator.unwrap_model(policy),
-                        batch,
-                        noise_mode=cfg.sample_action_noise_mode,
-                    )
-                )
-        if cfg.flow_time_sweep:
-            sweep_seed = int(cfg.seed or 0) + 2_000_000 + eval_step
-            with torch.inference_mode(), accelerator.autocast():
-                local_metrics.update(
-                    _flow_time_sweep_metrics(
-                        policy,
-                        batch,
-                        seed=sweep_seed,
-                    )
-                )
-        batch_sums, batch_counts = _gather_metric_sums(
-            accelerator,
-            local_metrics,
-            local_batch_size,
-        )
-        for key in EVAL_METRIC_KEYS:
-            running_sums[key] += batch_sums[key]
-            running_counts[key] += batch_counts[key]
-
-        batch_metrics = {
-            key: batch_sums[key] / batch_counts[key] for key in EVAL_METRIC_KEYS if batch_counts[key] > 0
-        }
-
-        if is_main_process and progress is not None:
-            progress.update(1)
-        if is_main_process and cfg.log_freq > 0 and eval_step % cfg.log_freq == 0:
-            logging.info("eval_step:%s %s", eval_step, _format_metrics(batch_metrics))
-            if wandb_logger is not None:
-                wandb_logger.log_dict(
-                    {f"eval/{key}": value for key, value in batch_metrics.items()},
+            # Make flow time/noise, point sampling, and every other native RNG
+            # draw reproducible without replacing the model's training prior.
+            eval_seed = (
+                _fixed_anchor_phase_seed(
+                    int(cfg.fixed_anchor_seed),
+                    "forward",
                     eval_step,
+                    accelerator.process_index,
                 )
+                if fixed_anchor_enabled
+                else int(cfg.seed or 0) + eval_step
+            )
+            if not fixed_anchor_enabled:
+                torch.manual_seed(eval_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(eval_seed)
+            forward_rng = (
+                _fixed_anchor_rng(eval_seed) if fixed_anchor_enabled else nullcontext()
+            )
+            with forward_rng, torch.inference_mode(), accelerator.autocast():
+                loss, output_dict = policy(batch)
+
+            local_metrics = dict(output_dict or {})
+            local_metrics["loss"] = loss.detach()
+            if fixed_anchor_enabled:
+                anchor_total, anchor_gap = _anchor_total_from_metrics(
+                    local_metrics,
+                    pointseg_weight=fixed_anchor_loss_contract["pointseg_aux_loss_weight"],
+                )
+                local_metrics["loss_anchor_total"] = anchor_total
+                local_metrics["loss_anchor_total_gap"] = anchor_gap
+                if cfg.fixed_anchor_strict and anchor_gap > 1e-7:
+                    raise RuntimeError(
+                        "Native loss disagrees with fixed anchor formula "
+                        "action + worldflow + configured_weight * pointseg: "
+                        f"gap={anchor_gap:.9g} at batch {eval_step}."
+                    )
+            if cfg.sample_action_mse:
+                sample_seed = (
+                    _fixed_anchor_phase_seed(
+                        int(cfg.fixed_anchor_seed),
+                        "sample",
+                        eval_step,
+                        accelerator.process_index,
+                    )
+                    if fixed_anchor_enabled
+                    else int(cfg.seed or 0) + 1_000_000 + eval_step
+                )
+                if not fixed_anchor_enabled:
+                    torch.manual_seed(sample_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(sample_seed)
+                sample_rng = (
+                    _fixed_anchor_rng(sample_seed) if fixed_anchor_enabled else nullcontext()
+                )
+                with sample_rng, torch.inference_mode(), accelerator.autocast():
+                    local_metrics.update(
+                        _sampled_action_metrics(
+                            accelerator.unwrap_model(policy),
+                            batch,
+                            noise_mode=cfg.sample_action_noise_mode,
+                        )
+                    )
+            if cfg.flow_time_sweep:
+                sweep_seed = (
+                    _fixed_anchor_phase_seed(
+                        int(cfg.fixed_anchor_seed),
+                        "sweep",
+                        eval_step,
+                        accelerator.process_index,
+                    )
+                    if fixed_anchor_enabled
+                    else int(cfg.seed or 0) + 2_000_000 + eval_step
+                )
+                sweep_rng = (
+                    _fixed_anchor_rng(sweep_seed) if fixed_anchor_enabled else nullcontext()
+                )
+                with sweep_rng, torch.inference_mode(), accelerator.autocast():
+                    local_metrics.update(
+                        _flow_time_sweep_metrics(
+                            policy,
+                            batch,
+                            seed=sweep_seed,
+                        )
+                    )
+            batch_sums, batch_counts = _gather_metric_sums(
+                accelerator,
+                local_metrics,
+                local_batch_size,
+            )
+            for key in EVAL_METRIC_KEYS:
+                running_sums[key] += batch_sums[key]
+                running_counts[key] += batch_counts[key]
+
+            batch_metrics = {
+                key: batch_sums[key] / batch_counts[key]
+                for key in EVAL_METRIC_KEYS
+                if batch_counts[key] > 0
+            }
+
+            if is_main_process and progress is not None:
+                progress.update(1)
+            if is_main_process and cfg.log_freq > 0 and eval_step % cfg.log_freq == 0:
+                logging.info("eval_step:%s %s", eval_step, _format_metrics(batch_metrics))
+                if wandb_logger is not None:
+                    wandb_logger.log_dict(
+                        {f"eval/{key}": value for key, value in batch_metrics.items()},
+                        eval_step,
+                    )
 
     if progress is not None:
         progress.close()
@@ -688,6 +1247,67 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     summary_metrics = {
         key: running_sums[key] / running_counts[key] for key in EVAL_METRIC_KEYS if running_counts[key] > 0
     }
+    fixed_anchor_report = None
+    if fixed_anchor_enabled:
+        expected_indices = fixed_anchor_manifest["indices"]
+        if observed_anchor_indices != expected_indices:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (observed, expected) in enumerate(
+                        zip(observed_anchor_indices, expected_indices, strict=False)
+                    )
+                    if observed != expected
+                ),
+                min(len(observed_anchor_indices), len(expected_indices)),
+            )
+            raise RuntimeError(
+                "Fixed-anchor DataLoader changed index order/content: "
+                f"first mismatch={mismatch_index}, observed_count={len(observed_anchor_indices)}, "
+                f"expected_count={len(expected_indices)}."
+            )
+        raw_sha256 = raw_input_hasher.hexdigest() if cfg.fixed_anchor_hash_inputs else None
+        preprocessed_sha256 = (
+            preprocessed_input_hasher.hexdigest() if cfg.fixed_anchor_hash_inputs else None
+        )
+        comparison_contract = {
+            "schema_version": FIXED_ANCHOR_SCHEMA_VERSION,
+            "manifest_sha256": fixed_anchor_manifest["sha256"],
+            "fixed_anchor_seed": int(cfg.fixed_anchor_seed),
+            "batch_size": int(cfg.batch_size),
+            "num_processes": int(accelerator.num_processes),
+            "num_workers": effective_num_workers,
+            "preprocessor_sha256": preprocessor_assets["sha256"],
+            "raw_input_sha256": raw_sha256,
+            "preprocessed_input_sha256": preprocessed_sha256,
+            "pointseg_sample_cache_dir": str(cfg.pointseg_sample_cache_dir),
+            "deterministic_algorithms": bool(cfg.fixed_anchor_deterministic_algorithms),
+            "loss_formula": (
+                "loss_action + loss_worldflow_flow + "
+                f"{fixed_anchor_loss_contract['pointseg_aux_loss_weight']:.17g} * "
+                "loss_pointseg_aux"
+            ),
+        }
+        contract_json = json.dumps(
+            comparison_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        fixed_anchor_report = {
+            "enabled": True,
+            "strict": bool(cfg.fixed_anchor_strict),
+            "manifest": fixed_anchor_manifest,
+            "rng_phases": dict(_FIXED_ANCHOR_PHASE_IDS),
+            "preprocessor_assets": preprocessor_assets,
+            "loss_contract": fixed_anchor_loss_contract,
+            "raw_input_sha256": raw_sha256,
+            "preprocessed_input_sha256": preprocessed_sha256,
+            "comparison_contract": comparison_contract,
+            "comparison_contract_sha256": hashlib.sha256(
+                contract_json.encode("utf-8")
+            ).hexdigest(),
+        }
     evaluated_samples = int(running_counts.get("loss_action", 0.0))
     dataset_domain_report = None
     if dataset_domain_selection is not None:
@@ -706,12 +1326,18 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
         "num_processes": int(accelerator.num_processes),
         "seed": cfg.seed,
         "metrics": summary_metrics,
+        "fixed_anchor": fixed_anchor_report,
         "dataset_domain_selection": dataset_domain_report,
         "metric_semantics": {
             "loss_action": (
                 "The checkpoint's native flow-matching action velocity MSE, "
                 "computed by policy(batch) with the same preprocessing, action chunks, "
                 "padding masks, and PointSeg cache path as training."
+            ),
+            "loss_anchor_total": (
+                "Checkpoint-comparison objective reconstructed exactly as loss_action + "
+                "loss_worldflow_flow + the manifest/config-verified pointseg weight * "
+                "loss_pointseg_aux."
             ),
             "sample_action_mse": (
                 "Optional MSE between the fully denoised action chunk returned by "
@@ -742,8 +1368,20 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             "Evaluation unexpectedly modified model parameters in place: "
             + ", ".join(parameters_modified[:10])
         )
+    buffer_fingerprints_after = _tensor_state_fingerprints(raw_policy, buffers=True)
+    buffers_modified = _changed_tensor_fingerprints(
+        buffer_fingerprints_before,
+        buffer_fingerprints_after,
+    )
+    if buffers_modified:
+        raise RuntimeError(
+            "Evaluation unexpectedly modified model buffers (including possible BatchNorm stats): "
+            + ", ".join(buffers_modified[:10])
+        )
     summary["gradients_created"] = False
     summary["model_parameters_unchanged"] = True
+    summary["model_buffers_unchanged"] = True
+    summary["all_modules_eval_mode"] = True
 
     if is_main_process:
         logging.info("Evaluation summary: %s", _format_metrics(summary_metrics))
