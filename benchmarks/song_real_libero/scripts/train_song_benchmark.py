@@ -2845,6 +2845,9 @@ def update_policy(
         if record_loss:
             train_metrics.loss = loss.item()
         train_metrics.lr = optimizer.param_groups[0]["lr"]
+        for group_index, parameter_group in enumerate(optimizer.param_groups):
+            group_name = parameter_group.get("group_name", f"group_{group_index}")
+            output_dict[f"lr_{group_name}"] = float(parameter_group["lr"])
         train_metrics.update_s = time.perf_counter() - start_time
         return train_metrics, output_dict
 
@@ -2894,6 +2897,9 @@ def update_policy(
         train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
+    for group_index, parameter_group in enumerate(optimizer.param_groups):
+        group_name = parameter_group.get("group_name", f"group_{group_index}")
+        output_dict[f"lr_{group_name}"] = float(parameter_group["lr"])
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 

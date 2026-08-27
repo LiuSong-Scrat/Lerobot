@@ -434,3 +434,33 @@ def test_policy_optimizer_keeps_v3_trainables_and_uses_lower_lora_lr() -> None:
     assert {id(parameter) for parameter in groups[0]["params"]} == {
         id(parameter) for parameter in policy.model.vlm_with_expert.lm_expert.parameters()
     }
+
+
+def test_policy_optimizer_can_raise_only_action_expert_lr() -> None:
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        vla_adapter_enable=False,
+        vlm_backend="molmo2_full",
+        molmo_lora_enable=False,
+        action_expert_lr_multiplier=10.0,
+        optimizer_lr=3e-7,
+    )
+    policy.model = nn.Module()
+    policy.model.vlm_with_expert = nn.Module()
+    policy.model.vlm_with_expert.lm_expert = nn.Linear(4, 4)
+    policy.model.action_out_proj = nn.Linear(4, 2)
+
+    groups = policy.get_optim_params()
+
+    assert [group["group_name"] for group in groups] == [
+        "v3_nonexpert_trainable",
+        "action_expert",
+    ]
+    assert [group["lr"] for group in groups] == [3e-7, 3e-6]
+    assert {id(parameter) for parameter in groups[1]["params"]} == {
+        id(parameter) for parameter in policy.model.vlm_with_expert.lm_expert.parameters()
+    }
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter) for parameter in policy.model.action_out_proj.parameters()
+    }

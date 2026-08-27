@@ -547,6 +547,10 @@ class SmolVLAConfig(PreTrainedConfig):
     molmo_lora_alpha: float = 8.0
     molmo_lora_dropout: float = 0.0
     molmo_lora_lr_multiplier: float = 0.1
+    # Discriminative optimization for the large, freshly initialized Action
+    # Expert.  The multiplier changes only the optimizer group LR; it does not
+    # alter modules, token interaction, checkpoint tensors, or inference.
+    action_expert_lr_multiplier: float = 1.0
     # Optional raw SmolVLM directory/repository or SmolVLA policy checkpoint
     # used only as the source of the VLM weights. `vlm_model_name` remains the
     # source of the architecture and processor when a policy checkpoint is used.
@@ -761,6 +765,15 @@ class SmolVLAConfig(PreTrainedConfig):
             self.molmo_lora_lr_multiplier
         ) <= 0:
             raise ValueError("molmo_lora_lr_multiplier must be finite and positive.")
+        if not math.isfinite(float(self.action_expert_lr_multiplier)) or float(
+            self.action_expert_lr_multiplier
+        ) <= 0:
+            raise ValueError("action_expert_lr_multiplier must be finite and positive.")
+        if self.action_expert_lr_multiplier != 1.0 and self.vlm_backend != "molmo2_full":
+            raise ValueError(
+                "action_expert_lr_multiplier is currently supported only by "
+                "vlm_backend='molmo2_full'."
+            )
         if self.vlm_backend == "molmo2_text":
             if len(self.selected_camera_views) != 1:
                 raise ValueError(

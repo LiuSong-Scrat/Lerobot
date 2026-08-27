@@ -111,6 +111,18 @@ def test_full_config_locks_v043_multiview_doubleflow_contract() -> None:
     assert config.worldflow_target_type == "world_eef_trajectory"
     assert config.worldflow_world_eef_velocity_mode == "base_pose9_euclidean"
     assert config.pose9_action_noise_enable is False
+    assert config.action_expert_lr_multiplier == 1.0
+
+
+def test_full_config_allows_action_expert_lr_multiplier() -> None:
+    config = _full_worldflow_config(action_expert_lr_multiplier=10.0)
+    assert config.action_expert_lr_multiplier == 10.0
+
+
+@pytest.mark.parametrize("invalid_multiplier", [0.0, -1.0, float("inf"), float("nan")])
+def test_full_config_rejects_invalid_action_expert_lr_multiplier(invalid_multiplier) -> None:
+    with pytest.raises(ValueError, match="action_expert_lr_multiplier"):
+        _full_worldflow_config(action_expert_lr_multiplier=invalid_multiplier)
 
 
 def test_full_config_allows_pose9_action_noise_opt_in() -> None:

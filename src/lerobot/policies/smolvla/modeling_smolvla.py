@@ -1336,6 +1336,68 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 for name, parameter in self.named_parameters()
                 if parameter.requires_grad
             ]
+            action_expert_lr_multiplier = float(
+                getattr(self.config, "action_expert_lr_multiplier", 1.0)
+            )
+            if action_expert_lr_multiplier != 1.0:
+                expert_prefixes = (
+                    "model.vlm_with_expert.lm_expert.",
+                    "model.world_lm_expert.",
+                )
+                action_expert = [
+                    parameter
+                    for name, parameter in trainable
+                    if name.startswith(expert_prefixes)
+                ]
+                lora = [
+                    parameter
+                    for name, parameter in trainable
+                    if is_full_molmo2er_lora_policy_parameter_name(name)
+                ]
+                other = [
+                    parameter
+                    for name, parameter in trainable
+                    if not name.startswith(expert_prefixes)
+                    and not is_full_molmo2er_lora_policy_parameter_name(name)
+                ]
+                if not action_expert or not other:
+                    raise RuntimeError(
+                        "Action-Expert discriminative optimization requires non-empty "
+                        "Action Expert and non-Expert parameter groups."
+                    )
+                if bool(getattr(self.config, "molmo_lora_enable", False)) and not lora:
+                    raise RuntimeError(
+                        "V3-LoRA is enabled but no trainable Molmo LoRA parameters were found."
+                    )
+                grouped_ids = {
+                    id(parameter) for parameter in (*other, *action_expert, *lora)
+                }
+                if len(grouped_ids) != len(trainable):
+                    raise RuntimeError(
+                        "Action-Expert optimizer groups overlap or omit trainable parameters."
+                    )
+                base_lr = float(self.config.optimizer_lr)
+                groups = [
+                    {
+                        "params": other,
+                        "lr": base_lr,
+                        "group_name": "v3_nonexpert_trainable",
+                    },
+                    {
+                        "params": action_expert,
+                        "lr": base_lr * action_expert_lr_multiplier,
+                        "group_name": "action_expert",
+                    },
+                ]
+                if lora:
+                    groups.append(
+                        {
+                            "params": lora,
+                            "lr": base_lr * float(self.config.molmo_lora_lr_multiplier),
+                            "group_name": "molmo_v3_lora",
+                        }
+                    )
+                return groups
             if bool(getattr(self.config, "molmo_lora_enable", False)):
                 lora = [
                     parameter
