@@ -3486,11 +3486,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         with fixed_overfit_rng(cfg.diagnostic_fixed_batch_seed):
             fixed_overfit_batch = next(iter(dataloader))
         if is_main_process:
+            fixed_overfit_indices = fixed_overfit_batch.get("index")
+            if not torch.is_tensor(fixed_overfit_indices):
+                raise KeyError("Fixed-batch diagnostic requires the cached batch key 'index'.")
             fixed_overfit_contract = {
                 "version": 1,
                 "repeat_first_batch": True,
                 "batch_seed": int(cfg.diagnostic_fixed_batch_seed),
                 "forward_seed": int(cfg.diagnostic_fixed_forward_seed),
+                "repeat_forward_rng": bool(cfg.diagnostic_repeat_forward_rng),
+                "dataset_indices": [
+                    int(index) for index in fixed_overfit_indices.detach().cpu().reshape(-1).tolist()
+                ],
                 "batch_size": int(cfg.batch_size),
                 "gradient_accumulation_steps": int(cfg.gradient_accumulation_steps),
                 "num_processes": int(accelerator.num_processes),
@@ -3500,8 +3507,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 fixed_overfit_contract,
             )
             logging.warning(
-                "Fixed-batch capacity diagnostic is active: one cached batch and one RNG state "
-                "will be reused for every optimizer update. This run is not a generalization run."
+                "Fixed-batch capacity diagnostic is active: one cached batch will be reused for "
+                "every optimizer update; repeat_forward_rng=%s. This run is not a "
+                "generalization run.",
+                bool(cfg.diagnostic_repeat_forward_rng),
             )
         dl_iter = None
     else:
@@ -3586,7 +3595,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             start_time = time.perf_counter()
             overfit_rng = (
                 fixed_overfit_rng(cfg.diagnostic_fixed_forward_seed)
-                if cfg.diagnostic_repeat_first_batch
+                if cfg.diagnostic_repeat_first_batch and cfg.diagnostic_repeat_forward_rng
                 else nullcontext()
             )
             with overfit_rng:

@@ -94,6 +94,10 @@ class TrainPipelineConfig(HubMixin):
     diagnostic_repeat_first_batch: bool = False
     diagnostic_fixed_batch_seed: int = 20260827
     diagnostic_fixed_forward_seed: int = 20260828
+    # When false, keep the exact cached batch but let flow time/noise and point
+    # sampling advance exactly as in production training. The default retains
+    # the original single-target capacity diagnostic.
+    diagnostic_repeat_forward_rng: bool = True
     batch_size: int = 8
     # Match an equal-weight task benchmark by drawing the same number of valid
     # frames from each task per dataloader epoch. Disabled by default to retain

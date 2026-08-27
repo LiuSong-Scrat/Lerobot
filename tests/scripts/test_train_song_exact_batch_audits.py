@@ -52,6 +52,13 @@ def test_fixed_overfit_batch_clone_is_independent() -> None:
     assert clone["nested"][1][0] == "task"
 
 
+def test_repeat_forward_rng_defaults_to_original_fixed_target_mode() -> None:
+    from lerobot.configs.train import TrainPipelineConfig
+
+    field = TrainPipelineConfig.__dataclass_fields__["diagnostic_repeat_forward_rng"]
+    assert field.default is True
+
+
 def _exact_plan():
     plan = resolve_exact_global_batch_plan(
         global_batch_size=192,

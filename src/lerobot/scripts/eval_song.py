@@ -117,6 +117,9 @@ FLOW_TIME_SWEEP_METRICS = (
     "action_endpoint_trans_err",
     "action_endpoint_rot_err_deg",
     "action_endpoint_gripper_err",
+    "loss_worldflow_flow",
+    "worldflow_trans_err",
+    "worldflow_rot_err_deg",
 )
 EVAL_METRIC_KEYS = EVAL_METRIC_KEYS + tuple(
     f"flow_t{round(time_value * 1000):03d}_{metric_name}"
