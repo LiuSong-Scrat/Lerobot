@@ -88,6 +88,12 @@ class TrainPipelineConfig(HubMixin):
     seed: int | None = 1000
     # Number of workers for the dataloader.
     num_workers: int = 4
+    # Opt-in capacity diagnostic: cache the first complete batch and train on
+    # that exact batch with a restored RNG state before every forward pass.
+    # Defaults leave the production data and stochastic-flow paths unchanged.
+    diagnostic_repeat_first_batch: bool = False
+    diagnostic_fixed_batch_seed: int = 20260827
+    diagnostic_fixed_forward_seed: int = 20260828
     batch_size: int = 8
     # Optional exact number of samples contributing gradients to each optimizer
     # update across all distributed ranks. The training entrypoint validates
@@ -189,6 +195,15 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 f"gradient_accumulation_steps must be at least 1, got {self.gradient_accumulation_steps}."
             )
+        if self.diagnostic_repeat_first_batch:
+            for name in ("diagnostic_fixed_batch_seed", "diagnostic_fixed_forward_seed"):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
+            if int(self.gradient_accumulation_steps) != 1:
+                raise ValueError(
+                    "diagnostic_repeat_first_batch requires gradient_accumulation_steps=1."
+                )
         if self.global_batch_size is not None and (
             isinstance(self.global_batch_size, bool)
             or not isinstance(self.global_batch_size, int)

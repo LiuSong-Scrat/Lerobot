@@ -11,8 +11,10 @@ from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     aggregate_exact_global_batch_cuda_memory_records,
     audit_first_optimizer_step_trainable_gradients,
     build_exact_global_batch_cuda_memory_rank_record,
+    clone_fixed_overfit_batch,
     exact_global_batch_cuda_memory_audit_path,
     exact_global_batch_cuda_memory_rank_dir,
+    fixed_overfit_rng,
     hash_full_molmo2er_frozen_parameters,
     make_song_training_ddp_kwargs,
     optimizer_state_tensor_summary,
@@ -22,6 +24,32 @@ from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     write_exact_global_batch_cuda_memory_rank_record,
     write_full_molmo2er_frozen_parameter_hash_audit,
 )
+
+
+def test_fixed_overfit_rng_repeats_and_restores_cpu_rngs() -> None:
+    torch.manual_seed(7)
+    expected_torch_state = torch.random.get_rng_state().clone()
+    with fixed_overfit_rng(123):
+        first = torch.rand(4)
+    with fixed_overfit_rng(123):
+        second = torch.rand(4)
+    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        torch.random.get_rng_state(), expected_torch_state, rtol=0.0, atol=0.0
+    )
+
+
+def test_fixed_overfit_batch_clone_is_independent() -> None:
+    source = {
+        "tensor": torch.tensor([1.0, 2.0]),
+        "nested": [torch.tensor([3]), ("task", torch.tensor([4]))],
+    }
+    clone = clone_fixed_overfit_batch(source)
+    clone["tensor"].add_(10)
+    clone["nested"][0].add_(10)
+    assert source["tensor"].tolist() == [1.0, 2.0]
+    assert source["nested"][0].tolist() == [3]
+    assert clone["nested"][1][0] == "task"
 
 
 def _exact_plan():

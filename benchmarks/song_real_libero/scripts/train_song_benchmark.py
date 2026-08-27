@@ -18,11 +18,12 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 import sys
 import time
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from pprint import pformat
@@ -102,6 +103,43 @@ EXACT_GLOBAL_BATCH_MANIFEST_NAME = "exact_global_batch_manifest.json"
 FULL_MOLMO2ER_FIRST_STEP_GRADIENT_AUDIT_NAME = (
     "full_molmo2er_first_optimizer_step_gradient_audit.json"
 )
+
+
+@contextmanager
+def fixed_overfit_rng(seed: int):
+    """Seed then restore all RNGs used by the fixed-batch capacity diagnostic."""
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2**32))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def clone_fixed_overfit_batch(value: Any) -> Any:
+    """Clone a cached collated batch so preprocessing cannot mutate the source."""
+
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: clone_fixed_overfit_batch(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clone_fixed_overfit_batch(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clone_fixed_overfit_batch(item) for item in value)
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2897,6 +2935,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cpu=force_cpu,
         )
 
+    if cfg.diagnostic_repeat_first_batch and accelerator.num_processes != 1:
+        raise ValueError(
+            "diagnostic_repeat_first_batch is an exact single-process capacity test; "
+            f"got {accelerator.num_processes} processes. Run independent LR arms on separate GPUs."
+        )
+
     if getattr(cfg.policy, "vlm_backend", None) in {"molmo2_text", "molmo2_full"}:
         # safetensors treats the ambiguous string "cuda" as cuda:0 even when
         # Accelerate has selected another local rank.  A full policy warm-start
@@ -3334,6 +3378,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     collate_fn = make_song_train_collate_fn(dataset)
     dataloader_num_workers = int(cfg.num_workers)
+    if cfg.diagnostic_repeat_first_batch and dataloader_num_workers != 0:
+        if is_main_process:
+            logging.info(
+                "Fixed-batch capacity diagnostic sets DataLoader num_workers=0 so the cached "
+                "batch is selected synchronously under diagnostic_fixed_batch_seed."
+            )
+        dataloader_num_workers = 0
     if is_main_process and isinstance(collate_fn, OnlinePointSegBatchCollator):
         logging.info("Song pointseg online pseudo labels will be computed once per DataLoader batch.")
     if isinstance(collate_fn, OnlinePointSegBatchCollator) and collate_fn.device.type == "cuda" and dataloader_num_workers > 0:
@@ -3403,7 +3454,31 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "Full-Molmo2-ER DDP memory audit skipped for single-process execution; "
                 "gradient_as_bucket_view is only applicable to multi-process DDP."
             )
-    dl_iter = cycle(dataloader)
+    fixed_overfit_batch = None
+    if cfg.diagnostic_repeat_first_batch:
+        with fixed_overfit_rng(cfg.diagnostic_fixed_batch_seed):
+            fixed_overfit_batch = next(iter(dataloader))
+        if is_main_process:
+            fixed_overfit_contract = {
+                "version": 1,
+                "repeat_first_batch": True,
+                "batch_seed": int(cfg.diagnostic_fixed_batch_seed),
+                "forward_seed": int(cfg.diagnostic_fixed_forward_seed),
+                "batch_size": int(cfg.batch_size),
+                "gradient_accumulation_steps": int(cfg.gradient_accumulation_steps),
+                "num_processes": int(accelerator.num_processes),
+            }
+            _write_json_atomically(
+                Path(cfg.output_dir) / "fixed_batch_overfit_contract.json",
+                fixed_overfit_contract,
+            )
+            logging.warning(
+                "Fixed-batch capacity diagnostic is active: one cached batch and one RNG state "
+                "will be reused for every optimizer update. This run is not a generalization run."
+            )
+        dl_iter = None
+    else:
+        dl_iter = cycle(dataloader)
 
     policy.train()
     post_adam_cuda_memory_audit_done = True
@@ -3482,32 +3557,43 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 )
                 rank_contributes_gradient = rank_loss_scale > 0.0
             start_time = time.perf_counter()
-            batch = next(dl_iter)
-            batch = preprocessor(batch)
-            train_tracker.dataloading_s = time.perf_counter() - start_time
-            is_last_micro_step = micro_step + 1 == accumulation_steps
-            sync_context = nullcontext() if is_last_micro_step else accelerator.no_sync(policy)
-            with sync_context:
-                train_tracker, micro_output_dict = update_policy(
-                    train_tracker,
-                    policy,
-                    batch,
-                    optimizer,
-                    cfg.optimizer.grad_clip_norm,
-                    accelerator=accelerator,
-                    lr_scheduler=lr_scheduler,
-                    rabc_weights_provider=rabc_weights,
-                    loss_scale=rank_loss_scale,
-                    perform_optimizer_step=is_last_micro_step,
-                    require_per_sample_mean=exact_global_batch_plan is not None,
-                    audit_first_step_gradients=bool(
-                        full_molmo_audit and step == 0 and is_last_micro_step
-                    ),
-                    gradient_audit_output_dir=cfg.output_dir,
-                    # Exact mode records one globally reduced mean below,
-                    # rather than treating every micro-step as a full batch.
-                    record_loss=exact_global_batch_plan is None,
-                )
+            overfit_rng = (
+                fixed_overfit_rng(cfg.diagnostic_fixed_forward_seed)
+                if cfg.diagnostic_repeat_first_batch
+                else nullcontext()
+            )
+            with overfit_rng:
+                if fixed_overfit_batch is not None:
+                    batch = clone_fixed_overfit_batch(fixed_overfit_batch)
+                else:
+                    if dl_iter is None:
+                        raise RuntimeError("Training DataLoader iterator was not initialized.")
+                    batch = next(dl_iter)
+                batch = preprocessor(batch)
+                train_tracker.dataloading_s = time.perf_counter() - start_time
+                is_last_micro_step = micro_step + 1 == accumulation_steps
+                sync_context = nullcontext() if is_last_micro_step else accelerator.no_sync(policy)
+                with sync_context:
+                    train_tracker, micro_output_dict = update_policy(
+                        train_tracker,
+                        policy,
+                        batch,
+                        optimizer,
+                        cfg.optimizer.grad_clip_norm,
+                        accelerator=accelerator,
+                        lr_scheduler=lr_scheduler,
+                        rabc_weights_provider=rabc_weights,
+                        loss_scale=rank_loss_scale,
+                        perform_optimizer_step=is_last_micro_step,
+                        require_per_sample_mean=exact_global_batch_plan is not None,
+                        audit_first_step_gradients=bool(
+                            full_molmo_audit and step == 0 and is_last_micro_step
+                        ),
+                        gradient_audit_output_dir=cfg.output_dir,
+                        # Exact mode records one globally reduced mean below,
+                        # rather than treating every micro-step as a full batch.
+                        record_loss=exact_global_batch_plan is None,
+                    )
             if rank_contributes_gradient:
                 output_dict = micro_output_dict
                 if exact_global_batch_plan is not None:
