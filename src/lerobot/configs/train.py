@@ -95,6 +95,10 @@ class TrainPipelineConfig(HubMixin):
     diagnostic_fixed_batch_seed: int = 20260827
     diagnostic_fixed_forward_seed: int = 20260828
     batch_size: int = 8
+    # Match an equal-weight task benchmark by drawing the same number of valid
+    # frames from each task per dataloader epoch. Disabled by default to retain
+    # the historical global-uniform-over-frames training distribution.
+    task_balanced_sampling: bool = False
     # Optional exact number of samples contributing gradients to each optimizer
     # update across all distributed ranks. The training entrypoint validates
     # that this can be represented by its configured accumulation schedule.
