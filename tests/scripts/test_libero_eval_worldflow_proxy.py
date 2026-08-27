@@ -10,12 +10,59 @@ os.environ.setdefault("SONG_LIBERO_ENV_WORKER", "1")
 
 from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval import (  # noqa: E402
     ProcessInferenceProxy,
+    _build_episode_worker_jobs,
+    _configure_worker_egl_device,
+    _process_worker_environment,
     evaluation_protocol_for_config,
     inspect_policy_camera_alignment,
     policy_requires_rgb,
     reconcile_eval_camera_views_with_loaded_policy,
     validate_control_frequency,
 )
+
+
+def test_worker_egl_device_is_mapped_from_physical_cuda_ordinal(monkeypatch):
+    import benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval as eval_module
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "0")
+    monkeypatch.delenv("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", raising=False)
+    monkeypatch.setattr(eval_module, "_nvidia_egl_runtime_environment", lambda: {})
+    monkeypatch.setattr(
+        eval_module,
+        "_query_nvidia_egl_cuda_mapping",
+        lambda _environment: {0: 3, 1: 2},
+    )
+
+    environment = _process_worker_environment()
+
+    assert environment["MUJOCO_EGL_DEVICE_ID"] == "3"
+    assert environment["SONG_LIBERO_PHYSICAL_CUDA_ORDINAL"] == "0"
+    assert environment["CUDA_VISIBLE_DEVICES"] == ""
+
+
+def test_explicit_internal_worker_egl_override_wins(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", "7")
+    environment = {"CUDA_VISIBLE_DEVICES": "0"}
+
+    _configure_worker_egl_device(environment)
+
+    assert environment["MUJOCO_EGL_DEVICE_ID"] == "7"
+    assert environment["SONG_LIBERO_PHYSICAL_CUDA_ORDINAL"] == "0"
+
+
+def test_original_fifty_worker_sharding_is_not_capped():
+    jobs = _build_episode_worker_jobs(
+        [6],
+        episode_indices=list(range(50)),
+        episode_workers_per_task=50,
+    )
+
+    assert len(jobs) == 50
+    assert sorted(
+        episode for job in jobs for episode in job.episode_indices
+    ) == list(range(50))
 
 
 def test_process_proxy_preserves_molmo_rgb_and_worldflow_contracts():

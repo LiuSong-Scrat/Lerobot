@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "checkpoint_preload_gate_v23_20260816"
+EVAL_BUILD_TAG = "checkpoint_preload_gate_v23_cuda_egl_map_20260827"
 
 import argparse
 import atexit
@@ -8526,6 +8526,14 @@ def _build_episode_worker_jobs(
 
 
 def _process_worker_environment() -> dict[str, str]:
+    """Build the render-only worker environment.
+
+    ``CUDA_VISIBLE_DEVICES`` uses CUDA's physical ordinal while
+    ``MUJOCO_EGL_DEVICE_ID`` uses NVIDIA EGL's independent enumeration index.
+    On this host CUDA 0 is EGL 3, so copying one value into the other can put
+    rendering on a busy, unrelated GPU. Resolve the mapping once before the
+    workers are spawned and keep the original evaluator lifecycle unchanged.
+    """
     environment = {
         "SONG_LIBERO_ENV_WORKER": "1",
         "OMP_NUM_THREADS": "1",
@@ -8534,14 +8542,214 @@ def _process_worker_environment() -> dict[str, str]:
         "NUMEXPR_NUM_THREADS": "1",
         "MALLOC_ARENA_MAX": "2",
     }
-    for override_name, child_name in (
-        ("SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
-        ("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID", "MUJOCO_EGL_DEVICE_ID"),
-    ):
-        override = os.environ.get(override_name)
-        if override is not None:
-            environment[child_name] = override
+    cuda_visible_devices = os.environ.get(
+        "SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES",
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    )
+    environment["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    environment.update(_nvidia_egl_runtime_environment())
+    _configure_worker_egl_device(environment)
+
+    # Environment workers never run the policy or allocate CUDA tensors. An
+    # empty CUDA visibility avoids robosuite 1.4's import-time assertion that
+    # incorrectly compares a CUDA ordinal with an EGL enumeration index. EGL
+    # still selects the already-resolved device through MUJOCO_EGL_DEVICE_ID.
+    environment["CUDA_VISIBLE_DEVICES"] = ""
     return environment
+
+
+_EGL_CUDA_MAPPING_CACHE: dict[tuple[tuple[str, str], ...], dict[int, int]] = {}
+_EGL_MAPPING_LOGGED: set[tuple[int, int]] = set()
+
+
+def _nvidia_kernel_driver_version() -> str | None:
+    version_path = Path("/proc/driver/nvidia/version")
+    if not version_path.is_file():
+        return None
+    match = re.search(
+        r"Kernel Module\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)",
+        version_path.read_text(encoding="utf-8", errors="replace"),
+    )
+    return None if match is None else match.group(1)
+
+
+def _matching_nvidia_driver_library_dir() -> Path | None:
+    """Locate existing NVIDIA EGL libraries matching the loaded kernel."""
+
+    override = os.environ.get("SONG_LIBERO_EGL_DRIVER_LIB_DIR")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    version = _nvidia_kernel_driver_version()
+    if version is not None:
+        parts = version.split(".")
+        compact = "".join(parts[:2])
+        candidates.extend(
+            (
+                Path.home() / f"nvidia{compact}_full" / "lib",
+                Path.home() / f"NVIDIA-Linux-x86_64-{version}",
+            )
+        )
+    for candidate in candidates:
+        if (
+            (candidate / "libEGL_nvidia.so.0").exists()
+            and (candidate / "libnvidia-eglcore.so").exists()
+        ):
+            return candidate.resolve()
+    return None
+
+
+def _nvidia_egl_runtime_environment() -> dict[str, str]:
+    """Return only the library-selection variables needed by EGL workers."""
+
+    environment: dict[str, str] = {}
+    vendor_file = Path(
+        os.environ.get(
+            "SONG_LIBERO_EGL_VENDOR_FILE",
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+        )
+    )
+    if vendor_file.is_file():
+        environment["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(vendor_file)
+        # The active conda environment sets this to its Mesa-only directory.
+        environment["__EGL_VENDOR_LIBRARY_DIRS"] = ""
+
+    driver_dir = _matching_nvidia_driver_library_dir()
+    if driver_dir is not None:
+        inherited_paths = [
+            value
+            for value in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+            if value and value != str(driver_dir)
+        ]
+        environment["LD_LIBRARY_PATH"] = ":".join(
+            (str(driver_dir), *inherited_paths)
+        )
+    return environment
+
+
+def _query_nvidia_egl_cuda_mapping(
+    runtime_environment: dict[str, str] | None = None,
+) -> dict[int, int]:
+    """Return ``{physical CUDA ordinal: NVIDIA EGL device index}``."""
+
+    runtime_environment = dict(runtime_environment or {})
+    cache_key = tuple(sorted(runtime_environment.items()))
+    cached = _EGL_CUDA_MAPPING_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    probe_environment = os.environ.copy()
+    probe_environment.update(runtime_environment)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import ctypes
+import json
+from mujoco.egl import egl_ext as EGL
+
+libegl = ctypes.CDLL("libEGL.so.1")
+libegl.eglGetProcAddress.argtypes = [ctypes.c_char_p]
+libegl.eglGetProcAddress.restype = ctypes.c_void_p
+address = libegl.eglGetProcAddress(b"eglQueryDeviceAttribEXT")
+if not address:
+    raise RuntimeError("eglQueryDeviceAttribEXT is unavailable")
+query = ctypes.CFUNCTYPE(
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_ssize_t),
+)(address)
+mapping = {}
+for egl_index, device in enumerate(EGL.eglQueryDevicesEXT()):
+    cuda_ordinal = ctypes.c_ssize_t(-1)
+    if query(
+        ctypes.cast(device, ctypes.c_void_p),
+        0x323A,  # EGL_CUDA_DEVICE_NV
+        ctypes.byref(cuda_ordinal),
+    ):
+        mapping[int(cuda_ordinal.value)] = int(egl_index)
+print(json.dumps(mapping, sort_keys=True))
+""",
+        ],
+        env=probe_environment,
+        text=True,
+        capture_output=True,
+        timeout=30.0,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "Failed to query the NVIDIA CUDA-to-EGL device mapping: "
+            f"{probe.stderr.strip() or probe.stdout.strip()}"
+        )
+    try:
+        raw_mapping = json.loads(probe.stdout.strip().splitlines()[-1])
+        mapping = {int(cuda): int(egl) for cuda, egl in raw_mapping.items()}
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "NVIDIA CUDA-to-EGL mapping probe returned invalid output: "
+            f"{probe.stdout!r}"
+        ) from exc
+    if not mapping:
+        raise RuntimeError(
+            "NVIDIA EGL did not expose any CUDA-backed devices; refusing to "
+            "fall back to an unrelated renderer."
+        )
+    _EGL_CUDA_MAPPING_CACHE[cache_key] = dict(mapping)
+    return mapping
+
+
+def _single_visible_cuda_ordinal(value: str | None) -> int:
+    visible_devices = [
+        item.strip() for item in str(value or "").split(",") if item.strip()
+    ]
+    if len(visible_devices) != 1 or not visible_devices[0].isdigit():
+        raise RuntimeError(
+            "Process-based EGL evaluation requires exactly one physical CUDA "
+            f"ordinal in CUDA_VISIBLE_DEVICES, got {value!r}."
+        )
+    return int(visible_devices[0])
+
+
+def _configure_worker_egl_device(environment: dict[str, str]) -> None:
+    raw_override = os.environ.get("SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID")
+    physical_cuda = _single_visible_cuda_ordinal(
+        environment.get("CUDA_VISIBLE_DEVICES")
+    )
+    if raw_override is not None:
+        if not raw_override.isdigit():
+            raise RuntimeError(
+                "SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID must be a non-negative "
+                f"integer, got {raw_override!r}."
+            )
+        egl_index = int(raw_override)
+    else:
+        mapping = _query_nvidia_egl_cuda_mapping(environment)
+        if physical_cuda not in mapping:
+            raise RuntimeError(
+                f"Physical CUDA device {physical_cuda} is absent from the NVIDIA "
+                f"EGL mapping {mapping}."
+            )
+        egl_index = int(mapping[physical_cuda])
+
+    environment["MUJOCO_EGL_DEVICE_ID"] = str(egl_index)
+    environment["SONG_LIBERO_PHYSICAL_CUDA_ORDINAL"] = str(physical_cuda)
+    mapping_pair = (physical_cuda, egl_index)
+    if mapping_pair not in _EGL_MAPPING_LOGGED:
+        supplied = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+        correction = (
+            ""
+            if supplied in (None, str(egl_index))
+            else f"; corrected requested EGL {supplied}"
+        )
+        print(
+            f"[egl-map] physical CUDA {physical_cuda} -> NVIDIA EGL index "
+            f"{egl_index}{correction}",
+            flush=True,
+        )
+        _EGL_MAPPING_LOGGED.add(mapping_pair)
 
 
 def serialize_libero_task(task: Any) -> dict[str, str]:
@@ -9910,11 +10118,9 @@ def run_multi_gpu_suite_launcher(
             ]
             child_env = os.environ.copy()
             child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            # This robosuite / MuJoCo stack interprets both variables as
-            # physical EGL device ids and explicitly requires the EGL id to be
-            # present in CUDA_VISIBLE_DEVICES.  Torch still sees this one
-            # physical card as logical cuda:0 inside the child process.
-            child_env["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
+            # EGL has a different device ordering. The suite child maps this
+            # physical CUDA ordinal when it spawns its render-only workers.
+            child_env.pop("MUJOCO_EGL_DEVICE_ID", None)
             child_env["SONG_LIBERO_SUITE_WORKER"] = "1"
             process = subprocess.Popen(command, env=child_env, cwd=str(Path.cwd()))
             processes.append((suite_name, gpu_id, process))

@@ -1,0 +1,49 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_molmo2.Molmo2Processor",
+    "AutoVideoProcessor": "video_processing_molmo2.Molmo2VideoProcessor"
+  },
+  "crop_size": null,
+  "data_format": "channels_first",
+  "default_to_square": true,
+  "device": null,
+  "do_center_crop": null,
+  "do_convert_rgb": true,
+  "do_normalize": true,
+  "do_pad": null,
+  "do_rescale": true,
+  "do_resize": true,
+  "do_sample_frames": true,
+  "fps": null,
+  "frame_sample_mode": "uniform_last_frame",
+  "image_mean": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "image_std": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "input_data_format": null,
+  "max_fps": 2.0,
+  "num_frames": 128,
+  "patch_size": 14,
+  "pooling_size": [
+    3,
+    3
+  ],
+  "processor_class": "Molmo2Processor",
+  "resample": 2,
+  "rescale_factor": 0.00392156862745098,
+  "return_metadata": false,
+  "sampling_fps": 2,
+  "size": {
+    "height": 378,
+    "width": 378
+  },
+  "size_divisor": null,
+  "video_metadata": null,
+  "video_processor_type": "Molmo2VideoProcessor"
+}

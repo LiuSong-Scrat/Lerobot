@@ -1,0 +1,12 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_molmo2.Molmo2Processor"
+  },
+  "image_use_col_tokens": true,
+  "processor_class": "Molmo2Processor",
+  "use_frame_special_tokens": true,
+  "use_low_res_token_for_global_crops": false,
+  "use_single_crop_col_tokens": false,
+  "use_single_crop_start_token": true,
+  "video_use_col_tokens": false
+}

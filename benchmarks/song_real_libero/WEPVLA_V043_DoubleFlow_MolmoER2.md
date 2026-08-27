@@ -2,7 +2,7 @@
 
 结构基准：`origin/wep_vla_v0.4.3_multiview_doubleflow`（`da0ad03bf7eff2c6e9edcf04e1b324bebbdf93dd`）。
 
-以下均为可直接粘贴执行的命令行，不调用任何 `.sh`。当前拓扑标识为 `v3_feature_align_language_casual`，Native 使用官方 causal-or-image-image mask，旧全双向 feature-align checkpoint 不允许 resume，必须从头训练。当前短数据调试命令使用 GPU 1–7 共 7 张 A800、普通 DDP、每卡 batch 40、global batch 280；改回 0–7 时必须同步把 `num_processes` 改为 8、`global_batch_size` 改为 320。执行前请先确认输出目录不存在或为空；不要覆盖已有训练目录。
+以下均为可直接粘贴执行的命令行，不调用任何 `.sh`。当前短数据调试命令使用 GPU 1–7 共 7 张 A800、普通 DDP、每卡 batch 40、global batch 280；改回 0–7 时必须同步把 `num_processes` 改为 8、`global_batch_size` 改为 320。执行前请先确认输出目录不存在或为空；不要覆盖已有训练目录。
 
 ## 当前 7 卡短数据训练
 
@@ -50,8 +50,8 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --eval_freq=1500 \
   --log_freq=1 \
   --num_workers=12 \
-  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/v3_feature_align_language_casual_long68_fresh \
-  --job_name=v3_feature_align_language_casual_long68_fresh \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/lerobot_7B_molmo2_song/full_molmo2er_worldflow/v3_feature_align_long68_fresh \
+  --job_name=v3_feature_align_long68_fresh \
   --policy.device=cuda \
   --wandb.enable=true \
   --wandb.disable_artifact=true \
@@ -76,7 +76,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
   --policy.vla_adapter_enable=false \
   --policy.vla_adapter_freeze_vlm=true \
   --policy.vlm_backend=molmo2_full \
-  --policy.full_molmo_topology=v3_feature_align_language_casual \
+  --policy.full_molmo_topology=wepvla_scene_in_vlm_prefix_v3_feature_align \
   --policy.molmo_inference_only=false \
   --policy.molmo_gradient_checkpointing=true \
   --policy.molmo_gradient_checkpointing_layers_per_segment=2 \
@@ -173,7 +173,7 @@ benchmarks/song_real_libero/scripts/train_song_benchmark.py \
 
 当前 evaluator 会按 checkpoint 的 `worldflow_reference_frame` 显式传入当前 EEF pose；对于本权重使用 robot-base pose，并让 `left_compose_ego` 从同一个 seeded Ego noise 派生 World noise。Molmo2-ER 仍保持 `vla_adapter_enable=false`、`requires_rgb=true`，使用 checkpoint 的原生 256×256 `agentview` multimodal processor。
 
-下面是单卡、单任务、1 episode 的端到端推理 smoke test，用来确认 checkpoint 能加载并完成环境闭环；它不是可汇报的正式 LIBERO 分数。默认测试上面新 native-readout 拓扑从头训练目录的 `last` checkpoint，若实际 checkpoint 步数不同，只替换 `--policy.path`。旧 `molmo_inference_only=true` 的 030000 checkpoint 不兼容此拓扑。
+下面是单卡、单任务、1 episode 的端到端推理 smoke test，用来确认 checkpoint 能加载并完成环境闭环；它不是可汇报的正式 LIBERO 分数。默认测试上面新 WEP-prefix 从头训练目录的 `last` checkpoint，若实际 checkpoint 步数不同，只替换 `--policy.path`。旧 `molmo_inference_only=true` 的 030000 checkpoint 不兼容此拓扑。
 
 ```bash
 cd /home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song
@@ -190,7 +190,6 @@ CUDA_VISIBLE_DEVICES=0 \
 MUJOCO_EGL_DEVICE_ID=0 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
-__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
 PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song/src:/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song \
 SONG_POINTSEG_REQUIRE_POINTOPS=1 \
 SONG_POINTCLOUD_GRIPPER_POINTS=500 \
@@ -316,7 +315,6 @@ CUDA_VISIBLE_DEVICES=0 \
 MUJOCO_EGL_DEVICE_ID=0 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
-__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
 PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song/src:/home/liusong/ProgramFiles/Huggingface/lerobot_7B_molmo2_song \
 SONG_POINTSEG_REQUIRE_POINTOPS=1 \
 SONG_POINTCLOUD_GRIPPER_POINTS=500 \
