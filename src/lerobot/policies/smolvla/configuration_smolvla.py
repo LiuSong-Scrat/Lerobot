@@ -140,8 +140,11 @@ class SmolVLAConfig(PreTrainedConfig):
     # Number of denoising steps during flow matching inference.
     # Recommended values: 8-10 (fast), 20-30 (balanced), 50+ (high-quality)
     num_steps: int = 10
-    # The official large-data recipe samples continuous times from
-    # Beta(1.5, 1). For small-data fitting, ``integration_grid`` instead
+    # ``beta`` preserves the historical sampling in this model's noise-to-data
+    # time coordinate: 0.999 * Beta(1.5, 1) + 0.001.  The official model uses
+    # the opposite data-to-noise coordinate, so its exactly transformed
+    # distribution is exposed separately as ``beta_official_time_reversed``:
+    # 0.999 * Beta(1, 1.5).  For small-data fitting, ``integration_grid`` instead
     # trains exactly the Euler times used by sample_actions:
     # {0, 1/num_steps, ..., (num_steps-1)/num_steps}.
     flow_time_sampling: str = "beta"
@@ -715,9 +718,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 "execute predicted token 0 (action_index=0); do not apply the offset a second time.",
                 stacklevel=2,
             )
-        if self.flow_time_sampling not in {"beta", "uniform", "integration_grid"}:
+        if self.flow_time_sampling not in {
+            "beta",
+            "beta_official_time_reversed",
+            "uniform",
+            "integration_grid",
+        }:
             raise ValueError(
-                "flow_time_sampling must be one of beta, uniform, integration_grid; "
+                "flow_time_sampling must be one of beta, beta_official_time_reversed, "
+                "uniform, integration_grid; "
                 f"got {self.flow_time_sampling!r}."
             )
         if self.num_steps <= 0:

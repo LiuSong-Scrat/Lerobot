@@ -893,8 +893,11 @@ def _flow_time_sweep_metrics(
 ) -> dict[str, torch.Tensor]:
     """Measure velocity/endpoint error across the complete integration interval.
 
-    Standard SmolVLA samples training time from ``Beta(1.5, 1)``. On very small
-    datasets this can leave the beginning of the inference ODE under-trained.
+    Historical SmolVLA samples its noise-to-data time directly from
+    ``Beta(1.5, 1)``. On very small datasets this can leave the beginning of
+    the inference ODE under-trained; note that the official model uses the
+    opposite time coordinate, whose exact transformed distribution is
+    ``Beta(1, 1.5)``.
     Reusing the same Ego/World noise and point-operation RNG state at every
     requested time isolates that coverage issue from ordinary sampling noise.
     """

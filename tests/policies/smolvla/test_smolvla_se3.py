@@ -2358,6 +2358,37 @@ def test_integration_grid_time_sampling_can_emphasize_exact_zero():
     assert set(scaled.to(dtype=torch.int64).tolist()) == set(range(cfg.num_steps))
 
 
+def test_official_time_reversed_beta_matches_noise_to_data_coordinate():
+    cfg = SmolVLAConfig(flow_time_sampling="beta_official_time_reversed")
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    torch.manual_seed(7)
+    sampled = model.sample_time(100_000, torch.device("cpu"))
+
+    assert sampled.dtype == torch.float32
+    assert sampled.min() >= 0.0
+    assert sampled.max() < 0.999
+    # E[0.999 * Beta(1, 1.5)] = 0.999 / 2.5 = 0.3996.
+    assert torch.allclose(sampled.mean(), torch.tensor(0.3996), atol=0.003)
+
+
+def test_historical_beta_sampling_is_unchanged():
+    cfg = SmolVLAConfig(flow_time_sampling="beta")
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = cfg
+
+    torch.manual_seed(7)
+    sampled = model.sample_time(100_000, torch.device("cpu"))
+
+    assert sampled.min() > 0.001
+    assert sampled.max() <= 1.0
+    # E[0.999 * Beta(1.5, 1) + 0.001] = 0.6004.
+    assert torch.allclose(sampled.mean(), torch.tensor(0.6004), atol=0.003)
+
+
 def test_pose9_action_loss_weights_preserve_scale_and_prioritize_physical_groups():
     policy = SimpleNamespace(
         config=SimpleNamespace(

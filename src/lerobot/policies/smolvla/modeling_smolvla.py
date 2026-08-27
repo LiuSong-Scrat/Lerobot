@@ -4380,6 +4380,14 @@ class VLAFlowMatching(nn.Module):
             return step.to(dtype=torch.float32) / float(num_steps)
         if mode == "uniform":
             return torch.rand(int(bsize), device=device, dtype=torch.float32) * 0.999
+        if mode == "beta_official_time_reversed":
+            # The official flow uses data-to-noise time tau and samples
+            # tau = 0.999 * Beta(1.5, 1) + 0.001.  This implementation uses
+            # noise-to-data time s = 1 - tau, hence
+            # s = 0.999 * Beta(1, 1.5), with no +0.001 offset.
+            beta_dist = torch.distributions.Beta(concentration1=1.0, concentration0=1.5)
+            time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+            return time_beta * 0.999
         if mode != "beta":
             raise ValueError(f"Unsupported flow_time_sampling={mode!r}.")
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)

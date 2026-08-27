@@ -152,6 +152,7 @@ def test_full_config_allows_cli_scheduler_override() -> None:
     ("sampling", "zero_probability"),
     (
         ("beta", 0.0),
+        ("beta_official_time_reversed", 0.0),
         ("uniform", 0.0),
         ("integration_grid", 0.0),
         ("integration_grid", 0.25),
