@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from lerobot.optim.optimizers import FP32MasterAdamW
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
@@ -186,3 +187,100 @@ def test_resume_helper_default_preserves_checkpoint_optimizer_and_scheduler(tmp_
     assert step == 12
     assert resumed_optimizer.param_groups[0]["lr"] == saved_optimizer.param_groups[0]["lr"]
     assert resumed_scheduler.state_dict() == saved_scheduler.state_dict()
+
+
+def test_resume_can_reset_adam_moments_once_while_preserving_rng_phase(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    saved_optimizer = torch.optim.AdamW([parameter], lr=1e-4, betas=(0.9, 0.95))
+    saved_scheduler = torch.optim.lr_scheduler.LambdaLR(saved_optimizer, lambda _: 0.3)
+    parameter.grad = torch.tensor([0.5, -0.25])
+    saved_optimizer.step()
+    saved_scheduler.step()
+    save_training_state(tmp_path, 4_500, saved_optimizer, saved_scheduler)
+
+    resumed_optimizer = torch.optim.AdamW([parameter], lr=7e-5, betas=(0.8, 0.9))
+    cfg = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        resume_restart_scheduler=True,
+        resume_scheduler_start_lr=7e-5,
+        resume_scheduler_end_lr=2e-5,
+        resume_scheduler_decay_steps=30_000,
+        resume_scheduler_phase_start_step=None,
+        resume_reset_optimizer_moments=True,
+        resume_optimizer_moments_reset_step=None,
+        steps=34_500,
+    )
+
+    step, resumed_optimizer, _ = load_training_state_for_resume(
+        cfg,
+        resumed_optimizer,
+        torch.optim.lr_scheduler.LambdaLR(resumed_optimizer, lambda _: 0.5),
+    )
+
+    assert step == 4_500
+    assert cfg.resume_optimizer_moments_reset_step == 4_500
+    assert cfg.resume_optimizer_moments_reset_applied is True
+    assert len(resumed_optimizer.state) == 0
+    assert resumed_optimizer.param_groups[0]["lr"] == 7e-5
+
+
+def test_resume_moment_reset_is_not_reapplied_after_origin_step(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    saved_optimizer = torch.optim.AdamW([parameter], lr=7e-5)
+    saved_scheduler = torch.optim.lr_scheduler.LambdaLR(saved_optimizer, lambda _: 1.0)
+    parameter.grad = torch.tensor([0.25, -0.125])
+    saved_optimizer.step()
+    save_training_state(tmp_path, 5_000, saved_optimizer, saved_scheduler)
+
+    resumed_optimizer = torch.optim.AdamW([parameter], lr=7e-5)
+    cfg = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        resume_restart_scheduler=True,
+        resume_scheduler_start_lr=7e-5,
+        resume_scheduler_end_lr=2e-5,
+        resume_scheduler_decay_steps=30_000,
+        resume_scheduler_phase_start_step=4_500,
+        resume_reset_optimizer_moments=True,
+        resume_optimizer_moments_reset_step=4_500,
+        steps=34_500,
+    )
+
+    step, resumed_optimizer, _ = load_training_state_for_resume(
+        cfg,
+        resumed_optimizer,
+        torch.optim.lr_scheduler.LambdaLR(resumed_optimizer, lambda _: 0.5),
+    )
+
+    assert step == 5_000
+    assert cfg.resume_optimizer_moments_reset_applied is False
+    assert len(resumed_optimizer.state) == 1
+
+
+def test_resume_moment_reset_preserves_fp32_master_value(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    saved_optimizer = FP32MasterAdamW([parameter], lr=1e-4)
+    parameter.grad = torch.tensor([0.125], dtype=torch.bfloat16)
+    saved_optimizer.step()
+    saved_master = next(saved_optimizer.master_parameters()).detach().clone()
+    save_training_state(tmp_path, 20, saved_optimizer, scheduler=None)
+
+    resumed_parameter = torch.nn.Parameter(parameter.detach().clone())
+    resumed_optimizer = FP32MasterAdamW([resumed_parameter], lr=1e-5)
+    cfg = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        resume_restart_scheduler=False,
+        resume_reset_optimizer_moments=True,
+        resume_optimizer_moments_reset_step=None,
+    )
+
+    step, resumed_optimizer, resumed_scheduler = load_training_state_for_resume(
+        cfg,
+        resumed_optimizer,
+        scheduler=None,
+    )
+
+    assert step == 20
+    assert resumed_scheduler is None
+    assert len(resumed_optimizer.state) == 0
+    resumed_master = next(resumed_optimizer.master_parameters())
+    torch.testing.assert_close(resumed_master, saved_master)

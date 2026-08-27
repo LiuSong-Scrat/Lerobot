@@ -3249,6 +3249,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             optimizer,
             lr_scheduler,
         )
+        if cfg.resume_reset_optimizer_moments and is_main_process:
+            logging.info(
+                "Resume Adam-moment reset: restored_step=%s reset_origin_step=%s applied_now=%s "
+                "remaining_state_entries=%s",
+                step,
+                cfg.resume_optimizer_moments_reset_step,
+                bool(getattr(cfg, "resume_optimizer_moments_reset_applied", False)),
+                len(optimizer.state),
+            )
         if cfg.resume_restart_scheduler and is_main_process:
             logging.info(
                 "Resumed Adam/RNG/global step with a phase-relative scheduler restart: "

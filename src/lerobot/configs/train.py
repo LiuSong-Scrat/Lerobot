@@ -77,6 +77,12 @@ class TrainPipelineConfig(HubMixin):
     # from the first restored global step when omitted, allowing an interrupted
     # restarted phase to reconstruct the same scheduler position later.
     resume_scheduler_phase_start_step: int | None = None
+    # One-shot Adam-state ablation that still restores the checkpoint policy,
+    # global step and RNG state.  The first resumed checkpoint records the
+    # restored step below; later resumes from that phase do not reset the
+    # newly accumulated moments a second time.
+    resume_reset_optimizer_moments: bool = False
+    resume_optimizer_moments_reset_step: int | None = None
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -169,6 +175,16 @@ class TrainPipelineConfig(HubMixin):
                     "resume_scheduler_phase_start_step must be a non-negative integer or None, "
                     f"got {phase_start!r}."
                 )
+        if self.resume_reset_optimizer_moments and not self.resume:
+            raise ValueError("resume_reset_optimizer_moments=true requires resume=true.")
+        reset_step = self.resume_optimizer_moments_reset_step
+        if reset_step is not None and (
+            isinstance(reset_step, bool) or not isinstance(reset_step, int) or reset_step < 0
+        ):
+            raise ValueError(
+                "resume_optimizer_moments_reset_step must be a non-negative integer or None, "
+                f"got {reset_step!r}."
+            )
         if int(self.gradient_accumulation_steps) < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be at least 1, got {self.gradient_accumulation_steps}."

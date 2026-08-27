@@ -210,6 +210,30 @@ def load_training_state_for_resume(
         restore_scheduler_state=not restart_scheduler,
         restore_optimizer_param_group_hyperparameters=not restart_scheduler,
     )
+    reset_moments = bool(getattr(cfg, "resume_reset_optimizer_moments", False))
+    if reset_moments:
+        reset_step = getattr(cfg, "resume_optimizer_moments_reset_step", None)
+        if reset_step is None:
+            reset_step = step
+            cfg.resume_optimizer_moments_reset_step = step
+        if reset_step > step:
+            raise ValueError(
+                "resume_optimizer_moments_reset_step cannot exceed the restored global step: "
+                f"reset_step={reset_step}, restored_step={step}."
+            )
+        # The flag is deliberately one-shot across a resumed phase.  A
+        # checkpoint saved after this reset persists its origin step, so a
+        # later interruption (step > reset_step) keeps the moments learned in
+        # the new phase.  FP32MasterAdamW stores its master values in optimizer
+        # parameter data, not in optimizer.state, so clearing state preserves
+        # sub-ULP weights while resetting Adam's step/exp_avg/exp_avg_sq.
+        if reset_step == step:
+            optimizer.state.clear()
+            cfg.resume_optimizer_moments_reset_applied = True
+        else:
+            cfg.resume_optimizer_moments_reset_applied = False
+    else:
+        cfg.resume_optimizer_moments_reset_applied = False
     if not restart_scheduler:
         return step, optimizer, scheduler
 
