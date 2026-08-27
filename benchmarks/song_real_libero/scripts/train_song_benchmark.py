@@ -44,6 +44,7 @@ from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.optim.optimizers import FP32MasterAdamW, optimizer_model_parameters
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.configuration_smolvla import (
@@ -3142,6 +3143,47 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     if getattr(policy.config, "vlm_backend", None) == "molmo2_full":
+        fp32_master_config_enabled = bool(
+            getattr(cfg.optimizer, "fp32_master_weights", False)
+        )
+        fp32_master_runtime_enabled = isinstance(optimizer, FP32MasterAdamW)
+        if fp32_master_config_enabled != fp32_master_runtime_enabled:
+            raise RuntimeError(
+                "Full-Molmo2-ER FP32-master optimizer config/runtime mismatch: "
+                f"config={fp32_master_config_enabled}, runtime={type(optimizer).__name__}."
+            )
+        policy_fp32_master_requested = bool(
+            getattr(policy.config, "optimizer_fp32_master_weights", False)
+        )
+        if policy_fp32_master_requested and not fp32_master_runtime_enabled:
+            raise RuntimeError(
+                "policy.optimizer_fp32_master_weights=true did not enable the runtime optimizer. "
+                "On config_path resume, optimizer settings are restored independently from the "
+                "policy preset; also pass --optimizer.fp32_master_weights=true."
+            )
+        if fp32_master_runtime_enabled and not policy_fp32_master_requested:
+            # Preserve the actual optimizer mode in the policy/config artifacts
+            # written by this run, including resumes from an older config that
+            # predates the FP32-master option.
+            policy.config.optimizer_fp32_master_weights = True
+            cfg.policy.optimizer_fp32_master_weights = True
+        if is_main_process:
+            master_parameters = (
+                tuple(optimizer.master_parameters()) if fp32_master_runtime_enabled else ()
+            )
+            master_numel = sum(parameter.numel() for parameter in master_parameters)
+            master_bytes = sum(
+                parameter.numel() * parameter.element_size() for parameter in master_parameters
+            )
+            logging.info(
+                "Full-Molmo2-ER optimizer=%s fp32_master_weights=%s "
+                "master_tensors=%s master_parameters=%s master_bytes=%s",
+                type(optimizer).__name__,
+                fp32_master_runtime_enabled,
+                len(master_parameters),
+                master_numel,
+                master_bytes,
+            )
         # CUDA's automatic foreach AdamW path materializes a temporary tensor
         # list roughly as large as all 1.8B trainable parameters during the
         # first step.  The scalar-tensor path has identical AdamW
@@ -3154,11 +3196,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "Full-Molmo2-ER AdamW uses foreach=False to bound optimizer-step peak memory; "
                 "lr/betas/eps/weight_decay are unchanged."
             )
-        optimizer_parameter_ids = {
-            id(parameter)
-            for group in optimizer.param_groups
-            for parameter in group["params"]
-        }
+        optimizer_parameter_ids = {id(parameter) for parameter in optimizer_model_parameters(optimizer)}
         backend = policy.model.vlm_with_expert
         frozen_parameter_ids = {
             id(parameter)
@@ -3315,6 +3353,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    prepared_optimizer = getattr(optimizer, "optimizer", optimizer)
+    if isinstance(prepared_optimizer, FP32MasterAdamW):
+        prepared_optimizer.synchronize_master_parameters(src=0)
+        if is_main_process:
+            logging.info(
+                "Full-Molmo2-ER FP32 master parameters synchronized from rank 0 after "
+                "Accelerate/DDP preparation."
+            )
     if getattr(cfg.policy, "vlm_backend", None) == "molmo2_full":
         if accelerator.num_processes > 1:
             if not isinstance(policy, torch.nn.parallel.DistributedDataParallel):

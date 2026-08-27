@@ -503,6 +503,9 @@ class SmolVLAConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-10
     optimizer_grad_clip_norm: float = 10
+    # Accumulate low-LR BF16/FP16 updates in persistent FP32 master weights.
+    # Disabled by default to preserve historical optimizer and memory behavior.
+    optimizer_fp32_master_weights: bool = False
 
     scheduler_warmup_steps: int = 100 #1_000
     scheduler_decay_steps: int = 60_000 #30_000
@@ -1772,6 +1775,7 @@ class SmolVLAConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=self.optimizer_grad_clip_norm,
+            fp32_master_weights=self.optimizer_fp32_master_weights,
         )
 
     def get_scheduler_preset(self):

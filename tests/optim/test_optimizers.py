@@ -17,9 +17,11 @@ import torch
 from lerobot.optim.optimizers import (
     AdamConfig,
     AdamWConfig,
+    FP32MasterAdamW,
     MultiAdamConfig,
     SGDConfig,
     load_optimizer_state,
+    optimizer_model_parameters,
     save_optimizer_state,
 )
 from lerobot.utils.constants import (
@@ -83,6 +85,217 @@ def test_load_optimizer_state_can_keep_current_param_group_hyperparameters(tmp_p
     assert loaded_optimizer.param_groups[0]["betas"] == (0.8, 0.9)
     for state_name, expected_value in saved_optimizer.state[parameter].items():
         torch.testing.assert_close(loaded_optimizer.state[parameter][state_name], expected_value)
+
+
+def test_adamw_fp32_master_is_opt_in_and_accumulates_sub_ulp_updates():
+    ordinary_parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    master_parameter = torch.nn.Parameter(ordinary_parameter.detach().clone())
+    common = {
+        "lr": 1e-4,
+        "betas": (0.0, 0.0),
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+    }
+    ordinary_optimizer = AdamWConfig(**common).build([ordinary_parameter])
+    master_optimizer = AdamWConfig(**common, fp32_master_weights=True).build([master_parameter])
+
+    assert type(ordinary_optimizer) is torch.optim.AdamW
+    assert isinstance(master_optimizer, FP32MasterAdamW)
+
+    for _ in range(100):
+        ordinary_parameter.grad = torch.ones_like(ordinary_parameter)
+        master_parameter.grad = torch.ones_like(master_parameter)
+        ordinary_optimizer.step()
+        master_optimizer.step()
+        ordinary_optimizer.zero_grad()
+        master_optimizer.zero_grad()
+
+    # A 1e-4 update is below the BF16 ULP around 1.0, so ordinary AdamW
+    # repeatedly loses it. The FP32 master accumulates all 100 updates.
+    torch.testing.assert_close(ordinary_parameter.detach(), torch.tensor([1.0], dtype=torch.bfloat16))
+    assert master_parameter.item() < 1.0
+    torch.testing.assert_close(
+        master_optimizer.optimizer_parameter_for(master_parameter).detach(),
+        torch.tensor([0.99]),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+
+def test_fp32_master_preserves_param_groups_scheduler_and_model_identity():
+    low_precision = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float16))
+    full_precision = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = AdamWConfig(
+        lr=1e-3,
+        betas=(0.0, 0.0),
+        weight_decay=0.0,
+        fp32_master_weights=True,
+    ).build(
+        [
+            {"params": [low_precision], "lr": 1e-4, "group_name": "low"},
+            {"params": [full_precision], "lr": 2e-4, "group_name": "full"},
+        ]
+    )
+
+    low_master = optimizer.optimizer_parameter_for(low_precision)
+    assert low_master is not low_precision
+    assert low_master.dtype == torch.float32
+    master_parameters = list(optimizer.master_parameters())
+    assert len(master_parameters) == 1
+    assert master_parameters[0] is low_master
+    assert optimizer.optimizer_parameter_for(full_precision) is full_precision
+    assert [group["group_name"] for group in optimizer.param_groups] == ["low", "full"]
+    assert [group["lr"] for group in optimizer.param_groups] == [1e-4, 2e-4]
+    represented_parameters = list(optimizer_model_parameters(optimizer))
+    assert represented_parameters[0] is low_precision
+    assert represented_parameters[1] is full_precision
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 0.5)
+    assert [group["lr"] for group in optimizer.param_groups] == [5e-5, 1e-4]
+    low_precision.grad = torch.ones_like(low_precision)
+    full_precision.grad = torch.ones_like(full_precision)
+    optimizer.step()
+    scheduler.step()
+    assert [group["lr"] for group in optimizer.param_groups] == [5e-5, 1e-4]
+
+
+def test_fp32_master_zero_grad_clears_model_and_master_gradients():
+    low_precision = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    full_precision = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = AdamWConfig(fp32_master_weights=True).build([low_precision, full_precision])
+    low_master = optimizer.optimizer_parameter_for(low_precision)
+
+    # Use a view to mirror DDP's gradient_as_bucket_view=True behavior.
+    low_precision.grad = torch.ones(2, dtype=torch.bfloat16)[:1]
+    full_precision.grad = torch.ones_like(full_precision)
+    optimizer.step()
+    assert low_master.grad is not None
+
+    optimizer.zero_grad(set_to_none=False)
+    torch.testing.assert_close(low_precision.grad, torch.zeros_like(low_precision))
+    torch.testing.assert_close(low_master.grad, torch.zeros_like(low_master))
+    torch.testing.assert_close(full_precision.grad, torch.zeros_like(full_precision))
+
+    optimizer.zero_grad(set_to_none=True)
+    assert low_precision.grad is None
+    assert low_master.grad is None
+    assert full_precision.grad is None
+
+
+def test_fp32_master_synchronization_preserves_unrounded_master(monkeypatch):
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    optimizer = AdamWConfig(fp32_master_weights=True).build([parameter])
+    master = optimizer.optimizer_parameter_for(parameter)
+    with torch.no_grad():
+        master.copy_(torch.tensor([0.998]))
+
+    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_broadcast(tensor, src):
+        broadcasts.append((tensor, src))
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+    optimizer.synchronize_master_parameters(src=0)
+
+    assert broadcasts == [(master, 0)]
+    torch.testing.assert_close(master, torch.tensor([0.998]), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(parameter, master.to(dtype=torch.bfloat16), atol=0.0, rtol=0.0)
+
+
+def test_fp32_master_state_roundtrip_preserves_unrounded_master(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    optimizer = AdamWConfig(
+        lr=1e-4,
+        betas=(0.0, 0.0),
+        weight_decay=0.0,
+        fp32_master_weights=True,
+    ).build([parameter])
+    for _ in range(17):
+        parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        optimizer.zero_grad()
+    expected_master = optimizer.optimizer_parameter_for(parameter).detach().clone()
+    save_optimizer_state(optimizer, tmp_path)
+
+    resumed_parameter = torch.nn.Parameter(parameter.detach().clone())
+    resumed_optimizer = AdamWConfig(
+        lr=1e-4,
+        betas=(0.0, 0.0),
+        weight_decay=0.0,
+        fp32_master_weights=True,
+    ).build([resumed_parameter])
+    load_optimizer_state(resumed_optimizer, tmp_path)
+    resumed_master = resumed_optimizer.optimizer_parameter_for(resumed_parameter)
+
+    torch.testing.assert_close(resumed_master, expected_master, atol=0.0, rtol=0.0)
+    assert resumed_optimizer.state[resumed_master]["exp_avg"].dtype == torch.float32
+    assert resumed_optimizer.state[resumed_master]["exp_avg_sq"].dtype == torch.float32
+
+    parameter.grad = torch.ones_like(parameter)
+    resumed_parameter.grad = torch.ones_like(resumed_parameter)
+    optimizer.step()
+    resumed_optimizer.step()
+    torch.testing.assert_close(resumed_master, optimizer.optimizer_parameter_for(parameter))
+    torch.testing.assert_close(resumed_parameter, parameter)
+
+
+def test_fp32_master_state_roundtrip_before_first_adam_step(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    optimizer = AdamWConfig(fp32_master_weights=True).build([parameter])
+    master = optimizer.optimizer_parameter_for(parameter)
+    with torch.no_grad():
+        master.add_(-1e-4)
+    expected_master = master.detach().clone()
+    assert not optimizer.state
+    save_optimizer_state(optimizer, tmp_path)
+    # state_dict() must not make the serialized master a persistent live-state
+    # allocation, and load must not make AdamW mistake it for initialized m/v.
+    assert not optimizer.state
+
+    resumed_parameter = torch.nn.Parameter(parameter.detach().clone())
+    resumed_optimizer = AdamWConfig(fp32_master_weights=True).build([resumed_parameter])
+    load_optimizer_state(resumed_optimizer, tmp_path)
+    resumed_master = resumed_optimizer.optimizer_parameter_for(resumed_parameter)
+
+    torch.testing.assert_close(resumed_master, expected_master, atol=0.0, rtol=0.0)
+    assert not resumed_optimizer.state
+
+
+def test_fp32_master_loads_and_upgrades_legacy_bf16_adamw_state(tmp_path):
+    legacy_parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    legacy_optimizer = torch.optim.AdamW([legacy_parameter], lr=1e-3)
+    legacy_parameter.grad = torch.ones_like(legacy_parameter)
+    legacy_optimizer.step()
+    legacy_state_dict = legacy_optimizer.state_dict()
+    assert legacy_state_dict["state"][0]["exp_avg"].dtype == torch.bfloat16
+    save_optimizer_state(legacy_optimizer, tmp_path)
+
+    resumed_parameter = torch.nn.Parameter(legacy_parameter.detach().clone())
+    resumed_optimizer = AdamWConfig(lr=1e-3, fp32_master_weights=True).build([resumed_parameter])
+    load_optimizer_state(resumed_optimizer, tmp_path)
+    resumed_master = resumed_optimizer.optimizer_parameter_for(resumed_parameter)
+    resumed_state = resumed_optimizer.state[resumed_master]
+
+    assert resumed_state["exp_avg"].dtype == torch.float32
+    assert resumed_state["exp_avg_sq"].dtype == torch.float32
+    torch.testing.assert_close(resumed_master, resumed_parameter.float())
+
+
+def test_fp32_master_checkpoint_can_load_without_master_mode(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    optimizer = AdamWConfig(lr=1e-3, fp32_master_weights=True).build([parameter])
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    save_optimizer_state(optimizer, tmp_path)
+
+    ordinary_parameter = torch.nn.Parameter(parameter.detach().clone())
+    ordinary_optimizer = AdamWConfig(lr=1e-3).build([ordinary_parameter])
+    load_optimizer_state(ordinary_optimizer, tmp_path)
+
+    assert "fp32_master_param" not in ordinary_optimizer.state[ordinary_parameter]
+    assert ordinary_optimizer.state[ordinary_parameter]["exp_avg"].dtype == torch.bfloat16
 
 
 @pytest.fixture
