@@ -71,8 +71,6 @@ from lerobot.utils.utils import init_logging, inside_slurm
 
 EVAL_METRIC_KEYS = (
     "loss",
-    "loss_anchor_total",
-    "loss_anchor_total_gap",
     "loss_action",
     "loss_action_translation",
     "loss_action_rotation6d",
@@ -93,12 +91,6 @@ EVAL_METRIC_KEYS = (
     "loss_worldflow_equiv",
     "worldflow_trans_err",
     "worldflow_rot_err_deg",
-    "worldflow_flow_translation_err_m",
-    "worldflow_flow_rotation6d_rmse",
-    "worldflow_endpoint_translation_err_m",
-    "worldflow_endpoint_rotation_probe_err_m",
-    "loss_worldflow_gripper",
-    "worldflow_endpoint_gripper_err",
     "worldflow_valid_ratio",
     "worldflow_foreground_points",
     "worldflow_noise_conjugacy_error",
@@ -130,6 +122,20 @@ EVAL_METRIC_KEYS = EVAL_METRIC_KEYS + tuple(
     f"flow_t{round(time_value * 1000):03d}_{metric_name}"
     for time_value in FLOW_TIME_SWEEP_VALUES
     for metric_name in FLOW_TIME_SWEEP_METRICS
+)
+
+# Keep the legacy metric tuple untouched unless fixed-anchor mode is enabled.
+# Besides preserving ordinary eval_song output, this prevents an opt-in
+# comparison tool from subtly changing distributed gather payloads elsewhere.
+FIXED_ANCHOR_EXTRA_METRIC_KEYS = (
+    "loss_anchor_total",
+    "loss_anchor_total_gap",
+    "worldflow_flow_translation_err_m",
+    "worldflow_flow_rotation6d_rmse",
+    "worldflow_endpoint_translation_err_m",
+    "worldflow_endpoint_rotation_probe_err_m",
+    "loss_worldflow_gripper",
+    "worldflow_endpoint_gripper_err",
 )
 
 
@@ -720,11 +726,13 @@ def _gather_metric_sums(
     accelerator: Accelerator,
     metrics: dict[str, Any],
     local_batch_size: int,
+    *,
+    metric_keys: tuple[str, ...] = EVAL_METRIC_KEYS,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Gather weighted metric sums/counts from every process."""
 
     payload: list[float] = []
-    for key in EVAL_METRIC_KEYS:
+    for key in metric_keys:
         value = _to_scalar(metrics.get(key))
         if value is None:
             payload.extend((0.0, 0.0))
@@ -738,15 +746,19 @@ def _gather_metric_sums(
 
     sums: dict[str, float] = {}
     counts: dict[str, float] = {}
-    for index, key in enumerate(EVAL_METRIC_KEYS):
+    for index, key in enumerate(metric_keys):
         sums[key] = float(gathered[:, 2 * index].sum().item())
         counts[key] = float(gathered[:, 2 * index + 1].sum().item())
     return sums, counts
 
 
-def _format_metrics(metrics: dict[str, float]) -> str:
+def _format_metrics(
+    metrics: dict[str, float],
+    *,
+    metric_keys: tuple[str, ...] = EVAL_METRIC_KEYS,
+) -> str:
     parts = []
-    for key in EVAL_METRIC_KEYS:
+    for key in metric_keys:
         if key in metrics:
             parts.append(f"{key}:{metrics[key]:.4g}")
     return " ".join(parts)
@@ -1033,13 +1045,15 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
     parameter_versions_before = {
         name: int(parameter._version) for name, parameter in raw_policy.named_parameters()
     }
-    buffer_fingerprints_before = _tensor_state_fingerprints(raw_policy, buffers=True)
-    training_modules = [name for name, module in raw_policy.named_modules() if module.training]
-    if training_modules:
-        raise RuntimeError(
-            "Evaluation policy contains modules left in training mode: "
-            + ", ".join(training_modules[:10])
-        )
+    buffer_fingerprints_before = None
+    if fixed_anchor_enabled:
+        buffer_fingerprints_before = _tensor_state_fingerprints(raw_policy, buffers=True)
+        training_modules = [name for name, module in raw_policy.named_modules() if module.training]
+        if training_modules:
+            raise RuntimeError(
+                "Evaluation policy contains modules left in training mode: "
+                + ", ".join(training_modules[:10])
+            )
     available_batches = len(dataloader)
     max_batches = available_batches if fixed_anchor_enabled else min(int(cfg.steps), available_batches)
     if max_batches <= 0:
@@ -1069,8 +1083,13 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
 
     wandb_logger = WandBLogger(cfg) if cfg.wandb.enable and cfg.wandb.project and is_main_process else None
 
-    running_sums = dict.fromkeys(EVAL_METRIC_KEYS, 0.0)
-    running_counts = dict.fromkeys(EVAL_METRIC_KEYS, 0.0)
+    metric_keys = (
+        EVAL_METRIC_KEYS + FIXED_ANCHOR_EXTRA_METRIC_KEYS
+        if fixed_anchor_enabled
+        else EVAL_METRIC_KEYS
+    )
+    running_sums = dict.fromkeys(metric_keys, 0.0)
+    running_counts = dict.fromkeys(metric_keys, 0.0)
     raw_input_hasher = hashlib.sha256()
     preprocessed_input_hasher = hashlib.sha256()
     observed_anchor_indices: list[int] = []
@@ -1220,21 +1239,26 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
                 accelerator,
                 local_metrics,
                 local_batch_size,
+                metric_keys=metric_keys,
             )
-            for key in EVAL_METRIC_KEYS:
+            for key in metric_keys:
                 running_sums[key] += batch_sums[key]
                 running_counts[key] += batch_counts[key]
 
             batch_metrics = {
                 key: batch_sums[key] / batch_counts[key]
-                for key in EVAL_METRIC_KEYS
+                for key in metric_keys
                 if batch_counts[key] > 0
             }
 
             if is_main_process and progress is not None:
                 progress.update(1)
             if is_main_process and cfg.log_freq > 0 and eval_step % cfg.log_freq == 0:
-                logging.info("eval_step:%s %s", eval_step, _format_metrics(batch_metrics))
+                logging.info(
+                    "eval_step:%s %s",
+                    eval_step,
+                    _format_metrics(batch_metrics, metric_keys=metric_keys),
+                )
                 if wandb_logger is not None:
                     wandb_logger.log_dict(
                         {f"eval/{key}": value for key, value in batch_metrics.items()},
@@ -1245,7 +1269,7 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
         progress.close()
 
     summary_metrics = {
-        key: running_sums[key] / running_counts[key] for key in EVAL_METRIC_KEYS if running_counts[key] > 0
+        key: running_sums[key] / running_counts[key] for key in metric_keys if running_counts[key] > 0
     }
     fixed_anchor_report = None
     if fixed_anchor_enabled:
@@ -1326,18 +1350,12 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
         "num_processes": int(accelerator.num_processes),
         "seed": cfg.seed,
         "metrics": summary_metrics,
-        "fixed_anchor": fixed_anchor_report,
         "dataset_domain_selection": dataset_domain_report,
         "metric_semantics": {
             "loss_action": (
                 "The checkpoint's native flow-matching action velocity MSE, "
                 "computed by policy(batch) with the same preprocessing, action chunks, "
                 "padding masks, and PointSeg cache path as training."
-            ),
-            "loss_anchor_total": (
-                "Checkpoint-comparison objective reconstructed exactly as loss_action + "
-                "loss_worldflow_flow + the manifest/config-verified pointseg weight * "
-                "loss_pointseg_aux."
             ),
             "sample_action_mse": (
                 "Optional MSE between the fully denoised action chunk returned by "
@@ -1350,6 +1368,13 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             ),
         },
     }
+    if fixed_anchor_enabled:
+        summary["fixed_anchor"] = fixed_anchor_report
+        summary["metric_semantics"]["loss_anchor_total"] = (
+            "Checkpoint-comparison objective reconstructed exactly as loss_action + "
+            "loss_worldflow_flow + the manifest/config-verified pointseg weight * "
+            "loss_pointseg_aux."
+        )
 
     gradients_created = [
         name for name, parameter in raw_policy.named_parameters() if parameter.grad is not None
@@ -1368,23 +1393,27 @@ def evaluate(cfg: SongEvalPipelineConfig, accelerator: Accelerator | None = None
             "Evaluation unexpectedly modified model parameters in place: "
             + ", ".join(parameters_modified[:10])
         )
-    buffer_fingerprints_after = _tensor_state_fingerprints(raw_policy, buffers=True)
-    buffers_modified = _changed_tensor_fingerprints(
-        buffer_fingerprints_before,
-        buffer_fingerprints_after,
-    )
-    if buffers_modified:
-        raise RuntimeError(
-            "Evaluation unexpectedly modified model buffers (including possible BatchNorm stats): "
-            + ", ".join(buffers_modified[:10])
-        )
     summary["gradients_created"] = False
     summary["model_parameters_unchanged"] = True
-    summary["model_buffers_unchanged"] = True
-    summary["all_modules_eval_mode"] = True
+    if fixed_anchor_enabled:
+        buffer_fingerprints_after = _tensor_state_fingerprints(raw_policy, buffers=True)
+        buffers_modified = _changed_tensor_fingerprints(
+            buffer_fingerprints_before,
+            buffer_fingerprints_after,
+        )
+        if buffers_modified:
+            raise RuntimeError(
+                "Evaluation unexpectedly modified model buffers (including possible BatchNorm stats): "
+                + ", ".join(buffers_modified[:10])
+            )
+        summary["model_buffers_unchanged"] = True
+        summary["all_modules_eval_mode"] = True
 
     if is_main_process:
-        logging.info("Evaluation summary: %s", _format_metrics(summary_metrics))
+        logging.info(
+            "Evaluation summary: %s",
+            _format_metrics(summary_metrics, metric_keys=metric_keys),
+        )
         summary_path = output_dir / "eval_metrics.json"
         with summary_path.open("w", encoding="utf-8") as file:
             json.dump(summary, file, indent=2, ensure_ascii=False)
