@@ -959,8 +959,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 "empty_cameras": 0,
                 "tokenizer_max_length": 48,
                 "num_steps": 10,
-                "flow_time_sampling": "beta",
-                "flow_time_zero_probability": 0.0,
+                # flow_time_sampling and flow_time_zero_probability select the
+                # training-time objective distribution. They do not alter the
+                # module topology or the fixed Euler inference grid, so keep
+                # them CLI-configurable like optimizer/scheduler settings.
                 "use_cache": True,
                 "molmo_inference_only": False,
                 "molmo_image_fast_path": True,

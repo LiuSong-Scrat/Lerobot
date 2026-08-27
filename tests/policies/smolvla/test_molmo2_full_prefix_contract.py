@@ -148,6 +148,28 @@ def test_full_config_allows_cli_scheduler_override() -> None:
     assert config.scheduler_decay_lr == 1e-5
 
 
+@pytest.mark.parametrize(
+    ("sampling", "zero_probability"),
+    (
+        ("beta", 0.0),
+        ("uniform", 0.0),
+        ("integration_grid", 0.0),
+        ("integration_grid", 0.25),
+        ("integration_grid", 0.5),
+    ),
+)
+def test_full_config_allows_runtime_flow_time_sampling(
+    sampling: str,
+    zero_probability: float,
+) -> None:
+    config = _full_worldflow_config(
+        flow_time_sampling=sampling,
+        flow_time_zero_probability=zero_probability,
+    )
+    assert config.flow_time_sampling == sampling
+    assert config.flow_time_zero_probability == zero_probability
+
+
 def test_full_checkpoint_topology_gate_rejects_old_and_accepts_wep_prefix(tmp_path) -> None:
     checkpoint = tmp_path / "pretrained_model"
     checkpoint.mkdir()
