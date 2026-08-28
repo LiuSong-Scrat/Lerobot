@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -46,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--io-hard-mib-s", type=float, default=768.0)
     parser.add_argument("--gpu-soft-used-gib", type=float, default=2.0)
     parser.add_argument("--gpu-hard-used-gib", type=float, default=23.0)
+    parser.add_argument("--terminate-eval-memory-gib", type=float)
     return parser.parse_args()
 
 
@@ -115,6 +117,48 @@ def process_tree_snapshot(pid_dir: Path) -> dict[int, tuple[float, int, int]]:
         selected.add(pid)
         pending.extend(children.get(pid, ()))
     return {pid: stats[pid] for pid in selected if pid in stats}
+
+
+def descendant_pids(root_pids: set[int], parent_by_pid: dict[int, int]) -> set[int]:
+    children: dict[int, set[int]] = {}
+    for pid, ppid in parent_by_pid.items():
+        children.setdefault(ppid, set()).add(pid)
+    selected = set()
+    pending = list(root_pids)
+    while pending:
+        pid = pending.pop()
+        if pid in selected:
+            continue
+        selected.add(pid)
+        pending.extend(children.get(pid, ()))
+    return selected
+
+
+def terminate_eval_processes(pid_dir: Path) -> list[int]:
+    roots = set()
+    for path in pid_dir.glob("eval_*.pid") if pid_dir.is_dir() else ():
+        try:
+            roots.add(int(path.read_text().strip()))
+        except (FileNotFoundError, ValueError):
+            continue
+    parent_by_pid = {}
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        stat = _proc_stat(int(path.name))
+        if stat is not None:
+            parent_by_pid[int(path.name)] = stat[0]
+    selected = descendant_pids(roots, parent_by_pid)
+    terminated = []
+    for pid in sorted(selected, reverse=True):
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            terminated.append(pid)
+        except (PermissionError, ProcessLookupError):
+            continue
+    return terminated
 
 
 def cgroup_memory_bytes() -> int:
@@ -242,6 +286,20 @@ def main() -> int:
         payload = sample(args.root, args.gpu, args.sample_seconds, limits)
         append_audit(args.root, payload)
         print(json.dumps(payload, sort_keys=True), flush=True)
+        if (
+            args.terminate_eval_memory_gib is not None
+            and payload["memory_gib"] >= args.terminate_eval_memory_gib
+        ):
+            terminated = terminate_eval_processes(args.root / "pids")
+            emergency = {
+                "timestamp": time.time(),
+                "memory_gib": payload["memory_gib"],
+                "threshold_gib": args.terminate_eval_memory_gib,
+                "terminated_pids": terminated,
+            }
+            marker = args.root / "resource" / "EVAL_TERMINATED_RESOURCE_LIMIT"
+            marker.write_text(json.dumps(emergency, indent=2), encoding="utf-8")
+            print(json.dumps(emergency, sort_keys=True), flush=True)
         consecutive_ok = consecutive_ok + 1 if payload["soft_ok"] else 0
         if args.wait and consecutive_ok >= max(1, args.consecutive):
             return 0

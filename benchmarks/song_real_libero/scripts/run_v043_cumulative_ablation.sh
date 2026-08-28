@@ -19,6 +19,8 @@ num_workers=${SONG_ABLATION_NUM_WORKERS:-2}
 eval_episodes=${SONG_ABLATION_EVAL_EPISODES:-50}
 guard_sample_s=${SONG_ABLATION_GUARD_SAMPLE_S:-5}
 guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
+eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
+summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
 
 variants=(
   smolvla_src
@@ -225,13 +227,41 @@ checkpoint_ready() {
     && test -s "$checkpoint/policy_postprocessor.json"
 }
 
+eval_result_valid() {
+  local output=$1
+  "$python" - "$output/summary.json" "$eval_episodes" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+episodes_per_task = int(sys.argv[2])
+if not summary_path.is_file():
+    raise SystemExit(1)
+summary = json.loads(summary_path.read_text())
+expected_total = 2 * episodes_per_task
+if summary.get("overall", {}).get("episode_count") != expected_total:
+    raise SystemExit(1)
+tasks = [task for suite in summary.get("suite_reports", []) for task in suite.get("tasks", [])]
+if {task.get("task_id") for task in tasks} != {6, 8}:
+    raise SystemExit(1)
+episodes = [episode for task in tasks for episode in task.get("episodes", [])]
+if len(episodes) != expected_total:
+    raise SystemExit(1)
+if any(episode.get("error") not in (None, "") for episode in episodes):
+    raise SystemExit(1)
+if any(int(episode.get("model_call_count", 0)) <= 0 for episode in episodes):
+    raise SystemExit(1)
+PY
+}
+
 eval_one() {
   local variant=$1 gpu=$2 step=$3 checkpoint=$4
   local step_tag
   printf -v step_tag '%06d' "$step"
   local output="$root/eval/$variant/step$step_tag"
   local log="$root/logs/eval_${variant}_step${step_tag}.log"
-  if [[ -s "$output/summary.json" ]]; then
+  if eval_result_valid "$output"; then
     echo "[eval] reuse $variant step=$step_tag"
     return
   fi
@@ -239,33 +269,37 @@ eval_one() {
     echo "[eval] incomplete output exists: $output" >&2
     return 1
   fi
-  guard_wait "$gpu"
-  mkdir -p "$output" "$root/logs"
-  cd "$repo"
-  env \
-    PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-    NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES="$gpu" \
-    MUJOCO_EGL_DEVICE_ID="$gpu" PYTHONPATH="$repo/src" \
-    "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
-      --config benchmarks/song_real_libero/configs/libero.json \
-      --policy.path "$checkpoint" --device cuda \
-      --num-points 10000 \
-      --suite libero_10 --task-id 6 --task-id 8 --episodes "$eval_episodes" \
-      --policy-noise-seed 0 --env-seed 7 --strict-official-init \
-      --gripper-control-mode delta_width_initial_sync \
-      --gripper-delta-threshold 0.002 \
-      --gripper-delta-alignment current_minus_previous \
-      --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
-      --task-workers 2 --episode-workers-per-task 2 --task-worker-backend process \
-      --inference-batch-size 4 --inference-batching-mode fixed_barrier \
-      --no-release-event-exec-enable --control-freq 20 --action-index 0 \
-      --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
-      --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
-      --render-mode offscreen --no-visualize-foreground --no-save-video \
-      --no-world-to-ego-causal-ablation --output-dir "$output" \
-      >"$log" 2>&1
-  test -s "$output/summary.json"
+  (
+    flock 9
+    guard_wait "$gpu"
+    mkdir -p "$output" "$root/logs"
+    cd "$repo"
+    env \
+      PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+      NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
+      MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES="$gpu" \
+      MUJOCO_EGL_DEVICE_ID="$gpu" SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES="$gpu,0" \
+      SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID=0 PYTHONPATH="$repo/src" \
+      "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+        --config benchmarks/song_real_libero/configs/libero.json \
+        --policy.path "$checkpoint" --device cuda \
+        --num-points 10000 \
+        --suite libero_10 --task-id 6 --task-id 8 --episodes "$eval_episodes" \
+        --policy-noise-seed 0 --env-seed 7 --strict-official-init \
+        --gripper-control-mode delta_width_initial_sync \
+        --gripper-delta-threshold 0.002 \
+        --gripper-delta-alignment current_minus_previous \
+        --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
+        --task-workers 2 --episode-workers-per-task 1 --task-worker-backend process \
+        --inference-batch-size 2 --inference-batching-mode fixed_barrier \
+        --no-release-event-exec-enable --control-freq 20 --action-index 0 \
+        --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
+        --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
+        --render-mode offscreen --no-visualize-foreground --no-save-video \
+        --no-world-to-ego-causal-ablation --output-dir "$output" \
+        >"$log" 2>&1
+    eval_result_valid "$output"
+  ) 9>"$eval_lock"
 }
 
 eval_watch_one() {
@@ -279,10 +313,10 @@ eval_watch_one() {
       step_tag=$(basename "$(dirname "$checkpoint")")
       [[ "$step_tag" =~ ^[0-9]+$ ]] || continue
       step=$((10#$step_tag))
-      if [[ ! -s "$root/eval/$variant/step$step_tag/summary.json" ]]; then
+      if ! eval_result_valid "$root/eval/$variant/step$step_tag"; then
         if checkpoint_ready "$checkpoint"; then
           eval_one "$variant" "$gpu" "$step" "$checkpoint"
-          flock "$root/summary.lock" "$python" "$summarizer" \
+          flock "$summary_lock" "$python" "$summarizer" \
             --root "$root" --episodes-per-task "$eval_episodes"
         else
           found_pending=1
@@ -321,7 +355,8 @@ eval_all() {
 }
 
 resource_watch() {
-  "$python" "$guard" --root "$root" --watch --sample-seconds 10 --poll-seconds 20 \
+  "$python" "$guard" --root "$root" --watch --sample-seconds 2 --poll-seconds 2 \
+    --terminate-eval-memory-gib 56.5 \
     >>"$root/logs/resource_watch.log" 2>&1
 }
 
