@@ -356,12 +356,13 @@ eval_all() {
 
 resource_watch() {
   "$python" "$guard" --root "$root" --watch --sample-seconds 2 --poll-seconds 2 \
-    --terminate-eval-memory-gib 56.5 \
+    --terminate-eval-memory-gib 57 \
     >>"$root/logs/resource_watch.log" 2>&1
 }
 
 checkpoint_cache_watch() {
-  "$python" "$cache_reclaimer" --train-root "$root/train" --watch --poll-seconds 10 \
+  "$python" "$cache_reclaimer" --train-root "$root/train" --watch \
+    --poll-seconds 1 --readvise-seconds 60 \
     >>"$root/logs/checkpoint_cache_reclaimer.log" 2>&1
 }
 
