@@ -130,24 +130,28 @@ def cgroup_memory_bytes() -> int:
     raise RuntimeError("Cannot read cgroup memory usage.")
 
 
-def gpu_sample(gpu: int | None) -> dict[str, float | int] | None:
-    if gpu is None:
-        return None
+def gpu_samples(gpu: int | None) -> list[dict[str, float | int]]:
     command = [
         "nvidia-smi",
-        f"--id={gpu}",
-        "--query-gpu=memory.used,memory.total,utilization.gpu",
+        "--query-gpu=index,memory.used,memory.total,utilization.gpu",
         "--format=csv,noheader,nounits",
     ]
-    output = subprocess.check_output(command, text=True).strip().split(",")
-    if len(output) != 3:
-        raise RuntimeError(f"Unexpected nvidia-smi output: {output!r}")
-    return {
-        "index": gpu,
-        "used_gib": float(output[0]) / 1024.0,
-        "total_gib": float(output[1]) / 1024.0,
-        "utilization_percent": float(output[2]),
-    }
+    if gpu is not None:
+        command.insert(1, f"--id={gpu}")
+    result = []
+    for line in subprocess.check_output(command, text=True).strip().splitlines():
+        output = [value.strip() for value in line.split(",")]
+        if len(output) != 4:
+            raise RuntimeError(f"Unexpected nvidia-smi output: {output!r}")
+        result.append(
+            {
+                "index": int(output[0]),
+                "used_gib": float(output[1]) / 1024.0,
+                "total_gib": float(output[2]) / 1024.0,
+                "utilization_percent": float(output[3]),
+            }
+        )
+    return result
 
 
 def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
@@ -164,7 +168,7 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     )
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
     memory_gib = cgroup_memory_bytes() / GIB
-    gpu_info = gpu_sample(gpu)
+    gpu_info = gpu_samples(gpu)
     soft_reasons = []
     hard_reasons = []
     comparisons = (
@@ -177,15 +181,16 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
             soft_reasons.append(f"{name}={value:.2f}>={soft:.2f}")
         if value >= hard:
             hard_reasons.append(f"{name}={value:.2f}>={hard:.2f}")
-    if gpu_info is not None:
-        used_gib = float(gpu_info["used_gib"])
+    for item in gpu_info:
+        index = int(item["index"])
+        used_gib = float(item["used_gib"])
         if used_gib >= limits.gpu_soft_used_gib:
             soft_reasons.append(
-                f"gpu{gpu}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}"
+                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}"
             )
         if used_gib >= limits.gpu_hard_used_gib:
             hard_reasons.append(
-                f"gpu{gpu}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}"
+                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}"
             )
     return {
         "timestamp": time.time(),
@@ -195,7 +200,7 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         "experiment_rss_gib": experiment_rss_gib,
         "cpu_cores": cpu_cores,
         "io_mib_s": io_mib_s,
-        "gpu": gpu_info,
+        "gpus": gpu_info,
         "soft_ok": not soft_reasons,
         "hard_ok": not hard_reasons,
         "soft_reasons": soft_reasons,
@@ -210,9 +215,7 @@ def append_audit(root: Path, payload: dict) -> None:
     with (audit_dir / "samples.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, sort_keys=True) + "\n")
     marker = audit_dir / "HARD_LIMIT_EXCEEDED"
-    if payload["hard_ok"]:
-        marker.unlink(missing_ok=True)
-    else:
+    if not payload["hard_ok"]:
         marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -230,6 +233,12 @@ def main() -> int:
     )
     consecutive_ok = 0
     while True:
+        marker = args.root / "resource" / "HARD_LIMIT_EXCEEDED"
+        if args.wait and marker.is_file():
+            print(
+                f"Refusing new work after a hard resource limit: {marker}", flush=True
+            )
+            return 2
         payload = sample(args.root, args.gpu, args.sample_seconds, limits)
         append_audit(args.root, payload)
         print(json.dumps(payload, sort_keys=True), flush=True)

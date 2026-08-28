@@ -46,8 +46,9 @@ The runner admits each trainer and each evaluation only after three consecutive
 resource samples pass. Defaults reserve headroom below the requested host
 limits: 50 GiB / 36 CPU cores / 400 MiB/s are soft admission thresholds, while
 58 GiB / 42 cores / 768 MiB/s / 23 GiB per GPU are audited as hard limits.
-Every sample is appended to `resource/samples.jsonl`; a hard-limit marker is
-written under the same directory if a threshold is crossed. The 2D baseline
+Every sample, including all eight GPUs, is appended to
+`resource/samples.jsonl`; a persistent hard-limit marker is written under the
+same directory if a threshold is crossed, and it blocks new work. The 2D baseline
 does not wrap the point-cloud dataset, which removes unnecessary shared-storage
 reads and makes the modality ablation exact.
 
