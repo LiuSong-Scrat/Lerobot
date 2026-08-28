@@ -60,6 +60,10 @@ Every sample, including all eight GPUs, is appended to
 same directory if a threshold is crossed, and it blocks new work. The 2D baseline
 does not wrap the point-cloud dataset, which removes unnecessary shared-storage
 reads and makes the modality ablation exact.
+The IO rate uses Linux `/proc/<pid>/io` `read_bytes + write_bytes`, which tracks
+storage-accounted traffic. It intentionally excludes `rchar + wchar` because
+those fields count logical cached IO and can multiply-count checkpoint
+serialization without representing NFS load.
 
 Run the complete experiment from the repository root:
 

@@ -57,9 +57,7 @@ def _proc_stat(pid: int) -> tuple[int, float, int] | None:
         rest = raw[raw.rfind(")") + 2 :].split()
         ppid = int(rest[1])
         cpu_s = (int(rest[11]) + int(rest[12])) / CLK_TCK
-        rss = (
-            int((Path("/proc") / str(pid) / "statm").read_text().split()[1]) * PAGE_SIZE
-        )
+        rss = int((Path("/proc") / str(pid) / "statm").read_text().split()[1]) * PAGE_SIZE
         return ppid, cpu_s, rss
     except (
         FileNotFoundError,
@@ -71,13 +69,18 @@ def _proc_stat(pid: int) -> tuple[int, float, int] | None:
         return None
 
 
-def _proc_io_chars(pid: int) -> int:
+def storage_io_bytes_from_text(raw: str) -> int:
+    """Return storage-accounted bytes, excluding cached logical I/O."""
+    values = {}
+    for line in raw.splitlines():
+        key, value = line.split(":", 1)
+        values[key] = int(value)
+    return values.get("read_bytes", 0) + values.get("write_bytes", 0)
+
+
+def _proc_io_bytes(pid: int) -> int:
     try:
-        values = {}
-        for line in (Path("/proc") / str(pid) / "io").read_text().splitlines():
-            key, value = line.split(":", 1)
-            values[key] = int(value)
-        return values.get("rchar", 0) + values.get("wchar", 0)
+        return storage_io_bytes_from_text((Path("/proc") / str(pid) / "io").read_text())
     except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
         return 0
 
@@ -105,7 +108,7 @@ def process_tree_snapshot(pid_dir: Path) -> dict[int, tuple[float, int, int]]:
         if stat is None:
             continue
         ppid, cpu_s, rss = stat
-        stats[pid] = (cpu_s, rss, _proc_io_chars(pid))
+        stats[pid] = (cpu_s, rss, _proc_io_bytes(pid))
         children.setdefault(ppid, set()).add(pid)
 
     selected = set()
@@ -207,9 +210,7 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     elapsed = max(time.monotonic() - start_time, 1e-6)
     shared = start.keys() & end.keys()
     cpu_cores = sum(max(0.0, end[pid][0] - start[pid][0]) for pid in shared) / elapsed
-    io_mib_s = (
-        sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
-    )
+    io_mib_s = sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
     memory_gib = cgroup_memory_bytes() / GIB
     gpu_info = gpu_samples(gpu)
@@ -229,13 +230,9 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         index = int(item["index"])
         used_gib = float(item["used_gib"])
         if used_gib >= limits.gpu_soft_used_gib:
-            soft_reasons.append(
-                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}"
-            )
+            soft_reasons.append(f"gpu{index}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}")
         if used_gib >= limits.gpu_hard_used_gib:
-            hard_reasons.append(
-                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}"
-            )
+            hard_reasons.append(f"gpu{index}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}")
     return {
         "timestamp": time.time(),
         "root": str(root),
@@ -244,6 +241,7 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         "experiment_rss_gib": experiment_rss_gib,
         "cpu_cores": cpu_cores,
         "io_mib_s": io_mib_s,
+        "io_metric": "proc_read_bytes_plus_write_bytes",
         "gpus": gpu_info,
         "soft_ok": not soft_reasons,
         "hard_ok": not hard_reasons,
@@ -279,9 +277,7 @@ def main() -> int:
     while True:
         marker = args.root / "resource" / "HARD_LIMIT_EXCEEDED"
         if args.wait and marker.is_file():
-            print(
-                f"Refusing new work after a hard resource limit: {marker}", flush=True
-            )
+            print(f"Refusing new work after a hard resource limit: {marker}", flush=True)
             return 2
         payload = sample(args.root, args.gpu, args.sample_seconds, limits)
         append_audit(args.root, payload)
