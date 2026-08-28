@@ -361,7 +361,7 @@ resource_watch() {
 }
 
 checkpoint_cache_watch() {
-  "$python" "$cache_reclaimer" --train-root "$root/train" --watch --poll-seconds 60 \
+  "$python" "$cache_reclaimer" --train-root "$root/train" --watch --poll-seconds 10 \
     >>"$root/logs/checkpoint_cache_reclaimer.log" 2>&1
 }
 
