@@ -255,6 +255,48 @@ if any(int(episode.get("model_call_count", 0)) <= 0 for episode in episodes):
 PY
 }
 
+training_is_running() {
+  local variant pid
+  for variant in "${variants[@]}"; do
+    pid=$(cat "$root/pids/train_${variant}.pid" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_eval_command() {
+  local gpu=$1 checkpoint=$2 output=$3 log=$4
+  guard_wait "$gpu"
+  mkdir -p "$output" "$root/logs"
+  cd "$repo"
+  env \
+    PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
+    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES="$gpu" \
+    MUJOCO_EGL_DEVICE_ID="$gpu" SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES="$gpu,0" \
+    SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID=0 PYTHONPATH="$repo/src" \
+    "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+      --config benchmarks/song_real_libero/configs/libero.json \
+      --policy.path "$checkpoint" --device cuda \
+      --num-points 10000 \
+      --suite libero_10 --task-id 6 --task-id 8 --episodes "$eval_episodes" \
+      --policy-noise-seed 0 --env-seed 7 --strict-official-init \
+      --gripper-control-mode delta_width_initial_sync \
+      --gripper-delta-threshold 0.002 \
+      --gripper-delta-alignment current_minus_previous \
+      --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
+      --task-workers 2 --episode-workers-per-task 1 --task-worker-backend process \
+      --inference-batch-size 2 --inference-batching-mode fixed_barrier \
+      --no-release-event-exec-enable --control-freq 20 --action-index 0 \
+      --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
+      --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
+      --render-mode offscreen --no-visualize-foreground --no-save-video \
+      --no-world-to-ego-causal-ablation --output-dir "$output" \
+      >"$log" 2>&1
+}
+
 eval_one() {
   local variant=$1 gpu=$2 step=$3 checkpoint=$4
   local step_tag
@@ -270,36 +312,23 @@ eval_one() {
     return 1
   fi
   (
-    flock 9
-    guard_wait "$gpu"
-    mkdir -p "$output" "$root/logs"
-    cd "$repo"
-    env \
-      PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-      NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
-      MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES="$gpu" \
-      MUJOCO_EGL_DEVICE_ID="$gpu" SONG_LIBERO_ENV_CUDA_VISIBLE_DEVICES="$gpu,0" \
-      SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID=0 PYTHONPATH="$repo/src" \
-      "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
-        --config benchmarks/song_real_libero/configs/libero.json \
-        --policy.path "$checkpoint" --device cuda \
-        --num-points 10000 \
-        --suite libero_10 --task-id 6 --task-id 8 --episodes "$eval_episodes" \
-        --policy-noise-seed 0 --env-seed 7 --strict-official-init \
-        --gripper-control-mode delta_width_initial_sync \
-        --gripper-delta-threshold 0.002 \
-        --gripper-delta-alignment current_minus_previous \
-        --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
-        --task-workers 2 --episode-workers-per-task 1 --task-worker-backend process \
-        --inference-batch-size 2 --inference-batching-mode fixed_barrier \
-        --no-release-event-exec-enable --control-freq 20 --action-index 0 \
-        --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
-        --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
-        --render-mode offscreen --no-visualize-foreground --no-save-video \
-        --no-world-to-ego-causal-ablation --output-dir "$output" \
-        >"$log" 2>&1
+    exec 9>"$eval_lock"
+    while training_is_running; do
+      if flock -w "$guard_poll_s" 9; then
+        if training_is_running; then
+          run_eval_command "$gpu" "$checkpoint" "$output" "$log"
+          eval_result_valid "$output"
+          exit
+        fi
+        flock -u 9
+      fi
+    done
+
+    # With no trainers resident, the four fixed evaluation GPUs can run in
+    # parallel; the global resource watcher remains the emergency backstop.
+    run_eval_command "$gpu" "$checkpoint" "$output" "$log"
     eval_result_valid "$output"
-  ) 9>"$eval_lock"
+  )
 }
 
 eval_watch_one() {
@@ -393,24 +422,30 @@ status() {
     --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 }
 
-case "${1:-}" in
-  preflight) preflight ;;
-  train) train_all ;;
-  eval) eval_all ;;
-  all)
-    mkdir -p "$root/logs" "$root/pids"
-    resource_watch & resource_pid=$!
-    echo "$resource_pid" > "$root/pids/resource_watch.pid"
-    checkpoint_cache_watch & cache_reclaimer_pid=$!
-    echo "$cache_reclaimer_pid" > "$root/pids/checkpoint_cache_reclaimer.pid"
-    trap 'kill "$resource_pid" "$cache_reclaimer_pid" 2>/dev/null || true' EXIT
-    train_all & train_supervisor=$!
-    eval_all & eval_supervisor=$!
-    wait "$train_supervisor"
-    wait "$eval_supervisor"
-    summarize
-    ;;
-  summarize) summarize ;;
-  status) status ;;
-  *) usage; exit 2 ;;
-esac
+main() {
+  case "${1:-}" in
+    preflight) preflight ;;
+    train) train_all ;;
+    eval) eval_all ;;
+    all)
+      mkdir -p "$root/logs" "$root/pids"
+      resource_watch & resource_pid=$!
+      echo "$resource_pid" > "$root/pids/resource_watch.pid"
+      checkpoint_cache_watch & cache_reclaimer_pid=$!
+      echo "$cache_reclaimer_pid" > "$root/pids/checkpoint_cache_reclaimer.pid"
+      trap 'kill "$resource_pid" "$cache_reclaimer_pid" 2>/dev/null || true' EXIT
+      train_all & train_supervisor=$!
+      eval_all & eval_supervisor=$!
+      wait "$train_supervisor"
+      wait "$eval_supervisor"
+      summarize
+      ;;
+    summarize) summarize ;;
+    status) status ;;
+    *) usage; return 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
