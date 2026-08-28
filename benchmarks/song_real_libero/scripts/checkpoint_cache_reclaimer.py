@@ -19,7 +19,9 @@ REQUIRED_MODEL_FILES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-root", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--train-root", type=Path)
+    source.add_argument("--checkpoint", type=Path)
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--readvise-seconds", type=float, default=60.0)
@@ -108,6 +110,22 @@ def sweep_due(
 
 def main() -> int:
     args = parse_args()
+    if args.checkpoint is not None:
+        files, bytes_advised = release_checkpoint_cache(args.checkpoint)
+        print(
+            json.dumps(
+                {
+                    "timestamp": time.time(),
+                    "checkpoints": 1,
+                    "files": files,
+                    "bytes_advised": bytes_advised,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0
+    assert args.train_root is not None
     last_advised: dict[Path, float] = {}
     while True:
         payload = sweep_due(

@@ -68,3 +68,40 @@ def test_evaluations_are_serial_while_a_trainer_is_running(tmp_path: Path) -> No
 
 def test_evaluations_can_overlap_after_training_stops(tmp_path: Path) -> None:
     assert _run_admission_probe(tmp_path, trainer_running=False)
+
+
+def test_checkpoint_is_staged_locally_with_bandwidth_limit(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "source"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors").write_bytes(b"model")
+    (checkpoint / "config.json").write_text(
+        '{"vlm_model_name":"remote-architecture","vlm_weights_path":"remote-weights"}'
+    )
+    vlm = tmp_path / "vlm"
+    vlm.mkdir()
+    (vlm / "config.json").write_text("{}")
+    (vlm / "tokenizer.json").write_text("{}")
+    (vlm / "model.safetensors").write_bytes(b"excluded")
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    (weights / "config.json").write_text("{}")
+    (weights / "model.safetensors").write_bytes(b"weights")
+    stage_root = tmp_path / "stages"
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_CHECKPOINT_STAGE_ROOT={shlex.quote(str(stage_root))}
+export SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB=1024
+export SONG_ABLATION_VLM={shlex.quote(str(vlm))}
+export SONG_ABLATION_VLM_WEIGHTS={shlex.quote(str(weights))}
+source {shlex.quote(str(RUNNER))}
+stage=$(stage_checkpoint_locally {shlex.quote(str(checkpoint))} variant 000001)
+cmp {shlex.quote(str(checkpoint / 'model.safetensors'))} "$stage/pretrained_model/model.safetensors"
+cmp {shlex.quote(str(weights / 'model.safetensors'))} "$stage/vlm_weights/model.safetensors"
+[[ ! -e "$stage/vlm_architecture/model.safetensors" ]]
+jq -e --arg stage "$stage" \
+  '.vlm_model_name == ($stage + "/vlm_architecture") and .vlm_weights_path == ($stage + "/vlm_weights")' \
+  "$stage/pretrained_model/config.json"
+[[ "$stage" == {shlex.quote(str(stage_root))}/* ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)

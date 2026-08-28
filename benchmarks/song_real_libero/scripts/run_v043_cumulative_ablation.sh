@@ -23,6 +23,8 @@ eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
 summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-2}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
+checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
+checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-153600}
 
 variants=(
   smolvla_src
@@ -67,6 +69,11 @@ require_inputs() {
     echo "Post-training evaluation staggering must be non-negative." >&2
     exit 2
   fi
+  if (( checkpoint_stage_bwlimit_kib <= 0 )); then
+    echo "Checkpoint staging bandwidth must be positive." >&2
+    exit 2
+  fi
+  command -v rsync >/dev/null
 }
 
 guard_wait() {
@@ -302,9 +309,62 @@ acquire_post_training_eval_slot() {
   done
 }
 
+cleanup_stage_directory() {
+  local stage_dir=$1
+  if [[ -z "$stage_dir" || ! -d "$stage_dir" || "$stage_dir" != "$checkpoint_stage_root/"* ]]; then
+    return 2
+  fi
+  find "$stage_dir" -depth -delete
+}
+
+stage_checkpoint_locally() {
+  local checkpoint=$1 variant=$2 step=$3 stage_dir stage_checkpoint stage_vlm stage_vlm_weights
+  mkdir -p "$checkpoint_stage_root"
+  stage_dir=$(mktemp -d "$checkpoint_stage_root/${variant}_step${step}.XXXXXX")
+  stage_checkpoint="$stage_dir/pretrained_model"
+  stage_vlm="$stage_dir/vlm_architecture"
+  stage_vlm_weights="$stage_dir/vlm_weights"
+  mkdir -p "$stage_checkpoint" "$stage_vlm" "$stage_vlm_weights"
+  if ! rsync --archive --bwlimit="$checkpoint_stage_bwlimit_kib" \
+    "$checkpoint/" "$stage_checkpoint/" || \
+    ! rsync --archive --bwlimit="$checkpoint_stage_bwlimit_kib" \
+      "$vlm_weights/" "$stage_vlm_weights/" || \
+    ! rsync --archive --bwlimit="$checkpoint_stage_bwlimit_kib" \
+      --exclude=model.safetensors --exclude=onnx/ --exclude=.git/ \
+      "$vlm/" "$stage_vlm/"; then
+    cleanup_stage_directory "$stage_dir"
+    return 1
+  fi
+  if [[ ! -s "$stage_checkpoint/model.safetensors" || ! -s "$stage_checkpoint/config.json" ]]; then
+    cleanup_stage_directory "$stage_dir"
+    return 1
+  fi
+  "$python" - "$stage_checkpoint/config.json" "$stage_vlm" "$stage_vlm_weights" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+original_weights = config.get("vlm_weights_path")
+config["vlm_model_name"] = sys.argv[2]
+config["vlm_weights_path"] = sys.argv[3]
+if config.get("action_expert_weights_path") == original_weights:
+    config["action_expert_weights_path"] = sys.argv[3]
+path.write_text(json.dumps(config, indent=4) + "\n")
+PY
+  echo "$stage_dir"
+}
+
 run_eval_command() {
-  local gpu=$1 checkpoint=$2 output=$3 log=$4
+  local gpu=$1 checkpoint=$2 output=$3 log=$4 stage_checkpoint=${5:-false}
+  local eval_checkpoint=$checkpoint stage_dir= status=0
   guard_wait "$gpu"
+  if [[ "$stage_checkpoint" == true ]]; then
+    stage_dir=$(stage_checkpoint_locally \
+      "$checkpoint" "$(basename "$(dirname "$output")")" "$(basename "$output")")
+    eval_checkpoint="$stage_dir/pretrained_model"
+  fi
   mkdir -p "$output" "$root/logs"
   cd "$repo"
   env \
@@ -315,7 +375,7 @@ run_eval_command() {
     SONG_LIBERO_ENV_MUJOCO_EGL_DEVICE_ID=0 PYTHONPATH="$repo/src" \
     "$python" benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
       --config benchmarks/song_real_libero/configs/libero.json \
-      --policy.path "$checkpoint" --device cuda \
+      --policy.path "$eval_checkpoint" --device cuda \
       --num-points 10000 \
       --suite libero_10 --task-id 6 --task-id 8 --episodes "$eval_episodes" \
       --policy-noise-seed 0 --env-seed 7 --strict-official-init \
@@ -330,7 +390,12 @@ run_eval_command() {
       --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
       --render-mode offscreen --no-visualize-foreground --no-save-video \
       --no-world-to-ego-causal-ablation --output-dir "$output" \
-      >"$log" 2>&1
+      >"$log" 2>&1 || status=$?
+  if [[ -n "$stage_dir" ]]; then
+    "$python" "$cache_reclaimer" --checkpoint "$stage_dir" >/dev/null 2>&1 || true
+    cleanup_stage_directory "$stage_dir"
+  fi
+  return "$status"
 }
 
 eval_one() {
@@ -367,7 +432,7 @@ eval_one() {
     index=$(variant_index "$variant")
     sleep "$((index * post_training_eval_stagger_s))"
     acquire_post_training_eval_slot slot_fd
-    run_eval_command "$gpu" "$checkpoint" "$output" "$log"
+    run_eval_command "$gpu" "$checkpoint" "$output" "$log" true
     eval_result_valid "$output"
   )
 }
