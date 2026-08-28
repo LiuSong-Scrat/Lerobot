@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This host retains a stale zero-byte unversioned NVIDIA library symlink. Put
+# the valid versioned driver directory first so PyTorch and NVML resolve the
+# active 570 driver used by /dev/nvidia*.
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+
 repo=${SONG_ABLATION_REPO:-/home/liusong/ProgramFiles/Huggingface/lerobot}
 python=${SONG_ABLATION_PYTHON:-/home/liusong/anaconda3/envs/reap/bin/python}
 dataset=${SONG_ABLATION_DATASET:-/opt/data/private/liusong/benchmarks/song_real_libero/data/libero_setting/world_eef_task6_task8_100ep}
