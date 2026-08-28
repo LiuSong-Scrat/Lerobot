@@ -21,6 +21,8 @@ guard_sample_s=${SONG_ABLATION_GUARD_SAMPLE_S:-5}
 guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
 eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
 summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
+post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-2}
+post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 
 variants=(
   smolvla_src
@@ -55,6 +57,14 @@ require_inputs() {
   fi
   if (( num_workers > 2 )); then
     echo "Refusing num_workers=$num_workers: four trainers are capped at two workers each." >&2
+    exit 2
+  fi
+  if (( post_training_eval_slots < 1 || post_training_eval_slots > 2 )); then
+    echo "Post-training evaluation concurrency must be one or two." >&2
+    exit 2
+  fi
+  if (( post_training_eval_stagger_s < 0 )); then
+    echo "Post-training evaluation staggering must be non-negative." >&2
     exit 2
   fi
 }
@@ -266,6 +276,32 @@ training_is_running() {
   return 1
 }
 
+variant_index() {
+  local requested=$1 index
+  for index in "${!variants[@]}"; do
+    if [[ "${variants[$index]}" == "$requested" ]]; then
+      echo "$index"
+      return 0
+    fi
+  done
+  return 1
+}
+
+acquire_post_training_eval_slot() {
+  local output_variable=$1 slot candidate_fd
+  while true; do
+    for ((slot = 0; slot < post_training_eval_slots; slot++)); do
+      exec {candidate_fd}>"${eval_lock}.slot${slot}"
+      if flock -n "$candidate_fd"; then
+        printf -v "$output_variable" '%s' "$candidate_fd"
+        return 0
+      fi
+      exec {candidate_fd}>&-
+    done
+    sleep "$guard_poll_s"
+  done
+}
+
 run_eval_command() {
   local gpu=$1 checkpoint=$2 output=$3 log=$4
   guard_wait "$gpu"
@@ -324,8 +360,13 @@ eval_one() {
       fi
     done
 
-    # With no trainers resident, the four fixed evaluation GPUs can run in
-    # parallel; the global resource watcher remains the emergency backstop.
+    # With no trainers resident, use two bounded slots and stagger model loads.
+    # This keeps the evaluation backlog moving without four simultaneous NFS
+    # reads or four resident evaluator process trees.
+    local index slot_fd
+    index=$(variant_index "$variant")
+    sleep "$((index * post_training_eval_stagger_s))"
+    acquire_post_training_eval_slot slot_fd
     run_eval_command "$gpu" "$checkpoint" "$output" "$log"
     eval_result_valid "$output"
   )

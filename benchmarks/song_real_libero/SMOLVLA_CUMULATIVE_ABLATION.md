@@ -51,10 +51,11 @@ model, preventing four simultaneous VLM weight reads; all four then train
 concurrently.
 While any trainer is resident, full evaluations share one local lock and run
 serially to preserve host-memory headroom. After all four trainers exit, the
-waiting variant watchers automatically release that restriction and evaluate
-concurrently on GPUs 4--7. Each watcher still admits work through the same soft
-resource guard, and the global watcher terminates evaluations at 57 GiB before
-the 58 GiB hard memory limit.
+waiting variant watchers automatically switch to two bounded evaluation slots
+on GPUs 4--7. Variant starts are staggered by 60 seconds so model loads do not
+hit NFS together. Each watcher still admits work through the same soft resource
+guard, and the global watcher terminates evaluations at 57 GiB before the 58
+GiB hard memory limit.
 Every sample, including all eight GPUs, is appended to
 `resource/samples.jsonl`; a persistent hard-limit marker is written under the
 same directory if a threshold is crossed, and it blocks new work. The 2D baseline

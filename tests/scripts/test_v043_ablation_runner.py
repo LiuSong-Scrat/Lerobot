@@ -16,10 +16,24 @@ set -euo pipefail
 export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
 export SONG_ABLATION_EVAL_LOCK={shlex.quote(str(tmp_path / 'eval.lock'))}
 export SONG_ABLATION_GUARD_POLL_S=0.05
+export SONG_ABLATION_POST_TRAINING_EVAL_SLOTS=2
+export SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 eval_result_valid() {{ [[ -f "$1/done" ]]; }}
 run_eval_command() {{
   local output=$3
+  local probe_fd probe_slot
+  for probe_slot in 0 1; do
+    exec {{probe_fd}}>{shlex.quote(str(tmp_path))}/probe_$probe_slot.lock
+    if flock -n "$probe_fd"; then
+      break
+    fi
+    exec {{probe_fd}}>&-
+    probe_fd=
+  done
+  if [[ -z "$probe_fd" ]]; then
+    touch "$root/over_capacity"
+  fi
   if ! mkdir "$root/active_eval" 2>/dev/null; then
     touch "$root/overlap"
   fi
@@ -30,15 +44,19 @@ run_eval_command() {{
 }}
 eval_one smolvla_src 4 1 /checkpoint/a & first=$!
 eval_one smolvla_pointcloud 5 1 /checkpoint/b & second=$!
+eval_one smolvla_pointcloud_effseg 6 1 /checkpoint/c & third=$!
 wait "$first"
 wait "$second"
+wait "$third"
 [[ -f "$root/eval/smolvla_src/step000001/done" ]]
 [[ -f "$root/eval/smolvla_pointcloud/step000001/done" ]]
+[[ -f "$root/eval/smolvla_pointcloud_effseg/step000001/done" ]]
 if [[ -f "$root/overlap" ]]; then
   echo overlap
 else
   echo serial
 fi
+[[ ! -f "$root/over_capacity" ]]
 """
     result = subprocess.run(["bash", "-c", command], check=True, capture_output=True, text=True)
     return result.stdout.strip() == "overlap"
