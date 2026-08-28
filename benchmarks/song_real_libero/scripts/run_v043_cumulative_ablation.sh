@@ -29,6 +29,7 @@ variants=(
 train_gpus=(0 1 2 3)
 eval_gpus=(4 5 6 7)
 guard="$repo/benchmarks/song_real_libero/scripts/ablation_resource_guard.py"
+cache_reclaimer="$repo/benchmarks/song_real_libero/scripts/checkpoint_cache_reclaimer.py"
 summarizer="$repo/benchmarks/song_real_libero/scripts/summarize_v043_ablation.py"
 
 usage() {
@@ -41,6 +42,7 @@ require_inputs() {
   test -f "$vlm_weights/model.safetensors"
   test -f "$cache/manifest.json"
   test -f "$guard"
+  test -f "$cache_reclaimer"
   if (( steps <= 0 || checkpoint_interval_s <= 0 )); then
     echo "steps and checkpoint interval must be positive" >&2
     exit 2
@@ -323,6 +325,11 @@ resource_watch() {
     >>"$root/logs/resource_watch.log" 2>&1
 }
 
+checkpoint_cache_watch() {
+  "$python" "$cache_reclaimer" --train-root "$root/train" --watch --poll-seconds 60 \
+    >>"$root/logs/checkpoint_cache_reclaimer.log" 2>&1
+}
+
 summarize() {
   cd "$repo"
   "$python" "$summarizer" --root "$root" --episodes-per-task "$eval_episodes"
@@ -358,7 +365,9 @@ case "${1:-}" in
     mkdir -p "$root/logs" "$root/pids"
     resource_watch & resource_pid=$!
     echo "$resource_pid" > "$root/pids/resource_watch.pid"
-    trap 'kill "$resource_pid" 2>/dev/null || true' EXIT
+    checkpoint_cache_watch & cache_reclaimer_pid=$!
+    echo "$cache_reclaimer_pid" > "$root/pids/checkpoint_cache_reclaimer.pid"
+    trap 'kill "$resource_pid" "$cache_reclaimer_pid" 2>/dev/null || true' EXIT
     train_all & train_supervisor=$!
     eval_all & eval_supervisor=$!
     wait "$train_supervisor"
