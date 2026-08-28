@@ -61,6 +61,27 @@ guard_wait() {
     --sample-seconds "$guard_sample_s" --poll-seconds "$guard_poll_s" --consecutive 3
 }
 
+wait_for_training_gpu_allocation() {
+  local gpu=$1 pid=$2
+  local deadline=$((SECONDS + 600))
+  while kill -0 "$pid" 2>/dev/null; do
+    local used_mib
+    used_mib=$(nvidia-smi --id="$gpu" --query-gpu=memory.used --format=csv,noheader,nounits)
+    used_mib=${used_mib//[[:space:]]/}
+    if (( used_mib >= 2048 )); then
+      echo "[train] gpu=$gpu initialized with ${used_mib} MiB"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "[train] timed out waiting for GPU $gpu initialization" >&2
+      return 1
+    fi
+    sleep 5
+  done
+  echo "[train] process $pid ended before GPU $gpu initialization" >&2
+  return 1
+}
+
 preflight() {
   require_inputs
   cd "$repo"
@@ -185,6 +206,7 @@ train_all() {
     train_one "${variants[$i]}" "${train_gpus[$i]}" &
     pids+=("$!")
     echo "$!" > "$root/pids/train_${variants[$i]}.pid"
+    wait_for_training_gpu_allocation "${train_gpus[$i]}" "$!"
   done
   local failed=0
   for pid in "${pids[@]}"; do

@@ -46,6 +46,9 @@ The runner admits each trainer and each evaluation only after three consecutive
 resource samples pass. Defaults reserve headroom below the requested host
 limits: 50 GiB / 36 CPU cores / 400 MiB/s are soft admission thresholds, while
 58 GiB / 42 cores / 768 MiB/s / 23 GiB per GPU are audited as hard limits.
+Trainer startup is staged until each preceding process has allocated its CUDA
+model, preventing four simultaneous VLM weight reads; all four then train
+concurrently.
 Every sample, including all eight GPUs, is appended to
 `resource/samples.jsonl`; a persistent hard-limit marker is written under the
 same directory if a threshold is crossed, and it blocks new work. The 2D baseline
