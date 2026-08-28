@@ -164,6 +164,15 @@ class SmolVLAConfig(PreTrainedConfig):
     vla_adapter_enable: bool = False
     vla_adapter_freeze_vlm: bool = True
 
+    # Reproducible cumulative ablations. ``None`` preserves the historical
+    # configuration surface. A named variant owns the four architecture gates
+    # below so all runs differ by exactly one added 3D module.
+    ablation_variant: str | None = None
+    pointcloud_enable: bool = True
+    # Exact point slots presented to every 3D ablation. Zero preserves the
+    # historical variable-length behavior outside the named ablation protocol.
+    pointcloud_input_points: int = 0
+
     # Song point-cloud foreground/background conditioning.
     pointseg_enable: bool = False
     pointseg_checkpoint_path: str | None = None
@@ -545,7 +554,58 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
 
     def __post_init__(self):
+        ablation_presets = {
+            "smolvla_src": {
+                "pointcloud_enable": False,
+                "pointseg_enable": False,
+                "point_action_fusion_enable": False,
+                "worldflow_enable": False,
+            },
+            "smolvla_pointcloud": {
+                "pointcloud_enable": True,
+                "pointseg_enable": False,
+                "point_action_fusion_enable": False,
+                "worldflow_enable": False,
+            },
+            "smolvla_pointcloud_effseg": {
+                "pointcloud_enable": True,
+                "pointseg_enable": True,
+                "point_action_fusion_enable": False,
+                "worldflow_enable": False,
+            },
+            "smolvla_pointcloud_effseg_pointaction": {
+                "pointcloud_enable": True,
+                "pointseg_enable": True,
+                "point_action_fusion_enable": True,
+                "worldflow_enable": False,
+            },
+        }
+        if self.ablation_variant is not None:
+            if self.ablation_variant not in ablation_presets:
+                raise ValueError(
+                    "ablation_variant must be one of "
+                    f"{sorted(ablation_presets)}, got {self.ablation_variant!r}."
+                )
+            # Every ablation retains the official 2D SmolVLA RGB path and the
+            # same frozen SmolVLM initialization; only the cumulative 3D gates
+            # differ between variants.
+            self.vla_adapter_enable = True
+            self.vla_adapter_freeze_vlm = True
+            self.pointcloud_input_points = 10_000
+            for field_name, value in ablation_presets[self.ablation_variant].items():
+                setattr(self, field_name, value)
+
         super().__post_init__()
+
+        if not self.pointcloud_enable:
+            if self.pointseg_enable or self.pointseg_checkpoint_path is not None:
+                raise ValueError("PointSeg/EffSeg requires pointcloud_enable=True.")
+            if self.point_action_fusion_enable:
+                raise ValueError("PointAction fusion requires pointcloud_enable=True.")
+            if self.worldflow_enable:
+                raise ValueError("WorldFlow requires pointcloud_enable=True.")
+        if int(self.pointcloud_input_points) < 0:
+            raise ValueError("pointcloud_input_points must be non-negative.")
 
         """Input validation (not exhaustive)."""
         if self.camera_view_fusion not in {

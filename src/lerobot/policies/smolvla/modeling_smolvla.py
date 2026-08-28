@@ -1747,6 +1747,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         This variant replaces the original SmolVLA image preprocessing with a point cloud
         feature extractor. The batch is expected to contain `observation.point_cloud`.
         """
+        if not bool(getattr(self.config, "pointcloud_enable", True)):
+            return [], []
         if "observation.point_cloud" not in batch:
             raise ValueError(
                 f"Point cloud feature 'observation.point_cloud' is missing from the batch. "
@@ -1771,6 +1773,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         bsize = pc.shape[0]
         device = pc.device
         pc = pc.to(dtype=torch.float32)
+        source_num_points = pc.shape[1]
         if pc.shape[1] <= 0:
             raise ValueError(
                 "observation.point_cloud must contain at least one point per padded batch row."
@@ -1779,6 +1782,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError(
                 "observation.point_cloud_is_pad must match the point axes of "
                 f"observation.point_cloud: expected {pc.shape[:2]}, got {point_is_pad.shape}."
+            )
+        target_num_points = int(getattr(self.config, "pointcloud_input_points", 0))
+        resample_indices = None
+        if target_num_points > 0:
+            source_is_pad = (
+                point_is_pad.to(device=device, dtype=torch.bool)
+                if torch.is_tensor(point_is_pad)
+                else torch.zeros(pc.shape[:2], device=device, dtype=torch.bool)
+            )
+            if source_num_points != target_num_points or bool(source_is_pad.any().item()):
+                index_rows = []
+                for batch_index in range(bsize):
+                    valid_indices = torch.nonzero(~source_is_pad[batch_index], as_tuple=False).squeeze(1)
+                    if valid_indices.numel() == 0:
+                        raise ValueError(
+                            f"Ablation sample {batch_index} has no valid scene points; "
+                            f"cannot construct the required {target_num_points}-point input."
+                        )
+                    repeat_count = (target_num_points + valid_indices.numel() - 1) // valid_indices.numel()
+                    index_rows.append(valid_indices.repeat(repeat_count)[:target_num_points])
+                resample_indices = torch.stack(index_rows, dim=0)
+                pc = pc.gather(1, resample_indices[..., None].expand(-1, -1, pc.shape[-1]))
+            point_is_pad = torch.zeros(
+                bsize, target_num_points, device=device, dtype=torch.bool
             )
         point_cloud_payload: Tensor | dict[str, Tensor] = pc
         pointseg_keys = (
@@ -1799,6 +1826,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 value = batch[key]
                 if torch.is_tensor(value) and value.ndim >= 3 and value.shape[1] == 1:
                     value = value.squeeze(1)
+                if (
+                    resample_indices is not None
+                    and torch.is_tensor(value)
+                    and value.ndim >= 2
+                    and value.shape[0] == bsize
+                    and value.shape[1] == source_num_points
+                ):
+                    gather_index = resample_indices.to(device=value.device)
+                    for _ in range(value.ndim - 2):
+                        gather_index = gather_index.unsqueeze(-1)
+                    gather_index = gather_index.expand(-1, -1, *value.shape[2:])
+                    value = value.gather(1, gather_index)
                 payload[key] = value
             point_cloud_payload = payload
         mask = torch.ones(bsize, dtype=torch.bool, device=device)
@@ -3334,7 +3373,10 @@ class VLAFlowMatching(nn.Module):
             if self.config.se3_enable and self.config.se3_twist_head_mode == "direct_twist"
             else None
         )
+        use_pointcloud = bool(self.config.pointcloud_enable)
         use_pointseg = self.config.pointseg_enable or self.config.pointseg_checkpoint_path is not None
+        if use_pointseg and not use_pointcloud:
+            raise ValueError("PointSeg/EffSeg requires pointcloud_enable=True.")
         use_primary_residual = self.config.camera_view_fusion == "primary_residual"
         if use_primary_residual and not use_pointseg:
             raise ValueError(
@@ -3352,9 +3394,15 @@ class VLAFlowMatching(nn.Module):
             raise ValueError("se3_enable=True requires max_action_dim >= 10 for pose9 + gripper actions.")
         if self.config.se3_enable and self._rtc_enabled():
             raise ValueError("se3_enable=True is not supported with RTC enabled in v1.")
-        self.extractor = None if use_pointseg else LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
+        self.extractor = (
+            LitePTEncoder(in_dim=6, dim=64, n_tokens=256, grid_size=0.005)
+            if use_pointcloud and not use_pointseg
+            else None
+        )
         self.pointcloud_proj = (
-            None if use_pointseg else nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+            nn.Linear(64, self.vlm_with_expert.config.text_config.hidden_size)
+            if use_pointcloud and not use_pointseg
+            else None
         )
         self.pointseg_conditioner = SongPointCloudConditioner(config) if use_pointseg else None
         self.pointseg_object_proj = (
