@@ -1432,6 +1432,9 @@ def maybe_wrap_pointseg_cache_dataset(
 
 
 def maybe_wrap_point_cloud_memmap_dataset(dataset, policy_cfg=None):
+    if policy_cfg is not None and not bool(getattr(policy_cfg, "pointcloud_enable", True)):
+        logging.info("Point-cloud input is disabled; leaving the RGB-only dataset unwrapped.")
+        return dataset
     if isinstance(dataset, (PointSegCacheInjectedDataset, OnlinePointSegPseudoDataset)):
         return dataset
     root = Path(getattr(dataset, "root", dataset.meta.root))
@@ -2724,6 +2727,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    last_checkpoint_monotonic_s = time.monotonic()
     for _ in range(step, cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         output_dict = {}
@@ -2756,10 +2760,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         sparse_save_steps = {int(value) for value in cfg.save_steps}
+        timed_save_due = bool(
+            float(cfg.save_interval_s) > 0
+            and time.monotonic() - last_checkpoint_monotonic_s >= float(cfg.save_interval_s)
+        )
+        if accelerator.num_processes > 1:
+            timed_save_tensor = torch.tensor(
+                int(timed_save_due if is_main_process else False),
+                device=device,
+                dtype=torch.int32,
+            )
+            torch.distributed.broadcast(timed_save_tensor, src=0)
+            timed_save_due = bool(timed_save_tensor.item())
         is_saving_step = (
             step % cfg.save_freq == 0
             or step in sparse_save_steps
             or step == cfg.steps
+            or timed_save_due
         )
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
@@ -2866,6 +2883,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+            last_checkpoint_monotonic_s = time.monotonic()
 
         if cfg.env and is_eval_step:
             if is_main_process:

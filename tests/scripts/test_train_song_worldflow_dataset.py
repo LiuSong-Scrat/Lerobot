@@ -17,6 +17,7 @@ from benchmarks.song_real_libero.scripts.train_song_benchmark import (
     WorldFlowMemmapDataset as BenchmarkWorldFlowMemmapDataset,
     _paired_pointseg_cache_contract_mismatches,
     make_policy_on_accelerator_device,
+    maybe_wrap_point_cloud_memmap_dataset,
     update_policy,
     worldflow_ego_priority_projection_statistics,
 )
@@ -42,6 +43,19 @@ class _TinyDataset(torch.utils.data.Dataset):
             "frame_index": torch.tensor(self.frame_index),
             "action": torch.zeros(self.chunk_size, 10),
         }
+
+
+def test_rgb_only_ablation_does_not_wrap_or_read_point_cloud_directory(tmp_path):
+    dataset = _TinyDataset()
+    dataset.root = tmp_path
+    (tmp_path / "point_clouds").mkdir()
+
+    result = maybe_wrap_point_cloud_memmap_dataset(
+        dataset,
+        SimpleNamespace(pointcloud_enable=False),
+    )
+
+    assert result is dataset
 
 
 @pytest.mark.parametrize("fusion", ["fps", "voxel_fps"])

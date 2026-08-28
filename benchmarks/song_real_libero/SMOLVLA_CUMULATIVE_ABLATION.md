@@ -29,8 +29,8 @@ The fixed dataset is:
 ```
 
 It contains 50 demonstrations each for LIBERO-10 tasks 6 and 8. Evaluation uses
-fixed policy seed 0 and environment seed 7, with 10 episodes per task at every
-2,000-step checkpoint.
+fixed policy seed 0 and environment seed 7, with the standard 50 initial states
+per task (100 episodes total) for every wall-clock hourly checkpoint.
 
 ## Execution
 
@@ -39,8 +39,17 @@ VRAM:
 
 - GPUs 0-3: one training run per variant;
 - GPUs 4-7: one checkpoint-evaluation watcher per variant;
-- four DataLoader workers per training run;
+- two DataLoader workers per training run;
 - two tasks by two rollout workers per evaluation run.
+
+The runner admits each trainer and each evaluation only after three consecutive
+resource samples pass. Defaults reserve headroom below the requested host
+limits: 50 GiB / 36 CPU cores / 400 MiB/s are soft admission thresholds, while
+58 GiB / 42 cores / 768 MiB/s / 23 GiB per GPU are audited as hard limits.
+Every sample is appended to `resource/samples.jsonl`; a hard-limit marker is
+written under the same directory if a threshold is crossed. The 2D baseline
+does not wrap the point-cloud dataset, which removes unnecessary shared-storage
+reads and makes the modality ablation exact.
 
 Run the complete experiment from the repository root:
 
@@ -49,8 +58,9 @@ bash benchmarks/song_real_libero/scripts/run_v043_cumulative_ablation.sh preflig
 bash benchmarks/song_real_libero/scripts/run_v043_cumulative_ablation.sh all
 ```
 
-The default maximum is 30,000 steps. Checkpoints and fixed-seed rollouts are
-recorded every 2,000 steps. This upper bound is intentionally longer than a
+The default maximum is 30,000 steps. Checkpoints are recorded every 3,600
+seconds of training wall time and the dedicated evaluation GPU consumes each
+completed checkpoint in order. This upper bound is intentionally longer than a
 single pass over the 33,450-frame dataset; the checkpoint curves determine the
 actual convergence plateau.
 
@@ -67,7 +77,10 @@ Results are written below:
 /opt/data/private/liusong/benchmarks/song_real_libero/outputs/v043_cumulative_ablation_task6_task8_20260829
 ```
 
-`ablation_results.csv` contains every checkpoint result. `ABlation_RESULTS.md`
-reports the best completed checkpoint and adjacent cumulative deltas. Module
-claims must also inspect persistence across the full curve, because selecting a
-single best result from only 20 rollouts is noisy.
+`ablation_results.csv` contains every checkpoint result. `ABLATION_RESULTS.md`
+reports the latest and best completed checkpoints plus adjacent cumulative
+deltas. `stability.json` marks a variant stable only after step 8,000 when its
+latest three complete 100-episode success rates span no more than three
+percentage points. All four variants must pass that rule before the experiment
+is considered stable. Best-checkpoint numbers are descriptive only; module
+claims use persistence across the full curve and the latest stable results.

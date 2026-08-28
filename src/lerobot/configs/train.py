@@ -89,6 +89,9 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Optional wall-clock checkpoint cadence. Zero disables time-based saves.
+    # This complements `save_freq`; it does not replace final-step saving.
+    save_interval_s: float = 0.0
     # Additional sparse optimizer-step milestones. This keeps early checkpoints
     # such as 25/75/100 without forcing a large model save at every small
     # interval for the remainder of a full-epoch run.
@@ -116,6 +119,10 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "gradient_accumulation_steps must be at least 1, "
                 f"got {self.gradient_accumulation_steps}."
+            )
+        if float(self.save_interval_s) < 0:
+            raise ValueError(
+                f"save_interval_s must be non-negative, got {self.save_interval_s}."
             )
         invalid_save_steps = sorted(
             {

@@ -1,0 +1,245 @@
+#!/usr/bin/env python
+"""Resource admission and audit guard for the four-way WEPVLA ablation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+GIB = 1024**3
+MIB = 1024**2
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
+@dataclass(frozen=True)
+class Limits:
+    memory_soft_gib: float = 50.0
+    memory_hard_gib: float = 58.0
+    cpu_soft_cores: float = 36.0
+    cpu_hard_cores: float = 42.0
+    io_soft_mib_s: float = 400.0
+    io_hard_mib_s: float = 768.0
+    gpu_soft_used_gib: float = 2.0
+    gpu_hard_used_gib: float = 23.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--wait", action="store_true")
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--sample-seconds", type=float, default=5.0)
+    parser.add_argument("--poll-seconds", type=float, default=30.0)
+    parser.add_argument("--consecutive", type=int, default=3)
+    parser.add_argument("--memory-soft-gib", type=float, default=50.0)
+    parser.add_argument("--memory-hard-gib", type=float, default=58.0)
+    parser.add_argument("--cpu-soft-cores", type=float, default=36.0)
+    parser.add_argument("--cpu-hard-cores", type=float, default=42.0)
+    parser.add_argument("--io-soft-mib-s", type=float, default=400.0)
+    parser.add_argument("--io-hard-mib-s", type=float, default=768.0)
+    parser.add_argument("--gpu-soft-used-gib", type=float, default=2.0)
+    parser.add_argument("--gpu-hard-used-gib", type=float, default=23.0)
+    return parser.parse_args()
+
+
+def _proc_stat(pid: int) -> tuple[int, float, int] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text()
+        rest = raw[raw.rfind(")") + 2 :].split()
+        ppid = int(rest[1])
+        cpu_s = (int(rest[11]) + int(rest[12])) / CLK_TCK
+        rss = (
+            int((Path("/proc") / str(pid) / "statm").read_text().split()[1]) * PAGE_SIZE
+        )
+        return ppid, cpu_s, rss
+    except (
+        FileNotFoundError,
+        IndexError,
+        PermissionError,
+        ProcessLookupError,
+        ValueError,
+    ):
+        return None
+
+
+def _proc_io_chars(pid: int) -> int:
+    try:
+        values = {}
+        for line in (Path("/proc") / str(pid) / "io").read_text().splitlines():
+            key, value = line.split(":", 1)
+            values[key] = int(value)
+        return values.get("rchar", 0) + values.get("wchar", 0)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        return 0
+
+
+def _root_pids(pid_dir: Path) -> set[int]:
+    result = set()
+    for path in pid_dir.glob("*.pid") if pid_dir.is_dir() else ():
+        try:
+            pid = int(path.read_text().strip())
+            os.kill(pid, 0)
+            result.add(pid)
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+            continue
+    return result
+
+
+def process_tree_snapshot(pid_dir: Path) -> dict[int, tuple[float, int, int]]:
+    stats = {}
+    children: dict[int, set[int]] = {}
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        pid = int(path.name)
+        stat = _proc_stat(pid)
+        if stat is None:
+            continue
+        ppid, cpu_s, rss = stat
+        stats[pid] = (cpu_s, rss, _proc_io_chars(pid))
+        children.setdefault(ppid, set()).add(pid)
+
+    selected = set()
+    pending = list(_root_pids(pid_dir))
+    while pending:
+        pid = pending.pop()
+        if pid in selected:
+            continue
+        selected.add(pid)
+        pending.extend(children.get(pid, ()))
+    return {pid: stats[pid] for pid in selected if pid in stats}
+
+
+def cgroup_memory_bytes() -> int:
+    candidates = (
+        Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        Path("/sys/fs/cgroup/memory.current"),
+    )
+    for path in candidates:
+        try:
+            return int(path.read_text().strip())
+        except (FileNotFoundError, ValueError):
+            continue
+    raise RuntimeError("Cannot read cgroup memory usage.")
+
+
+def gpu_sample(gpu: int | None) -> dict[str, float | int] | None:
+    if gpu is None:
+        return None
+    command = [
+        "nvidia-smi",
+        f"--id={gpu}",
+        "--query-gpu=memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    output = subprocess.check_output(command, text=True).strip().split(",")
+    if len(output) != 3:
+        raise RuntimeError(f"Unexpected nvidia-smi output: {output!r}")
+    return {
+        "index": gpu,
+        "used_gib": float(output[0]) / 1024.0,
+        "total_gib": float(output[1]) / 1024.0,
+        "utilization_percent": float(output[2]),
+    }
+
+
+def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
+    pid_dir = root / "pids"
+    start = process_tree_snapshot(pid_dir)
+    start_time = time.monotonic()
+    time.sleep(max(0.1, seconds))
+    end = process_tree_snapshot(pid_dir)
+    elapsed = max(time.monotonic() - start_time, 1e-6)
+    shared = start.keys() & end.keys()
+    cpu_cores = sum(max(0.0, end[pid][0] - start[pid][0]) for pid in shared) / elapsed
+    io_mib_s = (
+        sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
+    )
+    experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
+    memory_gib = cgroup_memory_bytes() / GIB
+    gpu_info = gpu_sample(gpu)
+    soft_reasons = []
+    hard_reasons = []
+    comparisons = (
+        ("memory", memory_gib, limits.memory_soft_gib, limits.memory_hard_gib),
+        ("cpu", cpu_cores, limits.cpu_soft_cores, limits.cpu_hard_cores),
+        ("io", io_mib_s, limits.io_soft_mib_s, limits.io_hard_mib_s),
+    )
+    for name, value, soft, hard in comparisons:
+        if value >= soft:
+            soft_reasons.append(f"{name}={value:.2f}>={soft:.2f}")
+        if value >= hard:
+            hard_reasons.append(f"{name}={value:.2f}>={hard:.2f}")
+    if gpu_info is not None:
+        used_gib = float(gpu_info["used_gib"])
+        if used_gib >= limits.gpu_soft_used_gib:
+            soft_reasons.append(
+                f"gpu{gpu}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}"
+            )
+        if used_gib >= limits.gpu_hard_used_gib:
+            hard_reasons.append(
+                f"gpu{gpu}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}"
+            )
+    return {
+        "timestamp": time.time(),
+        "root": str(root),
+        "pids": sorted(end),
+        "memory_gib": memory_gib,
+        "experiment_rss_gib": experiment_rss_gib,
+        "cpu_cores": cpu_cores,
+        "io_mib_s": io_mib_s,
+        "gpu": gpu_info,
+        "soft_ok": not soft_reasons,
+        "hard_ok": not hard_reasons,
+        "soft_reasons": soft_reasons,
+        "hard_reasons": hard_reasons,
+        "limits": asdict(limits),
+    }
+
+
+def append_audit(root: Path, payload: dict) -> None:
+    audit_dir = root / "resource"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    with (audit_dir / "samples.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, sort_keys=True) + "\n")
+    marker = audit_dir / "HARD_LIMIT_EXCEEDED"
+    if payload["hard_ok"]:
+        marker.unlink(missing_ok=True)
+    else:
+        marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def main() -> int:
+    args = parse_args()
+    limits = Limits(
+        memory_soft_gib=args.memory_soft_gib,
+        memory_hard_gib=args.memory_hard_gib,
+        cpu_soft_cores=args.cpu_soft_cores,
+        cpu_hard_cores=args.cpu_hard_cores,
+        io_soft_mib_s=args.io_soft_mib_s,
+        io_hard_mib_s=args.io_hard_mib_s,
+        gpu_soft_used_gib=args.gpu_soft_used_gib,
+        gpu_hard_used_gib=args.gpu_hard_used_gib,
+    )
+    consecutive_ok = 0
+    while True:
+        payload = sample(args.root, args.gpu, args.sample_seconds, limits)
+        append_audit(args.root, payload)
+        print(json.dumps(payload, sort_keys=True), flush=True)
+        consecutive_ok = consecutive_ok + 1 if payload["soft_ok"] else 0
+        if args.wait and consecutive_ok >= max(1, args.consecutive):
+            return 0
+        if not args.wait and not args.watch:
+            return 0 if payload["soft_ok"] else 1
+        time.sleep(max(0.1, args.poll_seconds))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
