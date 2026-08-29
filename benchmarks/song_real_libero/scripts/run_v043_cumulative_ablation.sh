@@ -272,6 +272,88 @@ if any(int(episode.get("model_call_count", 0)) <= 0 for episode in episodes):
 PY
 }
 
+eval_output_resumable() {
+  local output=$1
+  "$python" - "$output" "$eval_episodes" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+episodes_per_task = int(sys.argv[2])
+suite_dir = output / "libero_10"
+progress_path = suite_dir / "progress.json"
+if not progress_path.is_file():
+    raise SystemExit(1)
+try:
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected_total = 2 * episodes_per_task
+if progress.get("suite") != "libero_10":
+    raise SystemExit(1)
+if progress.get("expected_task_ids") != [6, 8]:
+    raise SystemExit(1)
+if progress.get("episodes_per_task") != episodes_per_task:
+    raise SystemExit(1)
+if progress.get("expected_episode_count") != expected_total:
+    raise SystemExit(1)
+
+expected_protocol = {
+    "name": "single_uninterrupted_rollout",
+    "rollouts_per_initial_state": 1,
+    "retry_failed_rollout": False,
+    "action_samples_per_model_call": 1,
+    "action_sample_selection": "none",
+    "initial_state_source": "task_suite.get_task_init_states",
+    "fixture_reset_sequence": "seeded_serial_episode_index",
+    "benchmark_comparable": True,
+}
+expected_paths = {
+    suite_dir / f"task_{task_id:03d}" / f"episode_{episode_index:03d}" / "result.json"
+    for task_id in (6, 8)
+    for episode_index in range(episodes_per_task)
+}
+actual_paths = set(suite_dir.glob("task_*/episode_*/result.json"))
+if not actual_paths.issubset(expected_paths):
+    raise SystemExit(1)
+for result_path in actual_paths:
+    try:
+        record = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit(1)
+    expected_index = int(result_path.parent.name.removeprefix("episode_"))
+    if record.get("episode_index") != expected_index:
+        raise SystemExit(1)
+    if record.get("error") not in (None, ""):
+        raise SystemExit(1)
+    if int(record.get("steps", 0) or 0) <= 0:
+        raise SystemExit(1)
+    if int(record.get("max_steps", -1)) != 1000:
+        raise SystemExit(1)
+    if int(record.get("model_call_count", 0) or 0) <= 0:
+        raise SystemExit(1)
+    if int(record.get("policy_forward_call_count", 0) or 0) <= 0:
+        raise SystemExit(1)
+    if record.get("action_source") != "policy_flow_matching_sample":
+        raise SystemExit(1)
+    if record.get("evaluation_protocol") != expected_protocol:
+        raise SystemExit(1)
+    if record.get("policy_noise_seed_base") != 0:
+        raise SystemExit(1)
+    if record.get("strict_official_init") is not True:
+        raise SystemExit(1)
+    alignment = record.get("environment_alignment")
+    if not isinstance(alignment, dict) or alignment.get("benchmark_comparable") is not True:
+        raise SystemExit(1)
+    action_npz = Path(str(record.get("action_npz", "")))
+    if action_npz != result_path.parent / "actions.npz":
+        raise SystemExit(1)
+    if not action_npz.is_file() or action_npz.stat().st_size <= 0:
+        raise SystemExit(1)
+PY
+}
+
 training_is_running() {
   local variant pid
   for variant in "${variants[@]}"; do
@@ -423,8 +505,11 @@ eval_one() {
     return
   fi
   if [[ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-    echo "[eval] incomplete output exists: $output" >&2
-    return 1
+    if ! eval_output_resumable "$output"; then
+      echo "[eval] incomplete output is not safely resumable: $output" >&2
+      return 1
+    fi
+    echo "[eval] resume incomplete output: $output"
   fi
   (
     exec 9>"$eval_lock"

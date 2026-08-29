@@ -1,19 +1,28 @@
 #!/usr/bin/env python
 
+import json
 import os
 import queue
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 # Import the evaluator without loading a real policy or initializing CUDA.
 os.environ.setdefault("SONG_LIBERO_ENV_WORKER", "1")
 
+from benchmarks.song_real_libero.scripts.libero_setting import (  # noqa: E402
+    libero_pointcloud_eval as eval_module,
+)
 from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval import (  # noqa: E402
     FixedBatchInferenceCache,
     ProcessInferenceProxy,
     _ProcessInferenceRequest,
     _execute_process_inference_fixed_slots,
     _process_worker_environment,
+    evaluate_task,
+    initialize_realtime_suite_progress,
+    load_resumable_episode_record,
 )
 
 
@@ -25,6 +34,143 @@ class _FakeInference:
         self.calls.append((observation, kwargs))
         values = np.asarray(observation["value"], dtype=np.float32).reshape(-1)
         return values[:, None, None]
+
+
+def _resume_config() -> dict:
+    return {
+        "control": {"max_steps": 1000},
+        "policy_noise_seed": 0,
+        "strict_official_init": True,
+        "dataset_domain_env": False,
+        "dataset_domain_oracle_actions": False,
+        "worldflow_action_fusion_override": None,
+        "secondary_view_causal_ablation": False,
+        "world_to_ego_causal_ablation": False,
+        "episodes": 10,
+        "episode_ids": None,
+        "recreate_env_per_episode": True,
+    }
+
+
+def _write_resumable_result(output_dir, *, task_id: int, episode_index: int) -> None:
+    episode_dir = (
+        output_dir
+        / "libero_10"
+        / f"task_{task_id:03d}"
+        / f"episode_{episode_index:03d}"
+    )
+    episode_dir.mkdir(parents=True)
+    action_path = episode_dir / "actions.npz"
+    action_path.write_bytes(b"actions")
+    record = {
+        "episode_index": episode_index,
+        "success": True,
+        "error": None,
+        "steps": 42,
+        "max_steps": 1000,
+        "model_call_count": 2,
+        "policy_forward_call_count": 2,
+        "action_source": "policy_flow_matching_sample",
+        "action_npz": str(action_path),
+        "evaluation_protocol": {
+            "name": "single_uninterrupted_rollout",
+            "rollouts_per_initial_state": 1,
+            "retry_failed_rollout": False,
+            "action_samples_per_model_call": 1,
+            "action_sample_selection": "none",
+            "initial_state_source": "task_suite.get_task_init_states",
+            "fixture_reset_sequence": "seeded_serial_episode_index",
+            "benchmark_comparable": True,
+        },
+        "policy_noise_seed_base": 0,
+        "strict_official_init": True,
+        "environment_alignment": {
+            "enabled": False,
+            "benchmark_comparable": True,
+            "initial_state_source": "task_suite.get_task_init_states",
+        },
+    }
+    (episode_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_realtime_progress_reuses_only_strictly_validated_episode(tmp_path):
+    _write_resumable_result(tmp_path, task_id=6, episode_index=4)
+
+    initialize_realtime_suite_progress(
+        output_dir=tmp_path,
+        suite_name="libero_10",
+        task_ids=[6, 8],
+        episodes_per_task=10,
+        cfg=_resume_config(),
+    )
+
+    progress = json.loads((tmp_path / "libero_10" / "progress.json").read_text())
+    assert progress["completed_episode_count"] == 1
+    assert progress["success_count"] == 1
+    assert progress["tasks"]["6"]["episodes"]["4"]["steps"] == 42
+
+
+def test_resume_rejects_result_from_different_policy_seed(tmp_path):
+    _write_resumable_result(tmp_path, task_id=6, episode_index=4)
+    config = _resume_config()
+    config["policy_noise_seed"] = 1
+
+    with pytest.raises(RuntimeError, match="policy_noise_seed_base"):
+        load_resumable_episode_record(
+            output_dir=tmp_path,
+            suite_name="libero_10",
+            task_id=6,
+            episode_index=4,
+            cfg=config,
+        )
+
+
+def test_evaluate_task_skips_valid_completed_episode_without_creating_env(tmp_path):
+    _write_resumable_result(tmp_path, task_id=6, episode_index=0)
+
+    class _Suite:
+        @staticmethod
+        def get_task(task_id):
+            assert task_id == 6
+            return SimpleNamespace(name="task-6", language="do task 6")
+
+    summary = evaluate_task(
+        infer=None,
+        suite=_Suite(),
+        suite_name="libero_10",
+        task_id=6,
+        cfg=_resume_config(),
+        output_dir=tmp_path,
+        episode_indices=[0],
+        task_init_states=np.zeros((1, 1), dtype=np.float32),
+    )
+
+    assert summary["episode_count"] == 1
+    assert summary["success_rate"] == 1.0
+    assert summary["episodes"][0]["episode_index"] == 0
+
+
+def test_stale_evaluation_claim_is_atomically_replaced(tmp_path, monkeypatch):
+    claim_dir = tmp_path / ".evaluation_run.claim"
+    claim_dir.mkdir()
+    (claim_dir / "owner.json").write_text(
+        json.dumps(
+            {
+                "pid": 999_999_999,
+                "hostname": os.uname().nodename,
+                "started_unix_s": 0,
+                "argv": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(eval_module, "_EVALUATION_RUN_LOCK_CLAIM_DIR", None)
+
+    eval_module.acquire_evaluation_run_lock(tmp_path)
+
+    owner = json.loads((claim_dir / "owner.json").read_text())
+    assert owner["pid"] == os.getpid()
+    assert len(list(tmp_path.glob(".evaluation_run.claim.stale.*"))) == 1
 
 
 def test_process_proxy_preserves_worldflow_frame_contract():

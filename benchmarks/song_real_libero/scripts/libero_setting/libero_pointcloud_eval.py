@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "checkpoint_preload_gate_v23_20260816"
+EVAL_BUILD_TAG = "strict_episode_resume_v24_20260829"
 
 import argparse
 import atexit
@@ -36,7 +36,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -146,13 +146,45 @@ def acquire_evaluation_run_lock(output_dir: Path) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     claim_dir = output_dir / ".evaluation_run.claim"
-    try:
-        claim_dir.mkdir()
-    except FileExistsError as exc:
-        raise RuntimeError(
-            f"Evaluation output directory is already claimed: {output_dir}. "
-            f"Persistent claim: {claim_dir}"
-        ) from exc
+    stale_claim_dir: Path | None = None
+    while True:
+        try:
+            claim_dir.mkdir()
+            break
+        except FileExistsError as exc:
+            owner_path = claim_dir / "owner.json"
+            try:
+                owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                owner_pid = int(owner["pid"])
+                owner_hostname = str(owner["hostname"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise RuntimeError(
+                    f"Evaluation output directory has an unreadable claim: {claim_dir}"
+                ) from exc
+            if owner_hostname != os.uname().nodename:
+                raise RuntimeError(
+                    f"Evaluation output directory is claimed on host {owner_hostname}: "
+                    f"{output_dir}. Persistent claim: {claim_dir}"
+                ) from exc
+            owner_cmdline_path = Path("/proc") / str(owner_pid) / "cmdline"
+            try:
+                owner_cmdline = owner_cmdline_path.read_bytes().replace(b"\0", b" ").decode(
+                    errors="replace"
+                )
+            except OSError:
+                owner_cmdline = ""
+            if str(output_dir) in owner_cmdline and "libero_pointcloud_eval.py" in owner_cmdline:
+                raise RuntimeError(
+                    f"Evaluation output directory is already claimed by live PID "
+                    f"{owner_pid}: {output_dir}. Persistent claim: {claim_dir}"
+                ) from exc
+            stale_claim_dir = output_dir / (
+                f".evaluation_run.claim.stale.{owner_pid}.{time.time_ns()}"
+            )
+            try:
+                claim_dir.rename(stale_claim_dir)
+            except FileNotFoundError:
+                continue
     owner_path = claim_dir / "owner.json"
     owner_path.write_text(
         json.dumps(
@@ -169,6 +201,11 @@ def acquire_evaluation_run_lock(output_dir: Path) -> None:
         encoding="utf-8",
     )
     _EVALUATION_RUN_LOCK_CLAIM_DIR = claim_dir
+    if stale_claim_dir is not None:
+        print(
+            f"[resume] replaced stale evaluation claim {stale_claim_dir.name}",
+            flush=True,
+        )
 
 
 def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
@@ -1378,6 +1415,82 @@ def _suite_progress_summary(progress: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_resumable_episode_record(
+    *,
+    output_dir: Path,
+    suite_name: str,
+    task_id: int,
+    episode_index: int,
+    cfg: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Load one completed rollout only when it matches the active protocol."""
+
+    episode_dir = (
+        output_dir
+        / suite_name
+        / f"task_{int(task_id):03d}"
+        / f"episode_{int(episode_index):03d}"
+    )
+    result_path = episode_dir / "result.json"
+    if not result_path.is_file():
+        return None
+
+    def reject(reason: str) -> NoReturn:
+        raise RuntimeError(
+            "Refusing incompatible partial evaluation result "
+            f"{result_path}: {reason}."
+        )
+
+    try:
+        record = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        reject(f"invalid JSON ({exc})")
+    if not isinstance(record, dict):
+        reject("record is not a JSON object")
+    if int(record.get("episode_index", -1)) != int(episode_index):
+        reject(f"episode_index={record.get('episode_index')!r}")
+    if record.get("error") not in (None, ""):
+        reject(f"recorded error={record.get('error')!r}")
+    if int(record.get("steps", 0) or 0) <= 0:
+        reject(f"steps={record.get('steps')!r}")
+    if int(record.get("max_steps", -1)) != int(cfg["control"]["max_steps"]):
+        reject(f"max_steps={record.get('max_steps')!r}")
+    if int(record.get("model_call_count", 0) or 0) <= 0:
+        reject(f"model_call_count={record.get('model_call_count')!r}")
+    if int(record.get("policy_forward_call_count", 0) or 0) <= 0:
+        reject(
+            f"policy_forward_call_count={record.get('policy_forward_call_count')!r}"
+        )
+    if record.get("action_source") != "policy_flow_matching_sample":
+        reject(f"action_source={record.get('action_source')!r}")
+    expected_protocol = evaluation_protocol_for_config(cfg)
+    if record.get("evaluation_protocol") != expected_protocol:
+        reject("evaluation_protocol differs from the active configuration")
+    if int(record.get("policy_noise_seed_base", -1)) != int(cfg["policy_noise_seed"]):
+        reject(f"policy_noise_seed_base={record.get('policy_noise_seed_base')!r}")
+    expected_strict_official = bool(
+        cfg.get("strict_official_init", True)
+        and not cfg.get("dataset_domain_env", False)
+    )
+    if bool(record.get("strict_official_init", False)) != expected_strict_official:
+        reject(f"strict_official_init={record.get('strict_official_init')!r}")
+    expected_comparable = bool(expected_protocol["benchmark_comparable"])
+    alignment = record.get("environment_alignment")
+    if not isinstance(alignment, dict) or bool(
+        alignment.get("benchmark_comparable", False)
+    ) != expected_comparable:
+        reject("environment_alignment benchmark identity differs")
+    action_npz_value = record.get("action_npz")
+    if not isinstance(action_npz_value, str) or not action_npz_value:
+        reject("action_npz is missing")
+    action_npz = Path(action_npz_value)
+    if action_npz != episode_dir / "actions.npz":
+        reject(f"action_npz has an unexpected path ({action_npz})")
+    if not action_npz.is_file() or action_npz.stat().st_size <= 0:
+        reject(f"action_npz is missing or empty ({action_npz})")
+    return record
+
+
 def _update_root_progress(output_dir: Path, suite_progress: dict[str, Any]) -> None:
     progress_path = output_dir / "progress.json"
     with interprocess_file_lock(output_dir / ".progress.lock"):
@@ -1424,11 +1537,43 @@ def initialize_realtime_suite_progress(
     suite_name: str,
     task_ids: list[int],
     episodes_per_task: int,
+    cfg: dict[str, Any],
 ) -> None:
     suite_dir = output_dir / suite_name
     suite_dir.mkdir(parents=True, exist_ok=True)
     progress_path = suite_dir / "progress.json"
     expected_episode_count = len(task_ids) * int(episodes_per_task)
+    episode_indices = [
+        int(index)
+        for index in (cfg.get("episode_ids") or range(int(episodes_per_task)))
+    ]
+    if len(episode_indices) != int(episodes_per_task):
+        raise ValueError(
+            "Realtime progress episode count differs from configured episode indices: "
+            f"episodes_per_task={episodes_per_task}, episode_indices={episode_indices}."
+        )
+    task_progress: dict[str, dict[str, Any]] = {}
+    for task_id in task_ids:
+        episodes: dict[str, dict[str, Any]] = {}
+        for episode_index in episode_indices:
+            record = load_resumable_episode_record(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                task_id=int(task_id),
+                episode_index=int(episode_index),
+                cfg=cfg,
+            )
+            if record is not None:
+                episodes[str(int(episode_index))] = record
+        task_progress[str(int(task_id))] = {
+            "completed_episode_count": len(episodes),
+            "success_count": sum(
+                bool(record.get("success", False)) for record in episodes.values()
+            ),
+            "episodes": episodes,
+        }
+    completed = sum(item["completed_episode_count"] for item in task_progress.values())
+    success = sum(item["success_count"] for item in task_progress.values())
     progress = {
         "created_unix_s": time.time(),
         "updated_unix_s": time.time(),
@@ -1438,28 +1583,26 @@ def initialize_realtime_suite_progress(
         "expected_task_count": len(task_ids),
         "episodes_per_task": int(episodes_per_task),
         "expected_episode_count": expected_episode_count,
-        "completed_episode_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "completion_rate": 0.0,
-        "success_rate": 0.0,
+        "completed_episode_count": completed,
+        "success_count": success,
+        "failure_count": completed - success,
+        "completion_rate": float(completed / expected_episode_count),
+        "success_rate": float(success / completed) if completed else 0.0,
         "progress_path": str(progress_path),
-        "tasks": {
-            str(int(task_id)): {
-                "completed_episode_count": 0,
-                "success_count": 0,
-                "episodes": {},
-            }
-            for task_id in task_ids
-        },
+        "tasks": task_progress,
     }
     with interprocess_file_lock(suite_dir / ".progress.lock"):
         write_json_atomic(progress_path, progress)
-        # This file is scoped to one suite and therefore can be reset safely
-        # before its environment workers are started.
-        with open(suite_dir / "evaluation_events.jsonl", "w", encoding="utf-8"):
-            pass
+        events_path = suite_dir / "evaluation_events.jsonl"
+        if not events_path.exists():
+            events_path.touch()
     _update_root_progress(output_dir, progress)
+    if completed:
+        print(
+            f"[resume] suite={suite_name}: validated and reused "
+            f"{completed}/{expected_episode_count} completed episodes",
+            flush=True,
+        )
 
 
 def append_realtime_episode_event(
@@ -8131,7 +8274,18 @@ def evaluate_task(
                 f"all {len(full_episode_indices)} indices.",
                 flush=True,
             )
-    task_results: list[dict[str, Any]] = []
+    reusable_results: dict[int, dict[str, Any]] = {}
+    for episode_index in resolved_episode_indices:
+        record = load_resumable_episode_record(
+            output_dir=output_dir,
+            suite_name=suite_name,
+            task_id=int(task_id),
+            episode_index=int(episode_index),
+            cfg=cfg,
+        )
+        if record is not None:
+            reusable_results[int(episode_index)] = record
+    task_results: list[dict[str, Any]] = list(reusable_results.values())
     task_definition = suite.get_task(int(task_id))
     task_name = str(getattr(task_definition, "name", f"task_{int(task_id):03d}"))
     task_language = str(getattr(task_definition, "language", f"{suite_name}:{int(task_id)}"))
@@ -8186,6 +8340,23 @@ def evaluate_task(
         # sequence without consuming one extra random fixture placement.
         shared_layout_index = 0
         for episode_idx in resolved_episode_indices:
+            if int(episode_idx) in reusable_results:
+                record = reusable_results[int(episode_idx)]
+                record_realtime_failed_episode(
+                    output_dir=output_dir,
+                    suite_name=suite_name,
+                    task_id=int(task_id),
+                    episode_index=int(episode_idx),
+                    episode_record=record,
+                    task_name=task_name,
+                    task_language=task_language,
+                )
+                print(
+                    f"[resume] reuse suite={suite_name} task={task_id} "
+                    f"episode={episode_idx} success={bool(record.get('success', False))}",
+                    flush=True,
+                )
+                continue
             environment_alignment: dict[str, Any] | None = None
             oracle_raw_action_trajectory: np.ndarray | None = None
             oracle_absolute_action_trajectory: np.ndarray | None = None
@@ -8395,7 +8566,7 @@ def evaluate_task(
         task_id=int(task_id),
         task_name=task_name,
         task_language=task_language,
-        episodes=task_results,
+        episodes=sorted(task_results, key=lambda item: int(item["episode_index"])),
     )
 
 
@@ -9942,6 +10113,7 @@ def main() -> None:
                 suite_name=suite_name,
                 task_ids=[int(task_id) for task_id in task_ids],
                 episodes_per_task=int(selected_episode_count),
+                cfg=cfg,
             )
             suite_summaries = evaluate_suite_isolated_policy_processes(
                 suite_name=suite_name,
@@ -10130,6 +10302,7 @@ def main() -> None:
                 suite_name=suite_name,
                 task_ids=[int(task_id) for task_id in task_ids],
                 episodes_per_task=int(selected_episode_count),
+                cfg=cfg,
             )
             worker_count = min(int(cfg["task_workers"]), max(1, len(task_ids)))
             episode_worker_count = min(
