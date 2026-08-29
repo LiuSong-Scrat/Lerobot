@@ -45,7 +45,9 @@ gpu_preflight 1,2,3
     assert "(2, 3487)" in result.stderr
 
 
-def _run_admission_probe(tmp_path: Path, *, trainer_running: bool) -> bool:
+def _run_admission_probe(
+    tmp_path: Path, *, trainer_running: bool, training_eval_slots: int = 1
+) -> bool:
     root = tmp_path / "output"
     (root / "pids").mkdir(parents=True)
     pid = os.getpid() if trainer_running else 999_999_999
@@ -56,6 +58,7 @@ export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
 export SONG_ABLATION_EVAL_LOCK={shlex.quote(str(tmp_path / 'eval.lock'))}
 export SONG_ABLATION_GUARD_POLL_S=0.05
 export SONG_ABLATION_POST_TRAINING_EVAL_SLOTS=2
+export SONG_ABLATION_TRAINING_EVAL_SLOTS={training_eval_slots}
 export SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 eval_result_valid() {{ [[ -f "$1/done" ]]; }}
@@ -103,6 +106,14 @@ fi
 
 def test_evaluations_are_serial_while_a_trainer_is_running(tmp_path: Path) -> None:
     assert not _run_admission_probe(tmp_path, trainer_running=True)
+
+
+def test_evaluations_can_overlap_while_training_when_explicitly_enabled(
+    tmp_path: Path,
+) -> None:
+    assert _run_admission_probe(
+        tmp_path, trainer_running=True, training_eval_slots=2
+    )
 
 
 def test_evaluations_can_overlap_after_training_stops(tmp_path: Path) -> None:

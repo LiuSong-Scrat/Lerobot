@@ -23,6 +23,7 @@ guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
 eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
 summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-1}
+training_eval_slots=${SONG_ABLATION_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
 checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-102400}
@@ -64,6 +65,10 @@ require_inputs() {
   fi
   if (( post_training_eval_slots < 1 || post_training_eval_slots > 2 )); then
     echo "Post-training evaluation concurrency must be one or two." >&2
+    exit 2
+  fi
+  if (( training_eval_slots < 1 || training_eval_slots > 2 )); then
+    echo "Training-time evaluation concurrency must be one or two." >&2
     exit 2
   fi
   if (( post_training_eval_stagger_s < 0 )); then
@@ -516,9 +521,17 @@ variant_index() {
 }
 
 acquire_post_training_eval_slot() {
-  local output_variable=$1 slot candidate_fd
+  acquire_eval_slot "$1" "$post_training_eval_slots"
+}
+
+acquire_training_eval_slot() {
+  acquire_eval_slot "$1" "$training_eval_slots"
+}
+
+acquire_eval_slot() {
+  local output_variable=$1 slot_count=$2 slot candidate_fd
   while true; do
-    for ((slot = 0; slot < post_training_eval_slots; slot++)); do
+    for ((slot = 0; slot < slot_count; slot++)); do
       exec {candidate_fd}>"${eval_lock}.slot${slot}"
       if flock -n "$candidate_fd"; then
         printf -v "$output_variable" '%s' "$candidate_fd"
@@ -651,6 +664,14 @@ eval_one() {
     echo "[eval] resume incomplete output: $output"
   fi
   (
+    if training_is_running && (( training_eval_slots > 1 )); then
+      local training_slot_fd
+      acquire_training_eval_slot training_slot_fd
+      run_eval_command "$gpu" "$checkpoint" "$output" "$log"
+      eval_result_valid "$output"
+      exit
+    fi
+
     exec 9>"$eval_lock"
     while training_is_running; do
       if flock -w "$guard_poll_s" 9; then
