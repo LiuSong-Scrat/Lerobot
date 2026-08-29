@@ -120,6 +120,68 @@ def test_evaluations_can_overlap_after_training_stops(tmp_path: Path) -> None:
     assert _run_admission_probe(tmp_path, trainer_running=False)
 
 
+def test_eval_parallelism_uses_resource_phase_defaults() -> None:
+    command = f"""
+set -euo pipefail
+source {shlex.quote(str(RUNNER))}
+[[ "$training_eval_episode_workers_per_task" == 1 ]]
+[[ "$training_eval_inference_batch_size" == 2 ]]
+[[ "$post_training_eval_episode_workers_per_task" == 4 ]]
+[[ "$post_training_eval_inference_batch_size" == 8 ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_eval_parallelism_rejects_undersized_fixed_batch(tmp_path: Path) -> None:
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK=2
+export SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE=3
+source {shlex.quote(str(RUNNER))}
+status=0
+validate_eval_parallelism || status=$?
+[[ "$status" == 2 ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def _run_parallelism_phase_probe(tmp_path: Path, *, trainer_running: bool) -> str:
+    root = tmp_path / "output"
+    (root / "pids").mkdir(parents=True)
+    trainer_pid = os.getpid() if trainer_running else 999_999_999
+    (root / "pids" / "train_smolvla_src.pid").write_text(str(trainer_pid))
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+export SONG_ABLATION_EVAL_LOCK={shlex.quote(str(tmp_path / 'eval.lock'))}
+export SONG_ABLATION_TRAINING_EVAL_SLOTS=2
+export SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S=0
+source {shlex.quote(str(RUNNER))}
+eval_result_valid() {{ [[ -f "$1/done" ]]; }}
+run_eval_command() {{
+  printf '%s %s %s\n' "$5" "$6" "$7" >"$root/observed_parallelism"
+  mkdir -p "$3"
+  touch "$3/done"
+}}
+eval_one smolvla_src 4 1 /checkpoint
+cat "$root/observed_parallelism"
+"""
+    result = subprocess.run(
+        ["bash", "-c", command], check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+def test_eval_command_receives_training_parallelism(tmp_path: Path) -> None:
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 2"
+
+
+def test_eval_command_receives_post_training_parallelism(tmp_path: Path) -> None:
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=False) == "true 4 8"
+
+
 def test_checkpoint_is_staged_locally_with_bandwidth_limit(tmp_path: Path) -> None:
     checkpoint = tmp_path / "source"
     checkpoint.mkdir()

@@ -25,6 +25,10 @@ summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lo
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-1}
 training_eval_slots=${SONG_ABLATION_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
+training_eval_episode_workers_per_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-1}
+post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-4}
+training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * training_eval_episode_workers_per_task))}
+post_training_eval_inference_batch_size=${SONG_ABLATION_POST_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * post_training_eval_episode_workers_per_task))}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
 checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-102400}
 
@@ -42,6 +46,25 @@ summarizer="$repo/benchmarks/song_real_libero/scripts/summarize_v043_ablation.py
 
 usage() {
   echo "usage: $0 {preflight|train|extend|eval|all|summarize|status}"
+}
+
+validate_eval_parallelism() {
+  if (( training_eval_episode_workers_per_task < 1 || training_eval_episode_workers_per_task > eval_episodes )); then
+    echo "Training-time episode workers per task must be between one and $eval_episodes." >&2
+    return 2
+  fi
+  if (( post_training_eval_episode_workers_per_task < 1 || post_training_eval_episode_workers_per_task > eval_episodes )); then
+    echo "Post-training episode workers per task must be between one and $eval_episodes." >&2
+    return 2
+  fi
+  if (( training_eval_inference_batch_size < 2 * training_eval_episode_workers_per_task )); then
+    echo "Training-time fixed-barrier batch must cover both tasks' episode workers." >&2
+    return 2
+  fi
+  if (( post_training_eval_inference_batch_size < 2 * post_training_eval_episode_workers_per_task )); then
+    echo "Post-training fixed-barrier batch must cover both tasks' episode workers." >&2
+    return 2
+  fi
 }
 
 require_inputs() {
@@ -75,6 +98,7 @@ require_inputs() {
     echo "Post-training evaluation staggering must be non-negative." >&2
     exit 2
   fi
+  validate_eval_parallelism
   if (( checkpoint_stage_bwlimit_kib <= 0 )); then
     echo "Checkpoint staging bandwidth must be positive." >&2
     exit 2
@@ -592,6 +616,8 @@ PY
 
 run_eval_command() {
   local gpu=$1 checkpoint=$2 output=$3 log=$4 stage_checkpoint=${5:-false}
+  local episode_workers_per_task=${6:-$training_eval_episode_workers_per_task}
+  local inference_batch_size=${7:-$training_eval_inference_batch_size}
   local eval_checkpoint=$checkpoint stage_dir= stage_reclaimer_pid= status=0
   guard_wait "$gpu"
   if [[ "$stage_checkpoint" == true ]]; then
@@ -627,8 +653,10 @@ run_eval_command() {
       --gripper-delta-threshold 0.002 \
       --gripper-delta-alignment current_minus_previous \
       --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
-      --task-workers 2 --episode-workers-per-task 1 --task-worker-backend process \
-      --inference-batch-size 2 --inference-batching-mode fixed_barrier \
+      --task-workers 2 --episode-workers-per-task "$episode_workers_per_task" \
+      --task-worker-backend process \
+      --inference-batch-size "$inference_batch_size" \
+      --inference-batching-mode fixed_barrier \
       --no-release-event-exec-enable --control-freq 20 --action-index 0 \
       --exec-action-steps 24 --adaptive-exec-max-steps 24 --grasp-exec-steps 24 \
       --max-steps 1000 --no-use-suite-max-steps --recreate-env-per-episode \
@@ -667,7 +695,8 @@ eval_one() {
     if training_is_running && (( training_eval_slots > 1 )); then
       local training_slot_fd
       acquire_training_eval_slot training_slot_fd
-      run_eval_command "$gpu" "$checkpoint" "$output" "$log"
+      run_eval_command "$gpu" "$checkpoint" "$output" "$log" false \
+        "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size"
       eval_result_valid "$output"
       exit
     fi
@@ -676,7 +705,8 @@ eval_one() {
     while training_is_running; do
       if flock -w "$guard_poll_s" 9; then
         if training_is_running; then
-          run_eval_command "$gpu" "$checkpoint" "$output" "$log"
+          run_eval_command "$gpu" "$checkpoint" "$output" "$log" false \
+            "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size"
           eval_result_valid "$output"
           exit
         fi
@@ -691,7 +721,8 @@ eval_one() {
     index=$(variant_index "$variant")
     sleep "$((index * post_training_eval_stagger_s))"
     acquire_post_training_eval_slot slot_fd
-    run_eval_command "$gpu" "$checkpoint" "$output" "$log" true
+    run_eval_command "$gpu" "$checkpoint" "$output" "$log" true \
+      "$post_training_eval_episode_workers_per_task" "$post_training_eval_inference_batch_size"
     eval_result_valid "$output"
   )
 }
