@@ -105,7 +105,34 @@ wait_for_training_gpu_allocation() {
   return 1
 }
 
+gpu_preflight() {
+  local required_gpu_csv=${1:-0,1,2,3}
+  "$python" - "$required_gpu_csv" <<'PY'
+import subprocess
+import sys
+
+required_gpu_ids = {int(value) for value in sys.argv[1].split(",") if value}
+gpu_lines = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=index,memory.total,memory.used", "--format=csv,noheader,nounits"],
+    text=True,
+).strip().splitlines()
+assert len(gpu_lines) == 8, gpu_lines
+inventory = {}
+for line in gpu_lines:
+    index, total, used = [int(value.strip()) for value in line.split(",")]
+    assert total >= 24_000, (index, total)
+    inventory[index] = used
+assert required_gpu_ids.issubset(inventory), (required_gpu_ids, inventory.keys())
+for index in sorted(required_gpu_ids):
+    assert inventory[index] < 2_048, (index, inventory[index])
+print(f"gpu preflight PASS: gpus={len(gpu_lines)} required={sorted(required_gpu_ids)}")
+PY
+}
+
 preflight() {
+  local required_gpu_csv=${1:-0,1,2,3}
+  local required_gpu
+  local -a required_gpu_ids=()
   require_inputs
   cd "$repo"
   local branch
@@ -117,7 +144,6 @@ preflight() {
   mkdir -p "$root/logs" "$root/pids" "$root/resource"
   PYTHONPATH="$repo/src" "$python" - "$dataset" "$cache" "$eval_episodes" <<'PY'
 import json
-import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -156,21 +182,16 @@ for name, gates in expected.items():
     assert not cfg.worldflow_enable
     assert cfg.pointcloud_input_points == 10_000
 
-gpu_lines = subprocess.check_output(
-    ["nvidia-smi", "--query-gpu=index,memory.total,memory.used", "--format=csv,noheader,nounits"],
-    text=True,
-).strip().splitlines()
-assert len(gpu_lines) == 8, gpu_lines
-for line in gpu_lines:
-    index, total, used = [int(value.strip()) for value in line.split(",")]
-    assert total >= 24_000, (index, total)
-    assert used < 2_048, (index, used)
 print(
     f"ablation preflight PASS: frames={info['total_frames']} episodes={info['total_episodes']} "
-    f"test_episodes={2 * eval_episodes} gpus={len(gpu_lines)}"
+    f"test_episodes={2 * eval_episodes}"
 )
 PY
-  "$python" "$guard" --root "$root" --sample-seconds 1
+  gpu_preflight "$required_gpu_csv"
+  IFS=, read -ra required_gpu_ids <<<"$required_gpu_csv"
+  for required_gpu in "${required_gpu_ids[@]}"; do
+    "$python" "$guard" --root "$root" --gpu "$required_gpu" --sample-seconds 1
+  done
 }
 
 train_one() {
@@ -309,9 +330,8 @@ extend_train_one() {
 }
 
 extend_unstable() {
-  preflight
-  local variant index gpu pid failed=0
-  local candidates=() train_pids=() eval_pids=()
+  local variant index gpu pid failed=0 required_gpu_csv
+  local candidates=() required_gpus=() train_pids=() eval_pids=()
   if (( extension_steps <= steps )); then
     echo "[extend] extension_steps must exceed the original training steps" >&2
     return 2
@@ -326,7 +346,11 @@ extend_unstable() {
       echo "[extend] pending evaluations remain for $variant; refusing early extension" >&2
       return 1
     fi
+    index=$(variant_index "$variant")
+    required_gpus+=("${train_gpus[$index]}")
   done
+  required_gpu_csv=$(IFS=,; echo "${required_gpus[*]}")
+  preflight "$required_gpu_csv"
   for variant in "${candidates[@]}"; do
     index=$(variant_index "$variant")
     gpu=${train_gpus[$index]}

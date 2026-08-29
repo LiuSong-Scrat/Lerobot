@@ -6,6 +6,45 @@ from pathlib import Path
 RUNNER = Path("benchmarks/song_real_libero/scripts/run_v043_cumulative_ablation.sh").resolve()
 
 
+def _write_nvidia_smi(tmp_path: Path, used_by_gpu: dict[int, int]) -> Path:
+    executable = tmp_path / "nvidia-smi"
+    lines = [f"{index}, 24564, {used_by_gpu.get(index, 0)}" for index in range(8)]
+    executable.write_text("#!/bin/sh\nprintf '%s\\n' " + " ".join(map(shlex.quote, lines)) + "\n")
+    executable.chmod(0o755)
+    return executable
+
+
+def test_gpu_preflight_ignores_busy_unrequested_gpu(tmp_path: Path) -> None:
+    _write_nvidia_smi(tmp_path, {0: 3487})
+    command = f"""
+set -euo pipefail
+export PATH={shlex.quote(str(tmp_path))}:$PATH
+source {shlex.quote(str(RUNNER))}
+gpu_preflight 1,2,3
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command], check=True, capture_output=True, text=True
+    )
+    assert "required=[1, 2, 3]" in result.stdout
+
+
+def test_gpu_preflight_rejects_busy_requested_gpu(tmp_path: Path) -> None:
+    _write_nvidia_smi(tmp_path, {2: 3487})
+    command = f"""
+set -euo pipefail
+export PATH={shlex.quote(str(tmp_path))}:$PATH
+source {shlex.quote(str(RUNNER))}
+gpu_preflight 1,2,3
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command], capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "(2, 3487)" in result.stderr
+
+
 def _run_admission_probe(tmp_path: Path, *, trainer_running: bool) -> bool:
     root = tmp_path / "output"
     (root / "pids").mkdir(parents=True)
