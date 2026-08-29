@@ -24,7 +24,7 @@ summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lo
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-2}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
-checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-153600}
+checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-102400}
 
 variants=(
   smolvla_src
