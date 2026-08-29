@@ -210,7 +210,7 @@ export SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB=1024
 export SONG_ABLATION_VLM={shlex.quote(str(vlm))}
 export SONG_ABLATION_VLM_WEIGHTS={shlex.quote(str(weights))}
 source {shlex.quote(str(RUNNER))}
-stage=$(stage_checkpoint_locally {shlex.quote(str(checkpoint))} variant 000001)
+stage=$(stage_checkpoint_locally {shlex.quote(str(checkpoint))} variant 000001 "$$")
 cmp {shlex.quote(str(checkpoint / 'model.safetensors'))} "$stage/pretrained_model/model.safetensors"
 cmp {shlex.quote(str(weights / 'model.safetensors'))} "$stage/vlm_weights/model.safetensors"
 [[ ! -e "$stage/vlm_architecture/model.safetensors" ]]
@@ -218,6 +218,25 @@ jq -e --arg stage "$stage" \
   '.vlm_model_name == ($stage + "/vlm_architecture") and .vlm_weights_path == ($stage + "/vlm_weights")' \
   "$stage/pretrained_model/config.json"
 [[ "$stage" == {shlex.quote(str(stage_root))}/* ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_stale_checkpoint_stages_are_reclaimed_without_touching_live_owner(
+    tmp_path: Path,
+) -> None:
+    stage_root = tmp_path / "stages"
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_CHECKPOINT_STAGE_ROOT={shlex.quote(str(stage_root))}
+source {shlex.quote(str(RUNNER))}
+mkdir -p "$checkpoint_stage_root/dead" "$checkpoint_stage_root/live"
+printf '%s\n' 999999999 > "$checkpoint_stage_root/dead/.stage_owner_pid"
+printf '%s\n' "$$" > "$checkpoint_stage_root/live/.stage_owner_pid"
+cleanup_stale_stage_directories
+[[ ! -e "$checkpoint_stage_root/dead" ]]
+[[ -d "$checkpoint_stage_root/live" ]]
 """
 
     subprocess.run(["bash", "-c", command], check=True)

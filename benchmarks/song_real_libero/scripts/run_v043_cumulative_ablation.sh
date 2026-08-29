@@ -637,10 +637,48 @@ cleanup_stage_directory() {
   find "$stage_dir" -depth -delete
 }
 
+stage_directory_in_use() {
+  local stage_dir=$1 owner_pid proc cmdline
+  owner_pid=$(cat "$stage_dir/.stage_owner_pid" 2>/dev/null || true)
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]] && [[ -d "/proc/$owner_pid" ]]; then
+    cmdline=$(tr '\0' ' ' < "/proc/$owner_pid/cmdline" 2>/dev/null || true)
+    if [[ "$cmdline" == *run_v043_cumulative_ablation.sh* ]]; then
+      return 0
+    fi
+  fi
+  for proc in /proc/[0-9]*; do
+    cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+    if [[ "$cmdline" == *libero_pointcloud_eval.py* && "$cmdline" == *"$stage_dir"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cleanup_stale_stage_directories() {
+  local stage_dir
+  for stage_dir in "$checkpoint_stage_root"/*; do
+    [[ -d "$stage_dir" ]] || continue
+    if stage_directory_in_use "$stage_dir"; then
+      continue
+    fi
+    "$python" "$cache_reclaimer" --checkpoint "$stage_dir" >/dev/null 2>&1 || true
+    cleanup_stage_directory "$stage_dir"
+    echo "[eval] removed stale checkpoint stage: $stage_dir" >&2
+  done
+}
+
 stage_checkpoint_locally() {
-  local checkpoint=$1 variant=$2 step=$3 stage_dir stage_checkpoint stage_vlm stage_vlm_weights
+  local checkpoint=$1 variant=$2 step=$3 owner_pid=$4
+  local stage_dir stage_checkpoint stage_vlm stage_vlm_weights stage_lock_fd
   mkdir -p "$checkpoint_stage_root"
+  exec {stage_lock_fd}>"$checkpoint_stage_root/.cleanup.lock"
+  flock "$stage_lock_fd"
+  cleanup_stale_stage_directories
   stage_dir=$(mktemp -d "$checkpoint_stage_root/${variant}_step${step}.XXXXXX")
+  printf '%s\n' "$owner_pid" > "$stage_dir/.stage_owner_pid"
+  flock -u "$stage_lock_fd"
+  exec {stage_lock_fd}>&-
   stage_checkpoint="$stage_dir/pretrained_model"
   stage_vlm="$stage_dir/vlm_architecture"
   stage_vlm_weights="$stage_dir/vlm_weights"
@@ -681,10 +719,12 @@ run_eval_command() {
   local episode_workers_per_task=${6:-$training_eval_episode_workers_per_task}
   local inference_batch_size=${7:-$training_eval_inference_batch_size}
   local eval_checkpoint=$checkpoint stage_dir= stage_reclaimer_pid= status=0
+  local stage_owner_pid=$BASHPID
   guard_wait "$gpu"
   if [[ "$stage_checkpoint" == true ]]; then
     stage_dir=$(stage_checkpoint_locally \
-      "$checkpoint" "$(basename "$(dirname "$output")")" "$(basename "$output")")
+      "$checkpoint" "$(basename "$(dirname "$output")")" "$(basename "$output")" \
+      "$stage_owner_pid")
     eval_checkpoint="$stage_dir/pretrained_model"
   fi
   mkdir -p "$output" "$root/logs"
