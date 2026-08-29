@@ -21,7 +21,7 @@ guard_sample_s=${SONG_ABLATION_GUARD_SAMPLE_S:-5}
 guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
 eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
 summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
-post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-2}
+post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
 checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-102400}
@@ -425,9 +425,9 @@ eval_one() {
       fi
     done
 
-    # With no trainers resident, use two bounded slots and stagger model loads.
-    # This keeps the evaluation backlog moving without four simultaneous NFS
-    # reads or four resident evaluator process trees.
+    # With no trainers resident, use bounded slots and stagger model loads.
+    # The default remains one because evaluator process trees are host-memory
+    # bound on the 60 GiB benchmark machine.
     local index slot_fd
     index=$(variant_index "$variant")
     sleep "$((index * post_training_eval_stagger_s))"
