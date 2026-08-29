@@ -4,6 +4,7 @@ from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
     cgroup_block_io_bytes_from_text,
     descendant_pids,
     failed_sample_payload,
+    inactive_file_bytes_from_text,
     nfs_server_io_bytes_from_text,
     storage_io_bytes_from_text,
 )
@@ -46,6 +47,15 @@ Total 800
 """
 
     assert cgroup_block_io_bytes_from_text(raw) == 400
+
+
+def test_inactive_file_prefers_hierarchical_cgroup_value() -> None:
+    raw = """inactive_file 100
+total_inactive_file 250
+active_file 500
+"""
+
+    assert inactive_file_bytes_from_text(raw) == 250
 
 
 def test_nfs_server_io_selects_data_mount() -> None:

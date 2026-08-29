@@ -237,6 +237,52 @@ def cgroup_memory_bytes() -> int:
     raise RuntimeError("Cannot read cgroup memory usage.")
 
 
+def inactive_file_bytes_from_text(raw: str) -> int:
+    values = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            values[fields[0]] = int(fields[1])
+    return values.get("total_inactive_file", values.get("inactive_file", 0))
+
+
+def cgroup_memory_snapshot() -> tuple[int, int, int]:
+    usage = cgroup_memory_bytes()
+    candidates = (
+        Path("/sys/fs/cgroup/memory/memory.stat"),
+        Path("/sys/fs/cgroup/memory.stat"),
+    )
+    for path in candidates:
+        try:
+            inactive_file = inactive_file_bytes_from_text(path.read_text())
+            return usage, inactive_file, max(0, usage - inactive_file)
+        except (FileNotFoundError, ValueError):
+            continue
+    raise RuntimeError("Cannot read cgroup inactive-file memory.")
+
+
+def cgroup_cpu_usage_seconds() -> float:
+    usage_candidates = (
+        Path("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"),
+        Path("/sys/fs/cgroup/cpuacct/cpuacct.usage"),
+    )
+    for path in usage_candidates:
+        try:
+            return int(path.read_text().strip()) / 1_000_000_000.0
+        except (FileNotFoundError, ValueError):
+            continue
+    cpu_stat = Path("/sys/fs/cgroup/cpu.stat")
+    try:
+        values = {
+            fields[0]: int(fields[1])
+            for line in cpu_stat.read_text().splitlines()
+            if len(fields := line.split()) == 2
+        }
+        return values["usage_usec"] / 1_000_000.0
+    except (FileNotFoundError, KeyError, ValueError):
+        raise RuntimeError("Cannot read cgroup CPU usage.") from None
+
+
 def gpu_samples(gpu: int | None) -> list[dict[str, float | int]]:
     command = [
         "nvidia-smi",
@@ -265,13 +311,18 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     pid_dir = root / "pids"
     start = process_tree_snapshot(pid_dir)
     block_start, nfs_start = system_io_snapshot()
+    cgroup_cpu_start = cgroup_cpu_usage_seconds()
     start_time = time.monotonic()
     time.sleep(max(0.1, seconds))
     end = process_tree_snapshot(pid_dir)
     block_end, nfs_end = system_io_snapshot()
+    cgroup_cpu_end = cgroup_cpu_usage_seconds()
     elapsed = max(time.monotonic() - start_time, 1e-6)
     shared = start.keys() & end.keys()
-    cpu_cores = sum(max(0.0, end[pid][0] - start[pid][0]) for pid in shared) / elapsed
+    experiment_cpu_cores = (
+        sum(max(0.0, end[pid][0] - start[pid][0]) for pid in shared) / elapsed
+    )
+    cpu_cores = max(0.0, cgroup_cpu_end - cgroup_cpu_start) / elapsed
     process_io_mib_s = (
         sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
     )
@@ -279,7 +330,8 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     nfs_io_mib_s = max(0, nfs_end - nfs_start) / elapsed / MIB
     io_mib_s = max(block_io_mib_s, nfs_io_mib_s)
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
-    memory_gib = cgroup_memory_bytes() / GIB
+    cgroup_usage_bytes, inactive_file_bytes, working_set_bytes = cgroup_memory_snapshot()
+    memory_gib = working_set_bytes / GIB
     gpu_info = gpu_samples(gpu)
     soft_reasons = []
     hard_reasons = []
@@ -309,8 +361,13 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         "root": str(root),
         "pids": sorted(end),
         "memory_gib": memory_gib,
+        "memory_metric": "cgroup_working_set_usage_minus_inactive_file",
+        "cgroup_usage_gib": cgroup_usage_bytes / GIB,
+        "inactive_file_gib": inactive_file_bytes / GIB,
         "experiment_rss_gib": experiment_rss_gib,
         "cpu_cores": cpu_cores,
+        "cpu_metric": "cgroup_cpuacct_usage",
+        "experiment_cpu_cores": experiment_cpu_cores,
         "io_mib_s": io_mib_s,
         "io_metric": "max_cgroup_block_and_nfs_server_bytes",
         "block_io_mib_s": block_io_mib_s,
@@ -342,8 +399,13 @@ def failed_sample_payload(root: Path, exc: BaseException, limits: Limits) -> dic
         "root": str(root),
         "pids": [],
         "memory_gib": None,
+        "memory_metric": "cgroup_working_set_usage_minus_inactive_file",
+        "cgroup_usage_gib": None,
+        "inactive_file_gib": None,
         "experiment_rss_gib": None,
         "cpu_cores": None,
+        "cpu_metric": "cgroup_cpuacct_usage",
+        "experiment_cpu_cores": None,
         "io_mib_s": None,
         "io_metric": "max_cgroup_block_and_nfs_server_bytes",
         "block_io_mib_s": None,
