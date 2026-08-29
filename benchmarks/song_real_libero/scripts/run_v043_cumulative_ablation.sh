@@ -13,6 +13,7 @@ vlm=${SONG_ABLATION_VLM:-/opt/data/private/liusong/hf_models/SmolVLM2-500M-Video
 vlm_weights=${SONG_ABLATION_VLM_WEIGHTS:-/opt/data/private/liusong/hf_models/smolvla_base}
 root=${SONG_ABLATION_OUTPUT_ROOT:-/opt/data/private/liusong/benchmarks/song_real_libero/outputs/v043_cumulative_ablation_task6_task8_20260829}
 steps=${SONG_ABLATION_STEPS:-30000}
+extension_steps=${SONG_ABLATION_EXTENSION_STEPS:-60000}
 checkpoint_interval_s=${SONG_ABLATION_CHECKPOINT_INTERVAL_S:-3600}
 batch_size=${SONG_ABLATION_BATCH_SIZE:-8}
 num_workers=${SONG_ABLATION_NUM_WORKERS:-2}
@@ -39,7 +40,7 @@ cache_reclaimer="$repo/benchmarks/song_real_libero/scripts/checkpoint_cache_recl
 summarizer="$repo/benchmarks/song_real_libero/scripts/summarize_v043_ablation.py"
 
 usage() {
-  echo "usage: $0 {preflight|train|eval|all|summarize|status}"
+  echo "usage: $0 {preflight|train|extend|eval|all|summarize|status}"
 }
 
 require_inputs() {
@@ -234,6 +235,119 @@ train_all() {
   for pid in "${pids[@]}"; do
     wait "$pid" || failed=1
   done
+  return "$failed"
+}
+
+unstable_variants() {
+  "$python" - "$root/stability.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit("Missing stability.json; finish and summarize current evaluations first")
+payload = json.loads(path.read_text())
+for variant, result in payload.get("variants", {}).items():
+    if result.get("stable") is False:
+        print(variant)
+PY
+}
+
+variant_evaluations_complete() {
+  local variant=$1 model_path checkpoint step_tag
+  while IFS= read -r model_path; do
+    checkpoint=$(dirname "$model_path")
+    step_tag=$(basename "$(dirname "$checkpoint")")
+    if ! eval_result_valid "$root/eval/$variant/step$step_tag"; then
+      return 1
+    fi
+  done < <(find "$root/train/$variant/checkpoints" -mindepth 3 -maxdepth 3 \
+    -path '*/pretrained_model/model.safetensors' -type f 2>/dev/null | sort -V)
+}
+
+latest_resumable_checkpoint() {
+  local variant=$1 checkpoint
+  while IFS= read -r checkpoint; do
+    if [[ -s "$checkpoint/pretrained_model/train_config.json" \
+      && -s "$checkpoint/training_state/training_step.json" \
+      && -s "$checkpoint/training_state/optimizer_state.safetensors" ]]; then
+      printf '%s\n' "$checkpoint"
+      return 0
+    fi
+  done < <(find "$root/train/$variant/checkpoints" -mindepth 1 -maxdepth 1 \
+    -type d 2>/dev/null | sort -Vr)
+  return 1
+}
+
+extend_train_one() {
+  local variant=$1 gpu=$2 checkpoint output log target_tag
+  output="$root/train/$variant"
+  log="$root/logs/train_${variant}_extend_to_${extension_steps}.log"
+  printf -v target_tag '%06d' "$extension_steps"
+  if [[ -s "$output/checkpoints/$target_tag/pretrained_model/model.safetensors" ]]; then
+    echo "[extend] reuse completed $variant target=$target_tag"
+    return 0
+  fi
+  checkpoint=$(latest_resumable_checkpoint "$variant") || {
+    echo "[extend] no resumable checkpoint for $variant" >&2
+    return 1
+  }
+  cd "$repo"
+  exec env \
+    PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MALLOC_ARENA_MAX=2 \
+    CUDA_VISIBLE_DEVICES="$gpu" PYTHONPATH="$repo/src" SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+    "$python" benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+      --resume=true \
+      --config_path="$checkpoint/pretrained_model/train_config.json" \
+      --steps="$extension_steps" --save_freq="$extension_steps" \
+      --save_interval_s="$checkpoint_interval_s" --eval_freq=0 --log_freq=10 \
+      --num_workers="$num_workers" --wandb.enable=false \
+      --output_dir="$output" --job_name="v043_ablation_${variant}_extended" \
+      >>"$log" 2>&1
+}
+
+extend_unstable() {
+  preflight
+  local variant index gpu pid failed=0
+  local candidates=() train_pids=() eval_pids=()
+  if (( extension_steps <= steps )); then
+    echo "[extend] extension_steps must exceed the original training steps" >&2
+    return 2
+  fi
+  mapfile -t candidates < <(unstable_variants)
+  if (( ${#candidates[@]} == 0 )); then
+    echo "[extend] all variants are already stable"
+    return 0
+  fi
+  for variant in "${candidates[@]}"; do
+    if ! variant_evaluations_complete "$variant"; then
+      echo "[extend] pending evaluations remain for $variant; refusing early extension" >&2
+      return 1
+    fi
+  done
+  for variant in "${candidates[@]}"; do
+    index=$(variant_index "$variant")
+    gpu=${train_gpus[$index]}
+    guard_wait "$gpu"
+    extend_train_one "$variant" "$gpu" &
+    pid=$!
+    train_pids+=("$pid")
+    printf '%s\n' "$pid" >"$root/pids/train_${variant}.pid"
+    wait_for_training_gpu_allocation "$gpu" "$pid"
+    eval_watch_one "$variant" "${eval_gpus[$index]}" &
+    pid=$!
+    eval_pids+=("$pid")
+    printf '%s\n' "$pid" >"$root/pids/eval_${variant}.pid"
+  done
+  for pid in "${train_pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  for pid in "${eval_pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  summarize
   return "$failed"
 }
 
@@ -658,6 +772,7 @@ main() {
   case "${1:-}" in
     preflight) preflight ;;
     train) train_all ;;
+    extend) extend_unstable ;;
     eval) eval_all ;;
     all)
       mkdir -p "$root/logs" "$root/pids"

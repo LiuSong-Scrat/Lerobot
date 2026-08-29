@@ -142,3 +142,100 @@ eval_one_resilient smolvla_src 4 1 /checkpoint || status=$?
 """
 
     subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_unstable_variants_reads_only_false_entries(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    (root / "stability.json").write_text(
+        '{"variants": {'
+        '"smolvla_src": {"stable": true}, '
+        '"smolvla_pointcloud": {"stable": false}, '
+        '"smolvla_pointcloud_effseg": {"stable": true}, '
+        '"smolvla_pointcloud_effseg_pointaction": {"stable": false}'
+        '}}'
+    )
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+unstable_variants
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command], check=True, capture_output=True, text=True
+    )
+    assert result.stdout.splitlines() == [
+        "smolvla_pointcloud",
+        "smolvla_pointcloud_effseg_pointaction",
+    ]
+
+
+def test_latest_resumable_checkpoint_requires_complete_training_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "output"
+    checkpoints = root / "train" / "smolvla_pointcloud" / "checkpoints"
+    incomplete = checkpoints / "040000"
+    complete = checkpoints / "030000"
+    for checkpoint in (incomplete, complete):
+        (checkpoint / "pretrained_model").mkdir(parents=True)
+        (checkpoint / "training_state").mkdir()
+        (checkpoint / "pretrained_model" / "train_config.json").write_text("{}")
+        (checkpoint / "training_state" / "training_step.json").write_text("{}")
+    (complete / "training_state" / "optimizer_state.safetensors").write_text("state")
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+latest_resumable_checkpoint smolvla_pointcloud
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command], check=True, capture_output=True, text=True
+    )
+    assert Path(result.stdout.strip()) == complete
+
+
+def test_extension_prevalidates_all_candidates_before_starting(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    root.mkdir()
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+preflight() {{ :; }}
+unstable_variants() {{ printf '%s\n' smolvla_pointcloud smolvla_pointcloud_effseg_pointaction; }}
+variant_evaluations_complete() {{ [[ "$1" == smolvla_pointcloud ]]; }}
+extend_train_one() {{ touch "$root/training_started"; }}
+status=0
+extend_unstable || status=$?
+[[ "$status" == 1 ]]
+[[ ! -e "$root/training_started" ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_extension_starts_matching_evaluation_watcher(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    (root / "pids").mkdir(parents=True)
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+preflight() {{ :; }}
+unstable_variants() {{ printf '%s\n' smolvla_pointcloud; }}
+variant_evaluations_complete() {{ :; }}
+guard_wait() {{ :; }}
+wait_for_training_gpu_allocation() {{ :; }}
+extend_train_one() {{ touch "$root/training_started"; }}
+eval_watch_one() {{ printf '%s %s\n' "$1" "$2" >"$root/eval_watcher_started"; }}
+summarize() {{ touch "$root/summarized"; }}
+extend_unstable
+[[ -f "$root/training_started" ]]
+[[ "$(cat "$root/eval_watcher_started")" == "smolvla_pointcloud 5" ]]
+[[ -f "$root/summarized" ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
