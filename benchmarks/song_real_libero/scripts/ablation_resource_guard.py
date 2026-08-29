@@ -16,6 +16,7 @@ GIB = 1024**3
 MIB = 1024**2
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+NFS_DATA_MOUNT = "/opt/data/private"
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,9 @@ def _proc_stat(pid: int) -> tuple[int, float, int] | None:
         rest = raw[raw.rfind(")") + 2 :].split()
         ppid = int(rest[1])
         cpu_s = (int(rest[11]) + int(rest[12])) / CLK_TCK
-        rss = int((Path("/proc") / str(pid) / "statm").read_text().split()[1]) * PAGE_SIZE
+        rss = (
+            int((Path("/proc") / str(pid) / "statm").read_text().split()[1]) * PAGE_SIZE
+        )
         return ppid, cpu_s, rss
     except (
         FileNotFoundError,
@@ -83,6 +86,55 @@ def _proc_io_bytes(pid: int) -> int:
         return storage_io_bytes_from_text((Path("/proc") / str(pid) / "io").read_text())
     except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
         return 0
+
+
+def cgroup_block_io_bytes_from_text(raw: str) -> int:
+    """Return actual block bytes without double-counting stacked devices."""
+    device_totals = []
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and ":" in fields[0] and fields[1] == "Total":
+            device_totals.append(int(fields[2]))
+    return max(device_totals, default=0)
+
+
+def _cgroup_block_io_bytes() -> int:
+    candidates = (
+        Path("/sys/fs/cgroup/blkio/blkio.throttle.io_service_bytes_recursive"),
+        Path("/sys/fs/cgroup/blkio/blkio.throttle.io_service_bytes"),
+    )
+    for path in candidates:
+        try:
+            return cgroup_block_io_bytes_from_text(path.read_text())
+        except (FileNotFoundError, PermissionError, ValueError):
+            continue
+    return 0
+
+
+def nfs_server_io_bytes_from_text(raw: str, mountpoint: str = NFS_DATA_MOUNT) -> int:
+    """Return bytes transferred to the NFS server for one mounted filesystem."""
+    selected = False
+    for line in raw.splitlines():
+        if line.startswith("device "):
+            selected = f" mounted on {mountpoint} with fstype nfs " in f"{line} "
+            continue
+        if selected and line.strip().startswith("bytes:"):
+            values = [int(value) for value in line.split(":", 1)[1].split()]
+            if len(values) < 6:
+                raise ValueError(f"Unexpected NFS bytes line: {line!r}")
+            return values[4] + values[5]
+    return 0
+
+
+def _nfs_server_io_bytes() -> int:
+    try:
+        return nfs_server_io_bytes_from_text(Path("/proc/self/mountstats").read_text())
+    except (FileNotFoundError, PermissionError, ValueError):
+        return 0
+
+
+def system_io_snapshot() -> tuple[int, int]:
+    return _cgroup_block_io_bytes(), _nfs_server_io_bytes()
 
 
 def _root_pids(pid_dir: Path) -> set[int]:
@@ -204,13 +256,20 @@ def gpu_samples(gpu: int | None) -> list[dict[str, float | int]]:
 def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     pid_dir = root / "pids"
     start = process_tree_snapshot(pid_dir)
+    block_start, nfs_start = system_io_snapshot()
     start_time = time.monotonic()
     time.sleep(max(0.1, seconds))
     end = process_tree_snapshot(pid_dir)
+    block_end, nfs_end = system_io_snapshot()
     elapsed = max(time.monotonic() - start_time, 1e-6)
     shared = start.keys() & end.keys()
     cpu_cores = sum(max(0.0, end[pid][0] - start[pid][0]) for pid in shared) / elapsed
-    io_mib_s = sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
+    process_io_mib_s = (
+        sum(max(0, end[pid][2] - start[pid][2]) for pid in shared) / elapsed / MIB
+    )
+    block_io_mib_s = max(0, block_end - block_start) / elapsed / MIB
+    nfs_io_mib_s = max(0, nfs_end - nfs_start) / elapsed / MIB
+    io_mib_s = max(block_io_mib_s, nfs_io_mib_s)
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
     memory_gib = cgroup_memory_bytes() / GIB
     gpu_info = gpu_samples(gpu)
@@ -230,9 +289,13 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         index = int(item["index"])
         used_gib = float(item["used_gib"])
         if used_gib >= limits.gpu_soft_used_gib:
-            soft_reasons.append(f"gpu{index}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}")
+            soft_reasons.append(
+                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_soft_used_gib:.2f}"
+            )
         if used_gib >= limits.gpu_hard_used_gib:
-            hard_reasons.append(f"gpu{index}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}")
+            hard_reasons.append(
+                f"gpu{index}_used={used_gib:.2f}>={limits.gpu_hard_used_gib:.2f}"
+            )
     return {
         "timestamp": time.time(),
         "root": str(root),
@@ -241,7 +304,10 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         "experiment_rss_gib": experiment_rss_gib,
         "cpu_cores": cpu_cores,
         "io_mib_s": io_mib_s,
-        "io_metric": "proc_read_bytes_plus_write_bytes",
+        "io_metric": "max_cgroup_block_and_nfs_server_bytes",
+        "block_io_mib_s": block_io_mib_s,
+        "nfs_io_mib_s": nfs_io_mib_s,
+        "process_io_mib_s": process_io_mib_s,
         "gpus": gpu_info,
         "soft_ok": not soft_reasons,
         "hard_ok": not hard_reasons,
@@ -277,7 +343,9 @@ def main() -> int:
     while True:
         marker = args.root / "resource" / "HARD_LIMIT_EXCEEDED"
         if args.wait and marker.is_file():
-            print(f"Refusing new work after a hard resource limit: {marker}", flush=True)
+            print(
+                f"Refusing new work after a hard resource limit: {marker}", flush=True
+            )
             return 2
         payload = sample(args.root, args.gpu, args.sample_seconds, limits)
         append_audit(args.root, payload)

@@ -1,5 +1,7 @@
 from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
+    cgroup_block_io_bytes_from_text,
     descendant_pids,
+    nfs_server_io_bytes_from_text,
     storage_io_bytes_from_text,
 )
 
@@ -28,3 +30,26 @@ cancelled_write_bytes: 0
 """
 
     assert storage_io_bytes_from_text(raw) == 3 * 1024 * 1024
+
+
+def test_cgroup_block_io_uses_busiest_stacked_device() -> None:
+    raw = """8:0 Read 100
+8:0 Write 300
+8:0 Total 400
+253:0 Read 100
+253:0 Write 300
+253:0 Total 400
+Total 800
+"""
+
+    assert cgroup_block_io_bytes_from_text(raw) == 400
+
+
+def test_nfs_server_io_selects_data_mount() -> None:
+    raw = """device server:/other mounted on /other with fstype nfs statvers=1.1
+\tbytes:\t1 2 3 4 500 600 7 8
+device server:/private mounted on /opt/data/private with fstype nfs statvers=1.1
+\tbytes:\t10 20 30 40 5000 6000 70 80
+"""
+
+    assert nfs_server_io_bytes_from_text(raw) == 11_000
