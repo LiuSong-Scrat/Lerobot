@@ -358,7 +358,7 @@ PY
 
 run_eval_command() {
   local gpu=$1 checkpoint=$2 output=$3 log=$4 stage_checkpoint=${5:-false}
-  local eval_checkpoint=$checkpoint stage_dir= status=0
+  local eval_checkpoint=$checkpoint stage_dir= stage_reclaimer_pid= status=0
   guard_wait "$gpu"
   if [[ "$stage_checkpoint" == true ]]; then
     stage_dir=$(stage_checkpoint_locally \
@@ -366,6 +366,16 @@ run_eval_command() {
     eval_checkpoint="$stage_dir/pretrained_model"
   fi
   mkdir -p "$output" "$root/logs"
+  if [[ -n "$stage_dir" ]]; then
+    (
+      while [[ ! -s "$output/progress.json" ]]; do
+        sleep 1
+      done
+      "$python" "$cache_reclaimer" --checkpoint "$stage_dir" >/dev/null 2>&1 || true
+      echo "[eval] released staged checkpoint cache: $stage_dir"
+    ) &
+    stage_reclaimer_pid=$!
+  fi
   cd "$repo"
   env \
     PYTHONHASHSEED=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -391,6 +401,10 @@ run_eval_command() {
       --render-mode offscreen --no-visualize-foreground --no-save-video \
       --no-world-to-ego-causal-ablation --output-dir "$output" \
       >"$log" 2>&1 || status=$?
+  if [[ -n "$stage_reclaimer_pid" ]]; then
+    kill "$stage_reclaimer_pid" 2>/dev/null || true
+    wait "$stage_reclaimer_pid" 2>/dev/null || true
+  fi
   if [[ -n "$stage_dir" ]]; then
     "$python" "$cache_reclaimer" --checkpoint "$stage_dir" >/dev/null 2>&1 || true
     cleanup_stage_directory "$stage_dir"
