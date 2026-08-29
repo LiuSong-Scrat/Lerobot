@@ -79,7 +79,8 @@ require_inputs() {
 guard_wait() {
   local gpu=$1
   "$python" "$guard" --root "$root" --gpu "$gpu" --wait \
-    --sample-seconds "$guard_sample_s" --poll-seconds "$guard_poll_s" --consecutive 3
+    --sample-seconds "$guard_sample_s" --poll-seconds "$guard_poll_s" --consecutive 3 \
+    --recover-hard-marker-after-soft
 }
 
 wait_for_training_gpu_allocation() {

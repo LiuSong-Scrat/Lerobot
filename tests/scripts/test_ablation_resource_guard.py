@@ -1,4 +1,5 @@
 from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
+    archive_resource_limit_incident,
     cgroup_block_io_bytes_from_text,
     descendant_pids,
     nfs_server_io_bytes_from_text,
@@ -53,3 +54,24 @@ device server:/private mounted on /opt/data/private with fstype nfs statvers=1.1
 """
 
     assert nfs_server_io_bytes_from_text(raw) == 11_000
+
+
+def test_resource_markers_are_archived_before_recovery(tmp_path) -> None:
+    resource_dir = tmp_path / "resource"
+    resource_dir.mkdir()
+    (resource_dir / "HARD_LIMIT_EXCEEDED").write_text('{"hard_ok": false}')
+    (resource_dir / "EVAL_TERMINATED_RESOURCE_LIMIT").write_text(
+        '{"terminated_pids": [123]}'
+    )
+
+    incident_dir = archive_resource_limit_incident(
+        tmp_path,
+        {"soft_ok": True, "memory_gib": 42.0},
+    )
+
+    assert incident_dir is not None
+    assert not (resource_dir / "HARD_LIMIT_EXCEEDED").exists()
+    assert not (resource_dir / "EVAL_TERMINATED_RESOURCE_LIMIT").exists()
+    assert (incident_dir / "HARD_LIMIT_EXCEEDED.json").is_file()
+    assert (incident_dir / "EVAL_TERMINATED_RESOURCE_LIMIT.json").is_file()
+    assert (incident_dir / "incident.json").is_file()

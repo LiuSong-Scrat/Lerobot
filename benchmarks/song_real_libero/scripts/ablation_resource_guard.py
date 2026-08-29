@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-soft-used-gib", type=float, default=2.0)
     parser.add_argument("--gpu-hard-used-gib", type=float, default=23.0)
     parser.add_argument("--terminate-eval-memory-gib", type=float)
+    parser.add_argument(
+        "--recover-hard-marker-after-soft",
+        action="store_true",
+        help=(
+            "In --wait mode, archive prior hard-limit markers only after the "
+            "requested consecutive soft-safe samples."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -327,6 +335,55 @@ def append_audit(root: Path, payload: dict) -> None:
         marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def archive_resource_limit_incident(root: Path, recovery_sample: dict) -> Path | None:
+    resource_dir = root / "resource"
+    marker_names = ("HARD_LIMIT_EXCEEDED", "EVAL_TERMINATED_RESOURCE_LIMIT")
+    active_markers = [
+        resource_dir / name
+        for name in marker_names
+        if (resource_dir / name).is_file()
+    ]
+    if not active_markers:
+        return None
+
+    timestamp = time.strftime("%Y%m%dT%H%M%S", time.localtime())
+    incidents_root = resource_dir / "incidents"
+    incidents_root.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        suffix_text = "" if suffix == 0 else f"_{suffix}"
+        incident_dir = incidents_root / f"{timestamp}_automatic_soft_recovery{suffix_text}"
+        try:
+            incident_dir.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
+
+    archived = []
+    for marker in active_markers:
+        destination = incident_dir / f"{marker.name}.json"
+        try:
+            marker.replace(destination)
+        except FileNotFoundError:
+            continue
+        archived.append(str(destination))
+    (incident_dir / "incident.json").write_text(
+        json.dumps(
+            {
+                "reason": "automatic recovery after consecutive soft-safe samples",
+                "recovery_sample": recovery_sample,
+                "archived_markers": archived,
+                "timestamp": time.time(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return incident_dir
+
+
 def main() -> int:
     args = parse_args()
     limits = Limits(
@@ -342,7 +399,11 @@ def main() -> int:
     consecutive_ok = 0
     while True:
         marker = args.root / "resource" / "HARD_LIMIT_EXCEEDED"
-        if args.wait and marker.is_file():
+        if (
+            args.wait
+            and marker.is_file()
+            and not args.recover_hard_marker_after_soft
+        ):
             print(
                 f"Refusing new work after a hard resource limit: {marker}", flush=True
             )
@@ -366,6 +427,13 @@ def main() -> int:
             print(json.dumps(emergency, sort_keys=True), flush=True)
         consecutive_ok = consecutive_ok + 1 if payload["soft_ok"] else 0
         if args.wait and consecutive_ok >= max(1, args.consecutive):
+            if args.recover_hard_marker_after_soft:
+                incident_dir = archive_resource_limit_incident(args.root, payload)
+                if incident_dir is not None:
+                    print(
+                        f"Archived recovered resource-limit incident: {incident_dir}",
+                        flush=True,
+                    )
             return 0
         if not args.wait and not args.watch:
             return 0 if payload["soft_ok"] else 1
