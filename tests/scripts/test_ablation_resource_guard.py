@@ -3,6 +3,7 @@ from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
     archive_resource_limit_incident,
     cgroup_block_io_bytes_from_text,
     descendant_pids,
+    evaluator_process_pids,
     failed_sample_payload,
     inactive_file_bytes_from_text,
     nfs_server_io_bytes_from_text,
@@ -21,6 +22,27 @@ def test_descendant_pids_selects_only_requested_trees() -> None:
     }
 
     assert descendant_pids({11, 21}, parent_by_pid) == {11, 12, 13, 21, 22}
+
+
+def test_evaluator_processes_exclude_watchers_and_supervisor() -> None:
+    parent_by_pid = {
+        11: 1,
+        12: 11,
+        13: 12,
+        14: 13,
+        21: 11,
+        22: 21,
+    }
+    cmdline_by_pid = {
+        11: "bash run_v043_cumulative_ablation.sh eval",
+        12: "bash run_v043_cumulative_ablation.sh eval",
+        13: "python libero_pointcloud_eval.py --device cuda",
+        14: "python multiprocessing.spawn --worker",
+        21: "bash waiting-for-slot",
+        22: "sleep 30",
+    }
+
+    assert evaluator_process_pids({11}, parent_by_pid, cmdline_by_pid) == {13, 14}
 
 
 def test_storage_io_excludes_cached_logical_io() -> None:

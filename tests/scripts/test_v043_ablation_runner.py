@@ -105,3 +105,40 @@ jq -e --arg stage "$stage" \
 """
 
     subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_resource_interruption_waits_and_requests_retry(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    marker = root / "resource" / "EVAL_TERMINATED_RESOURCE_LIMIT"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+eval_one() {{ return 143; }}
+guard_wait() {{ touch "$root/guard_wait_called"; rm -f {shlex.quote(str(marker))}; }}
+status=0
+eval_one_resilient smolvla_src 4 1 /checkpoint || status=$?
+[[ "$status" == 75 ]]
+[[ -f "$root/guard_wait_called" ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_non_resource_eval_failure_is_not_retried(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+eval_one() {{ return 23; }}
+guard_wait() {{ touch "$root/guard_wait_called"; }}
+status=0
+eval_one_resilient smolvla_src 4 1 /checkpoint || status=$?
+[[ "$status" == 23 ]]
+[[ ! -e "$root/guard_wait_called" ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)

@@ -197,6 +197,21 @@ def descendant_pids(root_pids: set[int], parent_by_pid: dict[int, int]) -> set[i
     return selected
 
 
+def evaluator_process_pids(
+    root_pids: set[int],
+    parent_by_pid: dict[int, int],
+    cmdline_by_pid: dict[int, str],
+) -> set[int]:
+    """Select evaluator workers and their children without killing supervisors."""
+    experiment_pids = descendant_pids(root_pids, parent_by_pid)
+    evaluator_roots = {
+        pid
+        for pid in experiment_pids
+        if "libero_pointcloud_eval.py" in cmdline_by_pid.get(pid, "")
+    }
+    return descendant_pids(evaluator_roots, parent_by_pid)
+
+
 def terminate_eval_processes(pid_dir: Path) -> list[int]:
     roots = set()
     for path in pid_dir.glob("eval_*.pid") if pid_dir.is_dir() else ():
@@ -205,13 +220,21 @@ def terminate_eval_processes(pid_dir: Path) -> list[int]:
         except (FileNotFoundError, ValueError):
             continue
     parent_by_pid = {}
+    cmdline_by_pid = {}
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
             continue
-        stat = _proc_stat(int(path.name))
+        pid = int(path.name)
+        stat = _proc_stat(pid)
         if stat is not None:
-            parent_by_pid[int(path.name)] = stat[0]
-    selected = descendant_pids(roots, parent_by_pid)
+            parent_by_pid[pid] = stat[0]
+        try:
+            cmdline_by_pid[pid] = (path / "cmdline").read_bytes().replace(
+                b"\0", b" "
+            ).decode(errors="replace")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    selected = evaluator_process_pids(roots, parent_by_pid, cmdline_by_pid)
     terminated = []
     for pid in sorted(selected, reverse=True):
         if pid == os.getpid():
@@ -505,14 +528,17 @@ def main() -> int:
             and payload["memory_gib"] is not None
             and payload["memory_gib"] >= args.terminate_eval_memory_gib
         ):
-            terminated = terminate_eval_processes(args.root / "pids")
             emergency = {
                 "timestamp": time.time(),
                 "memory_gib": payload["memory_gib"],
                 "threshold_gib": args.terminate_eval_memory_gib,
-                "terminated_pids": terminated,
+                "terminated_pids": [],
             }
             marker = args.root / "resource" / "EVAL_TERMINATED_RESOURCE_LIMIT"
+            marker.write_text(json.dumps(emergency, indent=2), encoding="utf-8")
+            emergency["terminated_pids"] = terminate_eval_processes(
+                args.root / "pids"
+            )
             marker.write_text(json.dumps(emergency, indent=2), encoding="utf-8")
             print(json.dumps(emergency, sort_keys=True), flush=True)
         consecutive_ok = consecutive_ok + 1 if payload["soft_ok"] else 0

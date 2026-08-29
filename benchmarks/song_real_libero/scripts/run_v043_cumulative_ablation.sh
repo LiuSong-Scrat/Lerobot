@@ -537,20 +537,42 @@ eval_one() {
   )
 }
 
+eval_one_resilient() {
+  local variant=$1 gpu=$2 step=$3 checkpoint=$4 status=0
+  eval_one "$variant" "$gpu" "$step" "$checkpoint" || status=$?
+  if (( status == 0 )); then
+    return 0
+  fi
+  if [[ ! -f "$root/resource/EVAL_TERMINATED_RESOURCE_LIMIT" ]]; then
+    return "$status"
+  fi
+  echo "[eval] resource guard interrupted $variant step=$step; waiting to resume"
+  guard_wait "$gpu"
+  return 75
+}
+
 eval_watch_one() {
   local variant=$1 gpu=$2
   local train_pid_file="$root/pids/train_${variant}.pid"
   while true; do
-    local found_pending=0
+    local found_pending=0 resource_interrupted=0
     while IFS= read -r model_path; do
-      local checkpoint step_tag step
+      local checkpoint step_tag step eval_status=0
       checkpoint=$(dirname "$model_path")
       step_tag=$(basename "$(dirname "$checkpoint")")
       [[ "$step_tag" =~ ^[0-9]+$ ]] || continue
       step=$((10#$step_tag))
       if ! eval_result_valid "$root/eval/$variant/step$step_tag"; then
         if checkpoint_ready "$checkpoint"; then
-          eval_one "$variant" "$gpu" "$step" "$checkpoint"
+          eval_one_resilient "$variant" "$gpu" "$step" "$checkpoint" \
+            || eval_status=$?
+          if (( eval_status == 75 )); then
+            resource_interrupted=1
+            break
+          fi
+          if (( eval_status != 0 )); then
+            return "$eval_status"
+          fi
           flock "$summary_lock" "$python" "$summarizer" \
             --root "$root" --episodes-per-task "$eval_episodes"
         else
@@ -559,6 +581,10 @@ eval_watch_one() {
       fi
     done < <(find "$root/train/$variant/checkpoints" -mindepth 3 -maxdepth 3 \
       -path '*/pretrained_model/model.safetensors' -type f 2>/dev/null | sort -V)
+
+    if (( resource_interrupted != 0 )); then
+      continue
+    fi
 
     local train_pid
     train_pid=$(cat "$train_pid_file" 2>/dev/null || true)
