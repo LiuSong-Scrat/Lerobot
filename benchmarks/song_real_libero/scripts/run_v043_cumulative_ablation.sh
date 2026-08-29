@@ -713,6 +713,7 @@ eval_one_resilient() {
 eval_watch_one() {
   local variant=$1 gpu=$2
   local train_pid_file="$root/pids/train_${variant}.pid"
+  local stopped_idle_scans=0
   while true; do
     local found_pending=0 resource_interrupted=0
     while IFS= read -r model_path; do
@@ -748,11 +749,18 @@ eval_watch_one() {
     local train_pid
     train_pid=$(cat "$train_pid_file" 2>/dev/null || true)
     if [[ -n "$train_pid" ]] && ! kill -0 "$train_pid" 2>/dev/null; then
-      if (( found_pending == 0 )); then
-        break
+      stopped_idle_scans=$((stopped_idle_scans + 1))
+      # Final checkpoints can become visible shortly after the trainer PID
+      # exits on NFS. Require a quiet window before declaring the queue done.
+      if (( stopped_idle_scans >= 3 )); then
+        if (( found_pending == 0 )); then
+          break
+        fi
+        echo "[eval] training ended with an incomplete checkpoint for $variant" >&2
+        return 1
       fi
-      echo "[eval] training ended with an incomplete checkpoint for $variant" >&2
-      return 1
+    else
+      stopped_idle_scans=0
     fi
     sleep 30
   done
