@@ -129,8 +129,8 @@ source {shlex.quote(str(RUNNER))}
 [[ "$training_eval_episode_workers_per_task" == 1 ]]
 [[ "$training_eval_inference_batch_size" == 2 ]]
 [[ "$training_eval_stagger_s" == 120 ]]
-[[ "$post_training_eval_episode_workers_per_task" == 1 ]]
-[[ "$post_training_eval_inference_batch_size" == 2 ]]
+[[ "$post_training_eval_episode_workers_per_task" == 2 ]]
+[[ "$post_training_eval_inference_batch_size" == 4 ]]
 """
 
     subprocess.run(["bash", "-c", command], check=True)
@@ -183,7 +183,7 @@ def test_eval_command_receives_training_parallelism(tmp_path: Path) -> None:
 
 
 def test_eval_command_receives_post_training_parallelism(tmp_path: Path) -> None:
-    assert _run_parallelism_phase_probe(tmp_path, trainer_running=False) == "true 1 2"
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=False) == "true 2 4"
 
 
 def test_checkpoint_is_staged_locally_with_bandwidth_limit(tmp_path: Path) -> None:
