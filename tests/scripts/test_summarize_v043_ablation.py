@@ -17,7 +17,7 @@ def _write_summary(
             {
                 "suite": "libero_10",
                 "task_id": task_id,
-                "episodes": [{"success": episode < successes} for episode in range(50)],
+                "episodes": [{"success": episode < successes} for episode in range(10)],
             }
         )
     output = root / "eval" / variant / f"step{step:06d}"
@@ -25,13 +25,13 @@ def _write_summary(
     (output / "summary.json").write_text(json.dumps({"results": results}))
 
 
-def test_summary_marks_all_variants_stable_from_three_complete_100_episode_runs(
+def test_summary_marks_all_variants_stable_from_three_complete_20_episode_runs(
     tmp_path, monkeypatch
 ):
     for variant in summarize_v043_ablation.VARIANTS:
-        _write_summary(tmp_path, variant, 8000, 40, 42)
-        _write_summary(tmp_path, variant, 9000, 41, 42)
-        _write_summary(tmp_path, variant, 10000, 41, 43)
+        _write_summary(tmp_path, variant, 8000, 8, 8)
+        _write_summary(tmp_path, variant, 9000, 8, 8)
+        _write_summary(tmp_path, variant, 10000, 8, 8)
     monkeypatch.setattr(sys, "argv", ["summarize", "--root", str(tmp_path)])
 
     summarize_v043_ablation.main()
@@ -44,12 +44,12 @@ def test_summary_marks_all_variants_stable_from_three_complete_100_episode_runs(
 
 
 def test_summary_rejects_shortened_test_protocol(tmp_path, monkeypatch):
-    _write_summary(tmp_path, summarize_v043_ablation.VARIANTS[0], 8000, 40, 42)
+    _write_summary(tmp_path, summarize_v043_ablation.VARIANTS[0], 8000, 8, 8)
     summary_path = next(tmp_path.rglob("summary.json"))
     summary = json.loads(summary_path.read_text())
     summary["results"][0]["episodes"].pop()
     summary_path.write_text(json.dumps(summary))
     monkeypatch.setattr(sys, "argv", ["summarize", "--root", str(tmp_path)])
 
-    with pytest.raises(RuntimeError, match="Expected 50 task 6 episodes"):
+    with pytest.raises(RuntimeError, match="Expected 10 task 6 episodes"):
         summarize_v043_ablation.main()

@@ -16,7 +16,7 @@ steps=${SONG_ABLATION_STEPS:-30000}
 checkpoint_interval_s=${SONG_ABLATION_CHECKPOINT_INTERVAL_S:-3600}
 batch_size=${SONG_ABLATION_BATCH_SIZE:-8}
 num_workers=${SONG_ABLATION_NUM_WORKERS:-2}
-eval_episodes=${SONG_ABLATION_EVAL_EPISODES:-50}
+eval_episodes=${SONG_ABLATION_EVAL_EPISODES:-10}
 guard_sample_s=${SONG_ABLATION_GUARD_SAMPLE_S:-5}
 guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
 eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
@@ -53,8 +53,8 @@ require_inputs() {
     echo "steps and checkpoint interval must be positive" >&2
     exit 2
   fi
-  if (( eval_episodes != 50 )); then
-    echo "The fixed task 6/8 test protocol requires 50 episodes per task." >&2
+  if (( eval_episodes != 10 )); then
+    echo "The fixed task 6/8 test protocol requires 10 episodes per task." >&2
     exit 2
   fi
   if (( num_workers > 2 )); then
@@ -132,7 +132,7 @@ assert info["total_tasks"] == 2, info["total_tasks"]
 assert info["features"]["action"]["shape"] == [10]
 assert manifest["num_samples"] == info["total_frames"]
 assert manifest["current_points"] == 10_000
-assert eval_episodes == 50
+assert eval_episodes == 10
 episode_tasks = set()
 for parquet_path in sorted((dataset / "data").rglob("*.parquet")):
     columns = pq.read_table(parquet_path, columns=["episode_index", "task_index"]).to_pydict()

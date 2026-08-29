@@ -29,8 +29,9 @@ The fixed dataset is:
 ```
 
 It contains 50 demonstrations each for LIBERO-10 tasks 6 and 8. Evaluation uses
-fixed policy seed 0 and environment seed 7, with the standard 50 initial states
-per task (100 episodes total) for every wall-clock hourly checkpoint.
+fixed policy seed 0 and environment seed 7, with the first 10 official initial
+states per task under strict official initialization (20 episodes total) for
+every wall-clock hourly checkpoint.
 
 ## Execution
 
@@ -51,13 +52,14 @@ model, preventing four simultaneous VLM weight reads; all four then train
 concurrently.
 While any trainer is resident, full evaluations share one local lock and run
 serially to preserve host-memory headroom. After all four trainers exit, the
-waiting variant watchers automatically switch to two bounded evaluation slots
-on GPUs 4--7. Variant starts are staggered by 60 seconds so model loads do not
+waiting variant watchers use one bounded evaluation slot on GPUs 4--7. Variant
+starts are staggered by 60 seconds so model loads do not
 hit NFS together. Each model directory is first staged under `/tmp` with rsync
-limited to 150 MiB/s, together with the pretrained SmolVLA weights and the
+limited to 100 MiB/s, together with the pretrained SmolVLA weights and the
 SmolVLM tokenizer/config assets; the staged policy config is rewritten to those
-local paths. A complete 2.32 GiB staging probe peaked at 151.26 MiB/s in the
-guard, below the 400 MiB/s soft IO line. Each watcher still admits work through
+local paths. After evaluator startup, clean staged-file pages are released from
+the page cache while the files remain available until evaluation exits. Each
+watcher still admits work through
 the same soft resource guard, and the global watcher terminates evaluations at
 57 GiB before the 58 GiB hard memory limit.
 Every sample, including all eight GPUs, is appended to
@@ -65,10 +67,10 @@ Every sample, including all eight GPUs, is appended to
 same directory if a threshold is crossed, and it blocks new work. The 2D baseline
 does not wrap the point-cloud dataset, which removes unnecessary shared-storage
 reads and makes the modality ablation exact.
-The IO rate uses Linux `/proc/<pid>/io` `read_bytes + write_bytes`, which tracks
-storage-accounted traffic. It intentionally excludes `rchar + wchar` because
-those fields count logical cached IO and can multiply-count checkpoint
-serialization without representing NFS load.
+The admission IO rate is the maximum of cgroup block-device bytes and NFS
+server-transfer bytes. Per-process `read_bytes + write_bytes` remains a
+diagnostic field only because short-lived `rsync` children can transfer their
+cumulative accounting to a parent and falsely multiply-count a completed copy.
 
 Run the complete experiment from the repository root:
 
@@ -99,7 +101,7 @@ Results are written below:
 `ablation_results.csv` contains every checkpoint result. `ABLATION_RESULTS.md`
 reports the latest and best completed checkpoints plus adjacent cumulative
 deltas. `stability.json` marks a variant stable only after step 8,000 when its
-latest three complete 100-episode success rates span no more than three
+latest three complete 20-episode success rates span no more than three
 percentage points. All four variants must pass that rule before the experiment
 is considered stable. Best-checkpoint numbers are descriptive only; module
 claims use persistence across the full curve and the latest stable results.

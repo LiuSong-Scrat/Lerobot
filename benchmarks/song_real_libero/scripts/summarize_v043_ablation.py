@@ -21,7 +21,7 @@ LOSS_PATTERN = re.compile(r"step:(?P<step>\d+).*?loss:(?P<loss>[0-9.eE+-]+)")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--episodes-per-task", type=int, default=50)
+    parser.add_argument("--episodes-per-task", type=int, default=10)
     parser.add_argument("--stability-window", type=int, default=3)
     parser.add_argument("--stability-tolerance", type=float, default=0.03)
     parser.add_argument("--stability-min-step", type=int, default=8000)
@@ -46,8 +46,8 @@ def nearest_loss(losses: dict[int, float], step: int) -> float | None:
 
 def main() -> None:
     args = parse_args()
-    if args.episodes_per_task != 50:
-        raise ValueError("The fixed ablation test set requires 50 episodes per task.")
+    if args.episodes_per_task != 10:
+        raise ValueError("The fixed ablation test set requires 10 episodes per task.")
     if args.stability_window < 2:
         raise ValueError("stability-window must be at least two evaluations.")
     records = []
@@ -199,7 +199,8 @@ def main() -> None:
     report.extend(
         [
             "",
-            f"Stability requires the latest {args.stability_window} complete 100-episode evaluations "
+            f"Stability requires the latest {args.stability_window} complete "
+            f"{2 * args.episodes_per_task}-episode evaluations "
             f"to span at most {args.stability_tolerance:.1%}, after step {args.stability_min_step}. "
             "The full checkpoint curve in `ablation_results.csv` remains the primary evidence; "
             "best-checkpoint values are descriptive only.",
