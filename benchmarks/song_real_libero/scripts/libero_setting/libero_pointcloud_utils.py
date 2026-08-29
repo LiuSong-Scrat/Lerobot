@@ -11,11 +11,21 @@ from scipy.spatial.transform import Rotation as R
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import LIBERO_DATA_ROOT
+    from .libero_pointcloud_fusion import (
+        compose_point_cloud_views,
+        parse_camera_view_fusion,
+        parse_camera_views,
+    )
 else:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import LIBERO_DATA_ROOT
+    from libero_setting.libero_pointcloud_fusion import (
+        compose_point_cloud_views,
+        parse_camera_view_fusion,
+        parse_camera_views,
+    )
 
 
 def ensure_libero_config(config_path: str | Path | None = None, dataset_root: str | Path | None = None) -> Path:
@@ -941,14 +951,6 @@ def observation_to_model_point_cloud(
       model_point_cloud: xyzrgb in the current end-effector frame.
       eef_pose_world:    current simulator EEF pose9 + physical gripper width.
     """
-
-    # Import lazily so this utility remains importable in lightweight LIBERO-only
-    # tools that do not initialize the policy package.
-    from lerobot.policies.smolvla.song_pointseg import (
-        compose_point_cloud_views,
-        parse_camera_view_fusion,
-        parse_camera_views,
-    )
 
     views = parse_camera_views(camera_views)
     stored_view_clouds: list[np.ndarray] = []

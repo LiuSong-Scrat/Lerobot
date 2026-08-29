@@ -315,6 +315,9 @@ def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any
         "eval_script_sha256": _sha256_file(script_path),
         "inference_wrapper_sha256": _sha256_file(script_path.parent.parent / "smolvla_model_inference.py"),
         "pointcloud_utils_sha256": _sha256_file(script_path.with_name("libero_pointcloud_utils.py")),
+        "pointcloud_fusion_sha256": _sha256_file(
+            script_path.with_name("libero_pointcloud_fusion.py")
+        ),
         "train_config_path": None if train_config_path is None else str(train_config_path),
         "train_config_sha256": _sha256_file(train_config_path) if train_config_path is not None else None,
         "modeling_smolvla_sha256": _sha256_file(
