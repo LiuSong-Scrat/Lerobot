@@ -335,6 +335,30 @@ def append_audit(root: Path, payload: dict) -> None:
         marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def failed_sample_payload(root: Path, exc: BaseException, limits: Limits) -> dict:
+    error = f"{type(exc).__name__}: {exc}"
+    return {
+        "timestamp": time.time(),
+        "root": str(root),
+        "pids": [],
+        "memory_gib": None,
+        "experiment_rss_gib": None,
+        "cpu_cores": None,
+        "io_mib_s": None,
+        "io_metric": "max_cgroup_block_and_nfs_server_bytes",
+        "block_io_mib_s": None,
+        "nfs_io_mib_s": None,
+        "process_io_mib_s": None,
+        "gpus": [],
+        "soft_ok": False,
+        "hard_ok": False,
+        "soft_reasons": [f"resource_sample_error={error}"],
+        "hard_reasons": [f"resource_sample_error={error}"],
+        "sample_error": error,
+        "limits": asdict(limits),
+    }
+
+
 def archive_resource_limit_incident(root: Path, recovery_sample: dict) -> Path | None:
     resource_dir = root / "resource"
     marker_names = ("HARD_LIMIT_EXCEEDED", "EVAL_TERMINATED_RESOURCE_LIMIT")
@@ -408,11 +432,15 @@ def main() -> int:
                 f"Refusing new work after a hard resource limit: {marker}", flush=True
             )
             return 2
-        payload = sample(args.root, args.gpu, args.sample_seconds, limits)
+        try:
+            payload = sample(args.root, args.gpu, args.sample_seconds, limits)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            payload = failed_sample_payload(args.root, exc, limits)
         append_audit(args.root, payload)
         print(json.dumps(payload, sort_keys=True), flush=True)
         if (
             args.terminate_eval_memory_gib is not None
+            and payload["memory_gib"] is not None
             and payload["memory_gib"] >= args.terminate_eval_memory_gib
         ):
             terminated = terminate_eval_processes(args.root / "pids")

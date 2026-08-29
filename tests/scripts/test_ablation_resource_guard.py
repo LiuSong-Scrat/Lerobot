@@ -1,7 +1,9 @@
 from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
+    Limits,
     archive_resource_limit_incident,
     cgroup_block_io_bytes_from_text,
     descendant_pids,
+    failed_sample_payload,
     nfs_server_io_bytes_from_text,
     storage_io_bytes_from_text,
 )
@@ -75,3 +77,12 @@ def test_resource_markers_are_archived_before_recovery(tmp_path) -> None:
     assert (incident_dir / "HARD_LIMIT_EXCEEDED.json").is_file()
     assert (incident_dir / "EVAL_TERMINATED_RESOURCE_LIMIT.json").is_file()
     assert (incident_dir / "incident.json").is_file()
+
+
+def test_failed_resource_sample_is_fail_closed(tmp_path) -> None:
+    payload = failed_sample_payload(tmp_path, RuntimeError("NVML unavailable"), Limits())
+
+    assert payload["soft_ok"] is False
+    assert payload["hard_ok"] is False
+    assert payload["memory_gib"] is None
+    assert payload["sample_error"] == "RuntimeError: NVML unavailable"
