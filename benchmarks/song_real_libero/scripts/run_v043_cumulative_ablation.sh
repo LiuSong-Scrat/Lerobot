@@ -25,6 +25,7 @@ summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lo
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-1}
 training_eval_slots=${SONG_ABLATION_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
+training_eval_stagger_s=${SONG_ABLATION_TRAINING_EVAL_STAGGER_S:-120}
 training_eval_episode_workers_per_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-1}
 post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-4}
 training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * training_eval_episode_workers_per_task))}
@@ -96,6 +97,10 @@ require_inputs() {
   fi
   if (( post_training_eval_stagger_s < 0 )); then
     echo "Post-training evaluation staggering must be non-negative." >&2
+    exit 2
+  fi
+  if (( training_eval_stagger_s < 0 )); then
+    echo "Training-time evaluation staggering must be non-negative." >&2
     exit 2
   fi
   validate_eval_parallelism
@@ -756,7 +761,9 @@ eval_one() {
   fi
   (
     if training_is_running && (( training_eval_slots > 1 )); then
-      local training_slot_fd
+      local index training_slot_fd
+      index=$(variant_index "$variant")
+      sleep "$(((index % training_eval_slots) * training_eval_stagger_s))"
       acquire_training_eval_slot training_slot_fd
       run_eval_command "$gpu" "$checkpoint" "$output" "$log" false \
         "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size"

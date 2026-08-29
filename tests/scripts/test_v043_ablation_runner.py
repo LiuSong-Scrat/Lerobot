@@ -61,6 +61,7 @@ export SONG_ABLATION_GUARD_POLL_S=0.05
 export SONG_ABLATION_POST_TRAINING_EVAL_SLOTS=2
 export SONG_ABLATION_TRAINING_EVAL_SLOTS={training_eval_slots}
 export SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S=0
+export SONG_ABLATION_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 eval_result_valid() {{ [[ -f "$1/done" ]]; }}
 run_eval_command() {{
@@ -127,6 +128,7 @@ set -euo pipefail
 source {shlex.quote(str(RUNNER))}
 [[ "$training_eval_episode_workers_per_task" == 1 ]]
 [[ "$training_eval_inference_batch_size" == 2 ]]
+[[ "$training_eval_stagger_s" == 120 ]]
 [[ "$post_training_eval_episode_workers_per_task" == 4 ]]
 [[ "$post_training_eval_inference_batch_size" == 8 ]]
 """
@@ -159,6 +161,7 @@ export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
 export SONG_ABLATION_EVAL_LOCK={shlex.quote(str(tmp_path / 'eval.lock'))}
 export SONG_ABLATION_TRAINING_EVAL_SLOTS=2
 export SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S=0
+export SONG_ABLATION_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 eval_result_valid() {{ [[ -f "$1/done" ]]; }}
 run_eval_command() {{
@@ -268,6 +271,7 @@ def test_zero_episode_dead_claim_is_cleared_and_restarted(tmp_path: Path) -> Non
 set -euo pipefail
 export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
 export SONG_ABLATION_TRAINING_EVAL_SLOTS=2
+export SONG_ABLATION_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 training_is_running() {{ :; }}
 acquire_training_eval_slot() {{ :; }}
