@@ -27,7 +27,7 @@ training_eval_slots=${SONG_ABLATION_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 training_eval_stagger_s=${SONG_ABLATION_TRAINING_EVAL_STAGGER_S:-120}
 training_eval_episode_workers_per_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-1}
-post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-2}
+post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-3}
 training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * training_eval_episode_workers_per_task))}
 post_training_eval_inference_batch_size=${SONG_ABLATION_POST_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * post_training_eval_episode_workers_per_task))}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
@@ -825,8 +825,8 @@ eval_one() {
     done
 
     # With no trainers resident, use bounded slots and stagger model loads.
-    # The default remains one because evaluator process trees are host-memory
-    # bound on the 60 GiB benchmark machine.
+    # Only one checkpoint is resident at a time because MuJoCo environment
+    # workers, rather than GPU inference, bound the 60 GiB benchmark machine.
     local index slot_fd
     index=$(variant_index "$variant")
     sleep "$((index * post_training_eval_stagger_s))"
