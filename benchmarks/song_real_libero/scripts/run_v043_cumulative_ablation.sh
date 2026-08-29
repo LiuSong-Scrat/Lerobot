@@ -522,6 +522,63 @@ for result_path in actual_paths:
 PY
 }
 
+eval_output_empty_restartable() {
+  local output=$1
+  "$python" - "$output" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+if not output.is_dir():
+    raise SystemExit(1)
+allowed_files = {
+    Path(".evaluation_run.claim/owner.json"),
+    Path("failed_episodes.json"),
+}
+files = {path.relative_to(output) for path in output.rglob("*") if path.is_file()}
+if not files or not files.issubset(allowed_files):
+    raise SystemExit(1)
+if any(output.rglob("result.json")) or any(output.rglob("actions.npz")):
+    raise SystemExit(1)
+if (output / "progress.json").exists() or (output / "summary.json").exists():
+    raise SystemExit(1)
+failures_path = output / "failed_episodes.json"
+if failures_path.is_file():
+    try:
+        failures = json.loads(failures_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit(1)
+    if int(failures.get("failure_count", -1)) != 0:
+        raise SystemExit(1)
+owner_path = output / ".evaluation_run.claim" / "owner.json"
+if owner_path.is_file():
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner_pid = int(owner["pid"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(1)
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+PY
+}
+
+cleanup_empty_eval_output() {
+  local output=$1
+  if [[ ! -d "$output" || "$output" != "$root/eval/"*/step* ]]; then
+    return 2
+  fi
+  eval_output_empty_restartable "$output" || return 1
+  find "$output" -depth -delete
+}
+
 training_is_running() {
   local variant pid
   for variant in "${variants[@]}"; do
@@ -686,10 +743,16 @@ eval_one() {
   fi
   if [[ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     if ! eval_output_resumable "$output"; then
-      echo "[eval] incomplete output is not safely resumable: $output" >&2
-      return 1
+      if eval_output_empty_restartable "$output"; then
+        echo "[eval] clear terminated zero-episode initialization: $output"
+        cleanup_empty_eval_output "$output"
+      else
+        echo "[eval] incomplete output is not safely resumable: $output" >&2
+        return 1
+      fi
+    else
+      echo "[eval] resume incomplete output: $output"
     fi
-    echo "[eval] resume incomplete output: $output"
   fi
   (
     if training_is_running && (( training_eval_slots > 1 )); then

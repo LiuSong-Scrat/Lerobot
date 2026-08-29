@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import subprocess
@@ -251,6 +252,53 @@ status=0
 eval_one_resilient smolvla_src 4 1 /checkpoint || status=$?
 [[ "$status" == 23 ]]
 [[ ! -e "$root/guard_wait_called" ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_zero_episode_dead_claim_is_cleared_and_restarted(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    output = root / "eval" / "smolvla_src" / "step000001"
+    claim = output / ".evaluation_run.claim"
+    claim.mkdir(parents=True)
+    (claim / "owner.json").write_text(json.dumps({"pid": 999_999_999}))
+    (output / "failed_episodes.json").write_text(json.dumps({"failure_count": 0}))
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+export SONG_ABLATION_TRAINING_EVAL_SLOTS=2
+source {shlex.quote(str(RUNNER))}
+training_is_running() {{ :; }}
+acquire_training_eval_slot() {{ :; }}
+eval_result_valid() {{ [[ -f "$1/done" ]]; }}
+run_eval_command() {{ mkdir -p "$3"; touch "$3/done"; }}
+eval_one smolvla_src 4 1 /checkpoint
+[[ -f {shlex.quote(str(output / 'done'))} ]]
+[[ ! -e {shlex.quote(str(claim))} ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_zero_episode_live_claim_is_not_cleared(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    output = root / "eval" / "smolvla_src" / "step000001"
+    claim = output / ".evaluation_run.claim"
+    claim.mkdir(parents=True)
+    (claim / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+    (output / "failed_episodes.json").write_text(json.dumps({"failure_count": 0}))
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
+source {shlex.quote(str(RUNNER))}
+eval_result_valid() {{ return 1; }}
+run_eval_command() {{ touch "$root/incorrectly_started"; }}
+status=0
+eval_one smolvla_src 4 1 /checkpoint || status=$?
+[[ "$status" == 1 ]]
+[[ -f {shlex.quote(str(claim / 'owner.json'))} ]]
+[[ ! -e "$root/incorrectly_started" ]]
 """
 
     subprocess.run(["bash", "-c", command], check=True)
