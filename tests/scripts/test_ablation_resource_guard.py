@@ -132,6 +132,18 @@ def test_memory_scope_can_isolate_experiment_processes() -> None:
     assert metric == "experiment_process_tree_rss"
 
 
+def test_memory_scope_can_account_shared_pages_proportionally() -> None:
+    memory_gib, metric = select_memory_measurement(
+        "experiment_pss",
+        cgroup_working_set_gib=92.0,
+        experiment_rss_gib=41.5,
+        experiment_pss_gib=15.0,
+    )
+
+    assert memory_gib == 15.0
+    assert metric == "experiment_process_tree_pss"
+
+
 def test_memory_scope_keeps_cgroup_working_set_default() -> None:
     memory_gib, metric = select_memory_measurement(
         "cgroup_working_set",

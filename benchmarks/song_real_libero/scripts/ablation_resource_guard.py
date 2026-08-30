@@ -17,7 +17,7 @@ MIB = 1024**2
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 NFS_DATA_MOUNT = "/opt/data/private"
-MEMORY_SCOPES = ("cgroup_working_set", "experiment_rss")
+MEMORY_SCOPES = ("cgroup_working_set", "experiment_rss", "experiment_pss")
 
 
 @dataclass(frozen=True)
@@ -104,6 +104,16 @@ def _proc_io_bytes(pid: int) -> int:
         return storage_io_bytes_from_text((Path("/proc") / str(pid) / "io").read_text())
     except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
         return 0
+
+
+def _proc_pss_bytes(pid: int, fallback_rss: int) -> int:
+    try:
+        for line in (Path("/proc") / str(pid) / "smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+    except (FileNotFoundError, IndexError, PermissionError, ProcessLookupError, ValueError):
+        pass
+    return fallback_rss
 
 
 def cgroup_block_io_bytes_from_text(raw: str) -> int:
@@ -345,6 +355,7 @@ def select_memory_measurement(
     *,
     cgroup_working_set_gib: float,
     experiment_rss_gib: float,
+    experiment_pss_gib: float = 0.0,
 ) -> tuple[float, str]:
     if memory_scope == "cgroup_working_set":
         return (
@@ -353,6 +364,8 @@ def select_memory_measurement(
         )
     if memory_scope == "experiment_rss":
         return experiment_rss_gib, "experiment_process_tree_rss"
+    if memory_scope == "experiment_pss":
+        return experiment_pss_gib, "experiment_process_tree_pss"
     raise ValueError(f"Unsupported memory scope: {memory_scope!r}")
 
 
@@ -385,12 +398,16 @@ def sample(
     nfs_io_mib_s = max(0, nfs_end - nfs_start) / elapsed / MIB
     io_mib_s = max(block_io_mib_s, nfs_io_mib_s)
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
+    experiment_pss_gib = (
+        sum(_proc_pss_bytes(pid, item[1]) for pid, item in end.items()) / GIB
+    )
     cgroup_usage_bytes, inactive_file_bytes, working_set_bytes = cgroup_memory_snapshot()
     cgroup_working_set_gib = working_set_bytes / GIB
     memory_gib, memory_metric = select_memory_measurement(
         memory_scope,
         cgroup_working_set_gib=cgroup_working_set_gib,
         experiment_rss_gib=experiment_rss_gib,
+        experiment_pss_gib=experiment_pss_gib,
     )
     gpu_info = gpu_samples(gpu)
     soft_reasons = []
@@ -426,6 +443,7 @@ def sample(
         "cgroup_usage_gib": cgroup_usage_bytes / GIB,
         "inactive_file_gib": inactive_file_bytes / GIB,
         "experiment_rss_gib": experiment_rss_gib,
+        "experiment_pss_gib": experiment_pss_gib,
         "cpu_cores": cpu_cores,
         "cpu_metric": "cgroup_cpuacct_usage",
         "experiment_cpu_cores": experiment_cpu_cores,
@@ -464,6 +482,7 @@ def failed_sample_payload(
         memory_scope,
         cgroup_working_set_gib=0.0,
         experiment_rss_gib=0.0,
+        experiment_pss_gib=0.0,
     )
     return {
         "timestamp": time.time(),
@@ -475,6 +494,7 @@ def failed_sample_payload(
         "cgroup_usage_gib": None,
         "inactive_file_gib": None,
         "experiment_rss_gib": None,
+        "experiment_pss_gib": None,
         "cpu_cores": None,
         "cpu_metric": "cgroup_cpuacct_usage",
         "experiment_cpu_cores": None,
