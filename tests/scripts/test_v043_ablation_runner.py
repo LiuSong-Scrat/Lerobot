@@ -129,6 +129,9 @@ source {shlex.quote(str(RUNNER))}
 [[ "$training_eval_episode_workers_per_task" == 1 ]]
 [[ "$training_eval_inference_batch_size" == 3 ]]
 [[ "$training_eval_episode_workers_by_task" == "6=1,8=2" ]]
+[[ "$single_trainer_eval_episode_workers_per_task" == 2 ]]
+[[ "$single_trainer_eval_inference_batch_size" == 5 ]]
+[[ "$single_trainer_eval_episode_workers_by_task" == "6=2,8=3" ]]
 [[ "$training_eval_stagger_s" == 120 ]]
 [[ "$post_training_eval_episode_workers_per_task" == 3 ]]
 [[ "$post_training_eval_inference_batch_size" == 6 ]]
@@ -167,11 +170,29 @@ validate_eval_parallelism || status=$?
     subprocess.run(["bash", "-c", command], check=True)
 
 
-def _run_parallelism_phase_probe(tmp_path: Path, *, trainer_running: bool) -> str:
+def test_eval_parallelism_rejects_undersized_single_trainer_batch() -> None:
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_SINGLE_TRAINER_EVAL_EPISODE_WORKERS_BY_TASK=6=2,8=3
+export SONG_ABLATION_SINGLE_TRAINER_EVAL_INFERENCE_BATCH_SIZE=4
+source {shlex.quote(str(RUNNER))}
+status=0
+validate_eval_parallelism || status=$?
+[[ "$status" == 2 ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def _run_parallelism_phase_probe(
+    tmp_path: Path, *, trainer_running: bool, trainer_count: int = 1
+) -> str:
     root = tmp_path / "output"
     (root / "pids").mkdir(parents=True)
     trainer_pid = os.getpid() if trainer_running else 999_999_999
     (root / "pids" / "train_smolvla_src.pid").write_text(str(trainer_pid))
+    if trainer_running and trainer_count > 1:
+        (root / "pids" / "train_smolvla_pointcloud.pid").write_text(str(trainer_pid))
     command = f"""
 set -euo pipefail
 export SONG_ABLATION_OUTPUT_ROOT={shlex.quote(str(root))}
@@ -196,7 +217,14 @@ cat "$root/observed_parallelism"
 
 
 def test_eval_command_receives_training_parallelism(tmp_path: Path) -> None:
-    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 3 6=1,8=2"
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 2 5 6=2,8=3"
+
+
+def test_eval_command_uses_lower_parallelism_with_multiple_trainers(tmp_path: Path) -> None:
+    assert (
+        _run_parallelism_phase_probe(tmp_path, trainer_running=True, trainer_count=2)
+        == "false 1 3 6=1,8=2"
+    )
 
 
 def test_eval_command_receives_post_training_parallelism(tmp_path: Path) -> None:
