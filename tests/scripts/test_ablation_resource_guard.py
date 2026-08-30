@@ -7,6 +7,7 @@ from benchmarks.song_real_libero.scripts.ablation_resource_guard import (
     failed_sample_payload,
     inactive_file_bytes_from_text,
     nfs_server_io_bytes_from_text,
+    select_memory_measurement,
     storage_io_bytes_from_text,
 )
 
@@ -118,3 +119,25 @@ def test_failed_resource_sample_is_fail_closed(tmp_path) -> None:
     assert payload["hard_ok"] is False
     assert payload["memory_gib"] is None
     assert payload["sample_error"] == "RuntimeError: NVML unavailable"
+
+
+def test_memory_scope_can_isolate_experiment_processes() -> None:
+    memory_gib, metric = select_memory_measurement(
+        "experiment_rss",
+        cgroup_working_set_gib=92.0,
+        experiment_rss_gib=31.5,
+    )
+
+    assert memory_gib == 31.5
+    assert metric == "experiment_process_tree_rss"
+
+
+def test_memory_scope_keeps_cgroup_working_set_default() -> None:
+    memory_gib, metric = select_memory_measurement(
+        "cgroup_working_set",
+        cgroup_working_set_gib=47.25,
+        experiment_rss_gib=20.0,
+    )
+
+    assert memory_gib == 47.25
+    assert metric == "cgroup_working_set_usage_minus_inactive_file"

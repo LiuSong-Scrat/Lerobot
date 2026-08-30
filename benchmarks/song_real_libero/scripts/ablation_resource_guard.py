@@ -17,6 +17,7 @@ MIB = 1024**2
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 NFS_DATA_MOUNT = "/opt/data/private"
+MEMORY_SCOPES = ("cgroup_working_set", "experiment_rss")
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consecutive", type=int, default=3)
     parser.add_argument("--memory-soft-gib", type=float, default=50.0)
     parser.add_argument("--memory-hard-gib", type=float, default=58.0)
+    parser.add_argument(
+        "--memory-scope",
+        choices=MEMORY_SCOPES,
+        default="cgroup_working_set",
+        help=(
+            "Account memory from the shared cgroup working set or only from "
+            "process trees rooted in the experiment pid directory."
+        ),
+    )
     parser.add_argument("--cpu-soft-cores", type=float, default=36.0)
     parser.add_argument("--cpu-hard-cores", type=float, default=42.0)
     parser.add_argument("--io-soft-mib-s", type=float, default=400.0)
@@ -330,7 +340,29 @@ def gpu_samples(gpu: int | None) -> list[dict[str, float | int]]:
     return result
 
 
-def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
+def select_memory_measurement(
+    memory_scope: str,
+    *,
+    cgroup_working_set_gib: float,
+    experiment_rss_gib: float,
+) -> tuple[float, str]:
+    if memory_scope == "cgroup_working_set":
+        return (
+            cgroup_working_set_gib,
+            "cgroup_working_set_usage_minus_inactive_file",
+        )
+    if memory_scope == "experiment_rss":
+        return experiment_rss_gib, "experiment_process_tree_rss"
+    raise ValueError(f"Unsupported memory scope: {memory_scope!r}")
+
+
+def sample(
+    root: Path,
+    gpu: int | None,
+    seconds: float,
+    limits: Limits,
+    memory_scope: str = "cgroup_working_set",
+) -> dict:
     pid_dir = root / "pids"
     start = process_tree_snapshot(pid_dir)
     block_start, nfs_start = system_io_snapshot()
@@ -354,7 +386,12 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
     io_mib_s = max(block_io_mib_s, nfs_io_mib_s)
     experiment_rss_gib = sum(item[1] for item in end.values()) / GIB
     cgroup_usage_bytes, inactive_file_bytes, working_set_bytes = cgroup_memory_snapshot()
-    memory_gib = working_set_bytes / GIB
+    cgroup_working_set_gib = working_set_bytes / GIB
+    memory_gib, memory_metric = select_memory_measurement(
+        memory_scope,
+        cgroup_working_set_gib=cgroup_working_set_gib,
+        experiment_rss_gib=experiment_rss_gib,
+    )
     gpu_info = gpu_samples(gpu)
     soft_reasons = []
     hard_reasons = []
@@ -384,7 +421,8 @@ def sample(root: Path, gpu: int | None, seconds: float, limits: Limits) -> dict:
         "root": str(root),
         "pids": sorted(end),
         "memory_gib": memory_gib,
-        "memory_metric": "cgroup_working_set_usage_minus_inactive_file",
+        "memory_metric": memory_metric,
+        "cgroup_working_set_gib": cgroup_working_set_gib,
         "cgroup_usage_gib": cgroup_usage_bytes / GIB,
         "inactive_file_gib": inactive_file_bytes / GIB,
         "experiment_rss_gib": experiment_rss_gib,
@@ -415,14 +453,25 @@ def append_audit(root: Path, payload: dict) -> None:
         marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def failed_sample_payload(root: Path, exc: BaseException, limits: Limits) -> dict:
+def failed_sample_payload(
+    root: Path,
+    exc: BaseException,
+    limits: Limits,
+    memory_scope: str = "cgroup_working_set",
+) -> dict:
     error = f"{type(exc).__name__}: {exc}"
+    _, memory_metric = select_memory_measurement(
+        memory_scope,
+        cgroup_working_set_gib=0.0,
+        experiment_rss_gib=0.0,
+    )
     return {
         "timestamp": time.time(),
         "root": str(root),
         "pids": [],
         "memory_gib": None,
-        "memory_metric": "cgroup_working_set_usage_minus_inactive_file",
+        "memory_metric": memory_metric,
+        "cgroup_working_set_gib": None,
         "cgroup_usage_gib": None,
         "inactive_file_gib": None,
         "experiment_rss_gib": None,
@@ -518,9 +567,20 @@ def main() -> int:
             )
             return 2
         try:
-            payload = sample(args.root, args.gpu, args.sample_seconds, limits)
+            payload = sample(
+                args.root,
+                args.gpu,
+                args.sample_seconds,
+                limits,
+                memory_scope=args.memory_scope,
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            payload = failed_sample_payload(args.root, exc, limits)
+            payload = failed_sample_payload(
+                args.root,
+                exc,
+                limits,
+                memory_scope=args.memory_scope,
+            )
         append_audit(args.root, payload)
         print(json.dumps(payload, sort_keys=True), flush=True)
         if (

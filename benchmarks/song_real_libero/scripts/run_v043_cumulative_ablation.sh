@@ -20,6 +20,7 @@ num_workers=${SONG_ABLATION_NUM_WORKERS:-2}
 eval_episodes=${SONG_ABLATION_EVAL_EPISODES:-10}
 guard_sample_s=${SONG_ABLATION_GUARD_SAMPLE_S:-5}
 guard_poll_s=${SONG_ABLATION_GUARD_POLL_S:-15}
+resource_memory_scope=${SONG_ABLATION_RESOURCE_MEMORY_SCOPE:-experiment_rss}
 eval_lock=${SONG_ABLATION_EVAL_LOCK:-/tmp/song_real_libero_v043_eval.lock}
 summary_lock=${SONG_ABLATION_SUMMARY_LOCK:-/tmp/song_real_libero_v043_summary.lock}
 post_training_eval_slots=${SONG_ABLATION_POST_TRAINING_EVAL_SLOTS:-1}
@@ -211,6 +212,7 @@ require_inputs() {
 guard_wait() {
   local gpu=$1
   "$python" "$guard" --root "$root" --gpu "$gpu" --wait \
+    --memory-scope "$resource_memory_scope" \
     --sample-seconds "$guard_sample_s" --poll-seconds "$guard_poll_s" --consecutive 3 \
     --recover-hard-marker-after-soft
 }
@@ -1052,6 +1054,7 @@ eval_all() {
 
 resource_watch() {
   "$python" "$guard" --root "$root" --watch --sample-seconds 2 --poll-seconds 2 \
+    --memory-scope "$resource_memory_scope" \
     --terminate-eval-memory-gib 57 \
     >>"$root/logs/resource_watch.log" 2>&1
 }
