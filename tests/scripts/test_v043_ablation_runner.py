@@ -131,6 +131,7 @@ source {shlex.quote(str(RUNNER))}
 [[ "$training_eval_stagger_s" == 120 ]]
 [[ "$post_training_eval_episode_workers_per_task" == 3 ]]
 [[ "$post_training_eval_inference_batch_size" == 6 ]]
+[[ "$post_training_eval_episode_workers_by_task" == "6=2,8=4" ]]
 """
 
     subprocess.run(["bash", "-c", command], check=True)
@@ -165,7 +166,7 @@ export SONG_ABLATION_TRAINING_EVAL_STAGGER_S=0
 source {shlex.quote(str(RUNNER))}
 eval_result_valid() {{ [[ -f "$1/done" ]]; }}
 run_eval_command() {{
-  printf '%s %s %s\n' "$5" "$6" "$7" >"$root/observed_parallelism"
+  printf '%s %s %s %s\n' "$5" "$6" "$7" "${{8:-none}}" >"$root/observed_parallelism"
   mkdir -p "$3"
   touch "$3/done"
 }}
@@ -179,11 +180,11 @@ cat "$root/observed_parallelism"
 
 
 def test_eval_command_receives_training_parallelism(tmp_path: Path) -> None:
-    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 2"
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 2 none"
 
 
 def test_eval_command_receives_post_training_parallelism(tmp_path: Path) -> None:
-    assert _run_parallelism_phase_probe(tmp_path, trainer_running=False) == "true 3 6"
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=False) == "true 3 6 6=2,8=4"
 
 
 def test_checkpoint_is_staged_locally_with_bandwidth_limit(tmp_path: Path) -> None:

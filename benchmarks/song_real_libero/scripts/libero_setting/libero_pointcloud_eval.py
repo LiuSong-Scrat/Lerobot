@@ -12,7 +12,7 @@ Removed from the original evaluator:
 """
 from __future__ import annotations
 
-EVAL_BUILD_TAG = "strict_episode_resume_v24_20260829"
+EVAL_BUILD_TAG = "strict_episode_resume_v25_20260830"
 
 import argparse
 import atexit
@@ -404,6 +404,35 @@ def resolve_task_ids_for_suite(
         raise ValueError(
             f"Invalid task id(s) for {suite_name}: {invalid}; valid range is [0, {task_count - 1}]"
         )
+    return resolved
+
+
+def parse_episode_workers_by_task(value: Any) -> dict[int, int]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        items = value.items()
+    elif isinstance(value, str):
+        items = []
+        for assignment in value.split(","):
+            task_text, separator, worker_text = assignment.strip().partition("=")
+            if not separator:
+                raise ValueError(
+                    "episode_workers_by_task must use comma-separated TASK_ID=COUNT assignments."
+                )
+            items.append((task_text, worker_text))
+    else:
+        raise TypeError("episode_workers_by_task must be a mapping or assignment string.")
+
+    resolved: dict[int, int] = {}
+    for task_value, worker_value in items:
+        task_id = int(task_value)
+        worker_count = int(worker_value)
+        if task_id < 0 or worker_count < 1:
+            raise ValueError("Task ids must be non-negative and worker counts must be positive.")
+        if task_id in resolved:
+            raise ValueError(f"Duplicate episode worker assignment for task {task_id}.")
+        resolved[task_id] = worker_count
     return resolved
 
 
@@ -1047,6 +1076,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Independent environment processes used to split the episodes of each active task. "
             "For example, 2 assigns even and odd episode indices to separate environments."
+        ),
+    )
+    parser.add_argument(
+        "--episode-workers-by-task",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated TASK_ID=COUNT overrides for episode workers, for example "
+            "'6=2,8=4'. Tasks not listed use --episode-workers-per-task."
         ),
     )
     parser.add_argument(
@@ -3847,6 +3885,12 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "task_workers": int(cfg["task_workers"]),
             "isolated_policy_workers": int(cfg.get("isolated_policy_workers", 1)),
             "episode_workers_per_task": int(cfg["episode_workers_per_task"]),
+            "episode_workers_by_task": {
+                str(task_id): int(worker_count)
+                for task_id, worker_count in sorted(
+                    cfg.get("episode_workers_by_task", {}).items()
+                )
+            },
             "task_worker_backend": str(cfg["task_worker_backend"]),
             "inference_batch_size": int(cfg["inference_batch_size"]),
             "inference_batch_wait_ms": float(cfg["inference_batch_wait_ms"]),
@@ -8620,14 +8664,16 @@ def _build_episode_worker_jobs(
     *,
     episode_indices: list[int],
     episode_workers_per_task: int,
+    episode_workers_by_task: dict[int, int] | None = None,
 ) -> list[_EpisodeWorkerJob]:
     resolved_episode_indices = [int(index) for index in episode_indices]
-    shard_count = min(
-        max(1, int(episode_workers_per_task)),
-        max(1, len(resolved_episode_indices)),
-    )
+    worker_overrides = episode_workers_by_task or {}
     jobs: list[_EpisodeWorkerJob] = []
     for task_id in task_ids:
+        shard_count = min(
+            max(1, int(worker_overrides.get(int(task_id), episode_workers_per_task))),
+            max(1, len(resolved_episode_indices)),
+        )
         for shard_index in range(shard_count):
             worker_episode_indices = tuple(
                 resolved_episode_indices[shard_index::shard_count]
@@ -8821,6 +8867,7 @@ def evaluate_suite_process_parallel(
             wave_task_ids,
             episode_indices=configured_episode_indices,
             episode_workers_per_task=episode_workers_per_task,
+            episode_workers_by_task=cfg.get("episode_workers_by_task"),
         )
         if batching_mode == "fixed_barrier" and len(jobs) > max_batch_size:
             raise ValueError(
@@ -9794,10 +9841,31 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
             )
         ),
     )
-    configured_environment_workers = (
-        cfg["task_workers"]
-        * min(cfg["episode_workers_per_task"], max(1, cfg["episodes"]))
+    cfg["episode_workers_by_task"] = parse_episode_workers_by_task(
+        cfg_get(
+            cfg,
+            args.episode_workers_by_task,
+            "episode_workers_by_task",
+            None,
+        )
     )
+    default_episode_workers = min(
+        cfg["episode_workers_per_task"], max(1, cfg["episodes"])
+    )
+    configured_task_ids = [int(task_id) for task_id in (cfg.get("task_ids") or [])]
+    if cfg["episode_workers_by_task"] and configured_task_ids:
+        configured_environment_workers = max(
+            sum(
+                min(
+                    cfg["episode_workers_by_task"].get(task_id, default_episode_workers),
+                    max(1, cfg["episodes"]),
+                )
+                for task_id in configured_task_ids[wave_start : wave_start + cfg["task_workers"]]
+            )
+            for wave_start in range(0, len(configured_task_ids), cfg["task_workers"])
+        )
+    else:
+        configured_environment_workers = cfg["task_workers"] * default_episode_workers
     cfg["task_worker_backend"] = str(
         cfg_get(
             cfg,

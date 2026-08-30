@@ -18,12 +18,36 @@ from benchmarks.song_real_libero.scripts.libero_setting.libero_pointcloud_eval i
     FixedBatchInferenceCache,
     ProcessInferenceProxy,
     _ProcessInferenceRequest,
+    _build_episode_worker_jobs,
     _execute_process_inference_fixed_slots,
     _process_worker_environment,
     evaluate_task,
     initialize_realtime_suite_progress,
     load_resumable_episode_record,
+    parse_episode_workers_by_task,
 )
+
+
+def test_episode_worker_jobs_support_per_task_load_balancing():
+    jobs = _build_episode_worker_jobs(
+        [6, 8],
+        episode_indices=list(range(10)),
+        episode_workers_per_task=3,
+        episode_workers_by_task={6: 2, 8: 4},
+    )
+
+    task_6_jobs = [job for job in jobs if job.task_id == 6]
+    task_8_jobs = [job for job in jobs if job.task_id == 8]
+    assert len(task_6_jobs) == 2
+    assert len(task_8_jobs) == 4
+    assert sorted(index for job in task_6_jobs for index in job.episode_indices) == list(range(10))
+    assert sorted(index for job in task_8_jobs for index in job.episode_indices) == list(range(10))
+
+
+def test_episode_worker_assignment_parser_rejects_duplicates():
+    assert parse_episode_workers_by_task("6=2,8=4") == {6: 2, 8: 4}
+    with pytest.raises(ValueError, match="Duplicate"):
+        parse_episode_workers_by_task("6=2,6=3")
 
 
 class _FakeInference:

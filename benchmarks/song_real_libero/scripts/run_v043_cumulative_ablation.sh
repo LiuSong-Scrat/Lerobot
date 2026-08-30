@@ -28,6 +28,7 @@ post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 training_eval_stagger_s=${SONG_ABLATION_TRAINING_EVAL_STAGGER_S:-120}
 training_eval_episode_workers_per_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-1}
 post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-3}
+post_training_eval_episode_workers_by_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_BY_TASK:-6=2,8=4}
 training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * training_eval_episode_workers_per_task))}
 post_training_eval_inference_batch_size=${SONG_ABLATION_POST_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * post_training_eval_episode_workers_per_task))}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
@@ -50,6 +51,8 @@ usage() {
 }
 
 validate_eval_parallelism() {
+  local assignment task_id worker_count worker_total=0
+  local -A assigned_tasks=()
   if (( training_eval_episode_workers_per_task < 1 || training_eval_episode_workers_per_task > eval_episodes )); then
     echo "Training-time episode workers per task must be between one and $eval_episodes." >&2
     return 2
@@ -65,6 +68,32 @@ validate_eval_parallelism() {
   if (( post_training_eval_inference_batch_size < 2 * post_training_eval_episode_workers_per_task )); then
     echo "Post-training fixed-barrier batch must cover both tasks' episode workers." >&2
     return 2
+  fi
+  if [[ -n "$post_training_eval_episode_workers_by_task" ]]; then
+    local -a assignments=()
+    IFS=',' read -ra assignments <<<"$post_training_eval_episode_workers_by_task"
+    for assignment in "${assignments[@]}"; do
+      if [[ ! "$assignment" =~ ^([0-9]+)=([1-9][0-9]*)$ ]]; then
+        echo "Post-training task worker overrides must use TASK_ID=COUNT assignments." >&2
+        return 2
+      fi
+      task_id=${BASH_REMATCH[1]}
+      worker_count=${BASH_REMATCH[2]}
+      if [[ -n "${assigned_tasks[$task_id]:-}" ]]; then
+        echo "Duplicate post-training worker override for task $task_id." >&2
+        return 2
+      fi
+      assigned_tasks[$task_id]=1
+      worker_total=$((worker_total + worker_count))
+    done
+    if [[ -z "${assigned_tasks[6]:-}" || -z "${assigned_tasks[8]:-}" ]]; then
+      echo "Post-training worker overrides must cover fixed tasks 6 and 8." >&2
+      return 2
+    fi
+    if (( worker_total > post_training_eval_inference_batch_size )); then
+      echo "Post-training fixed-barrier batch must cover all per-task workers." >&2
+      return 2
+    fi
   fi
 }
 
@@ -718,6 +747,11 @@ run_eval_command() {
   local gpu=$1 checkpoint=$2 output=$3 log=$4 stage_checkpoint=${5:-false}
   local episode_workers_per_task=${6:-$training_eval_episode_workers_per_task}
   local inference_batch_size=${7:-$training_eval_inference_batch_size}
+  local episode_workers_by_task=${8:-}
+  local -a episode_worker_override_args=()
+  if [[ -n "$episode_workers_by_task" ]]; then
+    episode_worker_override_args=(--episode-workers-by-task "$episode_workers_by_task")
+  fi
   local eval_checkpoint=$checkpoint stage_dir= stage_reclaimer_pid= status=0
   local stage_owner_pid=$BASHPID
   guard_wait "$gpu"
@@ -756,6 +790,7 @@ run_eval_command() {
       --gripper-delta-alignment current_minus_previous \
       --waypoint-max-hold-steps 1 --isolated-policy-workers 1 \
       --task-workers 2 --episode-workers-per-task "$episode_workers_per_task" \
+      "${episode_worker_override_args[@]}" \
       --task-worker-backend process \
       --inference-batch-size "$inference_batch_size" \
       --inference-batching-mode fixed_barrier \
@@ -832,7 +867,8 @@ eval_one() {
     sleep "$((index * post_training_eval_stagger_s))"
     acquire_post_training_eval_slot slot_fd
     run_eval_command "$gpu" "$checkpoint" "$output" "$log" true \
-      "$post_training_eval_episode_workers_per_task" "$post_training_eval_inference_batch_size"
+      "$post_training_eval_episode_workers_per_task" "$post_training_eval_inference_batch_size" \
+      "$post_training_eval_episode_workers_by_task"
     eval_result_valid "$output"
   )
 }
