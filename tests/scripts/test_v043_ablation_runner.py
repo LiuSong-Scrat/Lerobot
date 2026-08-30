@@ -127,7 +127,8 @@ def test_eval_parallelism_uses_resource_phase_defaults() -> None:
 set -euo pipefail
 source {shlex.quote(str(RUNNER))}
 [[ "$training_eval_episode_workers_per_task" == 1 ]]
-[[ "$training_eval_inference_batch_size" == 2 ]]
+[[ "$training_eval_inference_batch_size" == 3 ]]
+[[ "$training_eval_episode_workers_by_task" == "6=1,8=2" ]]
 [[ "$training_eval_stagger_s" == 120 ]]
 [[ "$post_training_eval_episode_workers_per_task" == 3 ]]
 [[ "$post_training_eval_inference_batch_size" == 6 ]]
@@ -141,7 +142,22 @@ def test_eval_parallelism_rejects_undersized_fixed_batch(tmp_path: Path) -> None
     command = f"""
 set -euo pipefail
 export SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK=2
+export SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_BY_TASK=
 export SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE=3
+source {shlex.quote(str(RUNNER))}
+status=0
+validate_eval_parallelism || status=$?
+[[ "$status" == 2 ]]
+"""
+
+    subprocess.run(["bash", "-c", command], check=True)
+
+
+def test_eval_parallelism_rejects_undersized_asymmetric_training_batch() -> None:
+    command = f"""
+set -euo pipefail
+export SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_BY_TASK=6=1,8=2
+export SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE=2
 source {shlex.quote(str(RUNNER))}
 status=0
 validate_eval_parallelism || status=$?
@@ -180,7 +196,7 @@ cat "$root/observed_parallelism"
 
 
 def test_eval_command_receives_training_parallelism(tmp_path: Path) -> None:
-    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 2 none"
+    assert _run_parallelism_phase_probe(tmp_path, trainer_running=True) == "false 1 3 6=1,8=2"
 
 
 def test_eval_command_receives_post_training_parallelism(tmp_path: Path) -> None:

@@ -27,9 +27,10 @@ training_eval_slots=${SONG_ABLATION_TRAINING_EVAL_SLOTS:-1}
 post_training_eval_stagger_s=${SONG_ABLATION_POST_TRAINING_EVAL_STAGGER_S:-60}
 training_eval_stagger_s=${SONG_ABLATION_TRAINING_EVAL_STAGGER_S:-120}
 training_eval_episode_workers_per_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-1}
+training_eval_episode_workers_by_task=${SONG_ABLATION_TRAINING_EVAL_EPISODE_WORKERS_BY_TASK:-6=1,8=2}
 post_training_eval_episode_workers_per_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_PER_TASK:-3}
 post_training_eval_episode_workers_by_task=${SONG_ABLATION_POST_TRAINING_EVAL_EPISODE_WORKERS_BY_TASK:-6=2,8=4}
-training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * training_eval_episode_workers_per_task))}
+training_eval_inference_batch_size=${SONG_ABLATION_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-3}
 post_training_eval_inference_batch_size=${SONG_ABLATION_POST_TRAINING_EVAL_INFERENCE_BATCH_SIZE:-$((2 * post_training_eval_episode_workers_per_task))}
 checkpoint_stage_root=${SONG_ABLATION_CHECKPOINT_STAGE_ROOT:-/tmp/song_real_libero_v043_checkpoints}
 checkpoint_stage_bwlimit_kib=${SONG_ABLATION_CHECKPOINT_STAGE_BWLIMIT_KIB:-102400}
@@ -69,6 +70,34 @@ validate_eval_parallelism() {
     echo "Post-training fixed-barrier batch must cover both tasks' episode workers." >&2
     return 2
   fi
+  if [[ -n "$training_eval_episode_workers_by_task" ]]; then
+    local -a training_assignments=()
+    IFS=',' read -ra training_assignments <<<"$training_eval_episode_workers_by_task"
+    for assignment in "${training_assignments[@]}"; do
+      if [[ ! "$assignment" =~ ^([0-9]+)=([1-9][0-9]*)$ ]]; then
+        echo "Training-time task worker overrides must use TASK_ID=COUNT assignments." >&2
+        return 2
+      fi
+      task_id=${BASH_REMATCH[1]}
+      worker_count=${BASH_REMATCH[2]}
+      if [[ -n "${assigned_tasks[$task_id]:-}" ]]; then
+        echo "Duplicate training-time worker override for task $task_id." >&2
+        return 2
+      fi
+      assigned_tasks[$task_id]=1
+      worker_total=$((worker_total + worker_count))
+    done
+    if [[ -z "${assigned_tasks[6]:-}" || -z "${assigned_tasks[8]:-}" ]]; then
+      echo "Training-time worker overrides must cover fixed tasks 6 and 8." >&2
+      return 2
+    fi
+    if (( worker_total > training_eval_inference_batch_size )); then
+      echo "Training-time fixed-barrier batch must cover all per-task workers." >&2
+      return 2
+    fi
+  fi
+  assigned_tasks=()
+  worker_total=0
   if [[ -n "$post_training_eval_episode_workers_by_task" ]]; then
     local -a assignments=()
     IFS=',' read -ra assignments <<<"$post_training_eval_episode_workers_by_task"
@@ -841,7 +870,8 @@ eval_one() {
       sleep "$(((index % training_eval_slots) * training_eval_stagger_s))"
       acquire_training_eval_slot training_slot_fd
       run_eval_command "$gpu" "$checkpoint" "$output" "$log" false \
-        "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size"
+        "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size" \
+        "$training_eval_episode_workers_by_task"
       eval_result_valid "$output"
       exit
     fi
@@ -851,7 +881,8 @@ eval_one() {
       if flock -w "$guard_poll_s" 9; then
         if training_is_running; then
           run_eval_command "$gpu" "$checkpoint" "$output" "$log" false \
-            "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size"
+            "$training_eval_episode_workers_per_task" "$training_eval_inference_batch_size" \
+            "$training_eval_episode_workers_by_task"
           eval_result_valid "$output"
           exit
         fi
