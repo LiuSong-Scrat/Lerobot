@@ -302,17 +302,18 @@ assert Counter(task for _, task in episode_tasks) == {0: 50, 1: 50}, episode_tas
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 expected = {
-    "smolvla_src": (False, False, False),
-    "smolvla_pointcloud": (True, False, False),
-    "smolvla_pointcloud_effseg": (True, True, False),
-    "smolvla_pointcloud_effseg_pointaction": (True, True, True),
+    "smolvla_src": (False, False, False, True),
+    "smolvla_pointcloud": (True, False, False, False),
+    "smolvla_pointcloud_effseg": (True, True, False, False),
+    "smolvla_pointcloud_effseg_pointaction": (True, True, True, False),
 }
-for name, gates in expected.items():
+for name, (*gates, encode_state) in expected.items():
     cfg = SmolVLAConfig(ablation_variant=name)
     actual = (cfg.pointcloud_enable, cfg.pointseg_enable, cfg.point_action_fusion_enable)
-    assert actual == gates, (name, actual, gates)
+    assert actual == tuple(gates), (name, actual, gates)
     assert cfg.vla_adapter_enable and cfg.vla_adapter_freeze_vlm
-    assert cfg.encode_robot_state and cfg.train_state_proj
+    assert cfg.encode_robot_state is encode_state
+    assert cfg.train_state_proj is encode_state
     assert not cfg.worldflow_enable
     assert cfg.pointcloud_input_points == 10_000
 
@@ -344,8 +345,12 @@ train_one() {
   fi
   mkdir -p "$output" "$root/logs"
   local -a cache_args=()
+  local -a state_args=(--policy.encode_robot_state=false --policy.train_state_proj=false)
   if [[ "$variant" == smolvla_pointcloud_effseg* ]]; then
     cache_args=(--pointseg_sample_cache_dir="$cache")
+  fi
+  if [[ "$variant" == smolvla_src ]]; then
+    state_args=(--policy.encode_robot_state=true --policy.train_state_proj=true)
   fi
   cd "$repo"
   exec env \
@@ -362,7 +367,7 @@ train_one() {
       --output_dir="$output" --job_name="v043_ablation_${variant}" \
       --policy.device=cuda --wandb.enable=false \
       --policy.ablation_variant="$variant" \
-      --policy.encode_robot_state=true --policy.train_state_proj=true \
+      "${state_args[@]}" \
       --policy.camera_views=agentview --policy.rgb_camera_views=agentview \
       --policy.vlm_model_name="$vlm" --policy.vlm_weights_path="$vlm_weights" \
       --policy.load_vlm_weights=true \

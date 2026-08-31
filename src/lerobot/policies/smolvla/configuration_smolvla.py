@@ -556,24 +556,32 @@ class SmolVLAConfig(PreTrainedConfig):
     def __post_init__(self):
         ablation_presets = {
             "smolvla_src": {
+                "encode_robot_state": True,
+                "train_state_proj": True,
                 "pointcloud_enable": False,
                 "pointseg_enable": False,
                 "point_action_fusion_enable": False,
                 "worldflow_enable": False,
             },
             "smolvla_pointcloud": {
+                "encode_robot_state": False,
+                "train_state_proj": False,
                 "pointcloud_enable": True,
                 "pointseg_enable": False,
                 "point_action_fusion_enable": False,
                 "worldflow_enable": False,
             },
             "smolvla_pointcloud_effseg": {
+                "encode_robot_state": False,
+                "train_state_proj": False,
                 "pointcloud_enable": True,
                 "pointseg_enable": True,
                 "point_action_fusion_enable": False,
                 "worldflow_enable": False,
             },
             "smolvla_pointcloud_effseg_pointaction": {
+                "encode_robot_state": False,
+                "train_state_proj": False,
                 "pointcloud_enable": True,
                 "pointseg_enable": True,
                 "point_action_fusion_enable": True,
@@ -586,13 +594,11 @@ class SmolVLAConfig(PreTrainedConfig):
                     "ablation_variant must be one of "
                     f"{sorted(ablation_presets)}, got {self.ablation_variant!r}."
                 )
-            # Every ablation retains the official 2D SmolVLA RGB/state path and
-            # the same frozen SmolVLM initialization; only the cumulative 3D
-            # gates differ between variants.
+            # The source baseline retains official SmolVLA state encoding. The
+            # three point-cloud variants isolate the 3D path without a state
+            # token; all variants share the same frozen SmolVLM initialization.
             self.vla_adapter_enable = True
             self.vla_adapter_freeze_vlm = True
-            self.encode_robot_state = True
-            self.train_state_proj = True
             self.pointcloud_input_points = 10_000
             for field_name, value in ablation_presets[self.ablation_variant].items():
                 setattr(self, field_name, value)

@@ -14,23 +14,23 @@ from lerobot.policies.smolvla.modeling_smolvla import (
 
 
 @pytest.mark.parametrize(
-    ("name", "gates"),
+    ("name", "gates", "encode_state"),
     [
-        ("smolvla_src", (False, False, False)),
-        ("smolvla_pointcloud", (True, False, False)),
-        ("smolvla_pointcloud_effseg", (True, True, False)),
-        ("smolvla_pointcloud_effseg_pointaction", (True, True, True)),
+        ("smolvla_src", (False, False, False), True),
+        ("smolvla_pointcloud", (True, False, False), False),
+        ("smolvla_pointcloud_effseg", (True, True, False), False),
+        ("smolvla_pointcloud_effseg_pointaction", (True, True, True), False),
     ],
 )
-def test_cumulative_ablation_presets(name, gates):
+def test_cumulative_ablation_presets(name, gates, encode_state):
     config = SmolVLAConfig(ablation_variant=name)
 
     assert (config.pointcloud_enable, config.pointseg_enable, config.point_action_fusion_enable) == gates
     assert config.pointcloud_input_points == 10_000
     assert config.vla_adapter_enable
     assert config.vla_adapter_freeze_vlm
-    assert config.encode_robot_state
-    assert config.train_state_proj
+    assert config.encode_robot_state is encode_state
+    assert config.train_state_proj is encode_state
     assert not config.worldflow_enable
 
 
@@ -53,15 +53,17 @@ class _StubSmolVLMWithExpert(nn.Module):
 
 
 @pytest.mark.parametrize(
-    ("name", "has_point_action"),
+    ("name", "has_state", "has_point_action"),
     [
-        ("smolvla_src", False),
-        ("smolvla_pointcloud", False),
-        ("smolvla_pointcloud_effseg", False),
-        ("smolvla_pointcloud_effseg_pointaction", True),
+        ("smolvla_src", True, False),
+        ("smolvla_pointcloud", False, False),
+        ("smolvla_pointcloud_effseg", False, False),
+        ("smolvla_pointcloud_effseg_pointaction", False, True),
     ],
 )
-def test_cumulative_ablation_constructs_exact_state_and_point_action_modules(name, has_point_action):
+def test_cumulative_ablation_constructs_exact_state_and_point_action_modules(
+    name, has_state, has_point_action
+):
     config = SmolVLAConfig(ablation_variant=name, device="cpu")
     with patch(
         "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel",
@@ -69,7 +71,7 @@ def test_cumulative_ablation_constructs_exact_state_and_point_action_modules(nam
     ):
         model = VLAFlowMatching(config)
 
-    assert model.state_proj.weight.requires_grad
+    assert model.state_proj.weight.requires_grad is has_state
     assert isinstance(model.point_action_fusion, PointActionSelfAttention) is has_point_action
 
 

@@ -7,13 +7,15 @@ start any variant from a trained WEP-VLA policy checkpoint.
 | `policy.ablation_variant` | RGB | State | 10k XYZRGB | EffSeg | PointAction |
 |---|---:|---:|---:|---:|---:|
 | `smolvla_src` | yes | yes | no | no | no |
-| `smolvla_pointcloud` | yes | yes | yes, whole-cloud LitePT token | no | no |
-| `smolvla_pointcloud_effseg` | yes | yes | yes | foreground/background tokens | no |
-| `smolvla_pointcloud_effseg_pointaction` | yes | yes | yes | foreground/background tokens | foreground local tokens to actions |
+| `smolvla_pointcloud` | yes | no | yes, whole-cloud LitePT token | no | no |
+| `smolvla_pointcloud_effseg` | yes | no | yes | foreground/background tokens | no |
+| `smolvla_pointcloud_effseg_pointaction` | yes | no | yes | foreground/background tokens | foreground local tokens to actions |
 
-Named ablation variants force the gates in the table. All four retain the
-official RGB and projected robot-state prefix while freezing the same SmolVLM
-backbone. The state projection remains trainable, matching official SmolVLA.
+Named ablation variants force the gates in the table. The 2D source baseline
+retains the official RGB and projected robot-state prefix, with a trainable
+state projection. The three point-cloud variants disable the state token and
+freeze its unused projection so their non-RGB conditioning comes only from the
+3D path. All four freeze the same SmolVLM backbone.
 WorldFlow is disabled because it is not one of the three cumulative modules
 being measured here.
 
