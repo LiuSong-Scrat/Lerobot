@@ -4,16 +4,18 @@ This protocol compares four cumulative architectures from the same fresh
 SmolVLA construction and the same SmolVLM2-500M weight source. It does not warm
 start any variant from a trained WEP-VLA policy checkpoint.
 
-| `policy.ablation_variant` | RGB | 10k XYZRGB | EffSeg | PointAction |
-|---|---:|---:|---:|---:|
-| `smolvla_src` | yes | no | no | no |
-| `smolvla_pointcloud` | yes | yes, whole-cloud LitePT token | no | no |
-| `smolvla_pointcloud_effseg` | yes | yes | foreground/background tokens | no |
-| `smolvla_pointcloud_effseg_pointaction` | yes | yes | foreground/background tokens | foreground local tokens to actions |
+| `policy.ablation_variant` | RGB | State | 10k XYZRGB | EffSeg | PointAction |
+|---|---:|---:|---:|---:|---:|
+| `smolvla_src` | yes | yes | no | no | no |
+| `smolvla_pointcloud` | yes | yes | yes, whole-cloud LitePT token | no | no |
+| `smolvla_pointcloud_effseg` | yes | yes | yes | foreground/background tokens | no |
+| `smolvla_pointcloud_effseg_pointaction` | yes | yes | yes | foreground/background tokens | foreground local tokens to actions |
 
 Named ablation variants force the gates in the table. All four retain the
-official RGB path and freeze the same SmolVLM backbone. WorldFlow is disabled
-because it is not one of the three cumulative modules being measured here.
+official RGB and projected robot-state prefix while freezing the same SmolVLM
+backbone. The state projection remains trainable, matching official SmolVLA.
+WorldFlow is disabled because it is not one of the three cumulative modules
+being measured here.
 
 For every point-enabled variant, `policy.pointcloud_input_points` is forced to
 10,000. Training point clouds and aligned EffSeg labels are deterministically

@@ -586,11 +586,13 @@ class SmolVLAConfig(PreTrainedConfig):
                     "ablation_variant must be one of "
                     f"{sorted(ablation_presets)}, got {self.ablation_variant!r}."
                 )
-            # Every ablation retains the official 2D SmolVLA RGB path and the
-            # same frozen SmolVLM initialization; only the cumulative 3D gates
-            # differ between variants.
+            # Every ablation retains the official 2D SmolVLA RGB/state path and
+            # the same frozen SmolVLM initialization; only the cumulative 3D
+            # gates differ between variants.
             self.vla_adapter_enable = True
             self.vla_adapter_freeze_vlm = True
+            self.encode_robot_state = True
+            self.train_state_proj = True
             self.pointcloud_input_points = 10_000
             for field_name, value in ablation_presets[self.ablation_variant].items():
                 setattr(self, field_name, value)

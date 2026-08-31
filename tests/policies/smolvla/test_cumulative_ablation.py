@@ -1,10 +1,16 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch import nn
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.smolvla.modeling_smolvla import (
+    PointActionSelfAttention,
+    SmolVLAPolicy,
+    VLAFlowMatching,
+)
 
 
 @pytest.mark.parametrize(
@@ -23,7 +29,48 @@ def test_cumulative_ablation_presets(name, gates):
     assert config.pointcloud_input_points == 10_000
     assert config.vla_adapter_enable
     assert config.vla_adapter_freeze_vlm
+    assert config.encode_robot_state
+    assert config.train_state_proj
     assert not config.worldflow_enable
+
+
+@pytest.mark.parametrize("name", ["smolvla_pointcloud", "smolvla_pointcloud_effseg"])
+def test_pre_pointaction_ablations_do_not_enable_point_action_adapter(name):
+    config = SmolVLAConfig(ablation_variant=name)
+
+    assert not config.point_action_fusion_enable
+
+
+class _StubSmolVLMWithExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=8, vocab_size=32))
+        self.expert_hidden_size = 8
+        self.processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(fake_image_token_id=1, global_image_token_id=2)
+        )
+        self.lm_expert = nn.Linear(1, 1)
+
+
+@pytest.mark.parametrize(
+    ("name", "has_point_action"),
+    [
+        ("smolvla_src", False),
+        ("smolvla_pointcloud", False),
+        ("smolvla_pointcloud_effseg", False),
+        ("smolvla_pointcloud_effseg_pointaction", True),
+    ],
+)
+def test_cumulative_ablation_constructs_exact_state_and_point_action_modules(name, has_point_action):
+    config = SmolVLAConfig(ablation_variant=name, device="cpu")
+    with patch(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel",
+        return_value=_StubSmolVLMWithExpert(),
+    ):
+        model = VLAFlowMatching(config)
+
+    assert model.state_proj.weight.requires_grad
+    assert isinstance(model.point_action_fusion, PointActionSelfAttention) is has_point_action
 
 
 def _minimal_policy(*, pointcloud_enable: bool, pointcloud_input_points: int) -> SmolVLAPolicy:

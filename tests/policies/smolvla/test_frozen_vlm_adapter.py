@@ -31,11 +31,12 @@ class _MeanPointExtractor(nn.Module):
         return point_cloud.mean(dim=1)
 
 
-def _make_prefix_model() -> VLAFlowMatching:
+def _make_prefix_model(*, encode_robot_state: bool = False) -> VLAFlowMatching:
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(vla_adapter_enable=True, encode_robot_state=False)
+    model.config = SimpleNamespace(vla_adapter_enable=True, encode_robot_state=encode_robot_state)
     model.vlm_with_expert = _DummyFrozenVLM(hidden_dim=8)
+    model.state_proj = nn.Linear(10, 8)
     model.extractor = _MeanPointExtractor()
     model.pointcloud_proj = nn.Linear(6, 8)
     model.pointseg_conditioner = None
@@ -120,3 +121,24 @@ def test_adapter_prefix_rejects_missing_rgb():
             torch.ones(1, 2, dtype=torch.long),
             torch.ones(1, 2, dtype=torch.bool),
         )
+
+
+def test_official_state_token_is_appended_to_adapter_prefix():
+    model = _make_prefix_model(encode_robot_state=True)
+    state = torch.randn(2, 10)
+
+    prefix, pad_mask, block_mask = model.embed_prefix(
+        [],
+        [],
+        torch.tensor([[1, 2], [3, 4]]),
+        torch.ones(2, 2, dtype=torch.bool),
+        state=state,
+        images=[torch.rand(2, 3, 4, 4)],
+        image_masks=[torch.ones(2, dtype=torch.bool)],
+    )
+
+    # Two image tokens, two language tokens, then the official state token.
+    assert prefix.shape == (2, 5, 8)
+    assert torch.allclose(prefix[:, -1], model.state_proj(state))
+    assert pad_mask[:, -1].all()
+    assert block_mask[:, -1].all()

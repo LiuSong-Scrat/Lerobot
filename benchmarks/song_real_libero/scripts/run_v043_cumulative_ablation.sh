@@ -312,6 +312,7 @@ for name, gates in expected.items():
     actual = (cfg.pointcloud_enable, cfg.pointseg_enable, cfg.point_action_fusion_enable)
     assert actual == gates, (name, actual, gates)
     assert cfg.vla_adapter_enable and cfg.vla_adapter_freeze_vlm
+    assert cfg.encode_robot_state and cfg.train_state_proj
     assert not cfg.worldflow_enable
     assert cfg.pointcloud_input_points == 10_000
 
@@ -361,6 +362,7 @@ train_one() {
       --output_dir="$output" --job_name="v043_ablation_${variant}" \
       --policy.device=cuda --wandb.enable=false \
       --policy.ablation_variant="$variant" \
+      --policy.encode_robot_state=true --policy.train_state_proj=true \
       --policy.camera_views=agentview --policy.rgb_camera_views=agentview \
       --policy.vlm_model_name="$vlm" --policy.vlm_weights_path="$vlm_weights" \
       --policy.load_vlm_weights=true \
