@@ -1362,6 +1362,9 @@ class SmolVLAConfig(PreTrainedConfig):
             if not key.startswith(f"{OBS_IMAGES}."):
                 continue
             camera = key[len(OBS_IMAGES) + 1 :]
+            # ``front`` predates camera-view metadata in RLBench checkpoints.
+            # Keep it when loading those legacy configs; explicit newer
+            # checkpoints still validate ``front`` in _parse_camera_views.
             if camera in {"agentview", "robot0_eye_in_hand"} and camera not in selected:
                 del self.input_features[key]
 
@@ -1381,7 +1384,7 @@ class SmolVLAConfig(PreTrainedConfig):
             text = str(value).strip().strip("[]")
             parts = [part.strip().strip("\"'") for part in text.split(",")]
         views = tuple(part for part in parts if part) or ("agentview",)
-        supported = {"agentview", "robot0_eye_in_hand"}
+        supported = {"agentview", "front", "robot0_eye_in_hand"}
         unknown = [view for view in views if view not in supported]
         if unknown:
             raise ValueError(
