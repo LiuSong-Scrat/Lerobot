@@ -83,6 +83,7 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    task_balanced_sampling: bool = False
     # Optional exact number of samples contributing gradients to each optimizer
     # update across all distributed ranks. The training entrypoint validates
     # that this can be represented by its configured accumulation schedule.

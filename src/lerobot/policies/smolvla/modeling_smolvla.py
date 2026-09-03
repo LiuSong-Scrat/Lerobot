@@ -115,8 +115,8 @@ FULL_MOLMO2ER_TOTAL_VOCAB_SIZE = 152_064
 
 # Locked after the exact v0.4.3 DoubleFlow graph is instantiated and audited.
 FULL_MOLMO2ER_WORLDFLOW_OFF_PARAMETER_BUDGET = {
-    "total": 6_261_215_886,
-    "trainable": 1_786_544_601,
+    "total": 4_941_174_366,
+    "trainable": 466_503_081,
     "frozen": 4_474_671_285,
 }
 FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET = {
@@ -125,8 +125,8 @@ FULL_MOLMO2ER_WORLDFLOW_ADDED_PARAMETER_BUDGET = {
     "frozen": 12_730_085,
 }
 FULL_MOLMO2ER_WORLDFLOW_ON_PARAMETER_BUDGET = {
-    "total": 6_310_910_734,
-    "trainable": 1_823_509_364,
+    "total": 4_990_869_214,
+    "trainable": 503_467_844,
     "frozen": 4_487_401_370,
 }
 # 36 fused QKV adapters plus 35 attention-output adapters. The final VLM
@@ -2023,7 +2023,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_images(self, batch):
         """Prepare one static RGB frame per configured camera for the frozen vision encoder."""
-        if getattr(getattr(self, "config", None), "vlm_backend", "smolvlm") == "molmo2_full":
+        if (
+            getattr(getattr(self, "config", None), "vlm_backend", "smolvlm") == "molmo2_full"
+            and bool(getattr(self.config, "molmo_wepvla_scene_projection_init_enable", False))
+        ):
             required = (
                 OBS_MOLMO_TOKEN_TYPE_IDS,
                 OBS_MOLMO_PIXEL_VALUES,
@@ -3785,6 +3788,7 @@ class VLAFlowMatching(nn.Module):
             if (
                 shared_expert_conjugate_bridge
                 and getattr(self.config, "vlm_backend", "smolvlm") == "molmo2_full"
+                and bool(getattr(self.config, "molmo_wepvla_scene_projection_init_enable", False))
             ):
                 # Match the Ego Molmo-prefix adapters exactly.  PyTorch's
                 # default Kaiming initialization would otherwise make World
@@ -5470,6 +5474,11 @@ class VLAFlowMatching(nn.Module):
                 object_emb = self.pointseg_object_proj(object_feat)
                 background_emb = self.pointseg_background_proj(background_feat)
                 pc_emb = torch.stack([object_emb, background_emb], dim=1)
+                # Match WEPVLA embedding construction, but only for the two
+                # trainable point-prefix tokens. Native Molmo image/language
+                # embeddings and Action Expert tokens retain their own scale.
+                if bool(getattr(self.config, "molmo_wepvla_input_scaling_enable", False)):
+                    pc_emb = pc_emb * math.sqrt(pc_emb.shape[-1])
                 if self.point_action_fusion is not None and not ablate_point:
                     foreground_tokens = conditioned.get("foreground_scene_tok1")
                     foreground_mask = conditioned.get("foreground_scene_mask1")
@@ -6428,8 +6437,7 @@ class VLAFlowMatching(nn.Module):
         object_emb = self.world_pointseg_object_proj(scene_features[:, 0])
         background_emb = self.world_pointseg_background_proj(scene_features[:, 1])
         world_emb = torch.stack([object_emb, background_emb], dim=1)
-        vlm_with_expert = getattr(self, "vlm_with_expert", None)
-        if bool(getattr(vlm_with_expert, "scale_input_embeddings", True)):
+        if bool(getattr(self.config, "molmo_wepvla_input_scaling_enable", False)):
             world_emb = world_emb * math.sqrt(world_emb.shape[-1])
         world_emb = world_emb + self.world_point_prefix_type_embedding
         world_mask = scene_mask.to(device=world_emb.device, dtype=torch.bool)

@@ -3,4 +3,4 @@
 """Stable identifiers shared by SmolVLA config and checkpoint loaders."""
 
 
-FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY = "wepvla_scene_in_vlm_prefix_v3"
+FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY = "v3_feature_align_wepvla_bidirectional_prefix"

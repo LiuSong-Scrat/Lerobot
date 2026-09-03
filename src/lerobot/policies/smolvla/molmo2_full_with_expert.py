@@ -90,7 +90,7 @@ _LM_HEAD_SOURCE_PREFIX = "lm_head."
 # therefore intentionally not included here.
 _EXPECTED_VISION_PARAMETERS = 439_117_264
 _EXPECTED_TEXT_PARAMETERS = 4_022_795_776
-_EXPECTED_EXPERT_PARAMETERS = 1_736_591_232
+_EXPECTED_EXPERT_PARAMETERS = 435_941_712
 _EXPECTED_FROZEN_PARAMETERS = _EXPECTED_VISION_PARAMETERS + _EXPECTED_TEXT_PARAMETERS
 _EXPECTED_BACKEND_PARAMETERS = _EXPECTED_FROZEN_PARAMETERS + _EXPECTED_EXPERT_PARAMETERS
 
@@ -310,7 +310,7 @@ def _audit_source_checkpoint(model_directory: Path) -> dict[str, Any]:
 
 
 class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
-    """Full 36/36 base-frozen Molmo2-ER plus a 36-layer 0.75x Action Expert."""
+    """Full 36/36 Molmo2-ER plus a feature-aligned 720-wide Action Expert."""
 
     scale_input_embeddings = False
     inference_only_vlm = False
@@ -326,7 +326,7 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
         num_expert_layers: int = -1,
         num_vlm_layers: int = 36,
         self_attn_every_n_layers: int = 2,
-        expert_width_multiplier: float = 0.75,
+        expert_width_multiplier: float = 0.28125,
         device: str | torch.device = "auto",
         torch_dtype: str | torch.dtype = torch.bfloat16,
         exact_vision_reuse: bool = True,
@@ -370,9 +370,10 @@ class Molmo2FullWithExpertModel(Molmo2WithExpertModel):
             num_expert_layers = num_vlm_layers
         if num_expert_layers != 36:
             raise ValueError(f"Full-Molmo2-ER requires a 36-layer Action Expert, got {num_expert_layers}.")
-        if not math.isclose(expert_width_multiplier, 0.75, rel_tol=0.0, abs_tol=1e-12):
+        if not math.isclose(expert_width_multiplier, 0.28125, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(
-                "Full-Molmo2-ER requires expert_width_multiplier=0.75 (H=1920), "
+                "Feature-aligned Full-Molmo2-ER requires "
+                "expert_width_multiplier=0.28125 (H=720), "
                 f"got {expert_width_multiplier}."
             )
         if "cross" not in attention_mode:

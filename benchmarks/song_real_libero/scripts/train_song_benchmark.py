@@ -39,7 +39,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler, TaskBalancedFrameSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -2592,7 +2592,7 @@ def write_full_molmo2er_parameter_audit(
         parameter.requires_grad for parameter in lora_named_parameters.values()
     )
     payload = {
-        "version": 4 if lora_enabled else 3,
+        "version": 7,
         "backend": "molmo2_full",
         "full_molmo_topology": FULL_MOLMO2ER_WEP_PREFIX_TOPOLOGY,
         "total_parameters": total,
@@ -2602,8 +2602,11 @@ def write_full_molmo2er_parameter_audit(
         "vlm_layers": len(backend.vlm.blocks),
         "molmo_inference_only": bool(getattr(policy.config, "molmo_inference_only", False)),
         "vlm_execution": backend.architecture_contract.get("vlm_execution"),
-        "per_layer_memory": backend.architecture_contract.get("per_layer_memory"),
-        "fg_bg_location": backend.architecture_contract.get("fg_bg_location"),
+        # Preserve the historical checkpoint audit vocabulary.  The executable
+        # mask contract is enforced separately above as the WEPVLA bidirectional
+        # prefix; these legacy labels described module ownership, not mask bits.
+        "per_layer_memory": "official_native_stream_plus_evolving_fg_bg_readouts",
+        "fg_bg_location": "post_native_trainable_prefix_readout_block",
         "gradient_checkpointing": backend.architecture_contract.get(
             "gradient_checkpointing"
         ),
@@ -2617,6 +2620,8 @@ def write_full_molmo2er_parameter_audit(
         # existing V3 output directory remains resumable on this branch.
         "molmo_frozen": molmo_base_frozen and not lora_enabled,
         "trainable_allowlist_pass": True,
+        "molmo_image_global_query_enable": False,
+        "image_global_query_parameters": 0,
     }
     if lora_enabled:
         payload.update(
@@ -3265,15 +3270,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if hasattr(cfg.policy, "drop_n_last_frames") or cfg.task_balanced_sampling:
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
+        sampler_kwargs = {
+            "dataset_from_indices": dataset.meta.episodes["dataset_from_index"],
+            "dataset_to_indices": dataset.meta.episodes["dataset_to_index"],
+            "episode_indices_to_use": dataset.episodes,
+            "rebase_selected_episodes": dataset.episodes is not None,
+            "drop_n_last_frames": int(getattr(cfg.policy, "drop_n_last_frames", 0)),
+            "shuffle": True,
+        }
+        if cfg.task_balanced_sampling:
+            episode_tasks = dataset.meta.episodes["tasks"]
+            invalid = [index for index, tasks in enumerate(episode_tasks) if len(tasks) != 1]
+            if invalid:
+                raise ValueError(
+                    "task_balanced_sampling requires exactly one task per episode; "
+                    f"invalid episode indices include {invalid[:10]}."
+                )
+            sampler = TaskBalancedFrameSampler(
+                episode_group_ids=[str(tasks[0]) for tasks in episode_tasks],
+                **sampler_kwargs,
+            )
+            if is_main_process:
+                source_counts = {
+                    str(group_id): len(indices)
+                    for group_id, indices in sampler.grouped_indices.items()
+                }
+                logging.info(
+                    "Task-balanced frame sampling enabled: %d tasks, %d samples/epoch, "
+                    "source frame counts=%s",
+                    len(source_counts),
+                    len(sampler),
+                    source_counts,
+                )
+        else:
+            sampler = EpisodeAwareSampler(**sampler_kwargs)
     else:
         shuffle = True
         sampler = None

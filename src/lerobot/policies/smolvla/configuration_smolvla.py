@@ -527,6 +527,21 @@ class SmolVLAConfig(PreTrainedConfig):
     # Two layers per segment halves retained boundary tensors relative to
     # one-layer segments while keeping the recomputation peak bounded.
     molmo_gradient_checkpointing_layers_per_segment: int = 2
+    # Feature-aligned WEPVLA contract recovered from the native64 checkpoint.
+    # These fields are explicit so loading a checkpoint cannot silently drop
+    # an information-flow or numerical-scaling choice.
+    molmo_expert_unified_context_kv: bool = False
+    molmo_expert_qk_norm_enable: bool = True
+    molmo_native_qk_norm_enable: bool = True
+    molmo_expert_cross_attention_kv_fp32: bool = False
+    molmo_wepvla_input_scaling_enable: bool = False
+    molmo_wepvla_scene_projection_init_enable: bool = False
+    molmo_expert_scene_key_bias: float = 0.0
+    molmo_image_global_query_enable: bool = False
+    molmo_action_image_token_budget: int = 0
+    molmo_native_image_token_budget: int = 0
+    molmo_wepvla_expert_depth_match_enable: bool = False
+    molmo_image_token_mask_enable: bool = False
     # Batch-vectorized fixed 256px/two-crop native image transform. Contract
     # mismatches always fall back to Molmo's trusted slow processor.
     molmo_image_fast_path: bool = True
@@ -925,8 +940,36 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.self_attn_every_n_layers != 2:
                 raise ValueError("Full-Molmo2-ER requires alternating even-SA/odd-CA Expert layers.")
-            if abs(float(self.expert_width_multiplier) - 0.75) > 1e-12:
-                raise ValueError("Full-Molmo2-ER requires expert_width_multiplier=0.75.")
+            if abs(float(self.expert_width_multiplier) - 0.28125) > 1e-12:
+                raise ValueError(
+                    "Feature-aligned Full-Molmo2-ER requires "
+                    "expert_width_multiplier=0.28125 (720/2560)."
+                )
+            recovered_attention_contract = {
+                "molmo_expert_unified_context_kv": False,
+                "molmo_expert_qk_norm_enable": True,
+                "molmo_native_qk_norm_enable": True,
+                "molmo_expert_cross_attention_kv_fp32": False,
+                "molmo_wepvla_input_scaling_enable": True,
+                "molmo_wepvla_scene_projection_init_enable": True,
+                "molmo_expert_scene_key_bias": 0.0,
+                "molmo_image_global_query_enable": False,
+                "molmo_action_image_token_budget": 0,
+                "molmo_native_image_token_budget": 0,
+                "molmo_wepvla_expert_depth_match_enable": False,
+                "molmo_image_token_mask_enable": False,
+            }
+            attention_drift = {
+                name: (expected, getattr(self, name))
+                for name, expected in recovered_attention_contract.items()
+                if getattr(self, name) != expected
+            }
+            if attention_drift:
+                details = ", ".join(
+                    f"{name}: expected {expected!r}, got {actual!r}"
+                    for name, (expected, actual) in attention_drift.items()
+                )
+                raise ValueError(f"Recovered Full-Molmo WEPVLA contract drift: {details}.")
             # Optimizer and scheduler values are run-time training choices, not
             # part of the Full-Molmo2-ER architecture contract. Keep every
             # optimizer_* and scheduler_* field configurable through the normal
