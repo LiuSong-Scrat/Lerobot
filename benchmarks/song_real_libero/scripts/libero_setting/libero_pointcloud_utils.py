@@ -12,10 +12,12 @@ from scipy.spatial.transform import Rotation as R
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import LIBERO_DATA_ROOT
     from ..virtual_gripper_geometry import (
+        allocate_surface_counts,
         CanonicalGripperParameters,
         GRIPPER_COLOR_RGB,
         physical_opening_width,
         physical_opening_widths,
+        sample_box_surface,
         sample_gripper_width,
     )
 else:
@@ -24,10 +26,12 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import LIBERO_DATA_ROOT
     from virtual_gripper_geometry import (
+        allocate_surface_counts,
         CanonicalGripperParameters,
         GRIPPER_COLOR_RGB,
         physical_opening_width,
         physical_opening_widths,
+        sample_box_surface,
         sample_gripper_width,
     )
 
@@ -181,7 +185,44 @@ def create_gripper_points(
     finger_thickness: float = 0.01,
     base_thickness: float = 0.01,
     handle_length: float = 0.05,
+    opening_max_width: float | None = None,
 ) -> np.ndarray:
+    if opening_max_width is not None:
+        # Compatibility path for the legacy RLBench-aligned REAP helper. Its
+        # caller supplies a normalized opening together with the physical
+        # opening scale; the canonical v3 path below always receives metres.
+        opening_scale = float(opening_max_width)
+        width = float(np.clip(opening_width_m, 0.0, 1.0)) * opening_scale
+        boxes = [
+            (
+                np.array([width / 2.0, base_thickness, 0.0]),
+                np.array([finger_thickness, finger_length, finger_thickness]),
+            ),
+            (
+                np.array([-width / 2.0 - finger_thickness, base_thickness, 0.0]),
+                np.array([finger_thickness, finger_length, finger_thickness]),
+            ),
+            (
+                np.array([-max_width / 2.0 - finger_thickness / 2.0, 0.0, 0.0]),
+                np.array([max_width + finger_thickness, base_thickness, finger_thickness]),
+            ),
+            (
+                np.array([-base_thickness / 2.0, -handle_length, 0.0]),
+                np.array([base_thickness, handle_length, base_thickness]),
+            ),
+        ]
+        box_counts = allocate_surface_counts(count, [size for _, size in boxes])
+        sampled = [
+            sample_box_surface(min_corner, size, box_count, rng)
+            for box_count, (min_corner, size) in zip(box_counts, boxes, strict=True)
+        ]
+        points = np.vstack(sampled) if sampled else np.empty((0, 3), dtype=np.float64)
+        static_rot = R.from_euler("zyx", [np.pi / 2.0, np.pi / 2.0, 0.0]).as_matrix()
+        points = points @ static_rot.T
+        points = points + np.array([0.0, 0.0, -gripper_len])
+        pose_rot = R.from_euler("zyx", pose[3:]).as_matrix()
+        return points @ pose_rot.T + pose[:3]
+
     if not np.isclose(float(gripper_len), 0.06):
         raise ValueError("RH20T v3 fixes the EEF origin at five eighths of the 0.08 m fingers; gripper_len must be 0.06")
     parameters = CanonicalGripperParameters(
@@ -223,6 +264,80 @@ def create_panda_gripper_points(
     )
 
 
+RLBENCH_PANDA_GRIPPER_TEMPLATE = "rlbench_panda"
+RLBENCH_PANDA_GRIPPER_TEMPLATE_VERSION = "rlbench_panda_tip_ttm_v1"
+RLBENCH_MINIMAL_TWO_FINGER_TEMPLATE = "rlbench_minimal_two_finger"
+RLBENCH_MINIMAL_TWO_FINGER_TEMPLATE_VERSION = "rlbench_panda_tip_minimal_two_finger_v1"
+RLBENCH_PANDA_MAX_WIDTH = 0.08
+
+
+def resolve_gripper_geometry_max_width(
+    gripper_template: str,
+    gripper_max_width: float | None,
+    gripper_opening_max_width: float | None,
+) -> float:
+    if gripper_max_width is not None:
+        return float(gripper_max_width)
+    if str(gripper_template) == "reap" and gripper_opening_max_width is not None:
+        return 0.06
+    return 0.08
+
+
+def rlbench_panda_gripper_local_boxes(width_percent: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Approximate the RLBench Panda tip geometry in its local frame."""
+    width = float(np.clip(width_percent, 0.0, 1.0)) * RLBENCH_PANDA_MAX_WIDTH
+    half_gap = width / 2.0
+    finger_half_x = 0.0106
+    finger_depth = 0.0265
+    finger_min_z = -0.0536
+    finger_size = np.array([2.0 * finger_half_x, finger_depth, 0.0539], dtype=np.float64)
+    palm_half_x = 0.0316
+    palm_half_y = 0.1043
+    return {
+        "left_finger": (
+            np.array([-finger_half_x, -half_gap - finger_depth, finger_min_z]),
+            finger_size.copy(),
+        ),
+        "right_finger": (
+            np.array([-finger_half_x, half_gap, finger_min_z]),
+            finger_size.copy(),
+        ),
+        "palm": (
+            np.array([-palm_half_x, -palm_half_y, -0.1381]),
+            np.array([2.0 * palm_half_x, 2.0 * palm_half_y, 0.0921]),
+        ),
+    }
+
+
+def create_rlbench_panda_gripper_points(
+    width_percent: float,
+    pose: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    boxes = list(rlbench_panda_gripper_local_boxes(width_percent).values())
+    counts = allocate_surface_counts(int(count), [size for _, size in boxes])
+    points = [sample_box_surface(min_corner, size, n, rng) for n, (min_corner, size) in zip(counts, boxes)]
+    local = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
+    pose = np.asarray(pose, dtype=np.float64)
+    return local @ R.from_euler("zyx", pose[3:]).as_matrix().T + pose[:3]
+
+
+def create_rlbench_minimal_two_finger_points(
+    width_percent: float,
+    pose: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    boxes = rlbench_panda_gripper_local_boxes(width_percent)
+    finger_boxes = [boxes["left_finger"], boxes["right_finger"]]
+    counts = allocate_surface_counts(int(count), [size for _, size in finger_boxes])
+    points = [sample_box_surface(min_corner, size, n, rng) for n, (min_corner, size) in zip(counts, finger_boxes)]
+    local = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
+    pose = np.asarray(pose, dtype=np.float64)
+    return local @ R.from_euler("zyx", pose[3:]).as_matrix().T + pose[:3]
+
+
 def create_gripper_cloud_rgb(
     opening_width_m: float,
     pose: np.ndarray,
@@ -231,17 +346,42 @@ def create_gripper_cloud_rgb(
     gripper_len: float,
     gripper_template: str = "rh20t_v3",
     gripper_max_width: float = 0.08,
+    gripper_opening_max_width: float | None = None,
 ) -> np.ndarray:
-    if str(gripper_template) not in {"reap", "panda", "rh20t_v3", "canonical"}:
+    template = str(gripper_template)
+    if template == RLBENCH_MINIMAL_TWO_FINGER_TEMPLATE:
+        width_fraction = gripper_opening_fraction_from_width_m(
+            opening_width_m, RLBENCH_PANDA_MAX_WIDTH
+        )
+        points = create_rlbench_minimal_two_finger_points(width_fraction, pose, count, rng)
+    elif template == RLBENCH_PANDA_GRIPPER_TEMPLATE:
+        width_fraction = gripper_opening_fraction_from_width_m(
+            opening_width_m, RLBENCH_PANDA_MAX_WIDTH
+        )
+        points = create_rlbench_panda_gripper_points(width_fraction, pose, count, rng)
+    elif template == "reap" and gripper_opening_max_width is not None:
+        opening_scale = float(gripper_opening_max_width)
+        width_fraction = gripper_opening_fraction_from_width_m(opening_width_m, opening_scale)
+        points = create_gripper_points(
+            width_fraction,
+            pose,
+            count,
+            rng,
+            gripper_len=gripper_len,
+            max_width=float(gripper_max_width),
+            opening_max_width=opening_scale,
+        )
+    elif template not in {"reap", "panda", "rh20t_v3", "canonical"}:
         raise ValueError(f"Unsupported gripper_template={gripper_template!r}; use rh20t_v3")
-    points = create_gripper_points(
-        opening_width_m,
-        pose,
-        count,
-        rng,
-        gripper_len=gripper_len,
-        max_width=gripper_max_width,
-    )
+    else:
+        points = create_gripper_points(
+            opening_width_m,
+            pose,
+            count,
+            rng,
+            gripper_len=gripper_len,
+            max_width=gripper_max_width,
+        )
     colors = np.tile(GRIPPER_COLOR_RGB[None, :], (points.shape[0], 1))
     return np.hstack((points.astype(np.float32), colors))
 
@@ -288,6 +428,7 @@ def add_reference_gripper_cloud_to_point_cloud(
     gripper_len: float = 0.06,
     gripper_template: str = "rh20t_v3",
     gripper_max_width: float = 0.08,
+    gripper_opening_max_width: float | None = None,
     seed: int = 0,
     drop_strategy: str = "random",
     shuffle_points: bool = False,
@@ -310,6 +451,7 @@ def add_reference_gripper_cloud_to_point_cloud(
         gripper_len=float(gripper_len),
         gripper_template=str(gripper_template),
         gripper_max_width=float(gripper_max_width),
+        gripper_opening_max_width=gripper_opening_max_width,
     )
     return merge_cloud_with_gripper(
         point_cloud_reference,
@@ -334,15 +476,21 @@ def add_reference_gripper_clouds_to_episode(
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
     gripper_max_width: float | None = None,
+    gripper_opening_max_width: float | None = None,
 ) -> np.ndarray:
     """Add gripper geometry to every frame while preserving the shared reference frame."""
 
     point_clouds_reference = np.asarray(point_clouds_reference, dtype=np.float32)
     current_pose9_grippers_reference = np.asarray(current_pose9_grippers_reference, dtype=np.float32)
+    normalization_max_width = (
+        gripper_max_width
+        if gripper_max_width is not None
+        else gripper_opening_max_width
+    )
     widths = normalize_gripper_widths(
         gripper_widths,
         already_normalized=widths_are_normalized,
-        max_physical_width=gripper_max_width,
+        max_physical_width=normalization_max_width,
     )
     if len(point_clouds_reference) != len(current_pose9_grippers_reference):
         raise ValueError(
@@ -364,7 +512,12 @@ def add_reference_gripper_clouds_to_episode(
             gripper_points=gripper_points,
             gripper_len=gripper_len,
             gripper_template=gripper_template,
-            gripper_max_width=float(gripper_max_width or 0.08),
+            gripper_max_width=resolve_gripper_geometry_max_width(
+                gripper_template,
+                gripper_max_width,
+                gripper_opening_max_width,
+            ),
+            gripper_opening_max_width=gripper_opening_max_width,
             seed=seed + frame_idx,
             drop_strategy=drop_strategy,
             shuffle_points=shuffle_points,
@@ -381,6 +534,7 @@ def add_local_gripper_cloud_to_point_cloud(
     gripper_len: float = 0.06,
     gripper_template: str = "rh20t_v3",
     gripper_max_width: float = 0.08,
+    gripper_opening_max_width: float | None = None,
     seed: int = 0,
     drop_strategy: str = "random",
     shuffle_points: bool = False,
@@ -400,6 +554,7 @@ def add_local_gripper_cloud_to_point_cloud(
         gripper_len=float(gripper_len),
         gripper_template=str(gripper_template),
         gripper_max_width=float(gripper_max_width),
+        gripper_opening_max_width=gripper_opening_max_width,
     )
     return merge_cloud_with_gripper(
         point_cloud_eff,
@@ -423,12 +578,18 @@ def add_local_gripper_clouds_to_episode(
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
     gripper_max_width: float | None = None,
+    gripper_opening_max_width: float | None = None,
 ) -> np.ndarray:
     point_clouds_eff = np.asarray(point_clouds_eff, dtype=np.float32)
+    normalization_max_width = (
+        gripper_max_width
+        if gripper_max_width is not None
+        else gripper_opening_max_width
+    )
     widths = normalize_gripper_widths(
         gripper_widths,
         already_normalized=widths_are_normalized,
-        max_physical_width=gripper_max_width,
+        max_physical_width=normalization_max_width,
     )
     if len(point_clouds_eff) != len(widths):
         raise ValueError(f"Point cloud frames {len(point_clouds_eff)} != gripper widths {len(widths)}")
@@ -441,7 +602,12 @@ def add_local_gripper_clouds_to_episode(
             gripper_points=gripper_points,
             gripper_len=gripper_len,
             gripper_template=gripper_template,
-            gripper_max_width=float(gripper_max_width or 0.08),
+            gripper_max_width=resolve_gripper_geometry_max_width(
+                gripper_template,
+                gripper_max_width,
+                gripper_opening_max_width,
+            ),
+            gripper_opening_max_width=gripper_opening_max_width,
             seed=seed + frame_idx,
             drop_strategy=drop_strategy,
             shuffle_points=shuffle_points,
@@ -570,6 +736,7 @@ def add_world_gripper_cloud_to_point_cloud(
     gripper_len: float = 0.06,
     gripper_template: str = "rh20t_v3",
     gripper_max_width: float = 0.08,
+    gripper_opening_max_width: float | None = None,
     seed: int = 0,
     drop_strategy: str = "random",
     shuffle_points: bool = False,
@@ -583,6 +750,7 @@ def add_world_gripper_cloud_to_point_cloud(
         gripper_len=float(gripper_len),
         gripper_template=str(gripper_template),
         gripper_max_width=float(gripper_max_width),
+        gripper_opening_max_width=gripper_opening_max_width,
         seed=seed,
         drop_strategy=drop_strategy,
         shuffle_points=shuffle_points,
@@ -604,13 +772,19 @@ def add_world_gripper_clouds_to_episode(
     shuffle_points: bool = False,
     widths_are_normalized: bool = False,
     gripper_max_width: float | None = None,
+    gripper_opening_max_width: float | None = None,
 ) -> np.ndarray:
     point_clouds_world = np.asarray(point_clouds_world, dtype=np.float32)
     current_pose9_grippers = np.asarray(current_pose9_grippers, dtype=np.float32)
+    normalization_max_width = (
+        gripper_max_width
+        if gripper_max_width is not None
+        else gripper_opening_max_width
+    )
     widths = normalize_gripper_widths(
         gripper_widths,
         already_normalized=widths_are_normalized,
-        max_physical_width=gripper_max_width,
+        max_physical_width=normalization_max_width,
     )
     if len(point_clouds_world) != len(current_pose9_grippers):
         raise ValueError(
@@ -631,7 +805,12 @@ def add_world_gripper_clouds_to_episode(
             gripper_points=gripper_points,
             gripper_len=gripper_len,
             gripper_template=gripper_template,
-            gripper_max_width=float(gripper_max_width or 0.08),
+            gripper_max_width=resolve_gripper_geometry_max_width(
+                gripper_template,
+                gripper_max_width,
+                gripper_opening_max_width,
+            ),
+            gripper_opening_max_width=gripper_opening_max_width,
             seed=seed + frame_idx,
             drop_strategy=drop_strategy,
             shuffle_points=shuffle_points,

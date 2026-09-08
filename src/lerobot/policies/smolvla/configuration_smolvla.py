@@ -32,6 +32,7 @@ RGB_CAMERA_VIEW_ALIASES = {
             "agentview",
             "external",
             "external_camera",
+            "front",
             "overhead",
             "overhead_camera",
             "overview",
@@ -1436,7 +1437,7 @@ class SmolVLAConfig(PreTrainedConfig):
             text = str(value).strip().strip("[]")
             parts = [part.strip().strip("\"'") for part in text.split(",")]
         views = tuple(part for part in parts if part) or ("agentview",)
-        supported = {"agentview", "robot0_eye_in_hand"}
+        supported = {"agentview", "front", "robot0_eye_in_hand"}
         unknown = [view for view in views if view not in supported]
         if unknown:
             raise ValueError(

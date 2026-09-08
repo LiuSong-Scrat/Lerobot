@@ -575,6 +575,9 @@ def song_pointseg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 POINT_CLOUD_VIEW_DIRS = {
     "agentview": "point_clouds",
+    # RLBench stores its external/front-camera cloud in the same canonical
+    # directory that LIBERO calls ``agentview``.
+    "front": "point_clouds",
     "robot0_eye_in_hand": "point_clouds_robot0_eye_in_hand",
 }
 
