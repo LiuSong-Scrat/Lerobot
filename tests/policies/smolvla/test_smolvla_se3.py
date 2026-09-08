@@ -1994,6 +1994,19 @@ def test_world_eef_trajectory_requires_independent_token_only_contract():
     assert "worldflow_targets=world_eef_trajectory" in cfg.flow_contract_summary()
     assert "worldflow_reference=robot_base" in cfg.flow_contract_summary()
 
+    camera_world_cfg = SmolVLAConfig(
+        worldflow_enable=True,
+        worldflow_target_type="world_eef_trajectory",
+        worldflow_reference_frame="pointcloud_reference_camera",
+        worldflow_frame_origin="global",
+        worldflow_scene_frame_origin="global",
+        worldflow_noise_coupling="independent",
+        worldflow_action_fusion="cross_attention",
+        worldflow_bridge_loss_weight=0.0,
+        worldflow_equiv_loss_weight=0.0,
+    )
+    assert "worldflow_reference=pointcloud_reference_camera" in camera_world_cfg.flow_contract_summary()
+
     shared_expert_cfg = SmolVLAConfig(
         worldflow_enable=True,
         worldflow_target_type="world_eef_trajectory",

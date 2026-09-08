@@ -28,6 +28,7 @@ from lerobot.policies.smolvla.song_pointseg import (
 
 if __package__ and __package__.startswith("benchmarks."):
     from .._paths import DEFAULT_LIBERO_CONFIG, LIBERO_DATA_ROOT, load_json_config
+    from ..virtual_gripper_geometry import GRIPPER_CONTRACT
     from .libero_pointcloud_utils import (
         add_reference_gripper_clouds_to_episode,
         ensure_libero_config,
@@ -45,6 +46,7 @@ if __package__ and __package__.startswith("benchmarks."):
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import DEFAULT_LIBERO_CONFIG, LIBERO_DATA_ROOT, load_json_config
+    from virtual_gripper_geometry import GRIPPER_CONTRACT
     from libero_setting.libero_pointcloud_utils import (
         add_reference_gripper_clouds_to_episode,
         ensure_libero_config,
@@ -489,6 +491,13 @@ def write_point_cloud_meta(
             "contains_gripper_template": True,
             "gripper_points": int(gripper_points),
             "gripper_at_tail": True,
+            "virtual_gripper_contract": GRIPPER_CONTRACT,
+            "virtual_gripper_template": "rh20t_canonical_four_box_v3",
+            "virtual_gripper_color_rgb": [255, 0, 0],
+            "virtual_gripper_width_unit": "meter",
+            "virtual_gripper_width_semantics": "clear_gap_between_inner_finger_faces",
+            "virtual_gripper_width_normalized_for_geometry": False,
+            "virtual_gripper_palm_width_m": 0.10,
         }
         if storage == "zarr":
             meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
@@ -1138,7 +1147,7 @@ def export_episode_preview(episode: dict[str, Any], vis_dir: Path, record: dict[
         "render_camera_names": rendered_camera_names(cfg),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
-        "gripper_template": str(cfg.get("gripper_template", "reap")),
+        "gripper_template": str(cfg.get("gripper_template", "rh20t_v3")),
         "files": {
             "umi_action_trajectory": "umi_action_trajectory.ply",
             "umi_observation_state_trajectory": "umi_observation_state_trajectory.ply",
@@ -1857,7 +1866,7 @@ def collect_demo_episode(
                     total_points=int(cfg["num_points"]),
                     gripper_points=int(cfg.get("gripper_points", 500)),
                     gripper_len=float(cfg.get("gripper_len", 0.06)),
-                    gripper_template=str(cfg.get("gripper_template", "reap")),
+                    gripper_template=str(cfg.get("gripper_template", "rh20t_v3")),
                     seed=episode_seed,
                     # Multi-view composition relies on one addressable gripper tail.
                     drop_strategy="tail",
@@ -2383,7 +2392,7 @@ def main() -> None:
         "image_feature_keys": cfg.get("image_feature_keys", []),
         "add_gripper_cloud": bool(cfg.get("add_gripper_cloud", True)),
         "gripper_points": int(cfg.get("gripper_points", 500)),
-        "gripper_template": str(cfg.get("gripper_template", "reap")),
+        "gripper_template": str(cfg.get("gripper_template", "rh20t_v3")),
         "point_cloud_storage": str(cfg.get("point_cloud_storage", "zarr")),
         "point_cloud_zarr_encoding": "packed_xyz_float16_rgb_uint8",
         "zarr_compression_level": int(cfg.get("zarr_compression_level", 3)),

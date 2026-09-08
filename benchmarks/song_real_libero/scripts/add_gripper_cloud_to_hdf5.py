@@ -10,134 +10,103 @@ from scipy.spatial.transform import Rotation as R
 
 if __package__ and __package__.startswith("benchmarks."):
     from ._paths import REAL_DATA_ROOT
+    from .virtual_gripper_geometry import (
+        CanonicalGripperParameters,
+        GRIPPER_COLOR_RGB,
+        GRIPPER_CONTRACT,
+        allocate_surface_counts,
+        physical_opening_widths,
+        sample_gripper_width,
+    )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _paths import REAL_DATA_ROOT
+    from virtual_gripper_geometry import (
+        CanonicalGripperParameters,
+        GRIPPER_COLOR_RGB,
+        GRIPPER_CONTRACT,
+        allocate_surface_counts,
+        physical_opening_widths,
+        sample_gripper_width,
+    )
 
 
-DEFAULT_INPUT_DIR = REAL_DATA_ROOT / "temp/hdf5_without_gripper"
-DEFAULT_OUTPUT_DIR = REAL_DATA_ROOT / "temp/hdf5_with_gripper"
+DEFAULT_INPUT_DIR = "/opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/hdf5_raw/fold/temp_num2"
+DEFAULT_OUTPUT_DIR = "/opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/hdf5_raw/fold/hdf5_with_gripper"
+RH20T_GRIPPER_CONTRACT = GRIPPER_CONTRACT
+RH20T_TOTAL_POINTS = 50_000
+RH20T_GRIPPER_POINTS = 500
+# StaticFranka recordings and LIBERO use the Franka 0.08 m physical opening.
+# Other RH20T hardware profiles may override this explicitly (for example
+# Robotiq 2F-85 with ``--gripper-max-width-m 0.085``).
+DEFAULT_GRIPPER_MAX_WIDTH_M = 0.08
+RH20T_GRIPPER_COLOR_RGB = GRIPPER_COLOR_RGB
 
 
 def natural_key(path):
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
 
 
-def normalize_widths(eff_angular, already_normalized=False):
-    widths = np.asarray(eff_angular, dtype=np.float32).reshape(-1).copy()
-    if already_normalized:
-        return np.clip(widths, 0.0, 1.0)
+def achieved_gripper_widths(eff_angular, already_normalized=False, max_width_m=DEFAULT_GRIPPER_MAX_WIDTH_M):
+    """Return achieved physical two-finger clear-gap widths in metres.
 
-    width_range = widths.max() - widths.min()
-    if width_range != 0:
-        widths = (widths - widths.min()) / width_range
-    else:
-        widths[widths >= 0] = 1.0
-    return np.clip(widths, 0.0, 1.0)
+    This follows the RH20T v3 observation rule: virtual geometry is driven by
+    the achieved opening, clipped to a fixed physical device limit, rather than
+    by per-episode min/max normalization.  Human-hand HDF5 ``eff_angular`` is
+    already an achieved parallel-jaw opening in metres.
+    """
 
-
-def allocate_counts(total, weights):
-    weights = np.asarray(weights, dtype=np.float64)
-    if total <= 0:
-        return np.zeros(len(weights), dtype=np.int64)
-    if weights.sum() <= 0:
-        counts = np.zeros(len(weights), dtype=np.int64)
-        counts[:total] = 1
-        return counts
-
-    expected = total * weights / weights.sum()
-    counts = np.floor(expected).astype(np.int64)
-    remainder = total - counts.sum()
-    if remainder > 0:
-        order = np.argsort(expected - counts)[::-1]
-        counts[order[:remainder]] += 1
-    return counts
+    return physical_opening_widths(
+        eff_angular,
+        already_normalized=already_normalized,
+        max_width_m=max_width_m,
+    )
 
 
-def box_faces(min_corner, size):
-    sx, sy, sz = size
-    x0, y0, z0 = min_corner
-    x1, y1, z1 = min_corner + size
-    return [
-        (sy * sz, np.array([x0, y0, z0]), np.array([0.0, sy, 0.0]), np.array([0.0, 0.0, sz])),
-        (sy * sz, np.array([x1, y0, z0]), np.array([0.0, sy, 0.0]), np.array([0.0, 0.0, sz])),
-        (sx * sz, np.array([x0, y0, z0]), np.array([sx, 0.0, 0.0]), np.array([0.0, 0.0, sz])),
-        (sx * sz, np.array([x0, y1, z0]), np.array([sx, 0.0, 0.0]), np.array([0.0, 0.0, sz])),
-        (sx * sy, np.array([x0, y0, z0]), np.array([sx, 0.0, 0.0]), np.array([0.0, sy, 0.0])),
-        (sx * sy, np.array([x0, y0, z1]), np.array([sx, 0.0, 0.0]), np.array([0.0, sy, 0.0])),
-    ]
+def reap_gripper_template(opening_width_m, count, rng, gripper_len=0.06, max_width_m=DEFAULT_GRIPPER_MAX_WIDTH_M):
+    """Compatibility entry point for the canonical RH20T v3 local template."""
+
+    if not np.isclose(float(gripper_len), 0.06):
+        raise ValueError("RH20T v3 fixes the EEF origin; gripper_len must remain 0.06")
+    parameters = CanonicalGripperParameters(max_width_m=float(max_width_m))
+    return sample_gripper_width(opening_width_m, count, rng, parameters=parameters)
 
 
-def sample_box_surface(min_corner, size, count, rng):
-    faces = box_faces(np.asarray(min_corner, dtype=np.float64), np.asarray(size, dtype=np.float64))
-    counts = allocate_counts(count, [face[0] for face in faces])
-    samples = []
-    for face_count, (_, origin, axis_a, axis_b) in zip(counts, faces):
-        if face_count == 0:
-            continue
-        uv = rng.random((face_count, 2), dtype=np.float64)
-        samples.append(origin + uv[:, :1] * axis_a + uv[:, 1:] * axis_b)
-    if not samples:
-        return np.empty((0, 3), dtype=np.float64)
-    return np.vstack(samples)
+def transform_eef_template_to_reference(points_eef, eef_pose):
+    """Apply T_reference<-EEF using [x,y,z,euler_zyx] achieved EEF pose."""
 
-
-def create_gripper_points(
-    width_percent,
-    pose,
-    count,
-    rng,
-    gripper_len=0.06,
-    max_width=0.06,
-    finger_length=0.08,
-    finger_thickness=0.01,
-    base_thickness=0.01,
-    handle_length=0.05,
-):
-    width = float(width_percent) * max_width
-    boxes = [
-        (
-            np.array([width / 2.0, base_thickness, 0.0]),
-            np.array([finger_thickness, finger_length, finger_thickness]),
-        ),
-        (
-            np.array([-width / 2.0 - finger_thickness, base_thickness, 0.0]),
-            np.array([finger_thickness, finger_length, finger_thickness]),
-        ),
-        (
-            np.array([-max_width / 2.0 - finger_thickness / 2.0, 0.0, 0.0]),
-            np.array([max_width + finger_thickness, base_thickness, finger_thickness]),
-        ),
-        (
-            np.array([-base_thickness / 2.0, -handle_length, 0.0]),
-            np.array([base_thickness, handle_length, base_thickness]),
-        ),
-    ]
-
-    box_areas = [2.0 * (size[0] * size[1] + size[0] * size[2] + size[1] * size[2]) for _, size in boxes]
-    box_counts = allocate_counts(count, box_areas)
-    points = []
-    for box_count, (min_corner, size) in zip(box_counts, boxes):
-        points.append(sample_box_surface(min_corner, size, box_count, rng))
-    points = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
-
-    static_rot = R.from_euler("zyx", [np.pi / 2.0, np.pi / 2.0, 0.0]).as_matrix()
+    points_eef = np.asarray(points_eef, dtype=np.float64)
+    pose = np.asarray(eef_pose, dtype=np.float64)
+    if points_eef.ndim != 2 or points_eef.shape[1] != 3:
+        raise ValueError(f"EEF template must have shape (N, 3), got {points_eef.shape}")
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise ValueError(f"EEF pose must be one finite [x,y,z,euler_zyx] vector, got {pose}")
     pose_rot = R.from_euler("zyx", pose[3:]).as_matrix()
-    points = points @ static_rot.T + np.array([0.0, 0.0, -gripper_len])
-    points = points @ pose_rot.T + pose[:3]
-    return points
+    # Safe row-vector form: p_reference = p_eef @ R.T + t.
+    return points_eef @ pose_rot.T + pose[:3]
 
 
-def create_gripper_cloud_rgb(width_percent, pose, count, rng, gripper_len):
-    points = create_gripper_points(width_percent, pose, count, rng, gripper_len=gripper_len)
-    colors = np.tile(np.array([[204.0, 51.0, 51.0]], dtype=np.float32), (points.shape[0], 1))
+def create_gripper_points(opening_width_m, eef_pose, count, rng, gripper_len=0.06, max_width_m=DEFAULT_GRIPPER_MAX_WIDTH_M):
+    template_eef = reap_gripper_template(
+        opening_width_m, count, rng, gripper_len=gripper_len, max_width_m=max_width_m
+    )
+    return transform_eef_template_to_reference(template_eef, eef_pose)
+
+
+def create_gripper_cloud_rgb(opening_width_m, pose, count, rng, gripper_len, max_width_m=DEFAULT_GRIPPER_MAX_WIDTH_M):
+    points = create_gripper_points(
+        opening_width_m, pose, count, rng, gripper_len=gripper_len, max_width_m=max_width_m
+    )
+    colors = np.tile(RH20T_GRIPPER_COLOR_RGB[None, :], (points.shape[0], 1))
     return np.hstack((points.astype(np.float32), colors))
 
 
-def create_gripper_cloud_rgb_batch(widths, poses, count, rng, gripper_len):
+def create_gripper_cloud_rgb_batch(widths, poses, count, rng, gripper_len, max_width_m=DEFAULT_GRIPPER_MAX_WIDTH_M):
     gripper_clouds = np.empty((len(poses), count, 6), dtype=np.float32)
     for idx, (width, pose) in enumerate(zip(widths, poses)):
-        gripper_clouds[idx] = create_gripper_cloud_rgb(width, pose, count, rng, gripper_len)
+        gripper_clouds[idx] = create_gripper_cloud_rgb(
+            width, pose, count, rng, gripper_len, max_width_m=max_width_m
+        )
     return gripper_clouds
 
 
@@ -262,24 +231,77 @@ def choose_batch_frames(dataset, batch_frames):
     return 16
 
 
-def process_cloud_dataset(read_ds, write_ds, poses, widths, args, rng):
+def write_cloud_contract_attrs(dataset, args, widths_m):
+    dataset.attrs["virtual_gripper_contract"] = RH20T_GRIPPER_CONTRACT
+    dataset.attrs["virtual_gripper_template"] = "rh20t_canonical_four_box_v3"
+    dataset.attrs["virtual_gripper_pose_source"] = args.pose_path
+    dataset.attrs["virtual_gripper_pose_representation"] = "xyz_euler_zyx"
+    dataset.attrs["virtual_gripper_width_source"] = args.eff_angular_path
+    dataset.attrs["virtual_gripper_width_source_unit"] = (
+        "normalized_fraction" if args.eff_angular_is_normalized else "meter"
+    )
+    dataset.attrs["virtual_gripper_width_geometry_unit"] = "meter"
+    dataset.attrs["virtual_gripper_width_geometry_semantics"] = "clear_gap_between_inner_finger_faces"
+    dataset.attrs["virtual_gripper_palm_width_m"] = 0.10
+    dataset.attrs["virtual_gripper_width_normalized_for_geometry"] = False
+    dataset.attrs["virtual_gripper_width_max_m"] = float(args.gripper_max_width_m)
+    dataset.attrs["virtual_gripper_width_min_m"] = float(np.min(widths_m))
+    dataset.attrs["virtual_gripper_width_observed_max_m"] = float(np.max(widths_m))
+    dataset.attrs["virtual_gripper_points"] = int(args.gripper_points)
+    dataset.attrs["virtual_gripper_color_rgb"] = RH20T_GRIPPER_COLOR_RGB.astype(np.uint8)
+    dataset.attrs["point_cloud_layout"] = (
+        f"scene={dataset.shape[1] - int(args.gripper_points)}, "
+        f"virtual_gripper_tail={int(args.gripper_points)}"
+    )
+
+
+def write_file_contract_attrs(h5_file, args, widths_m):
+    h5_file.attrs["virtual_gripper_contract"] = RH20T_GRIPPER_CONTRACT
+    h5_file.attrs["virtual_gripper_template"] = "rh20t_canonical_four_box_v3"
+    h5_file.attrs["virtual_gripper_pose_source"] = args.pose_path
+    h5_file.attrs["virtual_gripper_pose_semantics"] = "achieved_eef_pose"
+    h5_file.attrs["virtual_gripper_width_source"] = args.eff_angular_path
+    h5_file.attrs["virtual_gripper_width_semantics"] = "achieved_opening"
+    h5_file.attrs["virtual_gripper_width_geometry_unit"] = "meter"
+    h5_file.attrs["virtual_gripper_width_geometry_semantics"] = "clear_gap_between_inner_finger_faces"
+    h5_file.attrs["virtual_gripper_palm_width_m"] = 0.10
+    h5_file.attrs["virtual_gripper_width_normalized_for_geometry"] = False
+    h5_file.attrs["virtual_gripper_width_max_m"] = float(args.gripper_max_width_m)
+    h5_file.attrs["virtual_gripper_width_min_m"] = float(np.min(widths_m))
+    h5_file.attrs["virtual_gripper_width_observed_max_m"] = float(np.max(widths_m))
+    h5_file.attrs["virtual_gripper_points"] = int(args.gripper_points)
+    h5_file.attrs["point_cloud_total_points"] = RH20T_TOTAL_POINTS
+    h5_file.attrs["point_cloud_scene_points"] = RH20T_TOTAL_POINTS - int(args.gripper_points)
+    h5_file.attrs["point_cloud_layout"] = (
+        f"scene={RH20T_TOTAL_POINTS - int(args.gripper_points)}, "
+        f"virtual_gripper_tail={int(args.gripper_points)}"
+    )
+
+
+def process_cloud_dataset(read_ds, write_ds, poses, widths_m, args, rng):
     if read_ds.ndim != 3 or read_ds.shape[-1] != 6:
         raise ValueError(f"cloud dataset must have shape (T, N, 6), got {read_ds.shape}")
     if read_ds.shape[0] != poses.shape[0]:
         raise ValueError(f"cloud frame count {read_ds.shape[0]} != pose frame count {poses.shape[0]}")
 
     original_points_per_frame = read_ds.shape[1]
-    gripper_points = min(args.gripper_points, original_points_per_frame)
+    if original_points_per_frame != RH20T_TOTAL_POINTS:
+        raise ValueError(
+            f"RH20T contract requires {RH20T_TOTAL_POINTS} total points per frame, "
+            f"got {original_points_per_frame} in {read_ds.name}"
+        )
+    gripper_points = int(args.gripper_points)
     batch_frames = choose_batch_frames(read_ds, args.batch_frames)
     for start in range(0, read_ds.shape[0], batch_frames):
         end = min(start + batch_frames, read_ds.shape[0])
         original_block = read_ds[start:end]
         gripper_block = create_gripper_cloud_rgb_batch(
-            widths[start:end],
+            widths_m[start:end],
             poses[start:end],
             gripper_points,
             rng,
             gripper_len=args.gripper_len,
+            max_width_m=args.gripper_max_width_m,
         )
         write_ds[start:end] = merge_cloud_block_with_gripper(
             original_block,
@@ -288,10 +310,20 @@ def process_cloud_dataset(read_ds, write_ds, poses, widths, args, rng):
             drop_strategy=args.drop_strategy,
             shuffle_points=args.shuffle and not args.no_shuffle,
         )
+    write_cloud_contract_attrs(write_ds, args, widths_m)
     return read_ds.shape[0], original_points_per_frame, gripper_points
 
 
-def process_camera_dataset(cloud_group, camera_name, aliases, selected_names, poses, widths, args, rng):
+def process_camera_dataset(
+    cloud_group,
+    camera_name,
+    aliases,
+    selected_names,
+    poses,
+    widths_m,
+    args,
+    rng,
+):
     cloud_ds = cloud_group[camera_name]
     unselected_aliases = [name for name in aliases if name not in selected_names]
 
@@ -302,12 +334,16 @@ def process_camera_dataset(cloud_group, camera_name, aliases, selected_names, po
             suffix += 1
             tmp_name = f"__tmp_with_gripper_{camera_name}_{suffix}"
         new_ds = create_like_dataset(cloud_group, tmp_name, cloud_ds)
-        stats = process_cloud_dataset(cloud_ds, new_ds, poses, widths, args, rng)
+        stats = process_cloud_dataset(
+            cloud_ds, new_ds, poses, widths_m, args, rng
+        )
         del cloud_group[camera_name]
         cloud_group.move(tmp_name, camera_name)
         return stats, f"{camera_name} (separated from aliases: {','.join(unselected_aliases)})"
 
-    stats = process_cloud_dataset(cloud_ds, cloud_ds, poses, widths, args, rng)
+    stats = process_cloud_dataset(
+        cloud_ds, cloud_ds, poses, widths_m, args, rng
+    )
     selected_aliases = [name for name in aliases if name in selected_names]
     return stats, ",".join(selected_aliases)
 
@@ -372,12 +408,17 @@ def add_gripper_to_new_file(src_path, dst_path, args, rng):
             copy_group_except(src_file, dst_file, "", args.cloud_group_path)
 
             poses = src_file[args.pose_path][:].astype(np.float32)
-            widths = normalize_widths(
+            widths_m = achieved_gripper_widths(
                 src_file[args.eff_angular_path][:],
                 already_normalized=args.eff_angular_is_normalized,
+                max_width_m=args.gripper_max_width_m,
             )
-            if poses.shape[0] != widths.shape[0]:
-                raise ValueError(f"pose frame count {poses.shape[0]} != eff_angular frame count {widths.shape[0]}")
+            if poses.ndim != 2 or poses.shape[1] != 6:
+                raise ValueError(f"achieved EEF poses must have shape (T, 6), got {poses.shape}")
+            if poses.shape[0] != widths_m.shape[0]:
+                raise ValueError(
+                    f"pose frame count {poses.shape[0]} != eff_angular frame count {widths_m.shape[0]}"
+                )
 
             src_cloud_group = src_file[args.cloud_group_path]
             dst_cloud_group = ensure_group_path(dst_file, args.cloud_group_path, src_file)
@@ -398,7 +439,14 @@ def add_gripper_to_new_file(src_path, dst_path, args, rng):
                 source_name = selected_aliases[0]
                 src_ds = src_cloud_group[source_name]
                 dst_ds = create_like_dataset(dst_cloud_group, source_name, src_ds, args)
-                stats = process_cloud_dataset(src_ds, dst_ds, poses, widths, args, rng)
+                stats = process_cloud_dataset(
+                    src_ds,
+                    dst_ds,
+                    poses,
+                    widths_m,
+                    args,
+                    rng,
+                )
                 for alias in selected_aliases[1:]:
                     dst_cloud_group[alias] = dst_ds
 
@@ -410,6 +458,7 @@ def add_gripper_to_new_file(src_path, dst_path, args, rng):
                     f"[OK] {dst_path.name}: {label}, frames={frames}, "
                     f"points/frame={original_points_per_frame}, gripper_points/frame={gripper_points}"
                 )
+            write_file_contract_attrs(dst_file, args, widths_m)
     except Exception:
         if dst_path.exists():
             dst_path.unlink()
@@ -435,9 +484,10 @@ def add_gripper_to_file(src_path, dst_path, args, rng):
             raise KeyError(f"{args.cloud_group_path} not found in {dst_path}")
 
         poses = h5_file[args.pose_path][:].astype(np.float32)
-        widths = normalize_widths(
+        widths_m = achieved_gripper_widths(
             h5_file[args.eff_angular_path][:],
             already_normalized=args.eff_angular_is_normalized,
+            max_width_m=args.gripper_max_width_m,
         )
         cloud_group = h5_file[args.cloud_group_path]
         camera_names = selected_camera_names(cloud_group, args.camera)
@@ -445,8 +495,12 @@ def add_gripper_to_file(src_path, dst_path, args, rng):
         selected_names = set(camera_names)
         processed_addrs = set()
 
-        if poses.shape[0] != widths.shape[0]:
-            raise ValueError(f"pose frame count {poses.shape[0]} != eff_angular frame count {widths.shape[0]}")
+        if poses.ndim != 2 or poses.shape[1] != 6:
+            raise ValueError(f"achieved EEF poses must have shape (T, 6), got {poses.shape}")
+        if poses.shape[0] != widths_m.shape[0]:
+            raise ValueError(
+                f"pose frame count {poses.shape[0]} != eff_angular frame count {widths_m.shape[0]}"
+            )
 
         for camera_name in camera_names:
             cloud_ds = cloud_group[camera_name]
@@ -456,7 +510,14 @@ def add_gripper_to_file(src_path, dst_path, args, rng):
             if addr in processed_addrs and not unselected_aliases:
                 continue
             stats, label = process_camera_dataset(
-                cloud_group, camera_name, aliases, selected_names, poses, widths, args, rng
+                cloud_group,
+                camera_name,
+                aliases,
+                selected_names,
+                poses,
+                widths_m,
+                args,
+                rng,
             )
             frames, original_points_per_frame, gripper_points = stats
             print(
@@ -465,6 +526,7 @@ def add_gripper_to_file(src_path, dst_path, args, rng):
             )
             if not unselected_aliases:
                 processed_addrs.add(addr)
+        write_file_contract_attrs(h5_file, args, widths_m)
     return True
 
 
@@ -486,9 +548,32 @@ def parse_args():
     parser.add_argument("--cloud-group-path", default="observations/cloud_rgb")
     parser.add_argument("--pose-path", default="observations/pose_eular")
     parser.add_argument("--eff-angular-path", default="observations/eff_angular")
-    parser.add_argument("--gripper-points", type=int, default=500, help="Gripper points added per frame.")
+    parser.add_argument(
+        "--gripper-points",
+        type=int,
+        default=RH20T_GRIPPER_POINTS,
+        help=(
+            "Virtual-gripper points reserved at the tail of the fixed 50,000-point budget. "
+            f"RH20T v3 requires {RH20T_GRIPPER_POINTS}."
+        ),
+    )
     parser.add_argument("--gripper-len", type=float, default=0.06, help="Offset used by Stage2Editing.update_gripper.")
-    parser.add_argument("--eff-angular-is-normalized", action="store_true", help="Use eff_angular directly as width_percent.")
+    parser.add_argument(
+        "--gripper-max-width-m",
+        type=float,
+        default=DEFAULT_GRIPPER_MAX_WIDTH_M,
+        help=(
+            "Physical achieved-opening limit in metres. Metre-valued eff_angular is passed directly to "
+            "geometry and only clipped at this device limit; it is never normalized. "
+            f"Default: {DEFAULT_GRIPPER_MAX_WIDTH_M} m for StaticFranka/LIBERO; "
+            "override it for another physical gripper profile."
+        ),
+    )
+    parser.add_argument(
+        "--eff-angular-is-normalized",
+        action="store_true",
+        help="Interpret eff_angular as [0,1] achieved-opening fractions instead of metres.",
+    )
     parser.add_argument(
         "--drop-strategy",
         choices=["random", "tail", "near_gripper"],
@@ -522,6 +607,18 @@ def process_one_file(task):
 
 def main():
     args = parse_args()
+    if args.gripper_points != RH20T_GRIPPER_POINTS:
+        raise ValueError(
+            f"RH20T v3 requires exactly {RH20T_GRIPPER_POINTS} virtual-gripper points, "
+            f"got {args.gripper_points}"
+        )
+    if args.drop_strategy != "tail" or (args.shuffle and not args.no_shuffle):
+        raise ValueError(
+            "RH20T v3 requires an ordered point cloud with scene points first and the virtual "
+            "gripper in the fixed tail; use --drop-strategy tail without --shuffle."
+        )
+    if not np.isclose(float(args.gripper_len), 0.06):
+        raise ValueError(f"RH20T v3 canonical template requires --gripper-len 0.06, got {args.gripper_len}")
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     files = iter_hdf5_files(input_dir, args.pattern, args.max_files)
@@ -533,7 +630,9 @@ def main():
     print("Output: in-place" if args.in_place else f"Output: {output_dir}")
     print(f"Files: {len(files)}")
     print(f"Camera: {args.camera}")
+    print(f"Gripper contract: {RH20T_GRIPPER_CONTRACT}")
     print(f"Gripper points/frame: {args.gripper_points}")
+    print(f"Gripper max achieved width: {args.gripper_max_width_m} m")
     print(f"Drop strategy: {args.drop_strategy}, shuffle: {args.shuffle and not args.no_shuffle}")
     print(f"Output compression: {args.output_compression}")
     print(f"Workers: {args.num_workers}")

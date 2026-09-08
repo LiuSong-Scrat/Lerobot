@@ -198,7 +198,7 @@ if __package__ and __package__.startswith("benchmarks."):
         fast_inverse_homogeneous,
         get_task_init_states,
         gripper_scalar,
-        gripper_width_percent_from_scalar,
+        gripper_opening_fraction_from_width_m,
         make_libero_env,
         normalize_render_camera_name,
         observation_to_model_point_cloud,
@@ -218,7 +218,7 @@ else:
         fast_inverse_homogeneous,
         get_task_init_states,
         gripper_scalar,
-        gripper_width_percent_from_scalar,
+        gripper_opening_fraction_from_width_m,
         make_libero_env,
         normalize_render_camera_name,
         observation_to_model_point_cloud,
@@ -4246,7 +4246,7 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
         add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
         gripper_points=int(cfg.get("gripper_points", 500)),
         gripper_len=float(cfg.get("gripper_len", 0.06)),
-        gripper_template=str(cfg.get("gripper_template", "reap")),
+        gripper_template=str(cfg.get("gripper_template", "rh20t_v3")),
         gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         # Multi-view training relies on a single addressable gripper tail.
         gripper_drop_strategy=(
@@ -7027,7 +7027,7 @@ def run_episode(
                 add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
                 gripper_points=int(cfg.get("gripper_points", 500)),
                 gripper_len=float(cfg.get("gripper_len", 0.06)),
-                gripper_template=str(cfg.get("gripper_template", "reap")),
+                gripper_template=str(cfg.get("gripper_template", "rh20t_v3")),
                 gripper_max_width=gripper_max_width,
                 # compose_point_cloud_views() and dataset generation both
                 # require scene-first / gripper-tail layout in multi-view mode.
@@ -7400,7 +7400,7 @@ def run_episode(
                         )
                         gripper_absolute_position_normalized_targets.append(normalized)
                     gripper_width_pcts.append(
-                        gripper_width_percent_from_scalar(
+                        gripper_opening_fraction_from_width_m(
                             float(row[-1]), max_physical_width=gripper_max_width
                         )
                     )

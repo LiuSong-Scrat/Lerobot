@@ -7,7 +7,11 @@ import torch
 from torch import nn
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.configuration_smolvla import (
+    SmolVLAConfig,
+    canonical_rgb_camera_view_name,
+    resolve_rgb_camera_feature_aliases,
+)
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, VLAFlowMatching
 
 
@@ -55,6 +59,25 @@ def test_adapter_config_enforces_pretrained_frozen_vlm():
     assert config.load_vlm_weights
     assert config.train_expert_only
     assert config.freeze_vision_encoder
+
+
+def test_agentview_rgb_selection_accepts_overhead_dataset_feature():
+    config = SmolVLAConfig(rgb_camera_views="agentview")
+    overhead_key = "observation.images.overhead"
+    hand_key = "observation.images.hand"
+    config.input_features = {
+        overhead_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+        hand_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+    }
+
+    config.validate_features()
+
+    assert set(config.image_features) == {overhead_key}
+    assert canonical_rgb_camera_view_name("overhead") == "agentview"
+    assert resolve_rgb_camera_feature_aliases(
+        ("agentview",),
+        set(config.image_features),
+    ) == {"agentview": (overhead_key,)}
 
 
 def test_prepare_images_uses_last_static_frame_and_official_range():

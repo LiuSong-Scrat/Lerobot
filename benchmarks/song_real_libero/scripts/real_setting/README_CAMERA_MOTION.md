@@ -55,8 +55,8 @@ bash "$PIPE" view \
 # Ego数据处理
   ## 构造真机 HDF5 HDF5FromRawData  Raw--->HDF5
   cd ~/ProgramFiles/Huggingface/lerobot
-  DYNAMIC_OUTPUT_DIR=/home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/data/real_setting/rgbd_records/Dynamic_Ego_CubeStacking3
-  HDF5_OUTPUT_DIR=benchmarks/song_real_libero/data/real_setting/hdf5_raw
+  DYNAMIC_OUTPUT_DIR=/opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/rgbd_records/StaticFrankaFold/humanhand_demo_video
+  HDF5_OUTPUT_DIR=/opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/hdf5_raw/fold
 
   ###############################
   #inference可视化  --run-inference or --show-inference
@@ -116,8 +116,9 @@ bash "$PIPE" view \
     --camera-names overhead,hand \
     --segments "$(cat "$DYNAMIC_OUTPUT_DIR/segments.txt")" \
     --max-points 50000 \
+    --task "Fold the towel. first from the bottom right to the top left, then from the bottom left to the top right."\
     --rgb-reproject-workers 4 \
-    --segment-workers 4
+    --segment-workers 50
     
 只查看已经生成的直接 RGB-D JSONL（不会重新推理，也不会修复旧 JSONL）：
 python /home/liusong/ProgramFiles/HandPoseExtraction/scripts/run_rgbd_sequence_wilor.py\
@@ -141,7 +142,16 @@ python /home/liusong/ProgramFiles/HandPoseExtraction/scripts/run_rgbd_sequence_w
 
     python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/hdf5_edit_reduce.py
 
-    python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/add_gripper_cloud_to_hdf5.py
+    export HDF5_USE_FILE_LOCKING=FALSE
+    python benchmarks/song_real_libero/scripts/add_gripper_cloud_to_hdf5.py \
+      --input-dir /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/hdf5_raw/fold/temp_num2 \
+      --output-dir /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/hdf5_raw/fold/hdf5_with_gripper \
+      --camera all \
+      --gripper-points 500 \
+      --gripper-max-width-m 0.085 \
+      --drop-strategy tail \
+      --num-workers 60
+
 
     python /home/liusong/ProgramFiles/Huggingface/lerobot/benchmarks/song_real_libero/scripts/check_discontinuous_hdf5.py
 
@@ -155,34 +165,34 @@ python /home/liusong/ProgramFiles/HandPoseExtraction/scripts/run_rgbd_sequence_w
     # 当使用变长点云（适配StageGen Mixed）训练，使用 --num-points 0
     export HDF5_USE_FILE_LOCKING=FALSE
     python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py \
-      --input-dir benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo \
-      --output-root benchmarks/song_real_libero/data/real_setting/real_lerobot_dataset \
+      --input-dir /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo/stagegen_static_franka_fold_trash \
+      --output-root /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/wepvla_v043_doubleflow_static_franka_fold_trash_data_stagegen \
       --repo-id song_real_pointcloud \
       --fps 15 \
       --num-points 0 \
+      --cloud-frame camera \
       --input-has-gripper-cloud \
+      --camera-motion-compensation off \
       --point-cloud-storage zarr \
-      --workers 6 \
-      --vis-count 2 \
-      --overwrite \
-      --task  "Place the Red Cube on the Blue Cube"
+      --workers 100 \
+      --vis-count 10 \
+      --overwrite
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    cd /home/liusong/ProgramFiles/Huggingface/lerobot
+    export HDF5_USE_FILE_LOCKING=FALSE
+    python benchmarks/song_real_libero/scripts/real_setting/real_hdf5_to_dataset.py \
+      --input-dir /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/humanhand_offline_demo/temp \
+      --output-root /opt/data/private/liusong/benchmarks/song_real_libero/data/real_setting/wepvla_v043_doubleflow_static_franka_fold_trash_data \
+      --repo-id song_real_pointcloud \
+      --fps 15 \
+      --num-points 50000 \
+      --input-has-gripper-cloud \
+      --cloud-frame camera \
+      --camera-motion-compensation off \
+      --point-cloud-storage zarr \
+      --workers 100 \
+      --vis-count 10 \
+      --overwrite
 
 # L515 / D435I 采集、位姿检查与移动相机补偿
 

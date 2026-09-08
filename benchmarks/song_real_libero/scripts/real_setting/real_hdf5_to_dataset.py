@@ -262,7 +262,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gripper-points", type=int, default=500)
     parser.add_argument("--gripper-len", type=float, default=0.06)
-    parser.add_argument("--gripper-template", choices=("reap", "panda"), default="reap")
+    parser.add_argument(
+        "--gripper-template",
+        choices=("rh20t_v3", "canonical", "reap", "panda"),
+        default="rh20t_v3",
+        help="Canonical RH20T v3 four-box template; reap/panda are compatibility aliases.",
+    )
     parser.add_argument(
         "--gripper-drop-strategy",
         choices=("tail", "random", "near_gripper"),
@@ -1089,7 +1094,11 @@ def save_artifact_to_dataset(
     return record
 
 
-def write_dataset_sidecar_meta(root: Path, storage: str) -> None:
+def write_dataset_sidecar_meta(
+    root: Path,
+    storage: str,
+    cfg: dict[str, Any] | None = None,
+) -> None:
     point_cloud_dir = root / POINT_CLOUD_DIR_NAME
     point_cloud_dir.mkdir(parents=True, exist_ok=True)
     suffix = "zarr" if storage == "zarr" else "npy"
@@ -1110,6 +1119,21 @@ def write_dataset_sidecar_meta(root: Path, storage: str) -> None:
     }
     if storage == "zarr":
         point_meta["zarr_encoding"] = "packed_xyz_float16_rgb_uint8"
+    if cfg is not None and (
+        bool(cfg["add_gripper_cloud"]) or bool(cfg["input_has_gripper_cloud"])
+    ):
+        point_meta.update(
+            contains_gripper_template=True,
+            gripper_points=int(cfg["gripper_points"]),
+            gripper_at_tail=True,
+            virtual_gripper_contract="rh20t_canonical_parallel_gripper_v3",
+            virtual_gripper_template="rh20t_canonical_four_box_v3",
+            virtual_gripper_color_rgb=[255, 0, 0],
+            virtual_gripper_width_unit="meter",
+            virtual_gripper_width_semantics="clear_gap_between_inner_finger_faces",
+            virtual_gripper_width_normalized_for_geometry=False,
+            virtual_gripper_palm_width_m=0.10,
+        )
     (point_cloud_dir / "meta.json").write_text(json.dumps(point_meta, indent=2), encoding="utf-8")
 
     pose_dir = root / WORLD_EE_POSE_DIR_NAME
@@ -1262,7 +1286,7 @@ def main() -> None:
         root=output_root,
         use_videos=False,
     )
-    write_dataset_sidecar_meta(dataset.root, args.point_cloud_storage)
+    write_dataset_sidecar_meta(dataset.root, args.point_cloud_storage, cfg)
 
     jobs = []
     for index, source_path in enumerate(source_files):

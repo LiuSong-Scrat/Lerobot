@@ -222,6 +222,79 @@ tmux new-session -s wepvla_v043_doubleflow
 # 在 tmux 中执行上述训练命令
 ```
 
+
+
+
+
+
+# 训练真机 单流
+
+PYTHONHASHSEED=0 \
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  -m accelerate.commands.launch \
+  --multi_gpu \
+  --num_processes=7 \
+  --num_machines=1 \
+  --mixed_precision=no \
+  --dynamo_backend=no \
+  --main_process_port=0 \
+  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --policy.type=smolvla \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=/opt/data/private/liusong/benchmarks/song_real_libero/data/mixture_setting/real_data/static_human_data/wepvla_v043_doubleflow_static_franka_fold_trash_data/lerobot_dataset \
+  --pointseg_sample_cache_dir=/opt/data/private/liusong/benchmarks/song_real_libero/data/mixture_setting/real_data/static_human_data/wepvla_v043_doubleflow_static_franka_fold_trash_data/lerobot_cache \
+  --task_balanced_sampling=true \
+  --batch_size=80 \
+  --gradient_accumulation_steps=1 \
+  --steps=30000 \
+  --save_freq=2000 \
+  --log_freq=1 \
+  --eval_freq=2000 \
+  --num_workers=14 \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/wepvla_v043_doubleflow_static_franka_fold_trash \
+  --job_name=wepvla_v043_doubleflow_static_franka_fold_trash \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --wandb.disable_artifact=true \
+  --policy.optimizer_lr=1e-4 \
+  --policy.scheduler_warmup_steps=50 \
+  --policy.scheduler_decay_steps=30000 \
+  --policy.scheduler_decay_lr=1e-6 \
+  --policy.camera_views=agentview \
+  --policy.rgb_camera_views=agentview \
+  --policy.vla_adapter_enable=true \
+  --policy.vla_adapter_freeze_vlm=true \
+  --policy.vlm_model_name=/opt/data/private/liusong/hf_models/SmolVLM2-500M-Video-Instruct \
+  --policy.vlm_weights_path=/opt/data/private/liusong/hf_models/smolvla_base \
+  --policy.load_vlm_weights=true \
+  --policy.pointseg_enable=true \
+  --policy.pointseg_backbone_type=litept \
+  --policy.pointseg_grid_size=0.01 \
+  --policy.pointseg_feature_dim=64 \
+  --policy.pointseg_aux_loss_weight=0.0005 \
+  --policy.pointseg_foreground_ratio=0.08 \
+  --policy.pointseg_background_ratio=0.08 \
+  --policy.pointseg_min_foreground_points=4000 \
+  --policy.pointseg_min_background_points=0 \
+  --policy.pointseg_use_temporal_priors_as_input=false \
+  --policy.pointseg_use_pseudo_selection=false \
+  --policy.point_action_fusion_enable=true \
+  --policy.worldflow_enable=false \
+  --policy.worldflow_se3_head_enable=false \
+  --policy.se3_enable=false \
+  --policy.se3_final_correction_enable=false
+
+
+
 ## 4. 测试
 
 下面以 step 1300 为例，同时测试 LIBERO-10 task 6 和 task 8，各 50
@@ -336,3 +409,58 @@ PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
   --save-video \
   --no-world-to-ego-causal-ablation \
   --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_temp_a800_doubleflow_1500_after500_after1000_2
+
+
+
+
+
+# TEMP......................
+
+PYTHONHASHSEED=0 \
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+CUDA_VISIBLE_DEVICES=0 \
+MUJOCO_EGL_DEVICE_ID=0 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  benchmarks/song_real_libero/scripts/libero_setting/libero_pointcloud_eval.py \
+  --config benchmarks/song_real_libero/configs/libero.json \
+  --policy.path /opt/data/private/liusong/benchmarks/song_real_libero/outputs/2.2b_on_5090/pretrained_model \
+  --device cuda \
+  --suite libero_spatial \
+  --task-id 6 \
+  --task-id 8 \
+  --episodes 10 \
+  --policy-noise-seed 0 \
+  --env-seed 7 \
+  --strict-official-init \
+  --gripper-control-mode delta_width_initial_sync \
+  --gripper-delta-threshold 0.002 \
+  --gripper-delta-alignment current_minus_previous \
+  --waypoint-max-hold-steps 1 \
+  --isolated-policy-workers 1 \
+  --task-workers 2 \
+  --episode-workers-per-task 10 \
+  --task-worker-backend process \
+  --inference-batch-size 30 \
+  --inference-batching-mode fixed_barrier \
+  --no-release-event-exec-enable \
+  --control-freq 20 \
+  --action-index 0 \
+  --exec-action-steps 24 \
+  --adaptive-exec-max-steps 24 \
+  --grasp-exec-steps 24 \
+  --max-steps 1000 \
+  --no-use-suite-max-steps \
+  --recreate-env-per-episode \
+  --render-mode offscreen \
+  --no-visualize-foreground \
+  --save-video \
+  --no-world-to-ego-causal-ablation \
+  --output-dir benchmarks/song_real_libero/outputs/libero_setting/eval_2.2b_on_5090_spatial

@@ -281,6 +281,41 @@ def test_world_eef_trajectory_uses_robot_base_current_and_commanded_targets(tmp_
     )
 
 
+def test_world_eef_trajectory_uses_primary_camera_world_when_configured(tmp_path):
+    camera_poses = _pose_sequence(offset=50.0)
+    camera_targets = _pose_sequence(offset=60.0)
+    pose_dir = tmp_path / "world_camera_ee_poses"
+    target_dir = tmp_path / "world_camera_action_target_ee_poses"
+    pose_dir.mkdir()
+    target_dir.mkdir()
+    meta = {
+        "coordinate_frame": "primary_camera_optical",
+        "camera_serial": "104122061018",
+        "extrinsic_convention": "T_camera_from_calibration_world",
+    }
+    (pose_dir / "meta.json").write_text(json.dumps(meta))
+    (target_dir / "meta.json").write_text(
+        json.dumps({**meta, "target_semantics": "commanded_eef_pose"})
+    )
+    np.save(pose_dir / "episode_000000.npy", camera_poses)
+    np.save(target_dir / "episode_000000.npy", camera_targets)
+
+    wrapped = BenchmarkWorldFlowMemmapDataset(
+        _TinyDataset(frame_index=1, chunk_size=4),
+        tmp_path,
+        chunk_size=4,
+        target_type="world_eef_trajectory",
+        reference_frame="pointcloud_reference_camera",
+    )
+    item = wrapped[0]
+
+    assert torch.equal(item["worldflow.current_ee_pose"], torch.from_numpy(camera_poses[1]))
+    assert torch.equal(
+        item["worldflow.eef_trajectory"],
+        torch.from_numpy(camera_targets[[1, 2, 2, 2]]),
+    )
+
+
 def test_world_eef_trajectory_rejects_missing_base_target_sidecar(tmp_path):
     base_dir = tmp_path / "world_base_ee_poses"
     base_dir.mkdir()

@@ -41,6 +41,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla.configuration_smolvla import resolve_rgb_camera_feature_aliases
 from lerobot.policies.smolvla.processor_smolvla import validate_smolvla_worldflow_preprocessor
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
@@ -490,8 +491,10 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
 
     ``worldflow.current_ee_pose`` is the achieved pose at the observation
     frame. In ``world_eef_trajectory`` mode both it and the commanded future
-    EEF targets are expressed directly in the complete robot-base frame.
-    Legacy camera-frame datasets retain their historical behavior.
+    EEF targets are expressed in one explicit fixed reference frame. RH20T uses
+    its selected primary static camera optical frame; existing LIBERO datasets
+    may retain the robot-base reference. Legacy datasets keep their historical
+    behavior.
     """
 
     def __init__(
@@ -501,6 +504,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         *,
         chunk_size: int,
         target_type: str = "legacy_eef",
+        reference_frame: str = "robot_base",
         action_start_offset: int = 0,
         require_action_target_sidecar: bool = False,
         mmap_mode: str = "r",
@@ -508,15 +512,26 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
         self.dataset = dataset
         self.root = Path(root)
         self.target_type = str(target_type)
+        self.reference_frame = str(reference_frame)
         if self.target_type not in {"legacy_eef", "world_eef_trajectory"}:
             raise ValueError(f"Unsupported WorldFlow target_type={self.target_type!r}.")
+        if self.reference_frame not in {"pointcloud_reference_camera", "robot_base"}:
+            raise ValueError(f"Unsupported WorldFlow reference_frame={self.reference_frame!r}.")
+        strict_camera_world = (
+            self.target_type == "world_eef_trajectory"
+            and self.reference_frame == "pointcloud_reference_camera"
+        )
         self.pose_dir = self.root / (
-            "world_base_ee_poses"
+            "world_camera_ee_poses"
+            if strict_camera_world
+            else "world_base_ee_poses"
             if self.target_type == "world_eef_trajectory"
             else "world_ee_poses"
         )
         command_target_dir = self.root / (
-            "world_base_action_target_ee_poses"
+            "world_camera_action_target_ee_poses"
+            if strict_camera_world
+            else "world_base_action_target_ee_poses"
             if self.target_type == "world_eef_trajectory"
             else "action_target_ee_poses"
         )
@@ -547,29 +562,44 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             )
         if self.target_type == "world_eef_trajectory" and not command_target_dir.is_dir():
             raise FileNotFoundError(
-                "Robot-base WorldFlow requires the commanded EEF trajectory sidecar: "
-                f"{command_target_dir}. Camera-frame or achieved-pose fallbacks are forbidden."
+                "Fixed-reference WorldFlow requires the commanded EEF trajectory sidecar: "
+                f"{command_target_dir}. Achieved-pose fallbacks are forbidden."
             )
         if self.target_type == "world_eef_trajectory":
             base_meta_path = self.pose_dir / "meta.json"
             target_meta_path = command_target_dir / "meta.json"
             if not base_meta_path.is_file() or not target_meta_path.is_file():
                 raise FileNotFoundError(
-                    "Robot-base WorldFlow requires explicit coordinate metadata at "
+                    "Fixed-reference WorldFlow requires explicit coordinate metadata at "
                     f"{base_meta_path} and {target_meta_path}."
                 )
             with open(base_meta_path, encoding="utf-8") as f:
                 base_meta = json.load(f)
             with open(target_meta_path, encoding="utf-8") as f:
                 target_meta = json.load(f)
-            if (
-                base_meta.get("coordinate_frame") != "robot_base"
-                or target_meta.get("coordinate_frame") != "robot_base"
+            expected_coordinate_frame = (
+                "primary_camera_optical" if strict_camera_world else "robot_base"
+            )
+            invalid_metadata = (
+                base_meta.get("coordinate_frame") != expected_coordinate_frame
+                or target_meta.get("coordinate_frame") != expected_coordinate_frame
                 or target_meta.get("target_semantics") != "commanded_eef_pose"
-            ):
+            )
+            if strict_camera_world:
+                invalid_metadata = invalid_metadata or (
+                    not base_meta.get("camera_serial")
+                    or base_meta.get("camera_serial") != target_meta.get("camera_serial")
+                    or base_meta.get("extrinsic_convention")
+                    != "T_camera_from_calibration_world"
+                    or target_meta.get("extrinsic_convention")
+                    != "T_camera_from_calibration_world"
+                )
+            if invalid_metadata:
                 raise ValueError(
-                    "Robot-base WorldFlow metadata must declare robot_base coordinates and "
-                    "target_semantics='commanded_eef_pose'."
+                    "WorldFlow metadata does not match its configured fixed reference. "
+                    f"Expected coordinate_frame={expected_coordinate_frame!r}, "
+                    "target_semantics='commanded_eef_pose', and for camera World a shared "
+                    "camera_serial with extrinsic_convention='T_camera_from_calibration_world'."
                 )
         if self.target_type == "legacy_eef" and self.target_pose_dir == self.pose_dir:
             logging.warning(
@@ -1494,6 +1524,9 @@ def maybe_wrap_worldflow_dataset(dataset, policy_cfg):
         root=root,
         chunk_size=int(getattr(policy_cfg, "chunk_size", 32)),
         target_type=str(getattr(policy_cfg, "worldflow_target_type", "legacy_eef")),
+        reference_frame=str(
+            getattr(policy_cfg, "worldflow_reference_frame", "pointcloud_reference_camera")
+        ),
         action_start_offset=int(getattr(policy_cfg, "action_chunk_start_offset", 0)),
         require_action_target_sidecar=bool(
             getattr(policy_cfg, "worldflow_require_action_target_sidecar", False)
@@ -2449,20 +2482,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     selected_views = parse_camera_views(getattr(cfg.policy, "camera_views", "agentview"))
     rgb_value = getattr(cfg.policy, "rgb_camera_views", None)
     selected_rgb_views = parse_camera_views(selected_views if rgb_value is None else rgb_value)
-    expected_image_keys = {f"observation.images.{view}" for view in selected_rgb_views}
     actual_image_keys = set(getattr(policy.config, "image_features", {}))
-    missing_image_keys = sorted(expected_image_keys - actual_image_keys)
-    if missing_image_keys and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
+    rgb_feature_resolution = resolve_rgb_camera_feature_aliases(
+        selected_rgb_views,
+        actual_image_keys,
+    )
+    missing_rgb_views = sorted(
+        view for view, feature_keys in rgb_feature_resolution.items() if not feature_keys
+    )
+    if missing_rgb_views and bool(getattr(cfg.policy, "vla_adapter_enable", False)):
         raise ValueError(
-            f"Selected RGB camera views {selected_rgb_views} require image features {missing_image_keys}, "
-            f"but policy image features are {sorted(actual_image_keys)}."
+            f"Selected RGB camera views {selected_rgb_views} have no compatible image feature for "
+            f"views {missing_rgb_views}; policy image features are {sorted(actual_image_keys)}. "
+            "The external-view aliases agentview/overhead/overview/external are compatible, as are "
+            "the hand-view aliases robot0_eye_in_hand/hand/wrist."
         )
+    camera_cli_provenance["rgb_image_feature_resolution"] = {
+        view: list(feature_keys) for view, feature_keys in rgb_feature_resolution.items()
+    }
     if is_main_process:
         logging.info(
-            "Training point-cloud camera_views=%s; rgb_camera_views=%s; image_features=%s",
+            "Training point-cloud camera_views=%s; rgb_camera_views=%s; image_features=%s; "
+            "rgb_feature_resolution=%s",
             selected_views,
             selected_rgb_views,
             sorted(actual_image_keys),
+            rgb_feature_resolution,
         )
         provenance_path = write_training_camera_provenance(
             cfg,

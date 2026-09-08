@@ -26,6 +26,60 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 
+RGB_CAMERA_VIEW_ALIASES = {
+    "agentview": frozenset(
+        {
+            "agentview",
+            "external",
+            "external_camera",
+            "overhead",
+            "overhead_camera",
+            "overview",
+            "overview_camera",
+        }
+    ),
+    "robot0_eye_in_hand": frozenset(
+        {
+            "eye_in_hand",
+            "hand",
+            "hand_camera",
+            "robot0_eye_in_hand",
+            "wrist",
+            "wrist_camera",
+        }
+    ),
+}
+
+
+def canonical_rgb_camera_view_name(value: str) -> str:
+    """Map dataset/checkpoint RGB camera aliases to the policy's canonical view name."""
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    for canonical, aliases in RGB_CAMERA_VIEW_ALIASES.items():
+        if normalized in aliases:
+            return canonical
+    return normalized
+
+
+def resolve_rgb_camera_feature_aliases(
+    selected_views: tuple[str, ...] | list[str],
+    image_feature_keys: set[str] | list[str] | tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    """Resolve configured RGB views to compatible serialized image feature keys."""
+
+    feature_keys = tuple(sorted(str(key) for key in image_feature_keys))
+    resolution: dict[str, tuple[str, ...]] = {}
+    for view in selected_views:
+        canonical_view = canonical_rgb_camera_view_name(view)
+        resolution[str(view)] = tuple(
+            key
+            for key in feature_keys
+            if key.startswith(f"{OBS_IMAGES}.")
+            and canonical_rgb_camera_view_name(key[len(OBS_IMAGES) + 1 :]) == canonical_view
+        )
+    return resolution
+
+
 @PreTrainedConfig.register_subclass("smolvla")
 @dataclass
 class SmolVLAConfig(PreTrainedConfig):
@@ -212,12 +266,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Supervision semantics for the independent World branch. ``legacy_eef``
     # retains historical checkpoints whose World target is derived through
     # the old carrier/conjugacy path. ``world_eef_trajectory`` predicts the
-    # commanded EEF trajectory directly in the fixed robot-base frame. With
+    # commanded EEF trajectory directly in an explicit fixed frame. RH20T uses
+    # the selected primary static camera optical frame; datasets with an
+    # established robot-base contract may keep robot base. With
     # the foreground cloud in that same frame, the trajectory acts as sparse,
     # task-relevant point-flow supervision without explicit object poses or
     # dense scene-flow labels.
     worldflow_target_type: str = "legacy_eef"
-    # Velocity chart for an absolute robot-base EEF trajectory. The legacy
+    # Velocity chart for an absolute fixed-reference EEF trajectory. The legacy
     # spatial twist rotates/translates about the global origin and therefore
     # contains a position-dependent omega-cross-p lever arm. ``base_decoupled``
     # instead predicts [p_dot_base, omega_base]: translation and orientation
@@ -230,11 +286,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Expert does not have to relearn an unrelated 6D SO(3) flow and random
     # output head before the two streams can reach comparable accuracy.
     worldflow_world_eef_velocity_mode: str = "legacy_spatial_twist"
-    # Canonical fixed frame used by the World branch. Historical checkpoints
-    # used the first fixed camera. New World-EEF checkpoints use the robot
-    # base so scene geometry is invariant to camera placement and directly
-    # comparable across calibrated fixed cameras. This frame is never the UMI
-    # episode origin and never the current EEF frame.
+    # Canonical fixed frame used by the World branch. RH20T canonical data use
+    # the selected primary static camera optical frame. This frame is never the
+    # UMI episode origin and never the current EEF frame.
     worldflow_reference_frame: str = "pointcloud_reference_camera"
     worldflow_feature_dim: int = 64
     worldflow_grid_size: float = 0.01
@@ -824,8 +878,6 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.worldflow_target_type == "world_eef_trajectory":
                 world_trajectory_contract_errors = []
-                if self.worldflow_reference_frame != "robot_base":
-                    world_trajectory_contract_errors.append("worldflow_reference_frame='robot_base'")
                 if self.worldflow_scene_frame_origin != "global":
                     world_trajectory_contract_errors.append("worldflow_scene_frame_origin='global'")
                 if self.worldflow_frame_origin != "global":
@@ -1357,12 +1409,15 @@ class SmolVLAConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        selected = set(self.selected_rgb_camera_views)
+        selected = {
+            canonical_rgb_camera_view_name(camera) for camera in self.selected_rgb_camera_views
+        }
         for key in list(self.input_features):
             if not key.startswith(f"{OBS_IMAGES}."):
                 continue
             camera = key[len(OBS_IMAGES) + 1 :]
-            if camera in {"agentview", "robot0_eye_in_hand"} and camera not in selected:
+            canonical_camera = canonical_rgb_camera_view_name(camera)
+            if canonical_camera in RGB_CAMERA_VIEW_ALIASES and canonical_camera not in selected:
                 del self.input_features[key]
 
         for i in range(self.empty_cameras):

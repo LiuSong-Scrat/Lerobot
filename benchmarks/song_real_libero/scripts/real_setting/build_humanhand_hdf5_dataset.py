@@ -32,7 +32,7 @@ else:
 
 
 HANDPOSE_ROOT = Path("/home/liusong/ProgramFiles/HandPoseExtraction")
-REQUIRED_HANDPOSE_PIPELINE_VERSION = "wilor_mano_mesh_rgbd_chamfer_v5"
+REQUIRED_HANDPOSE_PIPELINE_VERSION = "wilor_mano_mesh_rgbd_rigid_icp_temporal_v7"
 DEFAULT_POINTS_NUM = 640 * 480
 _VIDEO_CAPTURE_CACHE = {}
 _SEGMENT_WORKER_CONTEXT = None
@@ -110,8 +110,9 @@ def main() -> None:
         "--camera-pose-jsonl",
         default=None,
         help=(
-            "Optional full-6DoF VIO/SLAM camera poses. Accepts either one JSONL file or an ORB-SLAM3 "
-            "directory containing segment_*/dataset/camera_pose_orbslam3.jsonl. All records are merged "
+            "Optional camera poses. Accepts either one JSONL file or a processed trajectory directory "
+            "containing segment_*/dataset/camera_pose_orbslam3.jsonl or camera_pose_static.jsonl. "
+            "All records are merged "
             "once by record_index before interactive slicing. Each exported episode is then independently "
             "aligned to its own first camera frame when --align-to-episode-first is enabled."
         ),
@@ -298,6 +299,12 @@ def main() -> None:
     parser.add_argument("--image-height", type=int, default=480)
     parser.add_argument("--allow-missing-gripper", action="store_true")
     parser.add_argument("--window-name", default="HumanHand offline slicer")
+    parser.add_argument(
+        "--review-start-record-index",
+        type=int,
+        default=None,
+        help="Initial record_index in the interactive review window.",
+    )
     args = parser.parse_args()
     if args.camera_pose_max_sync_error_ms < 0.0:
         raise ValueError("--camera-pose-max-sync-error-ms must be non-negative.")
@@ -512,7 +519,7 @@ def load_frame_records(input_dir: Path) -> list[dict]:
 
 
 def resolve_camera_pose_jsonl_paths(path: Path) -> list[Path]:
-    """Resolve one pose JSONL file or all per-segment ORB-SLAM3 pose JSONLs."""
+    """Resolve one pose JSONL file or all per-segment dynamic/static pose JSONLs."""
 
     path = path.expanduser().resolve()
     if path.is_file():
@@ -520,21 +527,26 @@ def resolve_camera_pose_jsonl_paths(path: Path) -> list[Path]:
     if not path.is_dir():
         raise FileNotFoundError(path)
 
-    preferred = sorted(path.glob("segment_*/dataset/camera_pose_orbslam3.jsonl"))
-    if preferred:
-        return preferred
+    supported_names = ("camera_pose_orbslam3.jsonl", "camera_pose_static.jsonl")
+    for name in supported_names:
+        preferred = sorted(path.glob(f"segment_*/dataset/{name}"))
+        if preferred:
+            return preferred
 
-    direct = path / "camera_pose_orbslam3.jsonl"
-    if direct.is_file():
-        return [direct]
+    for name in supported_names:
+        direct = path / name
+        if direct.is_file():
+            return [direct]
 
-    recursive = sorted(path.glob("**/camera_pose_orbslam3.jsonl"))
-    if recursive:
-        return recursive
+    for name in supported_names:
+        recursive = sorted(path.glob(f"**/{name}"))
+        if recursive:
+            return recursive
 
     raise FileNotFoundError(
-        f"No camera_pose_orbslam3.jsonl files found under {path}. Expected "
-        "segment_*/dataset/camera_pose_orbslam3.jsonl."
+        f"No supported camera-pose JSONL files found under {path}. Expected "
+        "segment_*/dataset/camera_pose_orbslam3.jsonl or "
+        "segment_*/dataset/camera_pose_static.jsonl."
     )
 
 
@@ -717,38 +729,82 @@ def run_interactive_slicer(
 ) -> list[Path]:
     import cv2
 
+    record_indices = [int(frame.get("index", i)) for i, (frame, _) in enumerate(samples)]
+    index_by_record = {record_index: i for i, record_index in enumerate(record_indices)}
     index = 0
+    if args.review_start_record_index is not None:
+        index = min(
+            range(len(record_indices)),
+            key=lambda candidate: abs(record_indices[candidate] - args.review_start_record_index),
+        )
+    requested_index = {"value": index}
     start_record_index: int | None = None
     start_camera_pose_sequence: str | None = None
     saved_paths: list[Path] = []
     print(
         "Controls: Right/D next, Left/A previous, Up/W set start, "
-        "Down/S save end, R clear start, U delete last saved, Q/Esc quit"
+        "Down/S save end, R clear start, U delete last saved, "
+        "G enter record_index, trackbar jump, Q/Esc quit"
     )
+    cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
+
+    def request_frame(value: int) -> None:
+        requested_index["value"] = int(np.clip(value, 0, len(samples) - 1))
+
+    cv2.createTrackbar("frame", args.window_name, index, max(0, len(samples) - 1), request_frame)
+    last_rendered_index = -1
     while True:
+        index = requested_index["value"]
         frame_record, payload = samples[index]
-        color_bgr, _depth_m, intrinsics = load_rgbd_frame(input_dir, frame_record, metadata)
-        preview = color_bgr.copy()
-        draw_payload_preview(cv2, preview, payload, intrinsics)
-        draw_overlay(
-            cv2,
-            preview,
-            index,
-            len(samples),
-            int(frame_record.get("index", index)),
-            str(frame_record.get("camera_pose_sequence", "no_pose")),
-            start_record_index,
-            start_camera_pose_sequence,
-            len(saved_paths),
-        )
-        cv2.imshow(args.window_name, preview)
-        key = cv2.waitKeyEx(0)
+        if index != last_rendered_index:
+            color_bgr, _depth_m, intrinsics = load_rgbd_frame(input_dir, frame_record, metadata)
+            preview = color_bgr.copy()
+            draw_payload_preview(cv2, preview, payload, intrinsics)
+            diagnostic_lines, reasons = describe_gripper_transition(samples, index)
+            draw_overlay(
+                cv2,
+                preview,
+                index,
+                len(samples),
+                int(frame_record.get("index", index)),
+                str(frame_record.get("camera_pose_sequence", "no_pose")),
+                start_record_index,
+                start_camera_pose_sequence,
+                len(saved_paths),
+                diagnostic_lines=diagnostic_lines,
+            )
+            cv2.setTrackbarPos("frame", args.window_name, index)
+            cv2.imshow(args.window_name, preview)
+            print(
+                f"[review] viewer_index={index} record_index={record_indices[index]} "
+                f"reasons={reasons or ['none']} | {' | '.join(diagnostic_lines)}",
+                flush=True,
+            )
+            last_rendered_index = index
+        key = cv2.waitKeyEx(30)
         if key in (27, ord("q"), ord("Q")):
             break
         if key in (83, 2555904, 65363, ord("d"), ord("D")):
-            index = min(index + 1, len(samples) - 1)
+            request_frame(index + 1)
         elif key in (81, 2424832, 65361, ord("a"), ord("A")):
-            index = max(index - 1, 0)
+            request_frame(index - 1)
+        elif key in (ord("g"), ord("G")):
+            try:
+                requested_record = int(input("Jump to record_index: ").strip())
+            except ValueError:
+                print("Invalid record_index; expected an integer.")
+                continue
+            target = index_by_record.get(requested_record)
+            if target is None:
+                target = min(
+                    range(len(record_indices)),
+                    key=lambda candidate: abs(record_indices[candidate] - requested_record),
+                )
+                print(
+                    f"record_index={requested_record} is absent; using nearest "
+                    f"record_index={record_indices[target]}."
+                )
+            request_frame(target)
         elif key in (82, 2490368, 65362, ord("w"), ord("W")):
             start_record_index = int(frame_record.get("index", index))
             start_camera_pose_sequence = str(frame_record.get("camera_pose_sequence", "no_pose"))
@@ -954,6 +1010,13 @@ def save_segment_hdf5(
     ]
     if not selected:
         raise RuntimeError(f"Segment {segment.start}:{segment.end} contains no frames.")
+
+    # A parallel-jaw gripper is unchanged by a 180-degree rotation about its
+    # approach (local Z) axis when the two fingers are indistinguishable. The
+    # frame-wise hand mapper can therefore alternate between two physically
+    # equivalent representatives, producing an artificial 180-degree action
+    # jump. Resolve that ambiguity independently inside every source segment.
+    parallel_jaw_symmetry_metrics = resolve_parallel_jaw_z_symmetry(selected)
 
     if not camera_names:
         raise ValueError("At least one camera name is required.")
@@ -1207,6 +1270,13 @@ def save_segment_hdf5(
         )
         root.attrs["segment_start_record_index"] = segment.start
         root.attrs["segment_end_record_index"] = segment.end
+        root.attrs["parallel_jaw_z_symmetry_method"] = "nearest_previous_same_segment"
+        root.attrs["parallel_jaw_z_symmetry_candidate_frames"] = int(
+            parallel_jaw_symmetry_metrics["candidate_frames"]
+        )
+        root.attrs["parallel_jaw_z_symmetry_half_turns_applied"] = int(
+            parallel_jaw_symmetry_metrics["half_turns_applied"]
+        )
         root.attrs["source_pose_frame"] = args.pose_frame
         root.attrs["episode_first_alignment_applied"] = bool(args.align_to_episode_first)
         root.attrs["rgb_reprojected_to_episode_first"] = bool(
@@ -1490,6 +1560,106 @@ def choose_hand(payload: dict, allow_missing: bool) -> dict | None:
     if allow_missing:
         return None
     raise RuntimeError(f"No gripper prediction at record_index={payload.get('record_index')}")
+
+
+def resolve_parallel_jaw_z_symmetry(
+    selected: list[tuple[dict, dict]],
+) -> dict[str, int]:
+    """Remove frame-to-frame local-Z half-turns from serialized gripper poses.
+
+    For an ideal symmetric two-finger gripper, ``R`` and
+    ``R @ diag(-1, -1, 1)`` describe the same physical jaw pose: local X and Y
+    change sign while the approach axis Z is preserved. The hand-to-gripper
+    mapper can switch between these representatives when its anatomical plane
+    estimate is ambiguous. This function lifts the quotient-space trajectory
+    to the temporally closest SO(3) representative, with state scoped to the
+    supplied segment.
+
+    This is discrete symmetry resolution, not temporal smoothing. It does not
+    average rotations or positions. When a half-turn is selected, the TCP is
+    recomputed from the stored pinch center and local offsets so an X offset
+    cannot turn the representation switch into a translation jump.
+    """
+
+    z_half_turn = np.diag([-1.0, -1.0, 1.0])
+    previous_rotation: np.ndarray | None = None
+    candidate_frames = 0
+    half_turns_applied = 0
+
+    for _frame, payload in selected:
+        hand = choose_hand(payload, allow_missing=True)
+        if hand is None:
+            # Do not bridge an unknown-duration detection gap with a stale
+            # representative. The next valid pose starts a new continuity run.
+            previous_rotation = None
+            continue
+        gripper = hand.get("gripper")
+        if not isinstance(gripper, dict):
+            previous_rotation = None
+            continue
+        try:
+            rotation = np.asarray(
+                gripper["rotation_camera_gripper"], dtype=np.float64
+            ).reshape(3, 3)
+        except (KeyError, TypeError, ValueError):
+            previous_rotation = None
+            continue
+        if not np.all(np.isfinite(rotation)):
+            previous_rotation = None
+            continue
+
+        candidate_frames += 1
+        alternate = rotation @ z_half_turn
+        apply_half_turn = False
+        if previous_rotation is not None:
+            raw_distance = rotation_geodesic_distance(previous_rotation, rotation)
+            alternate_distance = rotation_geodesic_distance(previous_rotation, alternate)
+            apply_half_turn = alternate_distance + 1e-12 < raw_distance
+
+        resolved_rotation = alternate if apply_half_turn else rotation
+        if apply_half_turn:
+            half_turns_applied += 1
+            x_offset_m = float(gripper.get("tcp_offset_x_m", 0.0))
+            z_offset_m = float(gripper.get("tcp_offset_z_m", 0.0))
+            pinch_center = np.asarray(
+                gripper.get("pinch_center_m", []), dtype=np.float64
+            )
+            if pinch_center.shape == (3,) and np.all(np.isfinite(pinch_center)):
+                gripper["position_m"] = (
+                    pinch_center
+                    - resolved_rotation[:, 0] * x_offset_m
+                    - resolved_rotation[:, 2] * z_offset_m
+                ).tolist()
+            else:
+                # Exact equivalent update when only the already-offset TCP was
+                # serialized. Local Z is invariant; only local X changes sign.
+                position = np.asarray(gripper.get("position_m", []), dtype=np.float64)
+                if position.shape == (3,) and np.all(np.isfinite(position)):
+                    gripper["position_m"] = (
+                        position + 2.0 * rotation[:, 0] * x_offset_m
+                    ).tolist()
+
+            gripper["rotation_camera_gripper"] = resolved_rotation.tolist()
+            gripper["rotation_camera_pinch_plane"] = resolved_rotation.tolist()
+            gripper["quaternion_xyzw"] = R.from_matrix(resolved_rotation).as_quat().tolist()
+
+        gripper["parallel_jaw_z_symmetry_resolved"] = True
+        gripper["parallel_jaw_z_half_turn_applied"] = bool(apply_half_turn)
+        gripper["parallel_jaw_z_symmetry_reference"] = "previous_frame_same_segment"
+        previous_rotation = resolved_rotation
+
+    return {
+        "candidate_frames": candidate_frames,
+        "half_turns_applied": half_turns_applied,
+    }
+
+
+def rotation_geodesic_distance(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the shortest SO(3) angle between two 3x3 rotations in radians."""
+
+    relative = np.asarray(first, dtype=np.float64).T @ np.asarray(second, dtype=np.float64)
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.arccos(cosine))
 
 
 def gripper_state_from_hand(
@@ -1967,6 +2137,7 @@ def draw_overlay(
     start_record_index: int | None,
     start_camera_pose_sequence: str | None,
     saved_count: int,
+    diagnostic_lines: list[str] | None = None,
 ) -> None:
     lines = [
         f"{index + 1}/{total} record_index={record_index} pose={camera_pose_sequence}",
@@ -1974,8 +2145,10 @@ def draw_overlay(
             f"start={start_record_index if start_record_index is not None else '-'} "
             f"start_pose={start_camera_pose_sequence or '-'} saved={saved_count}"
         ),
-        "Right/D Left/A | Up/W start | Down/S save | U undo | Q quit",
+        "Trackbar/G jump | Right/D Left/A | Up/W start | Down/S save | U undo | Q quit",
     ]
+    if diagnostic_lines:
+        lines.extend(diagnostic_lines)
     x, y = 12, 24
     for line in lines:
         cv2.putText(
@@ -1999,6 +2172,104 @@ def draw_overlay(
             cv2.LINE_AA,
         )
         y += 24
+
+
+def describe_gripper_transition(
+    samples: list[tuple[dict, dict]],
+    index: int,
+) -> tuple[list[str], list[str]]:
+    """Describe the current gripper measurement and why a transition is suspicious."""
+
+    _, payload = samples[index]
+    hand = select_primary_payload_hand(payload)
+    if hand is None:
+        return ["No gripper pose in this frame"], ["missing_gripper"]
+    gripper = hand["gripper"]
+    fusion = hand.get("fusion_transform", {})
+    source = str(fusion.get("depth_correction_source", "unknown"))
+    correction = fusion.get("depth_correction_m")
+    correction_text = "-" if correction is None else f"{float(correction) * 1000.0:.1f}mm"
+    valid_depth = int(np.count_nonzero(hand.get("valid_depth_mask", [])))
+    lines = [
+        f"depth={source} correction={correction_text} valid_depth={valid_depth}/21",
+    ]
+    reasons: list[str] = []
+    if gripper.get("humanego_depth_correction_repaired"):
+        reasons.append("depth_correction_repaired")
+    if gripper.get("humanego_detector_outlier_repaired"):
+        reasons.append("detector_outlier_repaired")
+    if source == "unavailable" or (correction is not None and abs(float(correction)) > 0.15):
+        reasons.append("unreliable_depth")
+
+    if index == 0:
+        lines.append("segment start: no previous-frame delta")
+        return lines, reasons
+    _, previous_payload = samples[index - 1]
+    if previous_payload.get("recording_segment_index") != payload.get("recording_segment_index"):
+        lines.append("segment boundary: temporal comparison reset")
+        return lines, reasons
+    previous_hand = select_primary_payload_hand(previous_payload)
+    if previous_hand is None:
+        lines.append("previous frame has no gripper pose")
+        return lines, reasons + ["previous_missing_gripper"]
+
+    previous_gripper = previous_hand["gripper"]
+    position = np.asarray(gripper.get("position_m", []), dtype=np.float64)
+    previous_position = np.asarray(previous_gripper.get("position_m", []), dtype=np.float64)
+    rotation = np.asarray(gripper.get("rotation_camera_gripper", []), dtype=np.float64)
+    previous_rotation = np.asarray(
+        previous_gripper.get("rotation_camera_gripper", []), dtype=np.float64
+    )
+    if position.shape != (3,) or previous_position.shape != (3,):
+        return lines + ["invalid position shape"], reasons + ["invalid_position"]
+    if rotation.shape != (3, 3) or previous_rotation.shape != (3, 3):
+        return lines + ["invalid rotation shape"], reasons + ["invalid_rotation"]
+
+    translation_mm = float(np.linalg.norm(position - previous_position) * 1000.0)
+    rotation_deg = rotation_distance_deg(previous_rotation, rotation)
+    z_axis_deg = vector_angle_deg(previous_rotation[:, 2], rotation[:, 2])
+    opening_mm = float(gripper.get("opening_width_m", 0.0)) * 1000.0
+    previous_opening_mm = float(previous_gripper.get("opening_width_m", 0.0)) * 1000.0
+    opening_delta_mm = abs(opening_mm - previous_opening_mm)
+    lines.append(
+        f"delta: xyz={translation_mm:.1f}mm R={rotation_deg:.1f}deg "
+        f"Z={z_axis_deg:.1f}deg opening={opening_mm:.1f}mm dOpen={opening_delta_mm:.1f}mm"
+    )
+    if translation_mm >= 25.0:
+        reasons.append("translation_jump")
+    if rotation_deg >= 12.0:
+        reasons.append("rotation_jump")
+    if z_axis_deg >= 12.0:
+        reasons.append("z_direction_jump")
+    if z_axis_deg >= 90.0:
+        reasons.append("z_direction_flip")
+    if opening_delta_mm >= 20.0:
+        reasons.append("fingertip_or_opening_jump")
+    lines.append(f"reason: {','.join(reasons) if reasons else 'none'}")
+    return lines, reasons
+
+
+def select_primary_payload_hand(payload: dict) -> dict | None:
+    hands = [hand for hand in payload.get("hands", []) if hand.get("gripper") is not None]
+    if not hands:
+        return None
+    return max(hands, key=lambda hand: float(hand.get("score", 0.0)))
+
+
+def rotation_distance_deg(first: np.ndarray, second: np.ndarray) -> float:
+    relative = np.asarray(first, dtype=np.float64).T @ np.asarray(second, dtype=np.float64)
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def vector_angle_deg(first: np.ndarray, second: np.ndarray) -> float:
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+    if denominator <= 1e-12:
+        return float("nan")
+    cosine = float(np.clip(np.dot(first, second) / denominator, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
 
 
 if __name__ == "__main__":
