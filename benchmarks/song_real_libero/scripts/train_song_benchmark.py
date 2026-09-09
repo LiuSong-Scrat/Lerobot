@@ -34,6 +34,12 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.merged_camera import (
+    is_merged_camera_metadata,
+    merged_cache_contract,
+    merged_source_group_ids,
+    validate_merged_camera_reference,
+)
 from lerobot.datasets.sampler import EpisodeAwareSampler, TaskBalancedFrameSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -521,6 +527,15 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             self.target_type == "world_eef_trajectory"
             and self.reference_frame == "pointcloud_reference_camera"
         )
+        self.merged_camera_reference = None
+        info_path = self.root / "meta/info.json"
+        if info_path.is_file() and is_merged_camera_metadata(json.loads(info_path.read_text())):
+            if not strict_camera_world:
+                raise ValueError(
+                    "Unified camera WorldFlow requires world_eef_trajectory and "
+                    "pointcloud_reference_camera; robot-base/legacy reinterpretation is forbidden."
+                )
+            self.merged_camera_reference = validate_merged_camera_reference(self.root)
         self.pose_dir = self.root / (
             "world_camera_ee_poses"
             if strict_camera_world
@@ -535,6 +550,9 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
             if self.target_type == "world_eef_trajectory"
             else "action_target_ee_poses"
         )
+        if self.merged_camera_reference is not None:
+            self.pose_dir = self.root / "world_ee_poses"
+            command_target_dir = self.root / "action_target_ee_poses"
         if (
             self.target_type == "legacy_eef"
             and require_action_target_sidecar
@@ -565,7 +583,7 @@ class WorldFlowMemmapDataset(torch.utils.data.Dataset):
                 "Fixed-reference WorldFlow requires the commanded EEF trajectory sidecar: "
                 f"{command_target_dir}. Achieved-pose fallbacks are forbidden."
             )
-        if self.target_type == "world_eef_trajectory":
+        if self.target_type == "world_eef_trajectory" and self.merged_camera_reference is None:
             base_meta_path = self.pose_dir / "meta.json"
             target_meta_path = command_target_dir / "meta.json"
             if not base_meta_path.is_file() or not target_meta_path.is_file():
@@ -1407,6 +1425,15 @@ def maybe_wrap_pointseg_cache_dataset(
     manifest = cache_dir / "manifest.json"
     if not manifest.exists():
         return maybe_online_fallback(f"Song pointseg cache not found at {cache_dir}")
+
+    if is_merged_camera_metadata(dataset.meta.info):
+        cache_manifest = json.loads(manifest.read_text())
+        if cache_manifest.get("merged_dataset_contract") != merged_cache_contract(dataset.meta.info):
+            raise ValueError(
+                "PointSeg cache is not certified for this merged dataset/alignment. "
+                "Regenerate it with song_cache_pointseg_samples.py or use online labels; "
+                "old per-source caches cannot be reused."
+            )
 
     strict = os.environ.get("SONG_POINTSEG_CACHE_STRICT", "1") != "0"
     root = Path(getattr(dataset, "root", dataset.meta.root))
@@ -2626,7 +2653,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames") or cfg.task_balanced_sampling:
+    if hasattr(cfg.policy, "drop_n_last_frames") or cfg.task_balanced_sampling or cfg.source_balanced_sampling:
         shuffle = False
         sampler_kwargs = {
             "dataset_from_indices": dataset.meta.episodes["dataset_from_index"],
@@ -2640,7 +2667,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             "drop_n_last_frames": int(getattr(cfg.policy, "drop_n_last_frames", 0)),
             "shuffle": True,
         }
-        if cfg.task_balanced_sampling:
+        if cfg.source_balanced_sampling:
+            if not is_merged_camera_metadata(dataset.meta.info):
+                raise ValueError("source_balanced_sampling requires merged source provenance.")
+            sampler = TaskBalancedFrameSampler(
+                episode_group_ids=merged_source_group_ids(
+                    dataset.root, list(dataset.meta.episodes["episode_index"])
+                ),
+                **sampler_kwargs,
+            )
+            if is_main_process:
+                logging.info("Equal source sampling: %s; %d frames per epoch",
+                             {str(k):len(v) for k,v in sampler.grouped_indices.items()}, len(sampler))
+        elif cfg.task_balanced_sampling:
             episode_tasks = dataset.meta.episodes["tasks"]
             invalid = [index for index, tasks in enumerate(episode_tasks) if len(tasks) != 1]
             if invalid:

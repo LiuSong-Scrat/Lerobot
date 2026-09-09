@@ -73,6 +73,9 @@ class TrainPipelineConfig(HubMixin):
     # frames from each task per dataloader epoch. Disabled by default to retain
     # the historical global-uniform-over-frames training distribution.
     task_balanced_sampling: bool = False
+    # Equal mass per source_id from merged provenance; frames within a source
+    # remain uniform. Mutually exclusive with task-text balancing.
+    source_balanced_sampling: bool = False
     # Number of micro-batches accumulated before one optimizer update.  ``steps``
     # continues to count optimizer updates, so enabling accumulation does not
     # silently change checkpoint or scheduler semantics.
@@ -112,6 +115,8 @@ class TrainPipelineConfig(HubMixin):
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
+        if self.source_balanced_sampling and self.task_balanced_sampling:
+            raise ValueError("Choose source_balanced_sampling or task_balanced_sampling, not both.")
         if int(self.gradient_accumulation_steps) < 1:
             raise ValueError(
                 "gradient_accumulation_steps must be at least 1, "

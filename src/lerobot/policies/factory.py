@@ -456,6 +456,10 @@ def make_policy(
     kwargs = {}
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
+        from lerobot.datasets.merged_camera import align_merged_rgb_features, is_merged_camera_metadata
+
+        if cfg.type == "smolvla" and is_merged_camera_metadata(ds_meta.info):
+            align_merged_rgb_features(cfg, features)
     else:
         if not cfg.pretrained_path:
             logging.warning(

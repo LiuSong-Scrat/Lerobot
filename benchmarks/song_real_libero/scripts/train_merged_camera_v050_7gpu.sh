@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# New fine-tuning run, not an optimizer-state resume. Does not modify the dataset.
+set -euo pipefail
+cd /home/liusong/ProgramFiles/Huggingface/lerobot
+
+PYTHONHASHSEED=0 \
+PYTHONDONTWRITEBYTECODE=1 \
+OMP_NUM_THREADS=7 \
+MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 \
+MALLOC_ARENA_MAX=2 \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 \
+PYTHONPATH=/home/liusong/ProgramFiles/Huggingface/lerobot/src:/home/liusong/ProgramFiles/Huggingface/lerobot \
+HF_HUB_OFFLINE=1 \
+HF_DATASETS_OFFLINE=1 \
+SONG_POINTSEG_REQUIRE_POINTOPS=1 \
+SONG_POINTCLOUD_GRIPPER_POINTS=500 \
+SONG_POINTSEG_ONLINE=1 \
+TOKENIZERS_PARALLELISM=false \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/liusong/anaconda3/envs/reap/bin/python \
+  -m accelerate.commands.accelerate_cli launch \
+  --multi_gpu \
+  --num_processes=7 \
+  --num_machines=1 \
+  --mixed_precision=no \
+  --dynamo_backend=no \
+  --main_process_port=29680 \
+  benchmarks/song_real_libero/scripts/train_song_benchmark.py \
+  --dataset.repo_id=local/merged_5datasets_rh20t_singleview \
+  --dataset.root=/home/liusong/datasets/merged_5datasets_rh20t_singleview_20260909_standalone \
+  --policy.path='/opt/data/private/liusong/benchmarks/song_real_libero/outputs/libero_setting/EVAL_TEST/V043_multiview_doubleflow/eval_temp_wep_vla_v043_multiview_doubleflow_finetune_4G_60k_after30k_after30k_libero_FULL_3-975*/checkpoints/pretrained_model' \
+  --policy.device=cuda \
+  --policy.camera_views=front \
+  --policy.rgb_camera_views=front \
+  --policy.n_obs_steps=1 \
+  --policy.chunk_size=32 \
+  --policy.n_action_steps=16 \
+  --policy.action_chunk_start_offset=0 \
+  --policy.worldflow_enable=true \
+  --policy.worldflow_target_type=world_eef_trajectory \
+  --policy.worldflow_reference_frame=pointcloud_reference_camera \
+  --policy.worldflow_require_action_target_sidecar=true \
+  --policy.worldflow_bootstrap_from_ego=false \
+  --policy.push_to_hub=false \
+  --policy.optimizer_lr=0.00003 \
+  --policy.scheduler_warmup_steps=500 \
+  --policy.scheduler_decay_steps=60000 \
+  --policy.scheduler_decay_lr=0.000003 \
+  --source_balanced_sampling=true \
+  --task_balanced_sampling=false \
+  --pointseg_sample_cache_dir='' \
+  --num_workers=0 \
+  --batch_size=16 \
+  --gradient_accumulation_steps=1 \
+  --steps=60000 \
+  --seed=1000 \
+  --resume=false \
+  --save_checkpoint=true \
+  --save_freq=2000 \
+  --log_freq=20 \
+  --eval_freq=0 \
+  --wandb.enable=false \
+  --output_dir=/opt/data/private/liusong/benchmarks/song_real_libero/outputs/mixture_setting/wep_vla_v050_unified_camera_from_v043_7gpu \
+  "$@"

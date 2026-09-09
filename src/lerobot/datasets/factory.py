@@ -26,6 +26,7 @@ from lerobot.datasets.lerobot_dataset import (
     MultiLeRobotDataset,
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+from lerobot.datasets.merged_camera import MergedCameraLeRobotDataset, is_merged_camera_metadata
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
 
@@ -89,8 +90,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        merged_camera = is_merged_camera_metadata(ds_meta.info)
+        if merged_camera and cfg.dataset.streaming:
+            raise ValueError("Merged camera training requires frame-indexed, non-streaming loading.")
         if not cfg.dataset.streaming:
-            dataset = LeRobotDataset(
+            dataset_cls = MergedCameraLeRobotDataset if merged_camera else LeRobotDataset
+            dataset = dataset_cls(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,

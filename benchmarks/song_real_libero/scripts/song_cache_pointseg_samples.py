@@ -22,6 +22,9 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.merged_camera import (
+    MergedCameraLeRobotDataset, is_merged_camera_metadata, merged_cache_contract,
+)
 from lerobot.policies.smolvla.song_pointseg import (
     DEFAULT_FUTURE_OFFSETS,
     POINTSEG_CACHE_LABEL_FIELDS,
@@ -169,7 +172,8 @@ def _make_lerobot_dataset(args: argparse.Namespace) -> LeRobotDataset:
     max_offset = max(args.future_offsets)
     metadata = LeRobotDatasetMetadata(repo_id, root=root)
     fps = int(metadata.fps)
-    return LeRobotDataset(
+    dataset_cls = MergedCameraLeRobotDataset if is_merged_camera_metadata(metadata.info) else LeRobotDataset
+    return dataset_cls(
         repo_id,
         root=root,
         episodes=args.episodes,
@@ -884,6 +888,10 @@ def cache_samples(args: argparse.Namespace) -> None:
 
     if is_main:
         manifest = {
+            "merged_dataset_contract": (
+                merged_cache_contract(full_dataset.meta.info)
+                if is_merged_camera_metadata(full_dataset.meta.info) else None
+            ),
             "version": POINTSEG_CACHE_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "role_names": list(ROLE_NAMES),
