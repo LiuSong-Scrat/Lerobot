@@ -65,13 +65,13 @@ if __package__:
     from .libero_setting.libero_pointcloud_utils import (
         add_local_gripper_cloud_to_point_cloud,
         add_world_gripper_cloud_to_point_cloud,
-        gripper_width_percent_from_scalar,
+        gripper_width_m_from_scalar,
     )
 else:
     from libero_setting.libero_pointcloud_utils import (
         add_local_gripper_cloud_to_point_cloud,
         add_world_gripper_cloud_to_point_cloud,
-        gripper_width_percent_from_scalar,
+        gripper_width_m_from_scalar,
     )
 
 
@@ -787,7 +787,7 @@ class SmolVLA_ModelInference:
         add_gripper_cloud: bool = True,
         gripper_points: int = 500,
         gripper_len: float = 0.06,
-        gripper_template: str = "reap",
+        gripper_template: str = "rh20t_v3",
         gripper_drop_strategy: str = "tail",
         gripper_shuffle_points: bool = False,
         gripper_qpos_max_width: float = 0.08,
@@ -802,7 +802,7 @@ class SmolVLA_ModelInference:
         """
         one_step_agent_pos = self._real_observation_to_pose9_gripper(cur_model_observation)
         point_cloud_world = self._to_numpy(cur_model_observation["point_cloud"]).astype(np.float32)
-        gripper_width_percent = gripper_width_percent_from_scalar(
+        gripper_width_m = gripper_width_m_from_scalar(
             float(one_step_agent_pos[-1]),
             max_physical_width=gripper_qpos_max_width,
         )
@@ -810,11 +810,12 @@ class SmolVLA_ModelInference:
             one_step_point_cloud = add_world_gripper_cloud_to_point_cloud(
                 point_cloud_world,
                 one_step_agent_pos,
-                gripper_width_percent,
+                gripper_width_m,
                 total_points=num_points,
                 gripper_points=gripper_points,
                 gripper_len=gripper_len,
                 gripper_template=gripper_template,
+                gripper_max_width=gripper_qpos_max_width,
                 drop_strategy=gripper_drop_strategy,
                 shuffle_points=gripper_shuffle_points,
             )
@@ -827,10 +828,11 @@ class SmolVLA_ModelInference:
                 one_step_point_cloud,
                 num_points=num_points,
                 add_gripper_cloud=False,
-                gripper_width_percent=gripper_width_percent,
+                gripper_width_percent=0.0,
                 gripper_points=gripper_points,
                 gripper_len=gripper_len,
                 gripper_template=gripper_template,
+                gripper_max_width=gripper_qpos_max_width,
                 gripper_drop_strategy=gripper_drop_strategy,
                 gripper_shuffle_points=gripper_shuffle_points,
             )
@@ -1326,7 +1328,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--add-gripper-cloud", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gripper-points", type=int, default=500)
     parser.add_argument("--gripper-len", type=float, default=0.06)
-    parser.add_argument("--gripper-template", choices=("reap", "panda"), default="reap")
+    parser.add_argument(
+        "--gripper-template",
+        choices=("rh20t_v3", "canonical", "reap", "panda"),
+        default="rh20t_v3",
+    )
     parser.add_argument("--gripper-drop-strategy", choices=("tail", "random", "near_gripper"), default="tail")
     parser.add_argument("--gripper-shuffle-points", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gripper-width-percent", type=float, default=1.0)
@@ -1366,18 +1372,24 @@ def prepare_inference_point_cloud(
     gripper_points: int,
     gripper_len: float,
     gripper_template: str,
+    gripper_max_width: float = 0.08,
     gripper_drop_strategy: str,
     gripper_shuffle_points: bool,
     seed: int = 0,
 ) -> np.ndarray:
     if add_gripper_cloud:
+        opening_width_m = gripper_width_m_from_scalar(
+            float(gripper_width_percent) * float(gripper_max_width),
+            max_physical_width=float(gripper_max_width),
+        )
         return add_local_gripper_cloud_to_point_cloud(
             xyzrgb_eff,
-            gripper_width_percent,
+            opening_width_m,
             total_points=int(num_points),
             gripper_points=int(gripper_points),
             gripper_len=float(gripper_len),
             gripper_template=str(gripper_template),
+            gripper_max_width=float(gripper_max_width),
             seed=int(seed),
             drop_strategy=str(gripper_drop_strategy),
             shuffle_points=bool(gripper_shuffle_points),
@@ -1535,6 +1547,7 @@ def main() -> None:
             gripper_points=args.gripper_points,
             gripper_len=args.gripper_len,
             gripper_template=args.gripper_template,
+            gripper_max_width=float(args.gripper_qpos_max_width),
             gripper_drop_strategy=args.gripper_drop_strategy,
             gripper_shuffle_points=args.gripper_shuffle_points,
         )

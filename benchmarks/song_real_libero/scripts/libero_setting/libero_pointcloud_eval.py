@@ -91,6 +91,19 @@ def validate_control_frequency(value: Any) -> float:
 def evaluation_protocol_for_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Describe whether this is a standard benchmark or a source-demo domain diagnostic."""
 
+    profile = contact_solver.validate_profile(cfg.get("contact_solver_profile", "default"))
+    if profile != "default":
+        base = evaluation_protocol_for_config({**cfg, "contact_solver_profile": "default"})
+        return {
+            **base,
+            "name": "contact_solver_modified_rollout",
+            "base_protocol": base["name"],
+            "contact_solver_profile": profile,
+            "contact_solver_activation": "after_initialization_before_policy",
+            "benchmark_comparable": False,
+            "diagnostic_only": True,
+        }
+
     if cfg.get("worldflow_action_fusion_override") is not None:
         return {
             **FAIR_EVALUATION_PROTOCOL,
@@ -202,6 +215,8 @@ def _identity_pose9_gripper(gripper: float = 0.0) -> np.ndarray:
     return state
 
 if __package__ and __package__.startswith("benchmarks."):
+    from . import libero_eval_artifacts as eval_artifacts
+    from . import libero_contact_solver as contact_solver
     from .._paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
     if (
         not _ENV_WORKER_BOOTSTRAP
@@ -228,9 +243,12 @@ if __package__ and __package__.startswith("benchmarks."):
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
         render_camera_names_from_config,
+        T_PREVIOUS_EEF_VIRTUAL_EEF,
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from libero_setting import libero_eval_artifacts as eval_artifacts
+    from libero_setting import libero_contact_solver as contact_solver
     from _paths import BENCHMARK_ROOT, DEFAULT_LIBERO_CONFIG, load_json_config
     from libero_setting.libero_pointcloud_utils import (
         attach_mujoco_3d_viewer,
@@ -248,6 +266,7 @@ else:
         pointcloud_camera_names_from_config,
         pose9_to_homo_np,
         render_camera_names_from_config,
+        T_PREVIOUS_EEF_VIRTUAL_EEF,
     )
     if (
         not _ENV_WORKER_BOOTSTRAP
@@ -351,11 +370,10 @@ def collect_evaluation_identity(policy_path: str | Path | None) -> dict[str, Any
                 "model_mtime_ns": int(stat.st_mtime_ns),
             }
         )
-        # Suite children do not write a global summary; avoid hashing the same
-        # 1.4 GB checkpoint once per GPU child.  The launcher or single process
-        # records the full digest exactly once.
-        if os.environ.get("SONG_LIBERO_SUITE_WORKER", "0") != "1":
-            identity["model_sha256"] = _sha256_file(model_path)
+        # Keep lightweight provenance without scanning multi-GB weights over
+        # network storage before inference can start. No checkpoint digest is
+        # computed here; size/mtime are provenance, not content verification.
+        identity["model_hash_status"] = "disabled"
     try:
         identity["git_commit"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
@@ -444,21 +462,33 @@ def append_video_frames(
             video_frames.setdefault(image_key, []).append(image.copy())
 
 
-def _write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
-    if not frames:
+def _write_video(path: Path, frames: Any, fps: int) -> None:
+    # Stream annotated native-size frames without a second full video buffer.
+    iterator = iter(frames)
+    first = next(iterator, None)
+    if first is None:
         return
+    first = np.asarray(first, dtype=np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
+    writer = None
     try:
-        import imageio.v3 as iio
-
-        iio.imwrite(path, np.asarray(frames, dtype=np.uint8), fps=fps)
-        return
+        import imageio.v2 as iio
+        writer = iio.get_writer(path, fps=fps, macro_block_size=1)
+        writer.append_data(first)
     except Exception:
-        pass
+        if writer is not None:
+            writer.close()
+        writer = None
+    if writer is not None:
+        try:
+            for frame in iterator:
+                writer.append_data(np.asarray(frame, dtype=np.uint8))
+        finally:
+            writer.close()
+        return
 
     import cv2
 
-    first = np.asarray(frames[0], dtype=np.uint8)
     height, width = first.shape[:2]
     writer = cv2.VideoWriter(
         str(path),
@@ -469,7 +499,8 @@ def _write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
     if not writer.isOpened():
         raise RuntimeError(f"Could not open video writer for {path}")
     try:
-        for frame in frames:
+        writer.write(cv2.cvtColor(first, cv2.COLOR_RGB2BGR))
+        for frame in iterator:
             writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
     finally:
         writer.release()
@@ -486,16 +517,27 @@ def export_episode_videos(
     video_frames = episode.get("video_frames") or {}
     if not video_frames:
         return []
-    video_dir_name = record.get("video_dir_name")
-    if video_dir_name is None:
-        video_dir_name = f"episode_{int(record['episode_index']):06d}_{record['demo_name']}"
-    episode_dir = video_dir / video_dir_name
+    primary = "agentview_image" if "agentview_image" in video_frames else next(iter(video_frames))
+    primary_frames = video_frames[primary]
+    if primary_frames:
+        record["video_rgb_min"] = int(min(np.min(frame) for frame in primary_frames))
+        record["video_rgb_max"] = int(max(np.max(frame) for frame in primary_frames))
+        record["video_rgb_mean"] = float(np.mean([np.mean(frame) for frame in primary_frames]))
+        if record["video_rgb_max"] == 0:
+            print(f"[video-warning] episode={record['episode_index']} all RGB frames are zero", flush=True)
     written: list[str] = []
-    for image_key, frames in video_frames.items():
+    for image_key in [primary] + [key for key in video_frames if key != primary]:
+        frames = video_frames[image_key]
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", image_key)
-        path = episode_dir / f"{safe_key}.mp4"
-        _write_video(path, frames, int(cfg["fps"]))
-        written.append(str(path))
+        directory = video_dir / "videos"
+        if image_key != primary:
+            directory /= safe_key
+        path = directory / f"episode_{int(record['episode_index']):03d}.mp4"
+        annotated = eval_artifacts.annotated_frames(
+            frames, episode.get("video_frame_metadata", []), record.get("task_name", "LIBERO"),
+            int(record['episode_index']), bool(episode.get("success", False)), cfg)
+        _write_video(path, annotated, int(cfg.get("video_fps", 20)))
+        written.append(str(path.relative_to(video_dir)))
     return written
 
 
@@ -503,6 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Clean LIBERO eval: point-cloud observation -> action chunk -> absolute pose execution."
     )
+    eval_artifacts.add_output_arguments(parser)
 
 
     ###################TrainDatasetTest##########
@@ -756,6 +799,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum per-episode Viewer3D goal-debug samples retained in goal_debug.json (default: 5000).",
     )
     parser.add_argument("--control-freq", type=float, default=None)
+    parser.add_argument(
+        "--contact-solver-profile", choices=contact_solver.PROFILES, default=None,
+        help="Opt-in MuJoCo 3.3.4 solver experiment; noslip_v1 enables 3 NoSlip iterations after initialization.",
+    )
 
     parser.add_argument("--action-index", type=int, default=None)
     parser.add_argument("--exec-action-steps", type=int, default=None)
@@ -1283,8 +1330,8 @@ def record_realtime_failed_episode(
         output_dir
         / suite_name
         / f"task_{task_id:03d}"
-        / f"episode_{episode_index:03d}"
-        / "result.json"
+        / "results"
+        / f"episode_{episode_index:03d}.json"
     )
 
     failure_record = {
@@ -3571,9 +3618,9 @@ def action_chunk_to_absolute_libero_actions(
     """Convert one model chunk to directly executable absolute OSC actions.
 
     The model chunk is treated like the original UMI-style trajectory: each row's
-    pose9 is relative to the current observation EEF frame.  We first turn the
-    whole chunk into fixed model-world targets, then map model EEF frame to the
-    robosuite OSC controller EEF site frame, and finally emit 7D LIBERO actions:
+    pose9 is relative to the current RH20T virtual-EEF frame. We first turn the
+    whole chunk into fixed model-world targets, then map the virtual EEF to the
+    robosuite OSC controller EEF site, and finally emit 7D LIBERO actions:
         [abs_x, abs_y, abs_z, abs_rx, abs_ry, abs_rz, gripper_open_close]
     """
     chunk = np.asarray(action_chunk, dtype=np.float32)
@@ -3682,6 +3729,26 @@ def aggregate_task_results(tasks: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[str], tasks: list[dict[str, Any]]) -> None:
+    # The report owner receives merged episode shards; workers never concatenate
+    # task-wide action arrays independently.
+    for task in tasks:
+        task_dir = output_dir / task["suite"] / f"task_{int(task['task_id']):03d}"
+        results = task.get("episodes", [])
+        alignment = eval_artifacts.finalize_alignment(task_dir, results)
+        write_json_atomic(task_dir / "config.json", json_safe(cfg))
+        write_json_atomic(task_dir / "summary.json", {
+            "task": task.get("task_name"), "task_language": task.get("task_language"),
+            "episodes": len(results), "successes": sum(bool(r.get("success")) for r in results),
+            "success_rate": task.get("success_rate", 0.0), "results": results,
+            "executed_action_alignment": {
+                "enabled": bool(cfg.get("save_action_records", True)),
+                "directory": "executed_action_alignment" if alignment else None,
+                "executed_environment_steps": sum(int(r.get("environment_actions", 0)) for r in results),
+                "manifest": "executed_action_alignment/manifest.json" if alignment else None,
+            },
+        })
+    if not os.environ.get("SONG_LIBERO_SUITE_WORKER"):
+        write_json_atomic(output_dir / "config.json", json_safe(cfg))
     suite_reports = []
     for suite_name in suite_names:
         suite_tasks = [task for task in tasks if task.get("suite") == suite_name]
@@ -3702,6 +3769,7 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
         "env_seed": int(cfg.get("env_seed", 0)),
         "evaluation_protocol": evaluation_protocol_for_config(cfg),
         "environment_domain": {
+            "contact_solver_profile": cfg.get("contact_solver_profile", "default"),
             "dataset_domain_env": bool(cfg.get("dataset_domain_env", False)),
             "dataset_domain_oracle_actions": bool(
                 cfg.get("dataset_domain_oracle_actions", False)
@@ -3827,6 +3895,8 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
             "width": int(cfg["observation_width"]),
             "add_gripper_cloud": bool(cfg["add_gripper_cloud"]),
             "gripper_points": int(cfg.get("gripper_points", 0)),
+            "eef_entity": "rh20t_canonical_virtual_gripper",
+            "T_previous_eef_virtual_eef": T_PREVIOUS_EEF_VIRTUAL_EEF.tolist(),
         },
         "control": {
             "controller_mode": "OSC_POSE absolute pose",
@@ -3907,6 +3977,8 @@ def write_eval_reports(output_dir: Path, cfg: dict[str, Any], suite_names: list[
 
 def compact_episode_record(result: dict[str, Any], episode_idx: int, action_npz: str | None) -> dict[str, Any]:
     drop_keys = {
+        "artifact_model_rows", "artifact_controller_rows", "artifact_execution_indices",
+        "video_frame_metadata",
         "video_frames",
         "libero_actions",
         "oracle_source_raw_actions",
@@ -4279,7 +4351,7 @@ def build_point_cloud_observation(env: Any, raw_obs: dict[str, Any], cfg: dict[s
         add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
         gripper_points=int(cfg.get("gripper_points", 500)),
         gripper_len=float(cfg.get("gripper_len", 0.06)),
-        gripper_template=str(cfg.get("gripper_template", "reap")),
+        gripper_template=str(cfg.get("gripper_template", "rh20t_v3")),
         gripper_max_width=float(cfg.get("gripper_qpos_max_width", 0.08)),
         # Multi-view training relies on a single addressable gripper tail.
         gripper_drop_strategy=(
@@ -4843,6 +4915,7 @@ class BatchedInferenceScheduler:
     ) -> None:
         self.infer = infer
         self.policy = infer.policy
+        self._artifact_local = threading.local()
         self.max_batch_size = max(1, int(max_batch_size))
         self.batch_wait_s = max(0.0, float(batch_wait_ms)) / 1000.0
         self._queue: queue.Queue[_InferenceRequest | object] = queue.Queue()
@@ -4889,7 +4962,13 @@ class BatchedInferenceScheduler:
                 future=future,
             )
         )
-        return future.result()
+        action, snapshot = future.result()
+        self._artifact_local.snapshot = snapshot
+        return action
+
+    @property
+    def artifact_snapshot(self):
+        return getattr(self._artifact_local, "snapshot", None)
 
     def _collect_batch(self, first: _InferenceRequest) -> tuple[list[_InferenceRequest], bool]:
         requests = [first]
@@ -4946,7 +5025,7 @@ class BatchedInferenceScheduler:
                     f"Policy returned batch {int(action_chunks.shape[0])}, expected {len(requests)}."
                 )
             for index, request in enumerate(requests):
-                request.future.set_result(action_chunks[index : index + 1])
+                request.future.set_result((action_chunks[index : index + 1], eval_artifacts.snapshot_row(self.infer, index)))
             self._batch_count += 1
             self._request_count += len(requests)
             self._max_observed_batch = max(self._max_observed_batch, len(requests))
@@ -5197,6 +5276,10 @@ class ProcessInferenceProxy:
             )
         if status != "ok":
             raise RuntimeError(f"Parent GPU inference failed:\n{payload}")
+        self.artifact_snapshot = None
+        if isinstance(payload, dict):
+            self.artifact_snapshot = payload.get("artifact_snapshot")
+            payload = payload["action_chunk"]
         return np.asarray(payload)
 
 
@@ -5318,8 +5401,9 @@ def _execute_process_inference_batch(
                 f"Policy returned batch {int(action_chunks.shape[0])}, expected {len(requests)}."
             )
         for index, request in enumerate(requests):
+            payload = eval_artifacts.inference_payload(action_chunks[index : index + 1], eval_artifacts.snapshot_row(infer, index))
             response_queues[request.worker_id].put(
-                ("ok", request.request_id, np.asarray(action_chunks[index : index + 1]))
+                ("ok", request.request_id, payload)
             )
     except BaseException:
         error_text = traceback.format_exc()
@@ -5376,6 +5460,7 @@ def _execute_process_inference_fixed_slots(
         observation_batch = _stack_model_observations([request.observation for request in slots])
         cache_key = inference_cache.key(slots) if inference_cache is not None else None
         action_chunks = inference_cache.load(cache_key) if inference_cache is not None else None
+        artifact_snapshots = {}
         if action_chunks is None:
             action_chunks = infer.predict_action_chunk_obs(
                 observation_batch,
@@ -5386,6 +5471,10 @@ def _execute_process_inference_fixed_slots(
                 if all(request.noise_seed is not None for request in slots)
                 else None,
             )
+            # Copy before an optional pre-existing repeatability probe can
+            # overwrite the model's last snapshot. Cache hits have no scores.
+            artifact_snapshots = {worker_id: eval_artifacts.snapshot_row(infer, worker_id)
+                                  for worker_id, _ in real_slots}
             if inference_cache is not None:
                 inference_cache.store(cache_key, action_chunks)
         if repeatability_probe_path is not None and not repeatability_probe_path.exists():
@@ -5460,8 +5549,9 @@ def _execute_process_inference_fixed_slots(
                 f"Policy returned fixed batch {int(action_chunks.shape[0])}, expected {slot_count}."
             )
         for worker_id, request in real_slots:
+            payload = eval_artifacts.inference_payload(action_chunks[worker_id : worker_id + 1], artifact_snapshots.get(worker_id))
             response_queues[worker_id].put(
-                ("ok", request.request_id, np.asarray(action_chunks[worker_id : worker_id + 1]))
+                ("ok", request.request_id, payload)
             )
     except BaseException:
         error_text = traceback.format_exc()
@@ -6438,6 +6528,7 @@ def run_episode(
     oracle_absolute_action_trajectory: np.ndarray | None = None,
     oracle_scaled_delta_trajectory: np.ndarray | None = None,
     oracle_raw_action_indices: np.ndarray | None = None,
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     control = cfg["control"]
     dataset_domain_env = bool(cfg.get("dataset_domain_env", False))
@@ -6566,6 +6657,8 @@ def run_episode(
     policy_noise_seed_base = int(cfg.get("policy_noise_seed", 0))
 
 
+    # A reused environment must initialize with its original solver settings.
+    contact_solver.restore_contact_solver(env)
     if reset_env:
         raw_obs = env.reset()
     else:
@@ -6635,6 +6728,10 @@ def run_episode(
         for _ in range(warmup_steps):
             raw_obs, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
 
+    contact_solver_settings = contact_solver.apply_contact_solver(
+        env, cfg.get("contact_solver_profile", "default")
+    )
+
     if not bool(getattr(infer, "shared_parallel_inference", False)):
         infer.policy.reset()
         infer.policy_reset()
@@ -6674,8 +6771,34 @@ def run_episode(
     pc_camera_names = pointcloud_camera_names_from_config(cfg)
     save_video = bool(cfg.get("save_video", True))
     video_frames: dict[str, list[np.ndarray]] = {}
-    if save_video:
-        append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+    video_frame_metadata: list[dict[str, Any]] = []
+    artifacts = eval_artifacts.EpisodeArtifacts(artifact_dir, episode_index, cfg) if artifact_dir else None
+    artifact_model_rows, artifact_controller_rows, artifact_execution_indices = [], [], []
+    artifact_errors: list[str] = []
+    initial_sim_time = float(getattr(getattr(env.sim, "data", None), "time", 0.0))
+
+    def record_output_frame(observation, frame_index, model_call=0, chunk_row=None):
+        if save_video:
+            append_video_frames(video_frames, observation, list(cfg["camera_names"]))
+            timestep = float(getattr(getattr(env.sim.model, "opt", None), "timestep", 0.0))
+            physics_frame = (round((float(env.sim.data.time) - initial_sim_time) / timestep)
+                             if timestep > 0 else "unknown")
+            video_frame_metadata.append({"physics_frame_index": physics_frame,
+                                         "model_call": model_call, "chunk_row": chunk_row})
+        if artifacts and cfg.get("save_frame_pointclouds", False) and frame_index % int(cfg.get("frame_pointcloud_every_n_frames", 2)) == 0:
+            try:
+                cloud, _, _ = build_point_cloud_observation(env, observation, cfg, seed=frame_index)
+                artifacts.frame(frame_index, cloud)
+            except Exception as exc:
+                artifact_errors.append(f"frame {frame_index}: {exc!r}")
+                print(f"[artifact-warning] {artifact_errors[-1]}", flush=True)
+
+    def record_executed_action(model_row, command, call, row_index, phase, attempt, step):
+        artifact_model_rows.append(np.full(10, np.nan, dtype=np.float32) if model_row is None else np.asarray(model_row[:10], dtype=np.float32).copy())
+        artifact_controller_rows.append(np.asarray(command, dtype=np.float32).copy())
+        artifact_execution_indices.append([episode_index, call, row_index, phase, attempt, step])
+
+    record_output_frame(raw_obs, 0)
 
     rewards: list[float] = []
     libero_actions: list[np.ndarray] = []
@@ -6851,6 +6974,7 @@ def run_episode(
 
             steps += 1
             rollback_step_count += 1
+            record_executed_action(None, rollback_action, model_call_count, -1, 2, 0, steps - 1)
             reward = float(reward)
             rewards.append(reward)
             rollback_actions.append(rollback_action.copy())
@@ -6873,8 +6997,7 @@ def run_episode(
             contact_counts.append(int(all_contact_count))
             robot_scene_contact_counts.append(int(robot_contact_count))
             render_viewer3d(env, cfg, steps)
-            if save_video:
-                append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+            record_output_frame(raw_obs, steps, model_call_count)
 
             achieved_controller_world = current_controller_eef_world(env)
             achieved_pose9 = matrix_to_pose9(achieved_controller_world)
@@ -6980,6 +7103,7 @@ def run_episode(
 
             steps += 1
             oracle_executed_count += 1
+            record_executed_action(None, absolute_action, model_call_count, -1, 3, 0, steps - 1)
             oracle_cursor = int(source_action_index)
             reward = float(reward)
             rewards.append(reward)
@@ -7035,12 +7159,7 @@ def run_episode(
             contact_counts.append(int(all_contact_count))
             robot_scene_contact_counts.append(int(robot_contact_count))
             render_viewer3d(env, cfg, steps)
-            if save_video:
-                append_video_frames(
-                    video_frames,
-                    raw_obs,
-                    list(cfg["camera_names"]),
-                )
+            record_output_frame(raw_obs, steps, model_call_count)
 
             try:
                 success_ever = success_ever or bool(env.check_success())
@@ -7077,7 +7196,7 @@ def run_episode(
                 add_gripper_cloud=bool(cfg.get("add_gripper_cloud", True)),
                 gripper_points=int(cfg.get("gripper_points", 500)),
                 gripper_len=float(cfg.get("gripper_len", 0.06)),
-                gripper_template=str(cfg.get("gripper_template", "reap")),
+                gripper_template=str(cfg.get("gripper_template", "rh20t_v3")),
                 gripper_max_width=gripper_max_width,
                 # compose_point_cloud_views() and dataset generation both
                 # require scene-first / gripper-tail layout in multi-view mode.
@@ -7161,6 +7280,23 @@ def run_episode(
                 chunk = np.asarray(chunk_batch)[0]
             predicted_action_chunks.append(np.asarray(chunk, dtype=np.float32))
             model_call_count += 1
+            if artifacts:
+                try:
+                    artifacts.umi(steps, model_call_count, chunk, point_cloud, renderer=vis_umi_data)
+                except Exception as exc:
+                    artifact_errors.append(f"UMI model_call {model_call_count}: {exc!r}")
+                    print(f"[artifact-warning] {artifact_errors[-1]}", flush=True)
+                try:
+                    start = min(action_index, len(chunk) - 1)
+                    stop = len(chunk) if exec_action_steps <= 0 else min(len(chunk), start + exec_action_steps)
+                    snapshot = (infer.artifact_snapshot if hasattr(infer, "artifact_snapshot")
+                                else eval_artifacts.snapshot_row(infer))
+                    artifacts.chunk(steps, model_call_count, chunk, point_cloud,
+                                    chunk_start_model_world, env, raw_obs, snapshot,
+                                    start, stop, float(eef_pose[-1]))
+                except Exception as exc:
+                    artifact_errors.append(f"model_call {model_call_count}: {exc!r}")
+                    print(f"[artifact-warning] {artifact_errors[-1]}", flush=True)
 
             one_shot_trajectory_vis = keyboard.pop_trajectory_visualization_request()
             continuous_trajectory_vis = bool(
@@ -7406,6 +7542,8 @@ def run_episode(
 
                     steps += 1
                     hold_count += 1
+                    record_executed_action(row, step_action, model_call_count, start_idx + selected_row_index,
+                                           0 if _hold_index == 0 else 1, _hold_index + 1, steps - 1)
                     step_object_positions, step_object_quaternions = capture_observable_object_poses(
                         raw_obs,
                         object_pose_names,
@@ -7474,8 +7612,7 @@ def run_episode(
                     tracking_rotation_errors.append(rotation_error)
                     previous_issued_target_model_world = np.asarray(model_world, dtype=np.float32)
 
-                    if save_video:
-                        append_video_frames(video_frames, raw_obs, list(cfg["camera_names"]))
+                    record_output_frame(raw_obs, steps, model_call_count, start_idx + selected_row_index)
 
                     if keyboard.poll():
                         manual_failure = True
@@ -7526,6 +7663,7 @@ def run_episode(
         manual_failure = manual_failure or keyboard.poll()
     finally:
         keyboard.close()
+        contact_solver.restore_contact_solver(env)
 
     if manual_failure:
         success_ever = False
@@ -7534,6 +7672,7 @@ def run_episode(
     final_eef_pose = eef_pose9_gripper_from_obs(raw_obs)
     return {
         "evaluation_protocol": evaluation_protocol_for_config(cfg),
+        "contact_solver_settings": contact_solver_settings,
         "initialization_mode": (
             "source_demo_exact_observation"
             if dataset_domain_env
@@ -7857,6 +7996,13 @@ def run_episode(
         "robot_scene_contact_counts": np.asarray(robot_scene_contact_counts, dtype=np.int32),
         "waypoint_hold_counts": np.asarray(waypoint_hold_counts, dtype=np.int16),
         "video_frames": video_frames,
+        "video_frame_metadata": video_frame_metadata,
+        "artifact_model_rows": artifact_model_rows,
+        "artifact_controller_rows": artifact_controller_rows,
+        "artifact_execution_indices": artifact_execution_indices,
+        "environment_actions": len(artifact_execution_indices),
+        "artifact_errors": artifact_errors,
+        **(artifacts.finish(bool(success_ever and not manual_failure)) if artifacts else {}),
     }
 
 
@@ -8247,8 +8393,11 @@ def evaluate_task(
                 output_dir
                 / suite_name
                 / f"task_{int(task_id):03d}"
+                / "diagnostics"
                 / f"episode_{episode_idx:03d}"
             )
+            task_dir = episode_dir.parent.parent
+            result_path = task_dir / "results" / f"episode_{episode_idx:03d}.json"
             episode_dir.mkdir(parents=True, exist_ok=True)
             append_realtime_episode_event(
                 output_dir=output_dir,
@@ -8342,6 +8491,7 @@ def evaluate_task(
                     init_state=episode_init_state,
                     cfg=cfg,
                     reset_env=False,
+                    artifact_dir=task_dir,
                     oracle_raw_action_trajectory=oracle_raw_action_trajectory,
                     oracle_absolute_action_trajectory=oracle_absolute_action_trajectory,
                     oracle_scaled_delta_trajectory=oracle_scaled_delta_trajectory,
@@ -8364,7 +8514,10 @@ def evaluate_task(
                 )
                 result["hard_reset_warmup_count"] = int(reset_warmup_count)
 
-                action_npz = save_episode_actions(result, episode_dir)
+                action_npz = None
+                if cfg.get("save_action_records", True):
+                    action_npz = save_episode_actions(result, episode_dir)
+                    result.update(eval_artifacts.save_action_records(task_dir, episode_idx, result))
                 goal_debug_path = save_episode_goal_debug(result, episode_dir)
                 episode_record = compact_episode_record(result, episode_idx, action_npz)
                 if goal_debug_path is not None:
@@ -8373,19 +8526,22 @@ def evaluate_task(
                 if bool(cfg.get("save_video", True)):
                     video_record = {
                         "episode_index": int(episode_idx),
+                        "task_name": task_name,
                         "demo_name": "rollout",
                         "video_dir_name": episode_dir.name,
                     }
                     video_paths = export_episode_videos(
                         result,
-                        episode_dir.parent,
+                        task_dir,
                         video_record,
                         cfg,
                     )
                     if video_paths:
                         episode_record["videos"] = video_paths
+                        episode_record["video"] = video_paths[0]
+                        episode_record.update({key: value for key, value in video_record.items() if key.startswith("video_rgb_")})
 
-                write_json_atomic(episode_dir / "result.json", episode_record)
+                write_json_atomic(result_path, episode_record)
                 update_realtime_episode_progress(
                     output_dir=output_dir,
                     suite_name=suite_name,
@@ -8415,8 +8571,8 @@ def evaluate_task(
                     "max_reward": 0.0,
                     "error": repr(exc),
                 }
-                write_json_atomic(episode_dir / "result.json", failure)
-                write_json_atomic(episode_dir / "error.json", failure)
+                write_json_atomic(result_path, failure)
+                write_json_atomic(task_dir / "errors" / f"episode_{episode_idx:03d}.json", failure)
                 update_realtime_episode_progress(
                     output_dir=output_dir,
                     suite_name=suite_name,
@@ -8432,6 +8588,8 @@ def evaluate_task(
                     flush=True,
                 )
             finally:
+                if env is not None:
+                    contact_solver.restore_contact_solver(env)
                 if bool(cfg.get("recreate_env_per_episode", False)) and env is not None:
                     try:
                         env.close()
@@ -9019,6 +9177,7 @@ def _isolated_policy_worker_entry(
             ),
         )
         reconcile_eval_camera_views_with_loaded_policy(infer, cfg)
+        eval_artifacts.enable_capture(infer, cfg)
         suite = benchmark.get_benchmark_dict()[suite_name]()
         summaries: list[dict[str, Any]] = []
         for task_id in task_ids:
@@ -9340,6 +9499,7 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         int(cfg_get(cfg, args.goal_debug_max_trace_points, "goal_debug_max_trace_points", 5000)),
     )
     cfg["save_video"] = bool(cfg_get(cfg, args.save_video, "save_video", True))
+    eval_artifacts.configure_output(cfg, args)
     cfg["visualize_foreground"] = bool(
         cfg_get(cfg, args.visualize_foreground, "visualize_foreground", False)
     )
@@ -9381,6 +9541,16 @@ def prepare_config(args: argparse.Namespace) -> tuple[dict[str, Any], list[str],
         cfg["gripper_points"] = int(args.gripper_points)
     configure_eval_camera_views(cfg, args, checkpoint_camera_selection)
 
+    cfg["contact_solver_profile"] = contact_solver.validate_profile(
+        cfg_get(cfg, args.contact_solver_profile, "contact_solver_profile", "default")
+    )
+    cfg["evaluation_identity"]["environment_domain"]["contact_solver_profile"] = cfg["contact_solver_profile"]
+    if cfg["contact_solver_profile"] != "default":
+        print(
+            "[warn] noslip_v1: solver-modified environment (not the original benchmark); "
+            "NoSlip iterations=3, applied after initialization; use a separate output directory.",
+            flush=True,
+        )
     cfg["control"]["control_freq"] = validate_control_frequency(
         cfg_get(
             cfg["control"],
@@ -10065,6 +10235,7 @@ def main() -> None:
             "worldflow_action_fusion_override"
         ),
     )
+    eval_artifacts.enable_capture(infer, cfg)
     if cfg.get("worldflow_action_fusion_override") is not None:
         print(
             "[diagnostic] WorldFlow action fusion overridden at load time: "
